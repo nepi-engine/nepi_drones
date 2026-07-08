@@ -1,0 +1,29 @@
+driver:
+  pkg_name: RBX_ARDUPILOT
+  display_name: Ardupilot Autopilot
+  description: Driver package for ardupilot autopilot systems
+  type: RBX
+  group_id: ARDU
+  NODE_DICT:
+    file_name: rbx_ardupilot_node.py
+    class_name: ArdupilotNode
+  DRIVER_DICT:
+    file_name: None
+    class_name: None
+  DISCOVERY_DICT:
+    file_name: rbx_ardupilot_discovery.py
+    class_name: ArdupilotDiscovery
+    process: CALL
+    OPTIONS:
+      connection:
+        type: Discrete
+        options:
+          - SERIAL
+        default: SERIAL
+        value: SERIAL
+      fake_gps:
+        type: 'Bool'
+        options:
+          - ''
+        default: 'True'
+        value: 'True'

@@ -1,0 +1,1 @@
+Files and Folders in this folder will be synced to NEPI's source-code build folder (/mnt/nepi_storage/nepi_src/nepi_engine_ws/src), then used during NEPI's build processes on top of NEPI's defualt source-code files. 
