@@ -9,16 +9,21 @@
 ##
 
 #######################################################################################################
-# Usage: $ ./deploy_nepi_engine_complete.sh
+# Usage: $ ./deploy_nepi_source.sh
 #
-# This script copies the complete nepi_engine source code to proper filesystem locations on target
-# hardware in preparation for building nepi-engine from source. 
+# Deploys this repo's src/ tree (nepi_drivers + nepi_apps) into the NEPI config overlay
+# location on the target:
 #
-# It can be run from a development host or directly on the target hardware as described in this
-# repository's README
+#     ${NEPI_CONFIG}/system_cfg/src           (default /mnt/nepi_config/system_cfg/src)
+#
+# That overlay is applied on top of /mnt/nepi_storage/nepi_src at build time, so deploying
+# here is how the drone drivers/apps get folded into a NEPI build. Same mechanism the
+# customer_ocean_aero deploy_nepi_source.sh uses.
+#
+# It can be run from a development host or directly on the target hardware.
 #
 # The script requires the following environment variable be set
-#    NEPI_REMOTE_SETUP: Indicates whether running from development host or directly on target 
+#    NEPI_REMOTE_SETUP: Indicates whether running from development host or directly on target
 #                      (1 = Dev. Host, 0 = From Target)
 # In the case that NEPI_REMOTE_SETUP == 1, some further environment variables must be set
 #    NEPI_TARGET_IP: Target IP address/hostname
@@ -41,7 +46,7 @@
 sudo -v
 
 
-REPO="REPO_FOLDER_NAME" 
+REPO="nepi_drones"
 
 
 # Set NEPI folder variables if not configured by nepi aliases bash script
@@ -110,7 +115,7 @@ echo "Deploying to NEPI target IP: ${NEPI_TARGET_IP} (port ${NEPI_SSH_PORT})"
 # fi
 
 
-RSYNC_EXCLUDES=" --exclude .git --exclude .gitmodules --exclude empty.txt"
+RSYNC_EXCLUDES=" --exclude .git --exclude .gitmodules --exclude __pycache__ --exclude empty.txt"
 
 echo "Excluding ${RSYNC_EXCLUDES}"
 
@@ -126,18 +131,6 @@ if [ "${NEPI_REMOTE_SETUP}" == "0" ]; then
 
 elif [ "${NEPI_REMOTE_SETUP}" == "1" ]; then
   echo 'rsync -avzhe "ssh -i '${NEPI_SSH_KEY}' -p '${NEPI_SSH_PORT}' -o StrictHostKeyChecking=no" --delete '${RSYNC_EXCLUDES}' '${SOURCE_PATH}'/ '${NEPI_DEPLOY_USERNAME}'@'${NEPI_TARGET_IP}':'${SOURCE_DEST_PATH}'/'
-  rsync -avzhe "ssh -i ${NEPI_SSH_KEY} -p ${NEPI_SSH_PORT} -o StrictHostKeyChecking=no" ${RSYNC_EXCLUDES} ${SOURCE_PATH}/ ${NEPI_DEPLOY_USERNAME}@${NEPI_TARGET_IP}:${SOURCE_DEST_PATH}/
-
-fi
-
-
-SCRIPTS_SOURCE_PATH=$(pwd)/src/nepi_scripts
-SCRIPTS_DEST_PATH=/mnt/nepi_storage/nepi_scripts
-echo "Syncing NEPI scripts from ${SCRIPTS_SOURCE_PATH} to ${SCRIPTS_DEST_PATH}"
-if [ "${NEPI_REMOTE_SETUP}" == "0" ]; then
-  rsync -avrh  --delete ${RSYNC_EXCLUDES} ${SCRIPTS_SOURCE_PATH}/ ${SCRIPTS_DEST_PATH}/
-
-elif [ "${NEPI_REMOTE_SETUP}" == "1" ]; then
-  rsync -avzhe "ssh -i ${NEPI_SSH_KEY} -p ${NEPI_SSH_PORT} -o StrictHostKeyChecking=no" --delete ${RSYNC_EXCLUDES} ${SCRIPTS_SOURCE_PATH}/ ${NEPI_DEPLOY_USERNAME}@${NEPI_TARGET_IP}:${SCRIPTS_DEST_PATH}/
+  rsync -avzhe "ssh -i ${NEPI_SSH_KEY} -p ${NEPI_SSH_PORT} -o StrictHostKeyChecking=no" --delete ${RSYNC_EXCLUDES} ${SOURCE_PATH}/ ${NEPI_DEPLOY_USERNAME}@${NEPI_TARGET_IP}:${SOURCE_DEST_PATH}/
 
 fi
