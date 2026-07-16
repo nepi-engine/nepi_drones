@@ -52,8 +52,10 @@ class ArdupilotDiscovery:
   ip_udp_port_list = ['14550']
   ip_tcp_port_list = ['14550']
 
-  # ArduPilot SITL running on the dev VM (reachable from this device over the bridged LAN)
-  sitl_addr_list = ['192.168.8.176']
+  # ArduPilot SITL running locally alongside mavros/the RBX driver (local VM/WSL dev setup,
+  # per docs/SIMULATOR_DEV_GUIDE.md) -- not a specific networked host, so this works for
+  # any developer's own local setup.
+  sitl_addr_list = ['127.0.0.1']
   sitl_tcp_port_list = ['5760']
 
   includeDevices = []
