@@ -19,6 +19,7 @@ driver:
         type: Discrete
         options:
           - SERIAL
+          - SITL
         default: SERIAL
         value: SERIAL
       fake_gps:

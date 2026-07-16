@@ -52,6 +52,10 @@ class ArdupilotDiscovery:
   ip_udp_port_list = ['14550']
   ip_tcp_port_list = ['14550']
 
+  # ArduPilot SITL running on the dev VM (reachable from this device over the bridged LAN)
+  sitl_addr_list = ['192.168.8.176']
+  sitl_tcp_port_list = ['5760']
+
   includeDevices = []
   excludedDevices = ['ttyACM']
 
@@ -153,6 +157,19 @@ class ArdupilotDiscovery:
                 success = self.launchUdpDeviceNode(path_str)
                 if success:
                   self.active_paths_list.append(path_str)
+    # RUN SITL PROCESS (ArduPilot Software-In-The-Loop over TCP)
+    elif connection_type == 'SITL':
+      for ip_addr_str in self.sitl_addr_list:
+        for ip_port_str in self.sitl_tcp_port_list:
+          path_str = "SITL_" + ip_addr_str + "_" + ip_port_str
+          if path_str not in self.active_paths_list and path_str not in self.dont_retry_list:
+            # Reuse the TCP reachability probe: only launch mavros once SITL's
+            # MAVLink TCP server is actually accepting connections.
+            [found_device, path_str] = self.checkForTcpDevice(path_str)
+            if found_device:
+              success = self.launchSitlDeviceNode(path_str)
+              if success:
+                self.active_paths_list.append(path_str)
     # Wrap Up
     return self.active_paths_list
 
@@ -392,6 +409,22 @@ class ArdupilotDiscovery:
     mav_sys_id = 1
     fcu_url = "tcp://" + ip_addr_str + ":" + ip_port_str
     gcs_url = ""
+    return self.launchDeviceNode(path_str, device_id_str, mav_comp_id, mav_sys_id, fcu_url, gcs_url)
+
+
+  ########## SITL PROCESS ############
+
+  def launchSitlDeviceNode(self, path_str):
+    # path_str format: "SITL_<host>_<port>"
+    [con_type, ip_addr_str, ip_port_str] = path_str.split("_")
+    device_id_str = "sitl"          # -> mavros node "mavlink_sitl", rbx node "ardupilot_sitl"
+    mav_comp_id = 1
+    mav_sys_id = 1                   # SITL default SYSID_THISMAV = 1
+    fcu_url = "tcp://" + ip_addr_str + ":" + ip_port_str
+    gcs_url = ""
+    # SITL simulates its own GPS + compass. Force fake GPS OFF so the injected
+    # GPS_INPUT can't fight the simulated sensors, regardless of the option value.
+    self.enable_fake_gps = False
     return self.launchDeviceNode(path_str, device_id_str, mav_comp_id, mav_sys_id, fcu_url, gcs_url)
 
 

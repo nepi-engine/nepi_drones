@@ -36,7 +36,7 @@ from std_msgs.msg import Empty, Int8, UInt8, UInt32, Bool, String, Float32, Floa
 from geometry_msgs.msg import Point, Pose, Quaternion, Twist, Vector3, PoseStamped
 from geographic_msgs.msg import GeoPoint, GeoPose, GeoPoseStamped
 from mavros_msgs.msg import State, AttitudeTarget, StatusText
-from mavros_msgs.srv import CommandBool, CommandBoolRequest, SetMode, SetModeRequest, CommandTOL, CommandTOLRequest, CommandHome, CommandHomeRequest
+from mavros_msgs.srv import CommandBool, CommandBoolRequest, SetMode, SetModeRequest, CommandTOL, CommandTOLRequest, CommandHome, CommandHomeRequest, CommandLong, CommandLongRequest
 
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Image, NavSatFix, BatteryState
@@ -61,12 +61,16 @@ class ArdupilotNode:
 
   CAP_SETTINGS = dict(
     takeoff_height_m = {"type":"Float","name":"takeoff_height_m","options":["0.0","100.0"]},
-    takeoff_min_pitch_deg =  {"type":"Float","name":"takeoff_min_pitch_deg","options":["-90.0","90.0"]}
+    takeoff_min_pitch_deg =  {"type":"Float","name":"takeoff_min_pitch_deg","options":["-90.0","90.0"]},
+    motor_count = {"type":"Int","name":"motor_count","options":["1","16"]},
+    motor_test_max_throttle_percent = {"type":"Float","name":"motor_test_max_throttle_percent","options":["0.0","100.0"]}
   )
 
   FACTORY_SETTINGS = dict(
     takeoff_height_m = {"type":"Float","name":"takeoff_height_m","value":"5"},
-    takeoff_min_pitch_deg =  {"type":"Float","name":"takeoff_min_pitch_deg","value":"10"}
+    takeoff_min_pitch_deg =  {"type":"Float","name":"takeoff_min_pitch_deg","value":"10"},
+    motor_count = {"type":"Int","name":"motor_count","value":"4"},
+    motor_test_max_throttle_percent = {"type":"Float","name":"motor_test_max_throttle_percent","value":"20"}
   )
 
   FACTORY_SETTINGS_OVERRIDES = dict()
@@ -89,6 +93,12 @@ class ArdupilotNode:
 
   SETPOINT_PUBLISH_RATE_HZ = 50
   POSITION_UPDATE_RATE = 10
+
+  # MAV_CMD_DO_MOTOR_TEST (verified against pymavlink common.xml -- NOT 176,
+  # which is MAV_CMD_DO_SET_MODE). ArduPilot auto-stops the motor after
+  # MOTOR_TEST_DURATION_S even if no further command is sent.
+  MAV_CMD_DO_MOTOR_TEST = 209
+  MOTOR_TEST_DURATION_S = 2.0
   # Create shared class variables and thread locks 
   
   device_info_dict = dict(device_name = "",
@@ -222,11 +232,13 @@ class ArdupilotNode:
     MAVLINK_SET_MODE_SERVICE = MAVLINK_NAMESPACE + "set_mode"
     MAVLINK_ARMING_SERVICE = MAVLINK_NAMESPACE + "cmd/arming"
     MAVLINK_TAKEOFF_SERVICE = MAVLINK_NAMESPACE + "cmd/takeoff"
+    MAVLINK_COMMAND_SERVICE = MAVLINK_NAMESPACE + "cmd/command"
 
     self.set_home_client = nepi_sdk.connect_service(MAVLINK_SET_HOME_SERVICE, CommandHome)
     self.mode_client = nepi_sdk.connect_service(MAVLINK_SET_MODE_SERVICE, SetMode)
     self.arming_client = nepi_sdk.connect_service(MAVLINK_ARMING_SERVICE, CommandBool)
     self.takeoff_client = nepi_sdk.connect_service(MAVLINK_TAKEOFF_SERVICE, CommandTOL)
+    self.command_client = nepi_sdk.connect_service(MAVLINK_COMMAND_SERVICE, CommandLong)
 
 
     # Subscribe to MAVLink topics
@@ -275,6 +287,10 @@ class ArdupilotNode:
         self.msg_if.pub_warn(str(setting))
     '''
 
+    # Per-motor commanded speed ratios (0-1), tracked locally since ArduPilot's
+    # DO_MOTOR_TEST is fire-and-forget and reports no ongoing per-motor state.
+    self.motor_ratios = [0.0] * int(self.settings_dict['motor_count']['value'])
+
 
     # Define fake gps namespace and create fake_gps publishers.
     # Created unconditionally so the goto/home/mode callbacks never hit a missing
@@ -322,9 +338,9 @@ class ArdupilotNode:
                                   setSetupActionIndFunction = self.setSetupActionInd,
                                   go_actions = self.RBX_GO_ACTIONS,
                                   setGoActionIndFunction = self.setGoActionInd,
-                                  manualControlsReadyFunction = None, #self.manualControlsReady,
-                                  getMotorControlRatios = None,
-                                  setMotorControlRatio = None,
+                                  manualControlsReadyFunction = self.manualControlsReady,
+                                  getMotorControlRatios = self.getMotorControlRatios,
+                                  setMotorControlRatio = self.setMotorControlRatio,
                                   autonomousControlsReadyFunction = self.autonomousControlsReady,
                                   getHomeFunction = self.getHomeLocation,
                                   setHomeFunction = self.setHomeLocation,
@@ -410,8 +426,8 @@ class ArdupilotNode:
     set_mode_function = globals()[self.RBX_MODE_FUNCTIONS[mode_ind]]
     success = set_mode_function(self)
     if success:
-      if self.RBX_MODES[mode_ind] == "RESUME": 
-        if self.RBX_MODES[self.mode_last] != "RESUME":
+      if self.RBX_MODES[mode_ind] == "RESUME":
+        if self.mode_last != "RESUME":
           self.mode_current = self.mode_last
           self.mode_ind = self.RBX_MODES.index(self.mode_last)
           self.mode_last = mode_on_entry # Don't update last on resume
@@ -445,10 +461,39 @@ class ArdupilotNode:
 
 
   def setMotorControlRatio(self,motor_ind,speed_ratio):
-    pass
+    if motor_ind < 0 or motor_ind >= len(self.motor_ratios):
+      self.msg_if.pub_warn("Motor test ignored: motor index " + str(motor_ind) + " out of range")
+      return
+    if self.state_current != "DISARM":
+      self.msg_if.pub_warn("Motor test ignored: only allowed while disarmed")
+      return
+    speed_ratio = max(0.0, min(1.0, speed_ratio))
+    throttle_percent = speed_ratio * 100.0
+    test_cmd = CommandLongRequest()
+    test_cmd.broadcast = False
+    test_cmd.command = self.MAV_CMD_DO_MOTOR_TEST
+    test_cmd.confirmation = 0
+    test_cmd.param1 = float(motor_ind + 1)  # ArduPilot motor test number is 1-based
+    test_cmd.param2 = 0.0                    # MOTOR_TEST_THROTTLE_PERCENT
+    test_cmd.param3 = throttle_percent if speed_ratio > 0.0 else 0.0
+    test_cmd.param4 = self.MOTOR_TEST_DURATION_S if speed_ratio > 0.0 else 0.0
+    test_cmd.param5 = 1.0  # motor count: test only this one motor
+    test_cmd.param6 = 0.0  # test order: default
+    test_cmd.param7 = 0.0
+    response = nepi_sdk.call_service(self.command_client, test_cmd)
+    if response is not None and response.success:
+      self.motor_ratios[motor_ind] = speed_ratio
+    else:
+      fail_msg = "Motor " + str(motor_ind) + " test command rejected"
+      reason = self.get_recent_fcu_reason()
+      if reason != "":
+        fail_msg = fail_msg + " (FCU: " + reason + ")"
+      self.msg_if.pub_warn(fail_msg)
+      if self.rbx_if is not None:
+        self.rbx_if.update_error_msg(fail_msg)
 
   def getMotorControlRatios(self):
-    return []
+    return self.motor_ratios
 
   def setSetupActionInd(self,action_ind):
     set_action_function = globals()[self.RBX_SETUP_ACTION_FUNCTIONS[action_ind]]
@@ -572,11 +617,9 @@ class ArdupilotNode:
   # Control Ready Check Funcitons
 
   def manualControlsReady(self):
-    ready = False
-    if self.mode_ind < len(self.RBX_MODES):
-      if self.RBX_MODES[self.mode_ind] == "MANUAL":
-        ready = True
-    return ready
+    # Motor test (DO_MOTOR_TEST) is a bench-test action -- only allow it while
+    # disarmed, matching how ArduPilot itself expects motor tests to be run.
+    return self.RBX_STATES[self.state_ind] == "DISARM"
 
   def autonomousControlsReady(self):
     ready = False
@@ -967,8 +1010,8 @@ class ArdupilotNode:
   def resume(self):
     cmd_success = False
     # Reset mode to last
-    self.msg_if.pub_info("Switching mavlink mode from " + self.RBX_MODES[self.mode_current] + " back to " + self.RBX_MODES[self.mode_last])
-    self.set_mavlink_mode(self.RBX_MODES[self.mode_last])
+    self.msg_if.pub_info("Switching mavlink mode from " + self.mode_current + " back to " + self.mode_last)
+    self.set_mavlink_mode(self.mode_last)
     cmd_success = True
     return cmd_success
 
