@@ -63,14 +63,16 @@ class ArdupilotNode:
     takeoff_height_m = {"type":"Float","name":"takeoff_height_m","options":["0.0","100.0"]},
     takeoff_min_pitch_deg =  {"type":"Float","name":"takeoff_min_pitch_deg","options":["-90.0","90.0"]},
     motor_count = {"type":"Int","name":"motor_count","options":["1","16"]},
-    motor_test_max_throttle_percent = {"type":"Float","name":"motor_test_max_throttle_percent","options":["0.0","100.0"]}
+    motor_test_max_throttle_percent = {"type":"Float","name":"motor_test_max_throttle_percent","options":["0.0","100.0"]},
+    motor_test_timeout_s = {"type":"Float","name":"motor_test_timeout_s","options":["1.0","300.0"]}
   )
 
   FACTORY_SETTINGS = dict(
     takeoff_height_m = {"type":"Float","name":"takeoff_height_m","value":"5"},
     takeoff_min_pitch_deg =  {"type":"Float","name":"takeoff_min_pitch_deg","value":"10"},
     motor_count = {"type":"Int","name":"motor_count","value":"4"},
-    motor_test_max_throttle_percent = {"type":"Float","name":"motor_test_max_throttle_percent","value":"20"}
+    motor_test_max_throttle_percent = {"type":"Float","name":"motor_test_max_throttle_percent","value":"20"},
+    motor_test_timeout_s = {"type":"Float","name":"motor_test_timeout_s","value":"30"}
   )
 
   FACTORY_SETTINGS_OVERRIDES = dict()
@@ -95,10 +97,10 @@ class ArdupilotNode:
   POSITION_UPDATE_RATE = 10
 
   # MAV_CMD_DO_MOTOR_TEST (verified against pymavlink common.xml -- NOT 176,
-  # which is MAV_CMD_DO_SET_MODE). ArduPilot auto-stops the motor after
-  # MOTOR_TEST_DURATION_S even if no further command is sent.
+  # which is MAV_CMD_DO_SET_MODE). ArduPilot auto-stops the motor after the
+  # commanded duration (motor_test_timeout_s setting) even if no further
+  # command is sent -- re-sliding re-issues the command and restarts the clock.
   MAV_CMD_DO_MOTOR_TEST = 209
-  MOTOR_TEST_DURATION_S = 2.0
   # Create shared class variables and thread locks 
   
   device_info_dict = dict(device_name = "",
@@ -462,13 +464,16 @@ class ArdupilotNode:
 
   def setMotorControlRatio(self,motor_ind,speed_ratio):
     if motor_ind < 0 or motor_ind >= len(self.motor_ratios):
-      self.msg_if.pub_warn("Motor test ignored: motor index " + str(motor_ind) + " out of range")
-      return
-    if self.state_current != "DISARM":
-      self.msg_if.pub_warn("Motor test ignored: only allowed while disarmed")
+      self.msg_if.pub_warn("Motor test ignored: motor index " + str(motor_ind + 1) + " out of range")
       return
     speed_ratio = max(0.0, min(1.0, speed_ratio))
-    throttle_percent = speed_ratio * 100.0
+    # Scale the 0-100% slider ratio onto [0, motor_test_max_throttle_percent]
+    # rather than straight onto [0,100] -- e.g. a 20% max throttle setting
+    # means the slider's 100% only ever commands 20% actual throttle, so the
+    # cap integrates with the slider UI instead of silently overriding it.
+    max_throttle_percent = float(self.settings_dict['motor_test_max_throttle_percent']['value'])
+    throttle_percent = speed_ratio * max_throttle_percent
+    timeout_s = float(self.settings_dict['motor_test_timeout_s']['value'])
     test_cmd = CommandLongRequest()
     test_cmd.broadcast = False
     test_cmd.command = self.MAV_CMD_DO_MOTOR_TEST
@@ -476,7 +481,7 @@ class ArdupilotNode:
     test_cmd.param1 = float(motor_ind + 1)  # ArduPilot motor test number is 1-based
     test_cmd.param2 = 0.0                    # MOTOR_TEST_THROTTLE_PERCENT
     test_cmd.param3 = throttle_percent if speed_ratio > 0.0 else 0.0
-    test_cmd.param4 = self.MOTOR_TEST_DURATION_S if speed_ratio > 0.0 else 0.0
+    test_cmd.param4 = timeout_s if speed_ratio > 0.0 else 0.0
     test_cmd.param5 = 1.0  # motor count: test only this one motor
     test_cmd.param6 = 0.0  # test order: default
     test_cmd.param7 = 0.0
@@ -484,7 +489,7 @@ class ArdupilotNode:
     if response is not None and response.success:
       self.motor_ratios[motor_ind] = speed_ratio
     else:
-      fail_msg = "Motor " + str(motor_ind) + " test command rejected"
+      fail_msg = "Motor " + str(motor_ind + 1) + " test command rejected"
       reason = self.get_recent_fcu_reason()
       if reason != "":
         fail_msg = fail_msg + " (FCU: " + reason + ")"
@@ -617,9 +622,17 @@ class ArdupilotNode:
   # Control Ready Check Funcitons
 
   def manualControlsReady(self):
-    # Motor test (DO_MOTOR_TEST) is a bench-test action -- only allow it while
-    # disarmed, matching how ArduPilot itself expects motor tests to be run.
-    return self.RBX_STATES[self.state_ind] == "DISARM"
+    # Always ready. ArduPilot's own DO_MOTOR_TEST handler arms the FC itself
+    # as a side effect of running a motor test (see ArduCopter/motor_test.cpp
+    # mavlink_motor_test_start()), which flips the mavros "armed" state we'd
+    # otherwise gate on here. Gating manual/motor controls on DISARM created a
+    # self-inflicted deadlock: testing one motor reported the vehicle as ARMed
+    # until that test's timeout elapsed, locking out every other motor
+    # command (including Turn Off) for the whole test duration. ArduPilot's
+    # own mavlink_motor_control_check() (board initialized, motor_test_checks,
+    # landed) is the real safety gate for motor tests -- no client-side arm
+    # check is needed on top of it.
+    return True
 
   def autonomousControlsReady(self):
     ready = False
