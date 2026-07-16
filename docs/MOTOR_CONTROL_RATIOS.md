@@ -213,17 +213,22 @@ Notes:
 - `setMotorControlRatio` is called for **one** motor at a time. If you need an all-stop,
   expect one call per motor with `speed_ratio = 0.0`.
 
-### Gotchas in the current interface code
+### Interface status (fixed 2026-07-16)
 
-If you turn this capability on, be aware of two rough edges in `device_if_rbx.py` as it
-stands (worth a fix, and worth knowing so your driver matches the path that actually runs):
+`device_if_rbx.py` had four defects in the motor-control path that were fixed on
+2026-07-16, so you are building against a clean interface. For the record (and in case
+you read older code / another copy):
 
-- The **runtime** path calls `setMotorControlRatio(motor_ind, speed_ratio)` with two
-  positional args ([device_if_rbx.py:1164](../../nepi_engine_ws/src/nepi_engine/nepi_api/src/nepi_api/device_if_rbx.py#L1164)).
-  Write your driver function to that two-argument signature. An init-time block passes a
-  single `MotorControl` object instead, so that startup path will not match a two-arg
-  function.
-- The `speed_ratio` range check at
-  [device_if_rbx.py:1161](../../nepi_engine_ws/src/nepi_engine/nepi_api/src/nepi_api/device_if_rbx.py#L1161)
-  tests the whole message object rather than the extracted `m_sr` value, so out-of-range
-  ratios can slip past that specific guard. Clamp inside your driver.
+- **Signature standardized on two positional args:** `setMotorControlRatio(motor_ind,
+  speed_ratio)` ([device_if_rbx.py:1164](../../nepi_engine_ws/src/nepi_engine/nepi_api/src/nepi_api/device_if_rbx.py#L1164)).
+  Write your driver function to that signature (the ArduPilot node stub already matches).
+  The init-time reset block now uses the same two-arg call.
+- **Init-time ordering** fixed: `setMotorControlRatio` is assigned before the manual-controls
+  setup block, so enabling manual controls no longer raises `AttributeError` at construction.
+- **Callback field** fixed: the `set_motor_control` callback now uses the `MotorControl`
+  message directly (it previously read a non-existent `.data` field and crashed on every
+  command).
+- **Range check** fixed: the `[0,1]` guard now tests `speed_ratio`, not the whole message
+  object.
+
+Still good practice: clamp `speed_ratio` to `[0,1]` inside your driver as cheap insurance.
