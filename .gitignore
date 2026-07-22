@@ -1,0 +1,7 @@
+# ArduPilot SITL run artifacts (regenerated every session, not source)
+eeprom.bin
+mav.tlog
+mav.tlog.raw
+
+__pycache__/
+*.pyc

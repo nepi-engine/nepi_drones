@@ -55,8 +55,14 @@ class ArdupilotDiscovery:
   # ArduPilot SITL running locally alongside mavros/the RBX driver (local VM/WSL dev setup,
   # per docs/SIMULATOR_DEV_GUIDE.md) -- not a specific networked host, so this works for
   # any developer's own local setup.
+  # 5771 is MAVProxy's dedicated --out port -- sitl_gazebo/gazebo_sitl on the dev VM always
+  # expose this via --out=tcpin:0.0.0.0:5771, alongside MAVProxy's own primary connection
+  # on SITL's raw port 5760 (used for --console/--map). Deliberately NOT also trying 5760
+  # here: with mavros and MAVProxy both live at once (5771 and 5760), discovery alternates
+  # between them every ~1Hz cycle, each time concluding "the other one died" and killing
+  # the node it just launched -- an infinite thrash loop. One canonical port avoids that.
   sitl_addr_list = ['127.0.0.1']
-  sitl_tcp_port_list = ['5760']
+  sitl_tcp_port_list = ['5771']
 
   includeDevices = []
   excludedDevices = ['ttyACM']

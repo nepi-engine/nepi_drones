@@ -24,6 +24,7 @@ import math
 import tf
 import random
 import sys
+import socket
 import cv2
 import copy
 
@@ -85,13 +86,19 @@ class ArdupilotNode:
 
   RBX_STATES = ["DISARM","ARM"]
   RBX_MODES = ["STABILIZE","LAND","RTL","LOITER","GUIDED","RESUME"]
-  RBX_SETUP_ACTIONS = ["TAKEOFF","LAUNCH"]
+  RBX_SETUP_ACTIONS = ["TAKEOFF","LAUNCH","RESET_SIM"]
   RBX_GO_ACTIONS = []
 
   RBX_STATE_FUNCTIONS = ["disarm","arm"]
   RBX_MODE_FUNCTIONS = ["stabilize","land","rtl","loiter","guided","resume"]
-  RBX_SETUP_ACTION_FUNCTIONS = ["takeoff","launch"]  
+  RBX_SETUP_ACTION_FUNCTIONS = ["takeoff","launch","reset_sim"]
   RBX_GO_ACTION_FUNCTIONS = []
+
+  # RESET_SIM reaches across the reverse SSH tunnel to a tiny listener
+  # (~/.local/bin/gz_reset_listener.py) running on the dev VM where Gazebo
+  # actually lives -- this driver runs on the NEPI device, not the VM.
+  RESET_SIM_HOST = "127.0.0.1"
+  RESET_SIM_PORT = 9021
 
   SETPOINT_PUBLISH_RATE_HZ = 50
   POSITION_UPDATE_RATE = 10
@@ -101,6 +108,12 @@ class ArdupilotNode:
   # commanded duration (motor_test_timeout_s setting) even if no further
   # command is sent -- re-sliding re-issues the command and restarts the clock.
   MAV_CMD_DO_MOTOR_TEST = 209
+  # MAV_CMD_COMPONENT_ARM_DISARM with the param2 "force" magic value (ArduPilot
+  # convention) bypasses the in-flight/pre-arm safety interlock that otherwise
+  # rejects a normal disarm while airborne -- required for RESET_SIM, since the
+  # whole point is to reset a sim that may currently be flying.
+  MAV_CMD_COMPONENT_ARM_DISARM = 400
+  MAV_CMD_FORCE_MAGIC = 21196.0
   # Create shared class variables and thread locks 
   
   device_info_dict = dict(device_name = "",
@@ -934,6 +947,29 @@ class ArdupilotNode:
         self.msg_if.pub_info("Takeoff action timed-out with error: " + str(alt_error) + " meters")
     else:
       self.msg_if.pub_info("Ignoring Takeoff command as system is not Armed")
+    return cmd_success
+
+  ## Action Function for force-disarming then teleporting the sim back to its
+  ## original spawn position and time (via gz_reset_listener.py on the VM)
+  global reset_sim
+  def reset_sim(self):
+    """Force-disarm, then reset the Gazebo sim's model poses and time to spawn."""
+    self.msg_if.pub_info("Recieved Reset Sim cmd")
+    force_disarm_cmd = CommandLongRequest()
+    force_disarm_cmd.broadcast = False
+    force_disarm_cmd.command = self.MAV_CMD_COMPONENT_ARM_DISARM
+    force_disarm_cmd.confirmation = 0
+    force_disarm_cmd.param1 = 0.0                     # 0 = disarm
+    force_disarm_cmd.param2 = self.MAV_CMD_FORCE_MAGIC # bypass in-flight safety interlock
+    nepi_sdk.call_service(self.command_client, force_disarm_cmd)
+    cmd_success = False
+    try:
+      sock = socket.create_connection((self.RESET_SIM_HOST, self.RESET_SIM_PORT), timeout=5)
+      reply = sock.recv(200)
+      sock.close()
+      cmd_success = reply.startswith(b'OK')
+    except Exception as e:
+      self.msg_if.pub_warn("Reset Sim failed to reach gz_reset_listener: " + str(e))
     return cmd_success
 
   ### Function for switching to STABILIZE mode
