@@ -567,6 +567,14 @@ class NepiDeviceControls extends Component {
     const { sendTriggerMsg, sendFloatGotoPoseMsg, sendFloatGotoPositionMsg, sendFloatGotoLocationMsg } = this.props.ros
     const NoneOption = <Option>None</Option>
     const namespace = this.props.rbxNamespace
+    // Ground rovers (e.g. RBX_SIM) report no roll/pitch control support --
+    // hide the roll/pitch pose controls and error readouts for them without
+    // affecting robots (e.g. drones) that do support roll/pitch. Defaults to
+    // shown while capabilities haven't loaded yet, matching this file's
+    // existing null-safe capability-gating pattern elsewhere.
+    const control_support = (this.state.rbx_capabilities !== null) ? this.state.rbx_capabilities.control_support : null
+    const has_roll = (control_support !== null && control_support !== undefined) ? (control_support.roll === true) : true
+    const has_pitch = (control_support !== null && control_support !== undefined) ? (control_support.pitch === true) : true
     return (
       <Section title={"Process Controls"}>
 
@@ -813,25 +821,29 @@ class NepiDeviceControls extends Component {
                   </label>
 
 
-                  <Label title={"Roll Deg"}>
-                    <Input
-                      value={this.state.roll_deg}
-                      id="roll_deg"
-                      onChange={(event) => onUpdateSetStateValue.bind(this)(event, "roll_deg")}
-                      onKeyDown={(event) => onEnterSetStateFloatValue.bind(this)(event, "roll_deg")}
-                      style={{ width: "80%" }}
-                    />
-                  </Label>
+                  <div hidden={!has_roll}>
+                    <Label title={"Roll Deg"}>
+                      <Input
+                        value={this.state.roll_deg}
+                        id="roll_deg"
+                        onChange={(event) => onUpdateSetStateValue.bind(this)(event, "roll_deg")}
+                        onKeyDown={(event) => onEnterSetStateFloatValue.bind(this)(event, "roll_deg")}
+                        style={{ width: "80%" }}
+                      />
+                    </Label>
+                  </div>
 
-                  <Label title={"Pitch Deg"}>
-                    <Input
-                      value={this.state.pitch_deg}
-                      id="pitch_deg"
-                      onChange={(event) => onUpdateSetStateValue.bind(this)(event, "pitch_deg")}
-                      onKeyDown={(event) => onEnterSetStateFloatValue.bind(this)(event, "pitch_deg")}
-                      style={{ width: "80%" }}
-                    />
-                  </Label>
+                  <div hidden={!has_pitch}>
+                    <Label title={"Pitch Deg"}>
+                      <Input
+                        value={this.state.pitch_deg}
+                        id="pitch_deg"
+                        onChange={(event) => onUpdateSetStateValue.bind(this)(event, "pitch_deg")}
+                        onKeyDown={(event) => onEnterSetStateFloatValue.bind(this)(event, "pitch_deg")}
+                        style={{ width: "80%" }}
+                      />
+                    </Label>
+                  </div>
 
                   <Label title={"Yaw Deg"}>
                     <Input
@@ -1022,21 +1034,25 @@ class NepiDeviceControls extends Component {
 
                 </Label>
 
-                <Label title={"Roll"}>
-                  <Input
-                    disabled value={this.state.errors_current_roll_deg}
-                    id="roll_error"
-                  />
+                <div hidden={!has_roll}>
+                  <Label title={"Roll"}>
+                    <Input
+                      disabled value={this.state.errors_current_roll_deg}
+                      id="roll_error"
+                    />
 
-                </Label>
+                  </Label>
+                </div>
 
-                <Label title={"Pitch"}>
-                  <Input
-                    disabled value={this.state.errors_current_pitch_deg}
-                    id="pitch_error"
-                  />
+                <div hidden={!has_pitch}>
+                  <Label title={"Pitch"}>
+                    <Input
+                      disabled value={this.state.errors_current_pitch_deg}
+                      id="pitch_error"
+                    />
 
-                </Label>
+                  </Label>
+                </div>
 
                 <Label title={"Yaw"}>
                   <Input

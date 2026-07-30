@@ -1,0 +1,458 @@
+<?xml version='1.0'?>
+<sdf version="1.6">
+  <model name="generic_rover">
+
+    <!-- Chassis. Origin sits at wheel-axle height (0.15 m) so the wheels
+         (r = 0.1 m) touch the ground plane when the model spawns at z = 0.
+
+         Was a single-axle 2-wheel differential drive plus two frictionless
+         caster spheres for pitch/roll support. The casters' point contacts,
+         under ODE's iterative "quick" solver, produced a small but
+         persistent yaw (and x/y) drift even at rest -- confirmed live via
+         repeated navpose samples with zero commanded velocity, yaw_deg
+         creeping monotonically rather than just noisy. Converted to a
+         4-wheel skid-steer layout instead of chasing that further: front and
+         rear axles (at the same +/-0.15m the casters used to occupy) replace
+         the casters entirely, so there's no frictionless point contact left
+         to drift. gazebo_ros_diff_drive accepts repeated <leftJoint>/
+         <rightJoint> elements for exactly this multi-wheel-per-side case
+         (see the plugin config below) -- both sides of an axle pair are
+         commanded identically, same as true skid-steer hardware. -->
+    <link name="base_link">
+      <pose>0 0 0.15 0 0 0</pose>
+      <inertial>
+        <mass>5.0</mass>
+        <inertia>
+          <ixx>0.0417</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.0708</iyy>
+          <iyz>0</iyz>
+          <izz>0.1042</izz>
+        </inertia>
+      </inertial>
+      <collision name="base_collision">
+        <geometry>
+          <box>
+            <size>0.4 0.3 0.1</size>
+          </box>
+        </geometry>
+      </collision>
+      <visual name="base_visual">
+        <geometry>
+          <box>
+            <size>0.4 0.3 0.1</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.1 0.3 0.6 1</ambient>
+          <diffuse>0.1 0.3 0.6 1</diffuse>
+        </material>
+      </visual>
+      <!-- Camera mast (visual only) up to the camera_link offset. -->
+      <visual name="camera_mast_visual">
+        <pose>0.2 0 0.25 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.01</radius>
+            <length>0.45</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.3 0.3 0.3 1</ambient>
+          <diffuse>0.3 0.3 0.3 1</diffuse>
+        </material>
+      </visual>
+    </link>
+
+    <link name="front_left_wheel">
+      <pose>0.15 0.17 0.1 -1.5707963 0 0</pose>
+      <inertial>
+        <mass>0.5</mass>
+        <inertia>
+          <ixx>0.00135</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.00135</iyy>
+          <iyz>0</iyz>
+          <izz>0.0025</izz>
+        </inertia>
+      </inertial>
+      <collision name="front_left_wheel_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.1</radius>
+            <length>0.05</length>
+          </cylinder>
+        </geometry>
+        <surface>
+          <friction>
+            <ode>
+              <mu>1.5</mu>
+              <mu2>1.5</mu2>
+            </ode>
+          </friction>
+        </surface>
+      </collision>
+      <visual name="front_left_wheel_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.1</radius>
+            <length>0.05</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.05 0.05 0.05 1</ambient>
+          <diffuse>0.05 0.05 0.05 1</diffuse>
+        </material>
+      </visual>
+    </link>
+
+    <link name="front_right_wheel">
+      <pose>0.15 -0.17 0.1 -1.5707963 0 0</pose>
+      <inertial>
+        <mass>0.5</mass>
+        <inertia>
+          <ixx>0.00135</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.00135</iyy>
+          <iyz>0</iyz>
+          <izz>0.0025</izz>
+        </inertia>
+      </inertial>
+      <collision name="front_right_wheel_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.1</radius>
+            <length>0.05</length>
+          </cylinder>
+        </geometry>
+        <surface>
+          <friction>
+            <ode>
+              <mu>1.5</mu>
+              <mu2>1.5</mu2>
+            </ode>
+          </friction>
+        </surface>
+      </collision>
+      <visual name="front_right_wheel_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.1</radius>
+            <length>0.05</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.05 0.05 0.05 1</ambient>
+          <diffuse>0.05 0.05 0.05 1</diffuse>
+        </material>
+      </visual>
+    </link>
+
+    <link name="rear_left_wheel">
+      <pose>-0.15 0.17 0.1 -1.5707963 0 0</pose>
+      <inertial>
+        <mass>0.5</mass>
+        <inertia>
+          <ixx>0.00135</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.00135</iyy>
+          <iyz>0</iyz>
+          <izz>0.0025</izz>
+        </inertia>
+      </inertial>
+      <collision name="rear_left_wheel_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.1</radius>
+            <length>0.05</length>
+          </cylinder>
+        </geometry>
+        <surface>
+          <friction>
+            <ode>
+              <mu>1.5</mu>
+              <mu2>1.5</mu2>
+            </ode>
+          </friction>
+        </surface>
+      </collision>
+      <visual name="rear_left_wheel_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.1</radius>
+            <length>0.05</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.05 0.05 0.05 1</ambient>
+          <diffuse>0.05 0.05 0.05 1</diffuse>
+        </material>
+      </visual>
+    </link>
+
+    <link name="rear_right_wheel">
+      <pose>-0.15 -0.17 0.1 -1.5707963 0 0</pose>
+      <inertial>
+        <mass>0.5</mass>
+        <inertia>
+          <ixx>0.00135</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.00135</iyy>
+          <iyz>0</iyz>
+          <izz>0.0025</izz>
+        </inertia>
+      </inertial>
+      <collision name="rear_right_wheel_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.1</radius>
+            <length>0.05</length>
+          </cylinder>
+        </geometry>
+        <surface>
+          <friction>
+            <ode>
+              <mu>1.5</mu>
+              <mu2>1.5</mu2>
+            </ode>
+          </friction>
+        </surface>
+      </collision>
+      <visual name="rear_right_wheel_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.1</radius>
+            <length>0.05</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.05 0.05 0.05 1</ambient>
+          <diffuse>0.05 0.05 0.05 1</diffuse>
+        </material>
+      </visual>
+    </link>
+
+    <joint name="front_left_wheel_joint" type="revolute">
+      <parent>base_link</parent>
+      <child>front_left_wheel</child>
+      <axis>
+        <xyz>0 1 0</xyz>
+        <use_parent_model_frame>true</use_parent_model_frame>
+      </axis>
+    </joint>
+
+    <joint name="front_right_wheel_joint" type="revolute">
+      <parent>base_link</parent>
+      <child>front_right_wheel</child>
+      <axis>
+        <xyz>0 1 0</xyz>
+        <use_parent_model_frame>true</use_parent_model_frame>
+      </axis>
+    </joint>
+
+    <joint name="rear_left_wheel_joint" type="revolute">
+      <parent>base_link</parent>
+      <child>rear_left_wheel</child>
+      <axis>
+        <xyz>0 1 0</xyz>
+        <use_parent_model_frame>true</use_parent_model_frame>
+      </axis>
+    </joint>
+
+    <joint name="rear_right_wheel_joint" type="revolute">
+      <parent>base_link</parent>
+      <child>rear_right_wheel</child>
+      <axis>
+        <xyz>0 1 0</xyz>
+        <use_parent_model_frame>true</use_parent_model_frame>
+      </axis>
+    </joint>
+
+    <!-- Camera at (0.2, 0.0, 0.5) relative to base_link per the plan doc's
+         Step 1.1 spec (base_link origin is at z = 0.15 in the model frame,
+         so the link pose below is 0.15 + 0.5). -->
+    <link name="camera_link">
+      <pose>0.2 0 0.65 0 0 0</pose>
+      <inertial>
+        <mass>0.05</mass>
+        <inertia>
+          <ixx>0.00001</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.00001</iyy>
+          <iyz>0</iyz>
+          <izz>0.00001</izz>
+        </inertia>
+      </inertial>
+      <visual name="camera_visual">
+        <geometry>
+          <box>
+            <size>0.04 0.08 0.04</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.8 0.2 0.2 1</ambient>
+          <diffuse>0.8 0.2 0.2 1</diffuse>
+        </material>
+      </visual>
+      <sensor type="camera" name="rover_camera_sensor">
+        <!-- Reverted the earlier 960x720/20Hz bump -- the real bottleneck
+             turned out to be downstream, not here: the NEPI device is a
+             Raspberry Pi (NEPI_HW_TYPE=rpi), and web_video_server (which
+             does the actual browser-facing MJPEG encode, live, per
+             connected viewer) was defaulting to JPEG quality 95 at up to
+             20fps regardless of this sensor's resolution -- see
+             streamingImageQuality/streamingImageRate in NepiDeviceRBX.js.
+             Raising the source resolution on top of that only made the
+             Pi's own live re-encode more expensive. Back to 640x480/15Hz,
+             the resolution this pipeline was actually tuned for. -->
+        <update_rate>15.0</update_rate>
+        <always_on>true</always_on>
+        <visualize>false</visualize>
+        <camera name="rover_camera">
+          <horizontal_fov>1.3962634</horizontal_fov>
+          <image>
+            <width>640</width>
+            <height>480</height>
+            <format>R8G8B8</format>
+          </image>
+          <clip>
+            <near>0.05</near>
+            <far>100.0</far>
+          </clip>
+        </camera>
+        <plugin name="camera_controller" filename="libgazebo_ros_camera.so">
+          <robotNamespace>/</robotNamespace>
+          <cameraName>rover/camera</cameraName>
+          <imageTopicName>image_raw</imageTopicName>
+          <cameraInfoTopicName>camera_info</cameraInfoTopicName>
+          <frameName>camera_link</frameName>
+        </plugin>
+      </sensor>
+    </link>
+
+    <joint name="camera_joint" type="fixed">
+      <parent>base_link</parent>
+      <child>camera_link</child>
+    </joint>
+
+    <!-- Third-person/chase camera, rigidly welded onto the rover -- see the
+         top-of-model plugin comment for why this replaces the old
+         standalone camera_rig model + camera_rig_controller.py's per-frame
+         /gazebo/set_model_state follow loop (that path had an inherent
+         one-tick-plus lag: odom update -> controller tick -> reposition,
+         each an independent async loop, visibly laggier than a real joint).
+         A fixed joint can't do a live look-at, but it doesn't need to: at a
+         CONSTANT offset from the rover, the correct look-at angle is itself
+         constant, so it can be baked in once instead of recomputed every
+         frame. Offset matches rbx_sim_node.py's old THIRD_PERSON
+         CAMERA_VIEW_PRESETS value (-2.5, 0.0, 1.5) body-frame, so the
+         framing is unchanged from before. pitch = atan2(1.5, 2.5) =
+         0.5404 rad (~31 deg nose-down) is the fixed tilt that puts the
+         rover in frame from directly behind and above -- solving the same
+         look-at geometry camera_rig_controller.py used to solve every
+         tick, just once, offline, since the geometry never changes once
+         rigid. yaw stays 0 (no y offset -> camera faces the same forward
+         direction as the rover, chasing rather than looking backward). -->
+    <link name="camera_link_chase">
+      <pose>-2.5 0 1.65 0 0.5404195 0</pose>
+      <inertial>
+        <mass>0.05</mass>
+        <inertia>
+          <ixx>0.00001</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.00001</iyy>
+          <iyz>0</iyz>
+          <izz>0.00001</izz>
+        </inertia>
+      </inertial>
+      <visual name="camera_chase_visual">
+        <geometry>
+          <box>
+            <size>0.06 0.1 0.05</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.2 0.8 0.2 1</ambient>
+          <diffuse>0.2 0.8 0.2 1</diffuse>
+        </material>
+      </visual>
+      <sensor type="camera" name="rover_camera_chase_sensor">
+        <update_rate>15.0</update_rate>
+        <always_on>true</always_on>
+        <visualize>false</visualize>
+        <camera name="rover_camera_chase">
+          <horizontal_fov>1.3962634</horizontal_fov>
+          <image>
+            <width>640</width>
+            <height>480</height>
+            <format>R8G8B8</format>
+          </image>
+          <clip>
+            <near>0.05</near>
+            <far>100.0</far>
+          </clip>
+        </camera>
+        <plugin name="camera_chase_controller" filename="libgazebo_ros_camera.so">
+          <robotNamespace>/</robotNamespace>
+          <cameraName>rover/camera_chase</cameraName>
+          <imageTopicName>image_raw</imageTopicName>
+          <cameraInfoTopicName>camera_info</cameraInfoTopicName>
+          <frameName>camera_link_chase</frameName>
+        </plugin>
+      </sensor>
+    </link>
+
+    <joint name="camera_joint_chase" type="fixed">
+      <parent>base_link</parent>
+      <child>camera_link_chase</child>
+    </joint>
+
+    <plugin name="diff_drive_controller" filename="libgazebo_ros_diff_drive.so">
+      <robotNamespace>/rover</robotNamespace>
+      <commandTopic>cmd_vel</commandTopic>
+      <odometryTopic>odom</odometryTopic>
+      <odometryFrame>odom</odometryFrame>
+      <odometrySource>world</odometrySource>
+      <robotBaseFrame>base_link</robotBaseFrame>
+      <!-- Repeated leftJoint/rightJoint tags: gazebo_ros_diff_drive drives
+           every listed left-side joint identically and every right-side
+           joint identically (a std::vector of JointPtrs behind 2 target
+           speeds), which is exactly the skid-steer pattern the front/rear
+           axle pairs need -- no plugin change required for the 2->4 wheel
+           conversion, just more joints listed here. -->
+      <leftJoint>front_left_wheel_joint</leftJoint>
+      <leftJoint>rear_left_wheel_joint</leftJoint>
+      <rightJoint>front_right_wheel_joint</rightJoint>
+      <rightJoint>rear_right_wheel_joint</rightJoint>
+      <wheelSeparation>0.34</wheelSeparation>
+      <wheelDiameter>0.2</wheelDiameter>
+      <!-- Raised from 10.0 -- tuned against the original 2.0 m/s speed cap.
+           With max_linear_speed_mps now settable up to 5.0 (rbx_sim_node.py),
+           the old torque limit couldn't deliver the wheel angular velocity a
+           turn requires at that linear speed (outer wheel needs to spin
+           faster than commanded, inner slower) without the ODE joint motor
+           torque-limiting and slipping -- reported as the rover traveling
+           "lopsided"/unbalanced at higher speeds. Scaled roughly with the
+           2.5x speed ceiling increase; needs live-test confirmation, not
+           verified against real physics behavior in this pass. -->
+      <wheelTorque>25.0</wheelTorque>
+      <!-- 0 disables the plugin's wheel-speed ramp: commanded velocity is
+           applied directly. A nonzero ramp made the rover crawl (~10x
+           slower than commanded) under this world's physics settings. -->
+      <wheelAcceleration>0.0</wheelAcceleration>
+      <updateRate>30.0</updateRate>
+      <publishOdomTF>true</publishOdomTF>
+      <publishWheelTF>false</publishWheelTF>
+      <publishWheelJointState>false</publishWheelJointState>
+      <legacyMode>false</legacyMode>
+    </plugin>
+
+  </model>
+</sdf>

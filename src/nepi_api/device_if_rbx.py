@@ -1070,29 +1070,32 @@ class RBXRobotIF:
             if action_ind < 0 or action_ind > (len(self.setup_actions)-1):
                 self.update_error_msg("No matching rbx action found")
             else:
-                if self.status_msg.ready is False:
-                    self.update_error_msg("Another Command Process is Active")
-                    self.update_error_msg("Ignoring this Request")
+                # No longer gated on self.status_msg.ready: that flag stays False for
+                # the full duration of an active goto command's blocking wait (up to
+                # cmd_timeout, tens of seconds), so a setup action like RESET_SIM --
+                # whose entire purpose is to be able to interrupt an in-progress
+                # command -- was silently swallowed ("Ignoring this Request") exactly
+                # when a user needed it most. goStopCb has no equivalent gate and
+                # correctly interrupts immediately; setup actions now match that.
+                self.status_msg.process_current = self.setup_actions[action_ind]
+                self.status_msg.ready = False
+                self.rbx_cmd_success_current = False
+                self.msg_if.pub_info("Starting action: " + self.setup_actions[action_ind])
+                success = self.setSetupActionIndFunction(action_ind)
+                self.rbx_cmd_success_current = success
+                if success:
+                  self.msg_if.pub_info("Finished action: " + self.setup_actions[action_ind])
                 else:
-                    self.status_msg.process_current = self.setup_actions[action_ind]
-                    self.status_msg.ready = False
-                    self.rbx_cmd_success_current = False
-                    self.msg_if.pub_info("Starting action: " + self.setup_actions[action_ind])
-                    success = self.setSetupActionIndFunction(action_ind)
-                    self.rbx_cmd_success_current = success
-                    if success:
-                      self.msg_if.pub_info("Finished action: " + self.setup_actions[action_ind])
-                    else:
-                      self.msg_if.pub_info("Action: " + self.setup_actions[action_ind] + " Failed to complete", log_name_list = self.log_name_list)
-                    self.status_msg.process_last = self.setup_actions[action_ind]
-                    self.status_msg.process_current = "None"
-                    self.status_msg.cmd_success = self.rbx_cmd_success_current
-                    time.sleep(0.5)
-                    self.status_msg.ready = True
+                  self.msg_if.pub_info("Action: " + self.setup_actions[action_ind] + " Failed to complete", log_name_list = self.log_name_list)
+                self.status_msg.process_last = self.setup_actions[action_ind]
+                self.status_msg.process_current = "None"
+                self.status_msg.cmd_success = self.rbx_cmd_success_current
+                time.sleep(0.5)
+                self.status_msg.ready = True
 
-                    str_val = self.setup_actions[action_ind]
-                    self.last_cmd_string = "setup_rbx_action(self,'" + str_val + "',timeout_sec = " + str(self.rbx_info.cmd_timeout)
-                    self.publishInfo()
+                str_val = self.setup_actions[action_ind]
+                self.last_cmd_string = "setup_rbx_action(self,'" + str_val + "',timeout_sec = " + str(self.rbx_info.cmd_timeout)
+                self.publishInfo()
         else:
             self.update_error_msg("Ignoring Setup Action command, no Set Action Function")
 
@@ -1221,7 +1224,13 @@ class RBXRobotIF:
     def goStopCb(self,stop_msg):
         self.msg_if.pub_info("Received go stop message", log_name_list = self.log_name_list)
         self.msg_if.pub_info(stop_msg)
-        time.sleep(1)
+        # Unlike gotoPoseCb/gotoPositionCb/gotoLocationCb, this callback has no
+        # "another command is active" ready-check to debounce -- it unconditionally
+        # calls goStopFunction() below. The copy-pasted time.sleep(1) here was pure
+        # added latency on what's meant to be an immediate stop: a goto command's
+        # own control loop (e.g. rbx_sim_node.py's gotoControlCb) keeps driving
+        # toward the original target for that whole extra second before the actual
+        # stop is even issued, reading as "Stop doesn't work" to the user.
         if self.goStopFunction is not None:
             self.status_msg.process_current = "Stop"
             self.rbx_cmd_success_current = False

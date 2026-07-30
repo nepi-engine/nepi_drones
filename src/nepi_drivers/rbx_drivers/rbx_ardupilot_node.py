@@ -27,11 +27,15 @@ import sys
 import socket
 import cv2
 import copy
+import base64
+import json
+import threading
 
-from nepi_sdk import nepi_sdk 
+from nepi_sdk import nepi_sdk
 from nepi_sdk import nepi_nav
 from nepi_sdk import nepi_utils
 from nepi_sdk import nepi_settings
+from nepi_sdk import nepi_img
 
 from std_msgs.msg import Empty, Int8, UInt8, UInt32, Bool, String, Float32, Float64
 from geometry_msgs.msg import Point, Pose, Quaternion, Twist, Vector3, PoseStamped
@@ -60,12 +64,25 @@ FILE_TYPE = 'NODE'
 class ArdupilotNode:
   DEFAULT_NODE_NAME = "ardupilot" # connection port added once discovered
 
+  # Camera-rig feature (Universal Simulator Bridge, ArduPilot SITL port):
+  # view mode + body-frame offset, following the exact same live
+  # CAP_SETTINGS/FACTORY_SETTINGS pattern as rbx_sim_node.py's own camera
+  # settings -- no new mechanism. One offset triple serves both view modes;
+  # switching modes only changes how camera_rig_controller_ardupilot.py aims
+  # the camera, not which offset it reads.
+  CAMERA_SETTING_NAMES = ("camera_view_mode", "camera_offset_x",
+                          "camera_offset_y", "camera_offset_z")
+
   CAP_SETTINGS = dict(
     takeoff_height_m = {"type":"Float","name":"takeoff_height_m","options":["0.0","100.0"]},
     takeoff_min_pitch_deg =  {"type":"Float","name":"takeoff_min_pitch_deg","options":["-90.0","90.0"]},
     motor_count = {"type":"Int","name":"motor_count","options":["1","16"]},
     motor_test_max_throttle_percent = {"type":"Float","name":"motor_test_max_throttle_percent","options":["0.0","100.0"]},
-    motor_test_timeout_s = {"type":"Float","name":"motor_test_timeout_s","options":["1.0","300.0"]}
+    motor_test_timeout_s = {"type":"Float","name":"motor_test_timeout_s","options":["1.0","300.0"]},
+    camera_view_mode = {"type":"Discrete","name":"camera_view_mode","options":["FIRST_PERSON","THIRD_PERSON"]},
+    camera_offset_x = {"type":"Float","name":"camera_offset_x","options":["-10.0","10.0"]},
+    camera_offset_y = {"type":"Float","name":"camera_offset_y","options":["-10.0","10.0"]},
+    camera_offset_z = {"type":"Float","name":"camera_offset_z","options":["-10.0","10.0"]}
   )
 
   FACTORY_SETTINGS = dict(
@@ -73,10 +90,29 @@ class ArdupilotNode:
     takeoff_min_pitch_deg =  {"type":"Float","name":"takeoff_min_pitch_deg","value":"10"},
     motor_count = {"type":"Int","name":"motor_count","value":"4"},
     motor_test_max_throttle_percent = {"type":"Float","name":"motor_test_max_throttle_percent","value":"20"},
-    motor_test_timeout_s = {"type":"Float","name":"motor_test_timeout_s","value":"30"}
+    motor_test_timeout_s = {"type":"Float","name":"motor_test_timeout_s","value":"30"},
+    # Matches camera_rig_controller_ardupilot.py's own defaults -- forward
+    # and slightly below the body, a nose/belly-mounted inspection-camera
+    # convention (distinct from the rover's flat camera_link mount point
+    # since this is a multirotor, not a ground vehicle).
+    camera_view_mode = {"type":"Discrete","name":"camera_view_mode","value":"FIRST_PERSON"},
+    camera_offset_x = {"type":"Float","name":"camera_offset_x","value":"0.15"},
+    camera_offset_y = {"type":"Float","name":"camera_offset_y","value":"0.0"},
+    camera_offset_z = {"type":"Float","name":"camera_offset_z","value":"-0.1"}
   )
 
   FACTORY_SETTINGS_OVERRIDES = dict()
+
+  # Camera-rig bridge (see camera_rig_controller_ardupilot.py and the
+  # session summary for the full design). Fixed constants, not sourced from
+  # DEVICE_DICT: unlike the rover's per-slot rbx_sim driver, ArduPilot SITL
+  # is single-instance-only on this dev VM, so there is exactly one bridge
+  # endpoint, matching how RESET_SIM_HOST/RESET_SIM_PORT are also fixed
+  # constants on this same class rather than discovery-supplied.
+  CAMERA_BRIDGE_HOST = "127.0.0.1"
+  CAMERA_BRIDGE_PORT = 9026
+  CAMERA_RECONNECT_INTERVAL_SEC = 3.0
+  CAMERA_SOCKET_TIMEOUT_SEC = 5.0
 
 
   # RBX State and Mode Dictionaries
@@ -284,7 +320,34 @@ class ArdupilotNode:
 
     self.msg_if.pub_info("... Connected to Mavlink!")
 
+    ##############################
+    # Camera-rig feature: publish decoded frames on a bare-relative topic
+    # name that RBXRobotIF's find_topic()-based image subscriber is pointed
+    # at via set_image_topic (see below). ArduPilot SITL is single-instance
+    # on this device (no second rbx_ardupilot node can ever coexist), so
+    # there is no cross-talk risk from another instance of THIS driver --
+    # confirmed rather than assumed, since the rover's camera-rover-multi
+    # phase found a real bug here (two rbx_sim instances' bare
+    # "color_2d_image" colliding on the shared device-wide namespace, per
+    # nepi_drvs.launchDriverNode only remapping __name, never __ns). This
+    # driver still qualifies its topic with its own device_name, matching
+    # rbx_sim_node.py's fix, as defense against the same shared-namespace
+    # colliding with a DIFFERENT RBX driver (e.g. rbx_sim) that might be
+    # running on this same device and left at RBXRobotIF's bare
+    # "color_2d_image" factory default.
+    self.image_topic_name = self.device_name + "/color_2d_image"
+    self.image_pub = nepi_sdk.create_publisher(self.image_topic_name, Image, queue_size = 1)
 
+    # Camera bridge client state and connection thread -- see
+    # camera_rig_controller_ardupilot.py and CAMERA_BRIDGE_HOST/PORT above.
+    # MAVLink (via mavros) carries telemetry/commands for this driver
+    # already; this is a second, independent persistent connection carrying
+    # ONLY camera settings out and compressed frames in.
+    self.camera_sock = None
+    self.camera_sock_lock = threading.Lock()
+    self.camera_bridge_thread = threading.Thread(target = self.cameraBridgeLoop)
+    self.camera_bridge_thread.daemon = True
+    self.camera_bridge_thread.start()
 
     # Initialize RBX Settings
     self.cap_settings = self.getCapSettings()
@@ -373,6 +436,13 @@ class ArdupilotNode:
     self.msg_if.pub_info("... RBX interface running")
     time.sleep(1)
 
+    ## Point the interface's image-source search at this instance's own
+    ## device-name-qualified topic (see the image_pub comment above) --
+    ## overrides RBXRobotIF's plain "color_2d_image" factory default/any
+    ## stale persisted config every startup, matching rbx_sim_node.py's own
+    ## deterministic-per-startup rationale.
+    self.rbx_if.setImageTopicCb(String(data = self.image_topic_name))
+
     ## Start goto setpoint check/send loop
     setpoint_pub_interval = float(1) / self.SETPOINT_PUBLISH_RATE_HZ
     nepi_sdk.start_timer_process(setpoint_pub_interval, self.sendGotoCommandLoop)
@@ -412,7 +482,9 @@ class ArdupilotNode:
       else:
         msg = (self.node_name  + " Setting name" + setting_str + " is not supported") 
       if success == True:
-        msg = ( self.node_name  + " UPDATED SETTINGS " + setting_str)                  
+        msg = ( self.node_name  + " UPDATED SETTINGS " + setting_str)
+        if setting_name in self.CAMERA_SETTING_NAMES:
+          self.sendCameraSettings()
     else:
       msg = (self.node_name  + " Setting data" + setting_str + " is not valid")
     return success, msg
@@ -1087,8 +1159,121 @@ class ArdupilotNode:
 
 
   #######################
+  # Camera Bridge Processes (Universal Simulator Bridge camera feature,
+  # ArduPilot SITL port -- see camera_rig_controller_ardupilot.py and the
+  # session summary for the full design). Independent persistent connection
+  # from the mavros/MAVLink path above: MAVLink already carries
+  # telemetry/commands, this connection carries ONLY camera settings out and
+  # compressed frames in.
+
+  def cameraBridgeLoop(self):
+    # Persistent client to the VM-side camera bridge server. The sim stack
+    # (or the tunnel) can restart independently of this node -- any failure
+    # tears the socket down and retries the connect on a fixed interval.
+    buf = b''
+    while not nepi_sdk.is_shutdown():
+      sock = None
+      try:
+        sock = socket.create_connection((self.CAMERA_BRIDGE_HOST, self.CAMERA_BRIDGE_PORT),
+                                        timeout = self.CAMERA_SOCKET_TIMEOUT_SEC)
+        sock.settimeout(self.CAMERA_SOCKET_TIMEOUT_SEC)
+      except Exception as e:
+        self.msg_if.pub_warn("Camera bridge connect to " + self.CAMERA_BRIDGE_HOST + ":" +
+                             str(self.CAMERA_BRIDGE_PORT) + " failed: " + str(e))
+        time.sleep(self.CAMERA_RECONNECT_INTERVAL_SEC)
+        continue
+      with self.camera_sock_lock:
+        self.camera_sock = sock
+      self.msg_if.pub_info("Connected to camera bridge at " + self.CAMERA_BRIDGE_HOST +
+                           ":" + str(self.CAMERA_BRIDGE_PORT))
+      # Sync the VM side to this node's actual current camera settings on
+      # every (re)connect -- a bare restart of this node resets
+      # settings_dict to factory, but camera_rig_controller_ardupilot.py
+      # keeps whatever settings it last had, so an explicit push avoids
+      # relying on both sides coincidentally matching factory defaults.
+      self.sendCameraSettings()
+      buf = b''
+      while not nepi_sdk.is_shutdown():
+        try:
+          data = sock.recv(65536)
+        except socket.timeout:
+          # Server pushes frames at ~7 Hz -- a quiet-but-open socket past
+          # the timeout means the far side is gone (e.g. tunnel half-open)
+          data = b''
+        except Exception:
+          data = b''
+        if not data:
+          break
+        buf += data
+        while b'\n' in buf:
+          line, buf = buf.split(b'\n', 1)
+          if line.strip():
+            self.processCameraBridgeLine(line)
+      with self.camera_sock_lock:
+        self.camera_sock = None
+      try:
+        sock.close()
+      except Exception:
+        pass
+      self.msg_if.pub_warn("Camera bridge connection lost -- retrying in " +
+                           str(self.CAMERA_RECONNECT_INTERVAL_SEC) + "s")
+      time.sleep(self.CAMERA_RECONNECT_INTERVAL_SEC)
+
+  def processCameraBridgeLine(self, line):
+    try:
+      msg = json.loads(line)
+    except Exception as e:
+      self.msg_if.pub_warn("Bad line from camera bridge: " + str(e))
+      return
+    if msg.get('type') == 'image':
+      self.processCameraImageLine(msg)
+    else:
+      self.msg_if.pub_warn("Unrecognized camera bridge line type: " + str(msg.get('type')))
+
+  def processCameraImageLine(self, msg):
+    # Bridge image frame -> decode the relayed JPEG and republish as a raw
+    # sensor_msgs/Image on this instance's own namespaced image topic (see
+    # the image_pub/setImageTopicCb comments in __init__).
+    try:
+      jpeg_bytes = base64.b64decode(msg['data'])
+      arr = np.frombuffer(jpeg_bytes, dtype = np.uint8)
+      cv2_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+      if cv2_img is None:
+        raise ValueError("cv2.imdecode returned None")
+      ros_img = nepi_img.cv2img_to_rosimg(cv2_img, encoding = "bgr8")
+      self.image_pub.publish(ros_img)
+    except Exception as e:
+      self.msg_if.pub_warn("Failed to process camera image frame: " + str(e))
+
+  def sendCameraSettings(self):
+    # All four current values together, always -- camera_rig_controller_
+    # ardupilot.py fills any missing key with its own default, so a partial
+    # push (e.g. only the field that just changed) would silently reset the
+    # rest to that default.
+    cmd = {
+      'type': 'camera_settings',
+      'view_mode': self.settings_dict['camera_view_mode']['value'],
+      'offset_x': float(self.settings_dict['camera_offset_x']['value']),
+      'offset_y': float(self.settings_dict['camera_offset_y']['value']),
+      'offset_z': float(self.settings_dict['camera_offset_z']['value']),
+    }
+    self.sendLineToCameraBridge(cmd, "Camera settings")
+
+  def sendLineToCameraBridge(self, line_dict, description):
+    with self.camera_sock_lock:
+      sock = self.camera_sock
+    if sock is None:
+      self.msg_if.pub_warn(description + " dropped -- camera bridge not connected")
+      return
+    try:
+      sock.sendall((json.dumps(line_dict) + '\n').encode())
+    except Exception as e:
+      # cameraBridgeLoop's recv will fail on the same dead socket and reconnect
+      self.msg_if.pub_warn("Failed to send " + description.lower() + " to camera bridge: " + str(e))
+
+  #######################
   # Node Cleanup Function
-  
+
   def cleanup_actions(self):
     self.msg_if.pub_info("Shutting down: Executing script cleanup actions")
 

@@ -1,0 +1,167 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <model name="obstacle_course">
+    <!-- Static: pure world geometry, no dynamics needed. Whole model is
+         spawned/deleted as one unit (sim_bridge_node.py's obstacle_course
+         command), so every obstacle lives under this single model name
+         rather than as separate top-level models. -->
+    <static>true</static>
+
+    <!-- Course runs along +x, starting at x=2 (clear of the rover's origin
+         spawn/turn radius) through x=24, inside a 6m-wide corridor
+         (y = -3..3): two boundary walls, a two-baffle chicane forcing a
+         weave, then a ramp-up/plateau/ramp-down bump to climb over. Left
+         deliberately open-ended (no end-cap walls) so a rover navigating in
+         either never gets fully boxed in. -->
+
+    <link name="left_wall">
+      <pose>13 3 0.5 0 0 0</pose>
+      <collision name="collision">
+        <geometry>
+          <box><size>22 0.2 1.0</size></box>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <box><size>22 0.2 1.0</size></box>
+        </geometry>
+        <material>
+          <script>
+            <uri>file://media/materials/scripts/gazebo.material</uri>
+            <name>Gazebo/Orange</name>
+          </script>
+        </material>
+      </visual>
+    </link>
+
+    <link name="right_wall">
+      <pose>13 -3 0.5 0 0 0</pose>
+      <collision name="collision">
+        <geometry>
+          <box><size>22 0.2 1.0</size></box>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <box><size>22 0.2 1.0</size></box>
+        </geometry>
+        <material>
+          <script>
+            <uri>file://media/materials/scripts/gazebo.material</uri>
+            <name>Gazebo/Orange</name>
+          </script>
+        </material>
+      </visual>
+    </link>
+
+    <!-- Chicane: baffle_a hangs off the left wall leaving a clear gap below
+         y=0.4 (drive-through on the right); baffle_b hangs off the right
+         wall leaving a clear gap above y=-0.4 (drive-through on the left) --
+         a simple S-weave. -->
+    <link name="baffle_a">
+      <pose>8 1.7 0.5 0 0 0</pose>
+      <collision name="collision">
+        <geometry>
+          <box><size>0.2 2.6 1.0</size></box>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <box><size>0.2 2.6 1.0</size></box>
+        </geometry>
+        <material>
+          <script>
+            <uri>file://media/materials/scripts/gazebo.material</uri>
+            <name>Gazebo/Orange</name>
+          </script>
+        </material>
+      </visual>
+    </link>
+
+    <link name="baffle_b">
+      <pose>14 -1.7 0.5 0 0 0</pose>
+      <collision name="collision">
+        <geometry>
+          <box><size>0.2 2.6 1.0</size></box>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <box><size>0.2 2.6 1.0</size></box>
+        </geometry>
+        <material>
+          <script>
+            <uri>file://media/materials/scripts/gazebo.material</uri>
+            <name>Gazebo/Orange</name>
+          </script>
+        </material>
+      </visual>
+    </link>
+
+    <!-- Ramp bump: climbs 0.35m over a 2m run (~10 degrees), a 1m flat
+         plateau at the top, then back down symmetrically -- full corridor
+         width so it can't be driven around. Pitch sign gives the +x-facing
+         edge of ramp_up the higher z (climbing as you drive toward +x);
+         ramp_down mirrors it back to ground level. -->
+    <link name="ramp_up">
+      <pose>19.0 0 0.175 0 -0.174 0</pose>
+      <collision name="collision">
+        <geometry>
+          <box><size>2.05 6.0 0.12</size></box>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <box><size>2.05 6.0 0.12</size></box>
+        </geometry>
+        <material>
+          <script>
+            <uri>file://media/materials/scripts/gazebo.material</uri>
+            <name>Gazebo/Yellow</name>
+          </script>
+        </material>
+      </visual>
+    </link>
+
+    <link name="ramp_plateau">
+      <pose>20.5 0 0.35 0 0 0</pose>
+      <collision name="collision">
+        <geometry>
+          <box><size>1.0 6.0 0.12</size></box>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <box><size>1.0 6.0 0.12</size></box>
+        </geometry>
+        <material>
+          <script>
+            <uri>file://media/materials/scripts/gazebo.material</uri>
+            <name>Gazebo/Yellow</name>
+          </script>
+        </material>
+      </visual>
+    </link>
+
+    <link name="ramp_down">
+      <pose>22.0 0 0.175 0 0.174 0</pose>
+      <collision name="collision">
+        <geometry>
+          <box><size>2.05 6.0 0.12</size></box>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <box><size>2.05 6.0 0.12</size></box>
+        </geometry>
+        <material>
+          <script>
+            <uri>file://media/materials/scripts/gazebo.material</uri>
+            <name>Gazebo/Yellow</name>
+          </script>
+        </material>
+      </visual>
+    </link>
+
+  </model>
+</sdf>
