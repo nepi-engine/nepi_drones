@@ -9,13 +9,13 @@
 # and needs its own local roscore. The two are independent simulations that
 # run at different times. Add to ~/.bashrc:
 #
-#   source /path/to/nepi_drones/scripts/sim_rover_dev_env.sh
+#   source /path/to/nepi_drones/sim_container/scripts/sim_rover_dev_env.sh
 #
 # Requires: gazebo11, ros-noetic-ros-base, ros-noetic-gazebo-ros-pkgs
 # (installed 2026-07-22 -- see .claude/sessions/2026-07-22-universal-sim-phase1.md).
 
 # Resolved at source time so the functions work from any cwd.
-NEPI_DRONES_SIM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/sim_container"
+NEPI_DRONES_SIM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Tiny liveness listener for the rover sim: listens on 127.0.0.1:<port> and
 # replies ALIVE to any connection. Exists so the NEPI rbx_sim driver's

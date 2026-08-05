@@ -38,7 +38,7 @@
 > 1. **`device_if_sim.py` (the generic contract implementation) is now owned by the
 >    NEPI-core team, not this repo.** This repo's own Phase 1/2 attempt at it (built
 >    2026-08-04, fully tested) is **archived, not deleted**, at
->    `sim_old_plan/app_sim_connector/` — kept for reference in case the NEPI-core team's
+>    `sim_container/sim_old_plan/app_sim_connector/` — kept for reference in case the NEPI-core team's
 >    version reuses pieces (the wire protocol ideas, the `SIM_VEHICLE_DICT` per-deployment
 >    config pattern), but it is **no longer the active plan** and nothing in this repo should
 >    build on it going forward. This repo's job now is the **driver-level two-camera
@@ -70,7 +70,7 @@ others later) so that:
 
 **Division of labor, decided 2026-08-05:** the NEPI-core team owns `device_if_sim.py` itself
 going forward — this repo's own earlier attempt at it is archived at
-`sim_old_plan/app_sim_connector/` (see the top note above). This repo's ongoing scope is the
+`sim_container/sim_old_plan/app_sim_connector/` (see the top note above). This repo's ongoing scope is the
 **driver-level camera contract** (two cameras — `scene_camera`/`robot_camera` — plus their
 controls, see [Camera configuration](#camera-configuration)) that will be built *on top of*
 whatever `device_if_sim.py` the NEPI-core team delivers, not a replacement for it.
@@ -309,7 +309,7 @@ This sketch is kept for historical/review context (it's what got reviewed and ap
 before Phase 1 was built). It was first superseded by this repo's own real Phase 1 build —
 and as of the 2026-08-05 decision that the NEPI-core team now owns `device_if_sim.py`, that
 Phase 1 build has itself been **archived** (kept for reference, not deleted — see the top
-note) to `nepi_drones/sim_old_plan/app_sim_connector/api/device_if_sim.py`. Neither is the
+note) to `nepi_drones/sim_container/sim_old_plan/app_sim_connector/api/device_if_sim.py`. Neither is the
 current source of truth for the contract going forward; read whatever `device_if_sim.py` the
 NEPI-core team actually delivers once received.
 
@@ -395,7 +395,7 @@ decisions) as given.
 > this repo's own attempt at `device_if_sim.py`/`sim_connector_node.py`, fully built and
 > tested 2026-08-04. The team meeting that day decided the NEPI-core team owns that generic
 > contract implementation going forward, not this repo. That work is **archived, not
-> deleted**, at `sim_old_plan/app_sim_connector/` — their own Verification sections below
+> deleted**, at `sim_container/sim_old_plan/app_sim_connector/` — their own Verification sections below
 > are left completely intact as an accurate historical record of what was built and tested,
 > but neither phase is the active plan anymore, and nothing new should build on the archived
 > copy. **The active plan starts at the new "Two-Camera Driver Contract" phase below,** which
@@ -452,7 +452,7 @@ and drone-shaped capability sets) before anything simulator-specific is built on
 
 #### Step 1.1: Define the new message/service types
 
-File location: `nepi_drones/sim_old_plan/app_sim_connector/msg/` and `srv/` (new sandbox
+File location: `nepi_drones/sim_container/sim_old_plan/app_sim_connector/msg/` and `srv/` (new sandbox
 folder — mirrors the real `nepi_apps/<app>/msg,srv/` convention; nothing here touches the
 real `nepi_interfaces` package).
 
@@ -472,7 +472,7 @@ real `nepi_interfaces` package).
 
 #### Step 1.2: Implement `device_if_sim.py`
 
-File location: `nepi_drones/sim_old_plan/app_sim_connector/api/device_if_sim.py`.
+File location: `nepi_drones/sim_container/sim_old_plan/app_sim_connector/api/device_if_sim.py`.
 
 Follow `device_if_rbx.py`'s structure exactly (confirmed by direct reading of
 `nepi_drones/src/nepi_api/device_if_rbx.py`, not assumed):
@@ -527,7 +527,7 @@ touch `nepi_engine_ws` or the remote device to get that, build a **throwaway** c
 workspace on this dev VM, `~/sim_connector_test_ws/`, containing:
 - Symlinks (not copies) of `nepi_interfaces`, `nepi_sdk`, `nepi_api` from
   `nepi_engine_ws/src/` — read-only references, never modified in place.
-- A symlink of `nepi_drones/sim_old_plan/app_sim_connector/`.
+- A symlink of `nepi_drones/sim_container/sim_old_plan/app_sim_connector/`.
 - **Real gap found and closed, not assumed away:** this dev VM's `/opt/ros/noetic` had
   never built or installed any NEPI-specific package before this pass (it previously only
   ever needed plain ROS + `gazebo_ros` + `mavros`). `nepi_sdk.py` itself imports
@@ -646,7 +646,7 @@ actions), `{"type":"camera_settings","view_mode":...}` (reused as-is),
 
 #### Step 2.2: Implement `sim_connector_node.py`
 
-File location: `nepi_drones/sim_old_plan/app_sim_connector/scripts/sim_connector_node.py`.
+File location: `nepi_drones/sim_container/sim_old_plan/app_sim_connector/scripts/sim_connector_node.py`.
 Owns the TCP server thread (same `settimeout(None)`-after-`init_node()` care documented in
 `src/nepi_drivers/CLAUDE.md` and already applied in `sim_bridge_node.py`/
 `camera_rig_controller_ardupilot.py`), and wires received lines into `SimDeviceIF`'s
@@ -753,9 +753,9 @@ definitions and controls that plug into it.
       exposes (extends `setCameraViewModeFunction`? a new callback? something else?).
 - [ ] **Blocked on the same delivery:** integrating/testing anything against a real
       `device_if_sim.py` instance at all — there's currently none to build against (the
-      archived one in `sim_old_plan/` is explicitly not to be used for this).
+      archived one in `sim_container/sim_old_plan/` is explicitly not to be used for this).
 - [ ] **Blocked, lower priority:** deciding what (if anything) from
-      `sim_old_plan/app_sim_connector/` is worth carrying over once the real contract
+      `sim_container/sim_old_plan/app_sim_connector/` is worth carrying over once the real contract
       arrives (the wire-protocol shapes, the `SIM_VEHICLE_DICT` per-deployment config
       pattern) vs. fully superseded — worth a look once there's something to compare it
       against, not before.
@@ -821,7 +821,7 @@ mistaken for an oversight later. Not blocking Phases 1-4.
 | Bridge connected but simulator paused/hung | The heartbeat-port pattern proves the socket is alive, not that telemetry is current | `bridge_connected` + `telemetry_age_sec` are two different signals precisely so this is distinguishable (Test Case 2.2) |
 | A capability flag left `True` with an empty backing list | E.g. `has_camera=True` but `available_image_topics` empty (bridge announced a camera, then it vanished) | `has_camera` must be *derived* from the live list every publish, never set once and cached — same reasoning as the first row |
 | New msg/srv types break `nepi_interfaces` conventions | Field naming drifts from `DeviceRBXStatus.msg`/`RBXCapabilitiesQuery.srv`'s existing plain-snake_case style | Confirmed by direct reading of both files — no `_str`/`_list` suffix invented where the RBX precedent doesn't use one |
-| Scratch test workspace accidentally becomes a dependency | Someone points real code at `~/sim_connector_test_ws/` instead of `nepi_drones` | It is explicitly disposable dev-VM scratch state (Step 1.3) — the authoritative source is always `nepi_drones/sim_old_plan/app_sim_connector/` |
+| Scratch test workspace accidentally becomes a dependency | Someone points real code at `~/sim_connector_test_ws/` instead of `nepi_drones` | It is explicitly disposable dev-VM scratch state (Step 1.3) — the authoritative source is always `nepi_drones/sim_container/sim_old_plan/app_sim_connector/` |
 
 ### Summary Checklist for Implementer
 
@@ -836,7 +836,7 @@ mistaken for an oversight later. Not blocking Phases 1-4.
       found and fixed (missing `node_if` class default, a method-name typo in the status
       timer); see Phase 1's own Verification section above for full detail. **Superseded**
       2026-08-05 — the NEPI-core team owns `device_if_sim.py` now; this build is archived at
-      `sim_old_plan/app_sim_connector/`, historical record only.
+      `sim_container/sim_old_plan/app_sim_connector/`, historical record only.
 - [x] **Phase 2 (2026-08-04, archived 2026-08-05):** `sim_connector_node.py` + generalized
       wire protocol (telemetry/sensor_topics/environment_options/image in;
       motor_control/goto_*/go_home/go_stop/setup_action/go_action/camera_settings/

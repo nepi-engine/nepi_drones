@@ -4,7 +4,7 @@
 # the rbx_ardupilot driver against the real NEPI device's RUI (see
 # docs/SIMULATOR_DEV_GUIDE.md). Add to ~/.bashrc:
 #
-#   source /path/to/nepi_drones/scripts/nepi_sitl_dev_env.sh
+#   source /path/to/nepi_drones/sim_container/scripts/nepi_sitl_dev_env.sh
 #
 # Requires: gazebo, ArduPilot's sim_vehicle.py on PATH, ~/ardupilot_gazebo
 # world files, and autossh (`sudo apt-get install autossh`) for nepi_tunnel.
@@ -16,7 +16,7 @@ alias sitl='sim_vehicle.py -v ArduCopter -f gazebo-iris --console --map'
 # Resolved at source time so sitl_gazebo works from any cwd (camera-rig
 # feature: needs nepi_drones/sim_container/models on GAZEBO_MODEL_PATH so
 # `model://camera_rig` resolves -- see camera_rig_controller_ardupilot.py).
-NEPI_DRONES_SIM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/sim_container"
+NEPI_DRONES_SIM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Launches Gazebo, waits for it to fully load (so the ArduPilotPlugin's FDM
 # socket is up before SITL starts sending), then runs SITL in the foreground

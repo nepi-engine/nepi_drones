@@ -21,7 +21,7 @@ scope — kept here verbatim for history, not as a current claim about what this
 covers. The plan is split into self-contained Phases and Steps so an AI assistant (or human
 developer) can execute and verify one component at a time without losing context.
 
-**Environment note (added 2026-07-21):** the original draft's code samples, file paths, and network topology assumed a generic same-LAN, shared-Docker-network deployment. Section 1a below corrects that to match this project's actual dev setup (see `docs/SIMULATOR_DEV_GUIDE.md`, `scripts/nepi_sitl_dev_env.sh`) — read it before starting Phase 1. The rest of the document has been reformatted for readability but keeps the original's structure and intent.
+**Environment note (added 2026-07-21):** the original draft's code samples, file paths, and network topology assumed a generic same-LAN, shared-Docker-network deployment. Section 1a below corrects that to match this project's actual dev setup (see `docs/SIMULATOR_DEV_GUIDE.md`, `sim_container/scripts/nepi_sitl_dev_env.sh`) — read it before starting Phase 1. The rest of the document has been reformatted for readability but keeps the original's structure and intent.
 
 ## 1. System Architecture & Preliminary Setup
 
@@ -54,9 +54,9 @@ developer) can execute and verify one component at a time without losing context
 
 The original draft assumed NEPI and the simulator share a single ROS master over the same LAN (`ROS_MASTER_URI=http://<SIMULATOR_IP>:11311`, Docker `--net=host`, "Cross-Container ROS Communication" via a shared `ROS_IP`/`ROS_MASTER_URI`). **That does not match this project's actual environment** and must not be built against:
 
-- The real NEPI device and this dev VM are two separate machines with two separate ROS masters, reachable only through a reverse SSH tunnel that forwards raw TCP ports (`nepi_tunnel` in `scripts/nepi_sitl_dev_env.sh`). Neither machine can see the other's ROS graph directly, and there is no shared Docker network between them.
+- The real NEPI device and this dev VM are two separate machines with two separate ROS masters, reachable only through a reverse SSH tunnel that forwards raw TCP ports (`nepi_tunnel` in `sim_container/scripts/nepi_sitl_dev_env.sh`). Neither machine can see the other's ROS graph directly, and there is no shared Docker network between them.
 - This is exactly the constraint the existing ArduPilot SITL bridge already solves, and it's the pattern to reuse: MAVLink is a plain socket protocol, so it tunnels trivially over a simple `-R` port forward, and `mavros` runs *on the device side*, translating the tunneled MAVLink stream into ROS topics on the device's own master. There is no shared ROS graph anywhere in the existing working system.
-- A generic Gazebo robot's `gazebo_ros_diff_drive` plugin speaks ROS topics natively, not a portable wire protocol, so it cannot be tunneled the way MAVLink is — ROS's dynamic XML-RPC port negotiation does not survive a simple SSH port forward. The correct approach is a small custom TCP bridge (same idea as `scripts/gz_reset_listener.py`, just bidirectional: motion commands one way, odometry/telemetry the other) rather than attempting to share a ROS master across machines.
+- A generic Gazebo robot's `gazebo_ros_diff_drive` plugin speaks ROS topics natively, not a portable wire protocol, so it cannot be tunneled the way MAVLink is — ROS's dynamic XML-RPC port negotiation does not survive a simple SSH port forward. The correct approach is a small custom TCP bridge (same idea as `sim_container/scripts/gz_reset_listener.py`, just bidirectional: motion commands one way, odometry/telemetry the other) rather than attempting to share a ROS master across machines.
 - Consequence: this VM needs its own local `roscore` for `sim_bridge_node.py` and Gazebo's ROS-integrated plugins to run against. This is new — the existing ArduPilot Gazebo setup never needed one, since ArduPilot's Gazebo plugin speaks MAVLink/FDM directly, not ROS.
 
 **Canonical source directories (corrected for this machine — replaces every `/home/production/nepi_engine_ws/...` reference below):**
@@ -318,7 +318,7 @@ To run two robots side by side (`robot_1`, `robot_2`), discovery and node topics
 | Scenario / edge case | Cause / mechanism | Solution / safeguard |
 |---|---|---|
 | Simulator boots after NEPI | NEPI driver starts before the Gazebo bridge is ready | Discovery's retry loop (see `rbx_ardupilot_discovery.py`'s `dont_retry_list` handling) polls continuously and self-heals once the bridge comes up — confirmed working for the ArduPilot case this same way |
-| NEPI device restarts while the simulator is already running | The reverse SSH tunnel dies with the device's sshd; a plain `ssh -N` tunnel does not reconnect | Use `autossh` for the tunnel (already done in `scripts/nepi_sitl_dev_env.sh`'s `nepi_tunnel`), not a bare `ssh -N` |
+| NEPI device restarts while the simulator is already running | The reverse SSH tunnel dies with the device's sshd; a plain `ssh -N` tunnel does not reconnect | Use `autossh` for the tunnel (already done in `sim_container/scripts/nepi_sitl_dev_env.sh`'s `nepi_tunnel`), not a bare `ssh -N` |
 | Deployed driver files revert after an on-device rebuild or power cycle | The device's stack runs from a committed Docker image; a live-container-only edit (`scpn` without `nepicommit`) is lost on the next restart | Always follow any on-device fix with `nepicommit` (which also restarts) and verify via `md5sum` that the fix survived — see the project memory on this recurring failure mode |
 | Option reverts on UI selection | `SIMULATOR` missing from `rbx_sim_params.yaml`'s `connection.options` | Ensure `connection.options` includes `SIMULATOR` in the params YAML |
 | High-latency camera stream | Uncompressed raw image stream over the bridge | Use `sensor_msgs/CompressedImage` for the bridged connection |

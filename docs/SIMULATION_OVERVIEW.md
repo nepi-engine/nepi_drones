@@ -218,7 +218,7 @@ The ArduPilot port of the same feature, adapted for a genuinely different vehicl
   telemetry/commands), this file runs its **own** minimal TCP JSON-lines server
   directly on port 9026, combining both roles the rover split across two files.
 
-#### 10. `scripts/nepi_sitl_dev_env.sh` and `scripts/sim_rover_dev_env.sh`
+#### 10. `sim_container/scripts/nepi_sitl_dev_env.sh` and `sim_container/scripts/sim_rover_dev_env.sh`
 The bash function libraries (sourced from `~/.bashrc`) that actually start/stop
 everything.
 
