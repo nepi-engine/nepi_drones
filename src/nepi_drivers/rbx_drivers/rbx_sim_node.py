@@ -157,6 +157,19 @@ class SimNode:
   NAVPOSE_UPDATE_RATE = 10
   TELEMETRY_FRESH_SEC = 2.0
 
+  # Manual motor-ratio tank-drive conversion (RBX_EXTERNAL_HARDWARE_INTERFACES.md
+  # worked example, section 6): motor 0 = left, motor 1 = right. Converted to
+  # the same linear/angular Twist gotoControlCb already sends, via standard
+  # differential-drive kinematics -- no new Gazebo model/plugin or bridge
+  # message needed, since this device's controller loop already owns sending
+  # velocity every tick. Per MotorControl.msg, speed_ratio is a 0-1 magnitude
+  # with no reverse/direction bit, so this can drive straight and
+  # differentially steer but cannot reverse or spin in place -- an honest
+  # limitation of the wire format, not this conversion. MOTOR_WHEEL_BASE_M is
+  # an approximation of generic_rover's actual wheel track width.
+  MOTOR_MAX_LINEAR_MPS = 0.5
+  MOTOR_WHEEL_BASE_M = 0.4
+
   # Closed-loop goto controller shape: proportional gains, plus a
   # turn-in-place gate so the rover rotates toward the target bearing
   # before driving (differential drive can pivot on the spot).
@@ -279,6 +292,15 @@ class SimNode:
     self.stop_triggered = False
 
     ##############################
+    # Manual motor-ratio state: RBX_EXTERNAL_HARDWARE_INTERFACES.md worked
+    # example (section 6) -- models a CAN-bus-style two-motor tank drive
+    # (0=left, 1=right) on top of this same simulated rover, converted to a
+    # Twist by sim_bridge_node.py's motorRatiosToTwist and applied through the
+    # same Gazebo diff-drive plugin the closed-loop goto controller already
+    # drives. See setMotorControlRatio/getMotorControlRatios below.
+    self.motor_ratios = [0.0, 0.0]
+
+    ##############################
     # Home position state: local ENU x/y/z meters (this rover has no WGS84
     # reference), carried over RBXRobotIF's existing GeoPoint-based
     # set_home/get_home/set_home_current plumbing -- see getHome/setHome
@@ -340,8 +362,8 @@ class SimNode:
                                   go_actions = self.RBX_GO_ACTIONS,
                                   setGoActionIndFunction = self.setGoActionInd,
                                   manualControlsReadyFunction = self.manualControlsReady,
-                                  getMotorControlRatios = None,
-                                  setMotorControlRatio = None,
+                                  getMotorControlRatios = self.getMotorControlRatios,
+                                  setMotorControlRatio = self.setMotorControlRatio,
                                   autonomousControlsReadyFunction = self.autonomousControlsReady,
                                   getHomeFunction = self.getHome,
                                   setHomeFunction = self.setHome,
@@ -443,12 +465,27 @@ class SimNode:
     return triggered
 
   def manualControlsReady(self):
-    # No manual motor-control surface: the rover's bridge speaks Twist
-    # velocities, not per-motor 0-1 speed ratios (which can't even express
-    # reverse). Provided (rather than None) because RBXRobotIF's
-    # setMotorControl calls this unguarded if a set_motor_control message
-    # ever arrives.
-    return False
+    # Gates manual motor-ratio commands the same way autonomousControlsReady
+    # gates goto commands: require a live bridge connection. Fresh telemetry
+    # is not required here (unlike goto) since a direct motor command doesn't
+    # depend on knowing the current position/heading.
+    with self.sock_lock:
+      return self.sock is not None
+
+  def setMotorControlRatio(self, motor_ind, speed_ratio):
+    # Only updates local state -- gotoControlCb (already running continuously
+    # at CONTROLLER_RATE_HZ) is the single authoritative sender of velocity
+    # commands to the bridge. A one-shot send from here was tried first and
+    # confirmed live to be immediately overwritten by that loop's next
+    # (0,0)-when-idle tick, since it sends every tick regardless of whether a
+    # goto or manual command is active. See motorControlToVelocity.
+    if motor_ind < 0 or motor_ind >= len(self.motor_ratios):
+      self.msg_if.pub_warn("Motor control ignored: motor index " + str(motor_ind) + " out of range")
+      return
+    self.motor_ratios[motor_ind] = max(0.0, min(1.0, speed_ratio))
+
+  def getMotorControlRatios(self):
+    return self.motor_ratios
 
   def autonomousControlsReady(self):
     # Gates all goto commands: require a live bridge connection with fresh
@@ -643,7 +680,19 @@ class SimNode:
           # Target reached: clear (lin/ang stay 0.0 -- rover stops)
           self.clearGotoTarget()
           self.msg_if.pub_info("Goto target reached")
+    elif any(self.motor_ratios):
+      # No active goto -- an active manual motor command takes over this
+      # same tick, so there is exactly one authoritative sender rather than
+      # a race between this loop and a separate one-shot command.
+      lin, ang = self.motorControlToVelocity()
     self.sendVelocityCmd(lin, ang)
+
+  def motorControlToVelocity(self):
+    left = self.motor_ratios[0]
+    right = self.motor_ratios[1]
+    lin = (left + right) / 2.0 * self.MOTOR_MAX_LINEAR_MPS
+    ang = (right - left) / self.MOTOR_WHEEL_BASE_M * self.MOTOR_MAX_LINEAR_MPS
+    return lin, ang
 
   def normalizeAngle(self,angle_rad):
     while angle_rad > math.pi:

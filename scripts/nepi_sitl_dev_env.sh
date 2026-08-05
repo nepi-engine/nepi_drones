@@ -63,7 +63,13 @@ gz_reset_listener() {
 # camera_rig_controller_ardupilot.py's own TCP JSON-lines server, next free
 # port in the 902x block; carries ONLY camera settings in and compressed
 # frames out, since MAVLink over 5771 already carries telemetry/commands for
-# this driver). This one tunnel serves both
+# this driver), and 9027 (the ArduPilot simulated AI-targeting bridge --
+# ai_targeting_controller_ardupilot.py's own TCP JSON-lines server, next free
+# port in the 902x block after the camera bridge; outbound-only, streams
+# synthetic range/azimuth/elevation for sim_ai_targeting_bridge_script.py to
+# republish as Targets on the NEPI device, standing in for the
+# app_ai_targeting app drone_follow_object_mission_script.py otherwise has no
+# way to test against). This one tunnel serves both
 # simulation workflows (ArduPilot SITL and the generic rover sim).
 # Uses autossh (not plain ssh) so the tunnel reconnects on its own whenever
 # either side restarts -- a power-cycle of the NEPI device kills its sshd and
@@ -78,7 +84,7 @@ nepi_tunnel() {
     fi
     AUTOSSH_GATETIME=0 nohup autossh -M 0 -p 2222 -i ~/.ssh/nepi_default_ssh_key \
         -o ConnectTimeout=5 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
-        -R 5760:127.0.0.1:5760 -R 5771:127.0.0.1:5771 -R 9021:127.0.0.1:9021 -R 9022:127.0.0.1:9022 -R 9023:127.0.0.1:9023 -R 9024:127.0.0.1:9024 -R 9025:127.0.0.1:9025 -R 9026:127.0.0.1:9026 \
+        -R 5760:127.0.0.1:5760 -R 5771:127.0.0.1:5771 -R 9021:127.0.0.1:9021 -R 9022:127.0.0.1:9022 -R 9023:127.0.0.1:9023 -R 9024:127.0.0.1:9024 -R 9025:127.0.0.1:9025 -R 9026:127.0.0.1:9026 -R 9027:127.0.0.1:9027 \
         -N nepi@nepi > /tmp/nepi_tunnel.log 2>&1 &
     disown
     sleep 2
@@ -161,6 +167,20 @@ sitl_gazebo() {
 camera_rig_controller_ardupilot() {
     source /opt/ros/noetic/setup.bash
     python3 "$NEPI_DRONES_SIM_DIR/scripts/camera_rig_controller_ardupilot.py"
+}
+
+# Simulated AI-targeting controller for the ArduPilot SITL sim (test
+# scaffolding standing in for the missing app_ai_targeting app -- see
+# drone_follow_object_mission_script.py's own "KNOWN GAP" docstring). Spawns
+# a moving "chair" target object into the running Gazebo world and streams
+# synthetic range/azimuth/elevation over its own TCP bridge (port 9027) for
+# sim_ai_targeting_bridge_script.py (run as a NEPI automation script on the
+# device) to republish as Targets. Not auto-started by sitl_gazebo -- same
+# manual-launch convention as camera_rig_controller_ardupilot: run this in a
+# separate terminal/screen session after sitl_gazebo is up.
+ai_targeting_controller_ardupilot() {
+    source /opt/ros/noetic/setup.bash
+    python3 "$NEPI_DRONES_SIM_DIR/scripts/ai_targeting_controller_ardupilot.py"
 }
 
 # Alias for typos / muscle memory -- identical to sitl_gazebo.

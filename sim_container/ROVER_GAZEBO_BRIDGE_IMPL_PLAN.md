@@ -1,10 +1,25 @@
-# UNIVERSAL_SIMULATOR_BRIDGE_IMPLEMENTATION_PLAN.md
+# ROVER_GAZEBO_BRIDGE_IMPL_PLAN.md
 
 ## Document Overview
 
-This document is a modular, step-by-step engineering blueprint for implementing a **Universal Gazebo Simulator Bridge & RBX Driver** for the NEPI Engine ecosystem.
+**Renamed 2026-08-05** from `UNIVERSAL_SIMULATOR_IMPL_PLAN.md` — despite the original
+"universal" framing below, this document is, and was always actually used as, the plan for
+one specific thing: the **rover Gazebo bridge and its `rbx_sim` driver** (`sim_bridge_node.py`
++ `rbx_sim_discovery.py`/`rbx_sim_node.py`), not a vehicle-agnostic simulator contract. That
+broader, genuinely device-agnostic effort is what `docs/SIMULATION_INTERFACE_SPEC.md` is for
+— read that document for current direction on the generic `device_if_sim` contract; treat this
+one as historical/rover-specific context only (see also `SIMULATION_OVERVIEW.md`'s own
+"Planning docs (historical context, not current-state truth)" section, which already flagged
+this doc that way before the rename).
 
-The goal is to let any robot — ground rover, drone, robotic arm, servo assembly, or FIRST Robotics vehicle — be simulated in Gazebo and controlled seamlessly by NEPI with zero physical hardware attached. The plan is split into self-contained Phases and Steps so an AI assistant (or human developer) can execute and verify one component at a time without losing context.
+This document is a modular, step-by-step engineering blueprint for implementing the rover's
+Gazebo Simulator Bridge & RBX Driver for the NEPI Engine ecosystem.
+
+The original goal statement below ("let any robot ... be simulated ... with zero physical
+hardware") was the aspiration that later became `docs/SIMULATION_INTERFACE_SPEC.md`'s actual
+scope — kept here verbatim for history, not as a current claim about what this document
+covers. The plan is split into self-contained Phases and Steps so an AI assistant (or human
+developer) can execute and verify one component at a time without losing context.
 
 **Environment note (added 2026-07-21):** the original draft's code samples, file paths, and network topology assumed a generic same-LAN, shared-Docker-network deployment. Section 1a below corrects that to match this project's actual dev setup (see `docs/SIMULATOR_DEV_GUIDE.md`, `scripts/nepi_sitl_dev_env.sh`) — read it before starting Phase 1. The rest of the document has been reformatted for readability but keeps the original's structure and intent.
 

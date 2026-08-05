@@ -2,7 +2,7 @@
 #
 # Provides the one-command roscore + Gazebo + sim bridge launcher for the
 # Universal Simulator Bridge Phase 1 workflow (see
-# UNIVERSAL_SIMULATOR_IMPL_PLAN.md). Deliberately a separate command from
+# sim_container/ROVER_GAZEBO_BRIDGE_IMPL_PLAN.md, renamed 2026-08-05). Deliberately a separate command from
 # sitl_gazebo (nepi_sitl_dev_env.sh): the ArduPilot workflow speaks
 # MAVLink/FDM directly to SITL and never needs ROS on this VM, while this
 # rover workflow is ROS-native (gazebo_ros_diff_drive / gazebo_ros_camera)
@@ -129,6 +129,49 @@ sim_rover_gazebo() {
         pkill -f "rosout/rosout" 2>/dev/null
     fi
     trap - INT TERM
+}
+
+# Manual test commands for the running generic-rover sim (sim_rover_gazebo).
+# Talk directly to this VM's local /rover/cmd_vel + /rover/odom -- see
+# sim_move.py's module docstring for why that's deliberately independent of
+# the sim bridge / NEPI device relay. Only meaningful once Gazebo is up.
+move() {
+    source /opt/ros/noetic/setup.bash > /dev/null 2>&1
+    python3 "$NEPI_DRONES_SIM_DIR/scripts/sim_move.py" "$@"
+}
+
+# Immediate stop -- in case a move overshoots or the rover is drifting and
+# you don't want to wait for a command to finish.
+stop() {
+    source /opt/ros/noetic/setup.bash > /dev/null 2>&1
+    rostopic pub -1 /rover/cmd_vel geometry_msgs/Twist \
+        "linear: {x: 0.0, y: 0.0, z: 0.0}
+angular: {x: 0.0, y: 0.0, z: 0.0}" > /dev/null
+    echo "stopped"
+}
+
+testcommands() {
+    cat <<'EOF'
+Rover sim test commands (run after sim_rover_gazebo is up):
+
+  move 10x              drive forward 10m (world x / east)
+  move -5x               drive backward 5m
+  move 5y                drive so as to end up 5m further north (world y)
+  move 10x 5y            combined x+y move (turns to face the point, then drives)
+  move 45yaw             turn in place 45 degrees (relative, left-positive)
+  move 10x 45yaw         drive 10m forward, then turn 45 degrees
+  move 10x, 5y, 3z, 45yaw   commas are fine -- z is accepted but ignored (ground rover)
+  stop                   zero velocity immediately
+  testcommands           show this list
+
+Notes:
+  - x/y are relative meters in the world frame, added to the rover's current
+    position (not "forward/left" relative to which way it's currently facing).
+  - yaw is relative degrees, applied as a final in-place turn after the drive.
+  - These commands drive Gazebo directly and will fight the real NEPI device
+    driver if it's actively connected and issuing commands at the same time --
+    use them for standalone sim testing.
+EOF
 }
 
 # Multi-robot variant of sim_rover_gazebo (Universal Simulator Bridge,

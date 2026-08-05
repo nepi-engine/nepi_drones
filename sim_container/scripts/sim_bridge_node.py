@@ -72,6 +72,17 @@
 # testing, single source of truth, just spawned live instead of baked into
 # the world file. `sim_rover_gazebo` (the default "basic room" command) still
 # always launches plain generic_rover.world with no obstacles.
+#
+# Manual per-motor control (RBX_EXTERNAL_HARDWARE_INTERFACES.md worked
+# example, section 6) is implemented entirely on the rbx_sim_node.py side:
+# it folds the left/right-ratio-to-Twist conversion into the SAME
+# continuously-running 20Hz control loop that already sends goto/idle
+# velocity commands (gotoControlCb), then sends the result over this
+# bridge's existing velocity-command shape. A one-shot motor_cmd message
+# here would have been immediately overwritten by that loop's next
+# (0,0)-when-idle tick, since it always sends every 20Hz regardless of
+# whether a goto is active -- confirmed live during development. No new
+# bridge message shape needed as a result.
 
 import base64
 import json

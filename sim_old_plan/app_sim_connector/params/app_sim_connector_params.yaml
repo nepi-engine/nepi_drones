@@ -1,0 +1,40 @@
+APP_DICT:
+  display_name: Sim Connector
+  description: Generic NEPI <-> simulator connector app
+  pkg_name: app_sim_connector
+  group_name: SIMULATION
+  config_file: app_sim_connector_params.yaml
+  app_file: sim_connector_node.py
+  node_name: app_sim_connector
+  license_type: 3-clause BSD
+  license_link: https://opensource.org/licenses/BSD-3-Clause
+
+# Per-deployment vehicle profile -- apps_mgr loads every top-level key in this
+# file onto this app's own param namespace before launching it (see
+# nepi_sdk.load_params_from_file), so sim_connector_node.py reads this dict at
+# startup the same way rbx_sim_node.py reads its driver-supplied DEVICE_DICT.
+# Whichever simulator this app instance connects to only announces the things
+# the bridge protocol defines as genuinely dynamic (available_sensor_topics,
+# available_environment_options) -- everything else that device_if_sim.py's
+# contract decides once at construction (wheel/motor counts, which goto
+# functions exist) has to be *configured* per deployment instead, exactly
+# like rbx_sim_node.py/rbx_ardupilot_node.py each hardcode their own vehicle's
+# capabilities as class constants, except here it's config because the code
+# itself must stay vehicle-agnostic. Factory defaults are the same
+# capability-empty profile Phase 1's registration test already verified safe
+# (Test Case 1.4) -- change these to match whatever simulator's bridge this
+# deployment will actually connect to.
+SIM_VEHICLE_DICT:
+  listen_port: 9030
+  wheel_count: 0
+  motor_count: 0
+  has_goto_position: false
+  has_goto_pose: false
+  has_goto_location: false
+  has_go_home: false
+  has_set_home: false
+  setup_actions: []
+  go_actions: []
+  has_camera_view_control: false
+  available_camera_view_modes: []
+  has_environment_controls: false

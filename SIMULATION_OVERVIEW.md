@@ -333,7 +333,7 @@ this. Documented in `src/nepi_drivers/CLAUDE.md`'s Known Constraints.
 
 ### C. Planning docs (historical context, not current-state truth)
 
-#### 14. `UNIVERSAL_SIMULATOR_IMPL_PLAN.md`
+#### 14. `sim_container/ROVER_GAZEBO_BRIDGE_IMPL_PLAN.md` (renamed 2026-08-05 from `UNIVERSAL_SIMULATOR_IMPL_PLAN.md` — despite the old name, always specific to the rover bridge, never the vehicle-agnostic contract `docs/SIMULATION_INTERFACE_SPEC.md` now owns)
 The original 5-phase plan for the rover simulator effort. Contains a notable
 self-correction: the first draft assumed NEPI and the simulator share one ROS master
 over LAN; the real environment turned out to be two fully separate machines connected
