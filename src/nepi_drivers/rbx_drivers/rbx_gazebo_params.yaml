@@ -1,0 +1,55 @@
+# Gazebo simulated robot RBX driver -- params / manifest.
+# See rbx_ardupilot_params.yaml for the shipped reference of this shape.
+
+driver:
+  pkg_name: RBX_GAZEBO
+  display_name: Gazebo Simulated Robot
+  description: Driver package for Gazebo-simulated robots reached over a JSON-lines bridge
+  type: RBX
+  group_id: GAZEBO
+
+  NODE_DICT:
+    file_name: rbx_gazebo_node.py
+    class_name: GazeboNode
+
+  # No separate driver file: all robot I/O goes over the bridge connection the
+  # node holds open, same as the ardupilot driver has no driver file of its own.
+  DRIVER_DICT:
+    file_name: None
+    class_name: None
+
+  DISCOVERY_DICT:
+    file_name: rbx_gazebo_discovery.py
+    class_name: GazeboDiscovery
+    process: CALL
+    OPTIONS:
+      # Host serving the Gazebo bridge. Discovery probes the heartbeat port on
+      # this host, so 'localhost' covers both a Gazebo instance on the device
+      # itself and one reached through a forwarded port; set a real address for a
+      # Gazebo instance on another machine on the network.
+      host:
+        type: String
+        options:
+          - ''
+        default: 'localhost'
+        value: 'localhost'
+      # Port a Gazebo-side heartbeat listener answers on. Discovery requires the
+      # ALIVE reply, not merely a successful connect: with a forwarded port,
+      # connect succeeds against the local forwarder even when nothing is
+      # listening on the far end.
+      heartbeat_port:
+        type: Int
+        options:
+          - '1024'
+          - '65535'
+        default: '9022'
+        value: '9022'
+      # Port serving the persistent JSON-lines command/telemetry bridge that the
+      # launched node connects to.
+      bridge_port:
+        type: Int
+        options:
+          - '1024'
+          - '65535'
+        default: '9023'
+        value: '9023'
