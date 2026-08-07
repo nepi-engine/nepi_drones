@@ -1,0 +1,135 @@
+APP_DICT:
+  display_name: Sim Connector
+  description: Generic connector between NEPI and any simulator that speaks the sim bridge protocol
+  pkg_name: nepi_app_sim_connector
+  group_name: AUTOMATION
+  config_file: app_sim_connector.yaml
+  app_file: sim_connector_app_node.py
+  node_name: app_sim_connector
+  license_type: 3-clause BSD
+  license_link: https://opensource.org/licenses/BSD-3-Clause
+RUI_DICT:
+  rui_files:
+  - NepiAppSimConnector.js
+  - Nepi_IF_Sim.js
+  - Nepi_IF_Sim-Controls.js
+  rui_main_file: NepiAppSimConnector.js
+  rui_main_class: NepiAppSimConnector
+
+# Per-deployment simulator profile. apps_mgr loads every top-level key in this
+# file onto this app's own param namespace before launching it, so the node
+# reads SIM_VEHICLE_DICT at startup the same way a driver node reads its
+# discovery-supplied DEVICE_DICT.
+#
+# Why this is config rather than something the bridge announces: the contract
+# decides capabilities once at construction and caches them, which is what lets
+# a client render controls purely from the flags. Only the two fields the
+# contract calls genuinely dynamic -- available_sensor_topics and
+# available_environment_options -- are live-refreshed from the connected bridge.
+# Everything that describes what kind of robot this is (wheel and motor counts,
+# which goto functions exist, which camera view modes are valid) is a named
+# robot config here. Selecting a different config re-derives the cached
+# capability report in place; see SimDeviceIF.apply_capability_profile.
+SIM_VEHICLE_DICT:
+  # Port a simulator's own bridge script dials into. Chosen clear of the ports
+  # NEPI already uses (5003 RUI, 9090 rosbridge, 9091 web_video_server) and of
+  # the 902x block existing simulator utility scripts allocate.
+  listen_port: 9030
+
+  # Which robot config the app starts in. Must name one of robot_configs below.
+  default_robot_config: default
+
+  # Named robot configs offered by the app's robot config selector. Selecting
+  # one tells the simulator which kind of robot is wanted, and a robot's kind is
+  # exactly what these fields describe. Add an entry per robot a deployment
+  # cares about; nothing here is simulator-specific.
+  robot_configs:
+
+    # Capability-empty factory default. Every flag off, so the RUI renders no
+    # controls at all. That is the intended safe starting state, not a broken
+    # one -- an operator picks a real robot config from the selector once a
+    # bridge is connected. Verified safe: an all-None callback set answers
+    # capabilities_query with all-False and no-ops every command.
+    default:
+      description: No capabilities. Safe default until a robot config is selected.
+      wheel_count: 0
+      motor_count: 0
+      has_goto_position: false
+      has_goto_pose: false
+      has_goto_location: false
+      has_go_home: false
+      has_set_home: false
+      has_go_stop: false
+      setup_actions: []
+      go_actions: []
+      has_camera_view_control: false
+      available_camera_view_modes: []
+      has_environment_controls: false
+
+    # Two-wheel differential-drive ground robot. Moves in the ground plane, so
+    # local position and yaw are commandable but attitude is not, and it has no
+    # global location reference of its own.
+    ground_robot_2_wheel:
+      description: Two-wheel differential-drive ground robot, local position control only
+      wheel_count: 2
+      motor_count: 2
+      has_goto_position: true
+      has_goto_pose: false
+      has_goto_location: false
+      has_go_home: true
+      has_set_home: true
+      has_go_stop: true
+      setup_actions:
+      - RESET
+      - RETURN_HOME
+      go_actions: []
+      has_camera_view_control: true
+      available_camera_view_modes:
+      - SCENE_CAMERA
+      - ROBOT_CAMERA
+      has_environment_controls: true
+
+    # Four-wheel ground robot, otherwise the same control surface as the
+    # two-wheel entry. Present to show that a robot's kind, not the simulator,
+    # is what a config selects.
+    ground_robot_4_wheel:
+      description: Four-wheel ground robot, local position control only
+      wheel_count: 4
+      motor_count: 4
+      has_goto_position: true
+      has_goto_pose: false
+      has_goto_location: false
+      has_go_home: true
+      has_set_home: true
+      has_go_stop: true
+      setup_actions:
+      - RESET
+      - RETURN_HOME
+      go_actions: []
+      has_camera_view_control: true
+      available_camera_view_modes:
+      - SCENE_CAMERA
+      - ROBOT_CAMERA
+      has_environment_controls: true
+
+    # Four-motor flight robot. No wheels, full attitude control, and a real
+    # global location reference, so all three goto surfaces are commandable.
+    flight_robot_4_motor:
+      description: Four-motor flight robot, full attitude plus local and global position control
+      wheel_count: 0
+      motor_count: 4
+      has_goto_position: true
+      has_goto_pose: true
+      has_goto_location: true
+      has_go_home: true
+      has_set_home: true
+      has_go_stop: true
+      setup_actions:
+      - TAKEOFF
+      - LAUNCH
+      go_actions: []
+      has_camera_view_control: true
+      available_camera_view_modes:
+      - SCENE_CAMERA
+      - ROBOT_CAMERA
+      has_environment_controls: false

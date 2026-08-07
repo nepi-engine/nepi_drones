@@ -1,0 +1,68 @@
+# This service definition provides the capabilities report for a SimDeviceIF
+# connector node. Mirrors nepi_interfaces/RBXCapabilitiesQuery.srv's existing
+# fields unchanged (reused as-is), plus the SimDeviceIF additions below them.
+#
+# The response is served from a cached struct decided at construction from which
+# constructor callbacks are real functions -- not computed per request. The one
+# documented exception is the live-derived block noted below, plus a robot-config
+# change, which re-runs the same derivation in place (see api/device_if_sim.py's
+# apply_capability_profile).
+
+---
+string device_name
+string device_path
+string device_node_name
+
+# Commanded controls for fields set to False will be ignored
+nepi_interfaces/AxisControls control_support
+
+bool has_battery_feedback
+
+bool has_manual_controls
+bool has_autonomous_controls
+bool has_set_home
+bool has_go_home
+bool has_go_stop
+bool has_goto_pose
+bool has_goto_position
+bool has_goto_location
+
+string[] state_options
+string[] mode_options
+string[] setup_action_options
+string[] go_action_options
+
+string[] data_products
+
+##############################
+# SimDeviceIF additions
+
+# Distinguishes a ground vehicle from a flight vehicle for UI layout purposes
+bool has_wheels
+int32 wheel_count
+
+# Generic motor-output capability -- effectively has_manual_controls, named
+# explicitly for clarity to a non-RBX-familiar reader
+bool has_motors
+int32 motor_count
+
+# Typed sensor-topic list (see SensorTopicInfo.msg) -- every sensor topic the
+# simulator currently exposes, not just cameras. Re-derived live.
+SensorTopicInfo[] available_sensor_topics
+
+# Derived from available_sensor_topics (msg_type == 'sensor_msgs/Image') on
+# every derivation pass, never independently tracked or cached
+bool has_camera
+string[] available_image_topics
+string active_image_topic
+
+# Camera view/rig control (which camera, follow angle, distance) -- distinct
+# from which image topic is active
+bool has_camera_view_control
+string[] available_camera_view_modes
+
+# Whether the world/environment can be reconfigured live (e.g. an obstacle
+# course toggle), distinct from a reset action which only resets the existing
+# world
+bool has_environment_controls
+string[] available_environment_options
