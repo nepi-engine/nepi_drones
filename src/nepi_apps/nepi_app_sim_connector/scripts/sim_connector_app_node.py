@@ -80,6 +80,7 @@
 import base64
 import copy
 import json
+import os
 import socket
 import threading
 
@@ -102,6 +103,7 @@ from nepi_sdk import nepi_sdk
 from nepi_sdk import nepi_utils
 from nepi_sdk import nepi_nav
 from nepi_sdk import nepi_img
+from nepi_sdk import nepi_system
 
 from std_msgs.msg import Bool, Empty, String
 from sensor_msgs.msg import Image
@@ -111,7 +113,28 @@ from nepi_interfaces.msg import AxisControls, DeviceRBXStatus
 
 from nepi_api.messages_if import MsgIF
 
+# Additive simulator auto-launch capability (see
+# docs/SIMULATOR_AUTO_LAUNCH_PLAN.md in nepi_drones) -- both imports are
+# optional at runtime. simulator_launcher.py is installed into nepi_api
+# alongside device_if_sim.py by this package's own CMakeLists (api/ ->
+# nepi_api dist-packages), so it is present on any device that has this
+# app installed; SimLauncherStatus is generated from this same package's
+# msg/. Neither existing import above changes.
+from nepi_api.simulator_launcher import (SimulatorLauncher, LauncherError,
+                                         find_config_path)
+from nepi_app_sim_connector.msg import SimLauncherStatus
+
 PKG_NAME = 'SIM_CONNECTOR'
+
+# This app's own ROS package name, used to find its installed params file by
+# matching APP_DICT.pkg_name -- the same key getAppsDict itself keys apps on,
+# so a params-file rename can't silently break the lookup.
+APP_PKG_NAME = 'nepi_app_sim_connector'
+SIM_VEHICLE_DICT_KEY = 'SIM_VEHICLE_DICT'
+# system_folders is published by system_mgr, which starts well before any app.
+# A short timeout is enough, and timing out is non-fatal (falls back to the
+# capability-empty factory profile, exactly as before this fallback existed).
+SYSTEM_FOLDERS_TIMEOUT_MSEC = 5000
 
 # Listen port a simulator's bridge script dials into. Configurable per
 # deployment via the params yaml.
@@ -188,14 +211,32 @@ class NepiSimConnectorApp:
     self.msg_if.pub_info("Starting Node Initialization Processes")
 
     ##############################
-    # Per-deployment robot configs. apps_mgr loads every top-level key of the
-    # params yaml onto this app's own param namespace before launching it, so
-    # SIM_VEHICLE_DICT is read from there the same way a driver node reads its
-    # discovery-supplied DEVICE_DICT.
+    # Per-deployment robot configs, read from the params namespace first.
+    #
+    # CORRECTION to an earlier assumption documented here: apps_mgr does NOT
+    # load every top-level key of an app's params yaml onto its param
+    # namespace. nepi_sdk/nepi_apps.py's getAppsDict extracts APP_DICT (plus
+    # RUI_DICT, nested inside it) and discards every other top-level key, and
+    # apps_mgr then set_params only that one app_dict -- so SIM_VEHICLE_DICT
+    # never arrived at all, and this app silently ran with nothing but the
+    # capability-empty factory profile (confirmed on a real device:
+    # `rosparam list` under this node showed only app_dict/npx/sim, and
+    # available_robot_configs reported just ['default']). This app is the only
+    # one in the repo that ships a third top-level params key, which is why
+    # nothing else surfaced the gap.
+    #
+    # Rather than add a new generic behavior to apps_mgr -- core, shared by
+    # every app, and a stop-and-write-up change per this repo's own rules --
+    # the app reads its own installed params file directly when the param is
+    # absent. The param still wins when set, so this stays backward compatible
+    # with a future apps_mgr that does propagate these keys, and with anything
+    # that sets the param itself.
     vehicle_dict_ns = nepi_sdk.create_namespace(self.node_namespace, 'SIM_VEHICLE_DICT')
     self.vehicle_dict = nepi_sdk.get_param(vehicle_dict_ns, dict())
     if not isinstance(self.vehicle_dict, dict):
       self.vehicle_dict = dict()
+    if not self.vehicle_dict:
+      self.vehicle_dict = self.loadVehicleDictFromParamsFile()
 
     self.listen_port = int(self.vehicle_dict.get('listen_port', FACTORY_LISTEN_PORT))
 
@@ -297,6 +338,56 @@ class NepiSimConnectorApp:
     self.server_thread.start()
 
     ##############################
+    # Simulator auto-launch (additive convenience trigger over the launcher
+    # helper -- see docs/SIMULATOR_AUTO_LAUNCH_PLAN.md). self.launcher stays
+    # None, and the topics below become permanent no-ops, on any deployment
+    # with no launch-targets config present (see find_config_path) -- this
+    # never becomes a required part of the app's own contract.
+    self.launcher = None
+    self.launcher_lock = threading.Lock()
+    # Launch, stop, AND install all share this one thread/lock -- simplest
+    # correct answer to "can these run concurrently": no, all three are
+    # heavy SSH operations against the same launch target, and running two
+    # at once (e.g. installing Gazebo while also trying to launch it) has no
+    # sensible outcome worth supporting.
+    self.launcher_thread = None
+    self.launcher_state = 'idle'
+    self.launcher_last_error = ''
+    self.selected_launch_target = ''
+    # target_key -> bool / 'unknown'|'checking'|'installed'|'not_installed'.
+    # Independent of launcher_state: every target's dependencies get checked
+    # in the background regardless of which one (if any) is selected.
+    self.launch_target_installed = {}
+    self.launch_target_installed_check_state = {}
+    launcher_config_path = find_config_path()
+    if launcher_config_path:
+      try:
+        self.launcher = SimulatorLauncher(launcher_config_path)
+        self.msg_if.pub_info("Simulator auto-launch enabled from " + launcher_config_path)
+      except LauncherError as e:
+        self.msg_if.pub_warn("Simulator auto-launch disabled (config at " +
+                             launcher_config_path + " unusable): " + str(e))
+
+    self.launcher_status_pub = nepi_sdk.create_publisher(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/launcher_status'),
+        SimLauncherStatus, queue_size = 1, latch = True)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/launch_simulator'),
+        String, self.launchSimulatorCb, queue_size = 1)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/stop_simulator'),
+        Empty, self.stopSimulatorCb, queue_size = 1)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/install_simulator'),
+        String, self.installSimulatorCb, queue_size = 1)
+    # Latched, so a client that subscribes after startup still gets a real
+    # report (available targets, "idle") instead of waiting for the first
+    # launch/stop -- the same reasoning SimStatus's own latch already uses.
+    self.publishLauncherStatus()
+    if self.launcher is not None:
+      self.startInstalledCheckAll()
+
+    ##############################
     # Simulator discovery scan, and the app's own status cadence
     nepi_sdk.start_timer_process(float(1) / SIM_DISCOVERY_RATE_HZ, self.simDiscoveryCb)
     nepi_sdk.start_timer_process(float(1) / STATUS_PUBLISH_RATE_HZ, self.statusPublishCb)
@@ -308,6 +399,57 @@ class NepiSimConnectorApp:
 
   #**********************
   # Robot-config profiles
+
+  def loadVehicleDictFromParamsFile(self):
+    # Fallback source for SIM_VEHICLE_DICT when it is not on the param server
+    # -- see the correction note in __init__ for why that is the normal case.
+    # Reads this app's own installed params yaml, found via system_folders'
+    # apps_param entry (the same folder apps_mgr scans) rather than a
+    # hardcoded path, and identified by APP_DICT.pkg_name rather than a
+    # hardcoded filename.
+    #
+    # Every failure path returns an empty dict rather than raising: the caller
+    # then proceeds with the capability-empty factory profile, which is the
+    # documented safe default and exactly the behavior that existed before
+    # this fallback. A missing or malformed params file must never stop the
+    # node from starting.
+    try:
+      folders = nepi_system.get_system_folders(timeout = SYSTEM_FOLDERS_TIMEOUT_MSEC)
+      if not isinstance(folders, dict):
+        self.msg_if.pub_warn("Could not read system_folders; " + SIM_VEHICLE_DICT_KEY +
+                             " unavailable, using factory robot config only")
+        return dict()
+      params_folder = folders.get('apps_param', '')
+      if not params_folder or not os.path.isdir(params_folder):
+        self.msg_if.pub_warn("Apps params folder not found (" + str(params_folder) + "); " +
+                             SIM_VEHICLE_DICT_KEY + " unavailable, using factory robot config only")
+        return dict()
+
+      # Same filename convention getAppsDict matches on ("*params*.yaml").
+      for filename in sorted(os.listdir(params_folder)):
+        if not filename.endswith('.yaml') or 'params' not in filename:
+          continue
+        file_path = os.path.join(params_folder, filename)
+        file_dict = nepi_utils.read_yaml_2_dict(file_path)
+        if not isinstance(file_dict, dict):
+          continue
+        app_dict = file_dict.get('APP_DICT', dict())
+        if not isinstance(app_dict, dict) or app_dict.get('pkg_name', '') != APP_PKG_NAME:
+          continue
+        vehicle_dict = file_dict.get(SIM_VEHICLE_DICT_KEY, dict())
+        if not isinstance(vehicle_dict, dict) or not vehicle_dict:
+          self.msg_if.pub_warn("Found " + file_path + " but it has no usable " +
+                               SIM_VEHICLE_DICT_KEY + ", using factory robot config only")
+          return dict()
+        self.msg_if.pub_info("Loaded " + SIM_VEHICLE_DICT_KEY + " from " + file_path)
+        return vehicle_dict
+
+      self.msg_if.pub_warn("No params file for " + APP_PKG_NAME + " found in " + params_folder +
+                           ", using factory robot config only")
+    except Exception as e:
+      self.msg_if.pub_warn("Failed to load " + SIM_VEHICLE_DICT_KEY + " from params file: " + str(e) +
+                           ", using factory robot config only")
+    return dict()
 
   def buildProfileFromConfig(self, config_name):
     # A robot config is a capability profile read whole from the params yaml. A
@@ -383,7 +525,19 @@ class NepiSimConnectorApp:
   # Robot config selector
 
   def getAvailableRobotConfigs(self):
-    return sorted(self.robot_configs.keys())
+    # Returns (keys, names) -- keys are what select_robot_config actually
+    # takes and what a bridge script matches against on the wire, so they
+    # never change; names are read from each config entry's own
+    # display_name (falling back to the key itself for any entry that
+    # doesn't have one yet, e.g. an older or hand-written params file), and
+    # exist purely for a UI to show something readable.
+    keys = sorted(self.robot_configs.keys())
+    names = []
+    for key in keys:
+      entry = self.robot_configs.get(key, dict())
+      display_name = entry.get('display_name', '') if isinstance(entry, dict) else ''
+      names.append(display_name if display_name else key)
+    return keys, names
 
   def getSelectedRobotConfig(self):
     return self.selected_robot_config
@@ -392,7 +546,7 @@ class NepiSimConnectorApp:
     config_name = str(config_name)
     if config_name not in self.robot_configs:
       self.msg_if.pub_warn("Robot config '" + config_name + "' is not one of " +
-                           str(self.getAvailableRobotConfigs()) + ", ignoring")
+                           str(sorted(self.robot_configs.keys())) + ", ignoring")
       return
     self.selected_robot_config = config_name
     self.profile = self.buildProfileFromConfig(config_name)
@@ -517,6 +671,182 @@ class NepiSimConnectorApp:
       return
     self.selected_simulator = namespace
     self.msg_if.pub_info("Selected simulator: " + namespace)
+
+  #**********************
+  # Simulator auto-launch. A convenience trigger over the existing passive
+  # flow, not a parallel path: on success this calls the same
+  # setSelectedRobotConfig already used by the robot-config selector above,
+  # so the rest of the app behaves exactly as if an operator had started the
+  # simulator by hand and picked that config themselves. Deliberately does
+  # NOT touch setSelectedSimulator/selected_simulator -- that selector picks
+  # among other simulator-*capable NEPI devices* discovered on the ROS graph
+  # (simDiscoveryCb above), a different axis entirely from which simulator
+  # *software* this launch target starts on a dev VM.
+  #
+  # launcher.launch()/wait_until_ready()/stop() all block for real seconds
+  # (an ssh round trip, sleeps while the simulator comes up) -- run on a
+  # background thread so the bridge server thread and ROS callback dispatch
+  # are never held up by one. launcher_lock only guards against two
+  # launch/stop requests racing each other, not against the sim's own I/O.
+
+  def launchSimulatorCb(self, msg):
+    if self.launcher is None:
+      self.msg_if.pub_warn("Simulator auto-launch is not configured on this deployment "
+                           "(no launch-targets config found), ignoring launch request")
+      return
+    target_key = str(msg.data).strip()
+    with self.launcher_lock:
+      if self.launcher_thread is not None and self.launcher_thread.is_alive():
+        self.msg_if.pub_warn("A launch/stop is already in progress, ignoring")
+        return
+      self.launcher_thread = threading.Thread(target = self.runLaunch, args = (target_key,))
+      self.launcher_thread.daemon = True
+      self.launcher_thread.start()
+
+  def stopSimulatorCb(self, msg):
+    if self.launcher is None or not self.selected_launch_target:
+      return
+    with self.launcher_lock:
+      if self.launcher_thread is not None and self.launcher_thread.is_alive():
+        self.msg_if.pub_warn("A launch/stop is already in progress, ignoring")
+        return
+      self.launcher_thread = threading.Thread(target = self.runStop, args = (self.selected_launch_target,))
+      self.launcher_thread.daemon = True
+      self.launcher_thread.start()
+
+  def runLaunch(self, target_key):
+    self.selected_launch_target = target_key
+    self.launcher_state = 'launching'
+    self.launcher_last_error = ''
+    self.publishLauncherStatus()
+    try:
+      self.launcher.launch(target_key)
+      ready = self.launcher.wait_until_ready(target_key)
+    except LauncherError as e:
+      self.launcher_state = 'failed'
+      self.launcher_last_error = str(e)
+      self.publishLauncherStatus()
+      return
+    if not ready:
+      self.launcher_state = 'failed'
+      self.launcher_last_error = 'Timed out waiting for the simulator to become ready'
+      self.publishLauncherStatus()
+      return
+    self.launcher_state = 'running'
+    self.publishLauncherStatus()
+    # Prefers whatever robot config the operator already picked from the
+    # existing selector over the launch target's own canned default -- this
+    # is what makes "choose a simulator, choose a model, Deploy" apply BOTH
+    # in one action without a new message: the model choice was already
+    # made through setSelectedRobotConfig (the existing, unmodified flow),
+    # Deploy just needs to not immediately stomp on it with a one-size
+    # default meant only for an operator who hasn't picked anything yet.
+    # FACTORY_ROBOT_CONFIG_NAME ('default', capability-empty) counts as
+    # "hasn't picked anything" rather than a real choice worth preserving.
+    robot_config = self.selected_robot_config
+    if not robot_config or robot_config == FACTORY_ROBOT_CONFIG_NAME:
+      robot_config = self.launcher.get_default_robot_config(target_key)
+    if robot_config:
+      self.setSelectedRobotConfig(robot_config)
+
+  def runStop(self, target_key):
+    self.launcher_state = 'stopping'
+    self.publishLauncherStatus()
+    try:
+      self.launcher.stop(target_key)
+    except LauncherError as e:
+      self.launcher_state = 'failed'
+      self.launcher_last_error = str(e)
+      self.publishLauncherStatus()
+      return
+    self.launcher_state = 'idle'
+    self.launcher_last_error = ''
+    self.selected_launch_target = ''
+    self.publishLauncherStatus()
+
+  def installSimulatorCb(self, msg):
+    if self.launcher is None:
+      self.msg_if.pub_warn("Simulator auto-launch is not configured on this deployment "
+                           "(no launch-targets config found), ignoring install request")
+      return
+    target_key = str(msg.data).strip()
+    with self.launcher_lock:
+      if self.launcher_thread is not None and self.launcher_thread.is_alive():
+        self.msg_if.pub_warn("A launch/stop/install is already in progress, ignoring")
+        return
+      self.launcher_thread = threading.Thread(target = self.runInstall, args = (target_key,))
+      self.launcher_thread.daemon = True
+      self.launcher_thread.start()
+
+  def runInstall(self, target_key):
+    self.launcher_state = 'installing'
+    self.launcher_last_error = ''
+    self.launch_target_installed_check_state[target_key] = 'checking'
+    self.publishLauncherStatus()
+    try:
+      self.launcher.install(target_key)
+    except LauncherError as e:
+      self.launcher_state = 'failed'
+      self.launcher_last_error = str(e)
+      # Not marked 'not_installed' here -- the install command failing
+      # doesn't necessarily mean the dependency is confirmed absent (could
+      # be a transient network/package-mirror failure), so re-check for real
+      # rather than assume either outcome.
+      self.checkInstalledOne(target_key)
+      self.publishLauncherStatus()
+      return
+    self.launcher_state = 'idle'
+    self.checkInstalledOne(target_key)
+    self.publishLauncherStatus()
+
+  def checkInstalledOne(self, target_key):
+    # Shared by the install-all background sweep and by runInstall's
+    # post-install re-check -- always leaves a definite state (never
+    # 'checking') so a caller doesn't have to remember to do that itself.
+    try:
+      installed = self.launcher.is_installed(target_key)
+      self.launch_target_installed[target_key] = installed
+      self.launch_target_installed_check_state[target_key] = 'installed' if installed else 'not_installed'
+    except LauncherError as e:
+      self.msg_if.pub_warn("Could not check install state for '" + target_key + "': " + str(e),
+                           throttle_s = 30.0)
+      self.launch_target_installed_check_state[target_key] = 'unknown'
+
+  def startInstalledCheckAll(self):
+    # Runs once at startup and once per config reload (see
+    # refreshLauncherConfigCb) -- NOT on the launcher_thread/launcher_lock
+    # launch/stop/install share, since checking is a read-only, low-stakes
+    # operation against every target and shouldn't be blocked by (or block)
+    # an in-flight launch/stop/install of one specific target.
+    thread = threading.Thread(target = self.checkInstalledAllCb)
+    thread.daemon = True
+    thread.start()
+
+  def checkInstalledAllCb(self):
+    if self.launcher is None:
+      return
+    keys, _names = self.launcher.get_available_targets()
+    for key in keys:
+      self.launch_target_installed_check_state[key] = 'checking'
+    self.publishLauncherStatus()
+    for key in keys:
+      self.checkInstalledOne(key)
+      self.publishLauncherStatus()
+
+  def publishLauncherStatus(self):
+    status = SimLauncherStatus()
+    if self.launcher is not None:
+      keys, names = self.launcher.get_available_targets()
+      status.available_launch_targets = keys
+      status.available_launch_target_names = names
+      status.available_launch_target_installed = [
+          bool(self.launch_target_installed.get(k, False)) for k in keys]
+      status.available_launch_target_installed_check_state = [
+          self.launch_target_installed_check_state.get(k, 'unknown') for k in keys]
+    status.selected_launch_target = self.selected_launch_target
+    status.launcher_state = self.launcher_state
+    status.last_error = self.launcher_last_error
+    self.launcher_status_pub.publish(status)
 
   #**********************
   # Connection health
@@ -832,6 +1162,46 @@ class NepiSimConnectorApp:
     # device status cadence is ever retuned.
     if self.sim_if is not None:
       self.sim_if.publish_status()
+    self.refreshLauncherConfigCb()
+
+  def refreshLauncherConfigCb(self):
+    # Picks up launch-target config changes (an edited file, or a file that
+    # appears after this node started) without an app restart, so adding a
+    # simulator target is just an edit. Both paths are a cheap stat/isfile
+    # check per tick that only does real work on an actual change.
+    #
+    # Skipped entirely while a launch or stop is in flight -- swapping the
+    # config out from under a running launch would leave its stop_command and
+    # ready_check_command referring to a target definition that no longer
+    # matches what was actually started.
+    if self.launcher_thread is not None and self.launcher_thread.is_alive():
+      return
+    try:
+      if self.launcher is None:
+        config_path = find_config_path()
+        if not config_path:
+          return
+        self.launcher = SimulatorLauncher(config_path)
+        self.msg_if.pub_info("Simulator auto-launch enabled from " + config_path)
+        self.publishLauncherStatus()
+        self.startInstalledCheckAll()
+      elif self.launcher.reload_if_changed():
+        self.msg_if.pub_info("Reloaded launch targets from " + self.launcher.config_path)
+        # A target that vanished from the config must not stay selected.
+        if self.selected_launch_target:
+          available, _names = self.launcher.get_available_targets()
+          if self.selected_launch_target not in available:
+            self.selected_launch_target = ''
+        self.publishLauncherStatus()
+        # Targets may have been added/edited -- re-check all of them rather
+        # than trying to diff what changed.
+        self.startInstalledCheckAll()
+    except LauncherError as e:
+      # throttle_s alone is correct here: pub_warn derives the throttle uid
+      # itself from the caller's file/function/line, and takes no uid argument
+      # (passing one is a TypeError) -- unlike the lower-level pub_msg, whose
+      # throttling is a no-op without an explicit uid.
+      self.msg_if.pub_warn("Could not load launch targets: " + str(e), throttle_s = 30.0)
 
   #######################
   # Node Cleanup Function

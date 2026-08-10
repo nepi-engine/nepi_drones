@@ -1,0 +1,190 @@
+#!/usr/bin/env python
+#
+# Copyright (c) 2024 Numurus, LLC <https://www.numurus.com>.
+#
+# This file is part of nepi-engine
+# (see https://github.com/nepi-engine).
+#
+# License: 3-clause BSD, see https://opensource.org/licenses/BSD-3-Clause
+#
+
+# Sample NEPI Process Script.
+# 1. Waits for LED system
+# 2. Waits for Camera image
+# 3. Connects to camera image
+# 4. Estimates image brightness with OpenCV
+# 5. Adjust LED brightness based on image brightness
+#
+# Updated for current NEPI Engine API (2026-07): the old bundled messaging helper module (which
+# provided the msg-publisher-creation and msg-info-publishing helpers) is gone -> replaced by
+# nepi_api.messages_if.MsgIF (self.msg_if.pub_info / pub_warn / pub_debug / pub_error).
+# Also corrected LED_CONTROL_TOPIC_NAME from "lsx/set_intensity" to "lsx/set_intensity_ratio" --
+# confirmed against nepi_api/device_if_lsx.py (SUBS_DICT['set_intensity_ratio']['topic'] =
+# 'set_intensity_ratio', a Float32 subscriber under the lsx/ namespace) that the real topic has
+# always been the "_ratio"-suffixed name; the un-suffixed form never matches any live topic because
+# nepi_sdk.nepi_ros.find_topic() explicitly excludes matches where the candidate is immediately
+# followed by "_" (i.e. "lsx/set_intensity" is deliberately NOT considered a match for
+# "lsx/set_intensity_ratio"), so wait_for_topic() would spin for its full timeout and return "".
+
+
+import time
+import sys
+import rospy
+import numpy as np
+from numpy.linalg import norm
+import cv2
+from nepi_sdk import nepi_ros
+from nepi_api.messages_if import MsgIF
+
+from std_msgs.msg import Float32
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+from std_msgs.msg import UInt8, Empty, String, Bool
+
+#########################################
+# USER SETTINGS - Edit as Necessary 
+#########################################
+
+LED_LEVEL_MAX = 0.3 # Ratio 0-1
+SENSITIVITY_RATIO = 1.0
+AVG_LENGTH = 40
+
+## Set ROS Image Topic Name to Use
+IMAGE_INPUT_TOPIC_NAME = "color_2d_image"
+#IMAGE_INPUT_TOPIC_NAME = "bw_2d_image"
+
+# Fallback searched alongside IMAGE_INPUT_TOPIC_NAME above (not instead of it) if that one
+# isn't found -- "idx/color_image" is a real IDX camera driver's own topic convention
+# (device_if_idx.py), distinct from the sim/RBX relay convention IMAGE_INPUT_TOPIC_NAME
+# defaults to. Lets this script find either a simulated or a real camera without editing.
+IMAGE_INPUT_TOPIC_FALLBACK = "idx/color_image"
+
+#Set LED Control ROS Topic Name (or partial name)
+LED_CONTROL_TOPIC_NAME = "lsx/set_intensity_ratio"
+
+
+def find_image_topic(candidates, timeout = 60):
+  # Polls nepi_ros.find_topic() across all candidates each tick (rather than trying each
+  # one for a full `timeout` in turn), so total worst-case wait is still just `timeout`,
+  # not timeout * len(candidates). timeout=60 matches this script's original bare
+  # wait_for_topic(IMAGE_INPUT_TOPIC_NAME) default.
+  start_time = time.time()
+  while (time.time() - start_time) < timeout and not nepi_ros.is_shutdown():
+    for candidate in candidates:
+      found = nepi_ros.find_topic(candidate)
+      if found != "":
+        return found
+    time.sleep(0.1)
+  return ""
+
+
+#########################################
+# Node Class
+#########################################
+
+class led_auto_level(object):
+
+  #######################
+  ### Node Initialization
+  DEFAULT_NODE_NAME = "led_auto_level" # Can be overwitten by luanch command
+  def __init__(self):
+    #### APP NODE INIT SETUP ####
+    nepi_ros.init_node(name= self.DEFAULT_NODE_NAME)
+    self.node_name = nepi_ros.get_node_name()
+    self.base_namespace = nepi_ros.get_base_namespace()
+    self.msg_if = MsgIF(log_name = self.node_name)
+    self.msg_if.pub_info("Starting Initialization Processes")
+    ##############################
+    ## Initialize Class Variables
+    self.led_level_max = LED_LEVEL_MAX
+    self.intensity_history = np.zeros(AVG_LENGTH)
+    self.avg_intensity = 0
+    self.img_brightness_ratio =0
+    ## Define Class Namespaces
+    IMAGE_OUTPUT_TOPIC = self.base_namespace + "image_custom"
+    ## Define Class Services Calls
+    ## Create Class Sevices    
+    ## Create Class Publishers
+    ## Create Class Publishers
+    led_control_topic_name = LED_CONTROL_TOPIC_NAME
+    self.msg_if.pub_info("Waiting for topic name: " + led_control_topic_name)
+    led_control_topic=nepi_ros.wait_for_topic(led_control_topic_name)
+
+    self.msg_if.pub_info("Found topic: " + led_control_topic)
+    self.led_intensity_pub = rospy.Publisher(led_control_topic, Float32, queue_size = 1)
+    ## Start Class Subscribers
+    # Wait for topic
+    self.msg_if.pub_info("Waiting for topic: " + IMAGE_INPUT_TOPIC_NAME + " (or " + IMAGE_INPUT_TOPIC_FALLBACK + ")")
+    image_topic = find_image_topic([IMAGE_INPUT_TOPIC_NAME, IMAGE_INPUT_TOPIC_FALLBACK])
+    # Start image contours overlay process and pubslisher
+    rospy.Subscriber(image_topic, Image, self.image_brightness_callback, queue_size = 1)
+    # Start regular print callback
+    rospy.Timer(rospy.Duration(1), self.lxs_print_callback)
+    ## Start Node Processes
+
+    ##############################
+    ## Initiation Complete
+    self.msg_if.pub_info(" Initialization Complete")
+    # Spin forever (until object is detected)
+    rospy.spin()
+    ##############################
+
+  #######################
+  ### Node Methods
+
+  def lxs_print_callback(self,timer):
+    #print(self.intensity_history)
+    print("Image brightness estimated at: " + "%.2f" % (self.img_brightness_ratio))
+    print("Intensity level set to: " + "%.2f" % (self.avg_intensity))
+
+  ### Add your CV2 image customization code here
+  def image_brightness_callback(self,img_msg):
+    #Convert image from ros to cv2
+    bridge = CvBridge()
+    cv_image = bridge.imgmsg_to_cv2(img_msg, "bgr8")
+    # Get brightness estimate
+    self.img_brightness_ratio=self.brightness_ratio(cv_image)
+    #Adjust LED level
+    intensity = self.led_level_max *  (1-self.img_brightness_ratio)
+    self.intensity_history = np.roll(self.intensity_history,1)
+    self.intensity_history[0]=intensity
+    self.avg_intensity = np.mean(self.intensity_history)
+    
+    self.object_detected = True
+    if not rospy.is_shutdown():
+      self.led_intensity_pub.publish(data = self.avg_intensity)
+
+  ### image brightness estimator
+  def brightness_ratio(self,img):
+      if len(img.shape) == 3:
+          # Colored RGB or BGR (*Do Not* use HSV images with this function)
+          # create brightness with euclidean norm
+          b_ratio = np.average(norm(img, axis=2)) / np.sqrt(3) / 255 * 2 * SENSITIVITY_RATIO
+      else:
+          # Grayscale
+          return np.average(img) / 255 * 2 * SENSITIVITY_RATIO
+      if b_ratio > 1:
+        b_ratio = 1
+      elif b_ratio < 0:
+        b_ratio = 0
+      return b_ratio
+
+
+  #######################
+  # Node Cleanup Function
+  
+  def cleanup_actions(self):
+    self.msg_if.pub_info("Shutting down: Executing script cleanup actions")
+    self.led_intensity_pub.publish(data = 0)
+
+#########################################
+# Main
+#########################################
+if __name__ == '__main__':
+  led_auto_level()
+
+
+
+
+
+

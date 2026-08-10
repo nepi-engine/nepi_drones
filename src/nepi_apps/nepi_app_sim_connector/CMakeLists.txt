@@ -22,6 +22,7 @@ nepi_interfaces
 add_message_files(FILES
 	SensorTopicInfo.msg
 	SimInfo.msg
+	SimLauncherStatus.msg
 	SimStatus.msg
 )
 

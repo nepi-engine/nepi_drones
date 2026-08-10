@@ -78,13 +78,13 @@ launch_targets:
 
 ## 2. New, additive surface (nothing existing changes)
 
-- [ ] New topics on `sim_connector_app_node.py` (not `device_if_sim.py` —
+- [x] New topics on `sim_connector_app_node.py` (not `device_if_sim.py` —
       this logic is app-specific, not part of the reusable `SimDeviceIF`
       contract):
   - `sim/launch_simulator` (`std_msgs/String`) — a key from
     `launch_targets`.
   - `sim/stop_simulator` (`std_msgs/Empty`).
-- [ ] New status message + latched topic, published by the app node
+- [x] New status message + latched topic, published by the app node
   directly (not `SimStatus` — a separate concern, separate message):
   `sim/launcher_status` (new `SimLauncherStatus.msg`):
   ```
@@ -94,18 +94,33 @@ launch_targets:
   string launcher_state      # idle | launching | running | stopping | failed
   string last_error
   ```
-- [ ] New helper, `nepi_apps/nepi_app_sim_connector/api/simulator_launcher.py`
+- [x] New helper, `nepi_apps/nepi_app_sim_connector/api/simulator_launcher.py`
   (app-owned, imported by the node script, not part of `SimDeviceIF`):
-  reads `simulator_launch_targets.yaml`, opens an SSH subprocess using
-  `NEPI_SSH_KEY`, runs `launch_command` in the background, probes
-  `heartbeat_host:heartbeat_port` a few times to confirm the launch actually
-  came up before flipping `launcher_state` to `running`, and — since the
-  launch target already knows its own `default_robot_config` — calls the
-  *existing*, unmodified `select_simulator`/`select_robot_config` topics
-  once confirmed, so the rest of the app behaves exactly as it already does
-  today. The launcher is a convenience trigger for the existing passive
-  flow, not a parallel path.
-- [ ] New RUI component, `Nepi_IF_SimLauncher.js` — deliberately a **separate
+  reads `simulator_launch_targets.yaml`, opens an SSH connection using
+  `NEPI_SSH_KEY`, runs `launch_command`, and — since the launch target
+  already knows its own `default_robot_config` — calls the *existing*,
+  unmodified `select_robot_config` topic once confirmed, so the rest of the
+  app behaves exactly as it already does today. The launcher is a
+  convenience trigger for the existing passive flow, not a parallel path.
+  Two corrections made during implementation, not in the original design
+  above:
+  - No separate `heartbeat_host:heartbeat_port` probe. Readiness is a
+    per-target `ready_check_command` run over the *same* SSH connection
+    used to launch — one mechanism instead of two, and no second port to
+    configure per target.
+  - Does **not** call `select_simulator`. That selector picks among other
+    simulator-*capable NEPI devices* discovered on the ROS graph
+    (`simDiscoveryCb`'s `DeviceRBXStatus` scan) — a different axis entirely
+    from which simulator *software* a launch target starts on a dev VM.
+    Only `select_robot_config` applies here.
+  - Also had to become session-lifetime-aware: closing the ssh exec channel
+    ends the remote login session, and on a systemd-managed host that tears
+    down every process still in that session's cgroup regardless of
+    `nohup`. `launch()` now holds the connection open with `Popen` for as
+    long as the simulator should run (`launch_command` itself ends in
+    `wait <pids>`), mirroring how `sim_rover_gazebo()` keeps a human's
+    terminal open for the same reason.
+- [x] New RUI component, `Nepi_IF_SimLauncher.js` — deliberately a **separate
   file** from `Nepi_IF_Sim.js` (which is already built, tested, and owned in
   spirit by the multi-simulator integration work) rather than editing it in
   place: a launch-target dropdown, Launch/Stop buttons, and a
@@ -114,29 +129,94 @@ launch_targets:
 
 ## 3. Build order
 
-1. [ ] `SimLauncherStatus.msg` + wire it into `nepi_app_sim_connector`'s
+1. [x] `SimLauncherStatus.msg` + wire it into `nepi_app_sim_connector`'s
    `CMakeLists.txt`/`package.xml` message list.
-2. [ ] `simulator_launch_targets.yaml` with the Gazebo rover entry filled in
-   (already have `sim_rover_gazebo` working end-to-end this session — reuse
-   it, don't reinvent).
-3. [ ] `simulator_launcher.py` helper — build and unit-test the SSH
-   launch/probe/stop logic in isolation (a plain Python script, no ROS)
-   before wiring it into the node.
-4. [ ] Wire the two new topics + status publisher into
+2. [x] `simulator_launch_targets.yaml` with the Gazebo rover entry filled in.
+   Ended up meaningfully different from the sketch in section 1 below --
+   see the corrections noted in section 2 above (no heartbeat port, an
+   explicit `roscore` bootstrap, `DISPLAY`/`XAUTHORITY` exports, and a
+   trailing `wait` instead of background-and-forget) -- all found by
+   actually running it against the real VM, not reused as originally
+   assumed from `sim_rover_gazebo`.
+3. [x] `simulator_launcher.py` helper — built and unit-tested standalone
+   (no ROS) against the real dev VM: launch, wait_until_ready, and stop all
+   verified working end-to-end, including real Gazebo + the new bridge
+   script coming up and `bridge_connected` flipping `true` on the device.
+4. [x] Wire the two new topics + status publisher into
    `sim_connector_app_node.py`.
-5. [ ] **Test Gazebo end to end** before touching any other simulator:
-   RUI → select `gazebo_rover` → Launch → confirm Gazebo actually comes up
-   on the VM, `launcher_state` reaches `running`, and — because the
-   launcher calls the existing selectors on success — `sim/status`'s
-   existing `bridge_connected` flips `true` exactly as it does today when
-   you start `sim_rover_gazebo` by hand.
-6. [ ] `Nepi_IF_SimLauncher.js`, wired into the RUI build (same
-   `Nepi_IF_Apps.js`/`rui-app/src/apps/` mechanism already documented in
-   `NEPI_APP_BUILD_AND_TEST_CHECKLIST.md`), verified live in a browser.
+5. [x] **Test Gazebo end to end** — done against an isolated, uniquely-named
+   test instance of the real node (separate listen port, separate ROS
+   params) rather than the live production instance, to avoid disrupting
+   the device's other running apps. `sim/launch_simulator` → `running` →
+   `sim/status`'s `bridge_connected: true` and `selected_robot_config:
+   ground_robot_2_wheel`, all confirmed live. `sim/stop_simulator` → `idle`
+   and the VM-side processes actually exiting, also confirmed.
+6. [x] `Nepi_IF_SimLauncher.js` written, wired into `NepiAppSimConnector.js`,
+   registered in `sim_connector_app_params.yaml`'s `rui_files`, and built
+   via a real `npm run build` on the device (production build, not dev
+   server) — succeeded with no errors attributable to the new file.
+   **Not yet visually verified in a browser** — that part is on the user.
 7. [ ] Repeat steps 2-5 for `webots_rover`, `stage_rover`, `pybullet_rover`
    — each is a config entry, not new code, once the mechanism itself works
    for Gazebo. This mirrors `MULTI_SIMULATOR_INTEGRATION_PLAN.md`'s own
    phase structure on purpose.
+
+## 3a. Follow-up fixes found while verifying on the real device
+
+All four were real defects found by running against the live device and VM,
+not by review. Recorded here because each one's failure mode was invisible
+from the outside.
+
+- [x] **`SIM_VEHICLE_DICT` never reached the app at all** — a pre-existing
+  bug that predates this plan and broke the *existing* robot-config selector,
+  not just auto-launch. `nepi_sdk/nepi_apps.py`'s `getAppsDict` extracts only
+  `APP_DICT` (plus `RUI_DICT`, nested into it) from each app's params yaml and
+  discards every other top-level key; `apps_mgr` then `set_param`s just that
+  one `app_dict`. So this app -- the only one in the repo shipping a third
+  top-level key -- silently ran with nothing but the capability-empty factory
+  profile (`available_robot_configs: ['default']`).
+  Fixed *inside the app* (`loadVehicleDictFromParamsFile`), reading its own
+  installed params yaml via `system_folders['apps_param']` when the param is
+  absent, rather than adding new generic behavior to `apps_mgr` -- core,
+  shared by every app, and a stop-and-write-up change per this repo's rules.
+  The param still wins when set, so a future `apps_mgr` that does propagate
+  these keys needs no change here. Now reports all six configs.
+- [x] **Launch-target config could never be found by the real app** — the
+  original env-var-only opt-in (`NEPI_SIM_LAUNCH_TARGETS_CONFIG`) worked only
+  for a hand-launched node, because `apps_mgr` spawns app nodes with no
+  per-app env vars. Added a discoverable default path,
+  `$NEPI_CONFIG/simulator_launch_targets.yaml` (`NEPI_CONFIG` is already in
+  every app node's environment); env var still overrides. Absence of the file
+  is still what safely disables auto-launch on a real device.
+- [x] **SSH key resolution was wrong on-device** — `NEPI_SSH_KEY` is a bare
+  *filename* in the platform's own environment (`NEPI_SSH_KEY_PATH` holds the
+  path), and `apps_mgr` runs app nodes as **root**, so `~/.ssh` expands to
+  `/root/.ssh`, which has no key. Now tries an ordered candidate list and
+  picks the first that exists, so the launcher works unchanged both as an
+  apps_mgr-spawned root process and standalone as a normal user.
+- [x] **Stop was dangerously broad, and readiness false-positived** — both
+  found against a live ArduPilot SITL Gazebo session sharing the VM:
+  - `stop_command` ran `pkill -x gzserver; pkill -x gzclient`, which would
+    have destroyed that unrelated simulation. Now scoped to the launch's own
+    **process group** via a pidfile, so it reaches its own gazebo wrapper,
+    gzserver, gzclient and bridge and nothing else.
+  - Two Gazebos cannot share gzserver's port 11345: the second one's gzserver
+    silently dies while its gzclient attaches to the *first* one's world. The
+    launcher reported a fully successful launch (`running`,
+    `bridge_connected: true`) while `generic_rover.world` had never loaded and
+    `/rover/odom` had `Publishers: None` -- the bridge having merely
+    registered itself as a subscriber. `launch_command` now refuses to start
+    when any gzserver is already running, surfacing the reason in
+    `last_error`, and `ready_check_command` now requires this target's own
+    world in gzserver's command line *and* a real publisher on `/rover/odom`.
+- [ ] **Editing `simulator_launch_targets.yaml` needs an app restart.**
+  `SimulatorLauncher` reads the yaml once at construction (as its own
+  docstring says), so a live config edit has no effect until the app is
+  toggled off/on -- confirmed the hard way when a freshly-deployed
+  refuse-to-launch guard didn't fire because the node still held the previous
+  config in memory. Not yet addressed; the honest options are to re-read the
+  file per launch request, or to surface the loaded config's mtime in
+  `SimLauncherStatus` so a stale config is at least visible.
 
 ## 4. Deferred / explicitly out of scope for this plan
 

@@ -965,15 +965,21 @@ class SimDeviceIF:
     self.status_msg.available_simulator_names = list(simulator_names)
     self.status_msg.selected_simulator = self.getSelectionStr(self.getSelectedSimulatorFunction)
 
+    # Returns (configs, names) -- the same two-parallel-lists shape
+    # getAvailableSimulatorsFunction above already uses -- rather than configs
+    # alone, so a UI can show a clean display name without that being a
+    # second, inconsistent convention in the same message.
     robot_configs = []
+    robot_config_names = []
     if self.getAvailableRobotConfigsFunction is not None:
       try:
-        robot_configs = self.getAvailableRobotConfigsFunction() or []
+        robot_configs, robot_config_names = self.getAvailableRobotConfigsFunction()
       except Exception as e:
         self.msg_if.pub_warn("getAvailableRobotConfigsFunction failed: " + str(e),
                              throttle_s = 5.0, log_name_list = self.log_name_list)
-        robot_configs = []
+        robot_configs, robot_config_names = [], []
     self.status_msg.available_robot_configs = list(robot_configs)
+    self.status_msg.available_robot_config_names = list(robot_config_names)
     self.status_msg.selected_robot_config = self.getSelectionStr(self.getSelectedRobotConfigFunction)
 
     if not nepi_sdk.is_shutdown() and self.node_if is not None:

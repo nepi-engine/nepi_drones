@@ -98,6 +98,16 @@ string selected_simulator
 # Named robot configs this deployment offers, and which one is selected.
 # Selecting a config tells the simulator which kind of robot is wanted, which is
 # what determines the capability profile reported by the capabilities query.
+#
+# available_robot_config_names is a parallel display-name list, same
+# reported-list-plus-names shape available_simulators/available_simulator_names
+# above already use -- selected_robot_config and everything sent over the wire
+# (the {'type': 'robot_config', 'config': ...} message a bridge script matches
+# against) still uses the entries in available_robot_configs; the name list
+# exists purely so a UI can show "Quadcopter" instead of
+# "flight_robot_4_motor" without that cosmetic choice touching the wire
+# protocol at all.
 
 string[] available_robot_configs
+string[] available_robot_config_names
 string selected_robot_config

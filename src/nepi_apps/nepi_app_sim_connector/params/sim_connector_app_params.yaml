@@ -13,6 +13,7 @@ RUI_DICT:
   - NepiAppSimConnector.js
   - Nepi_IF_Sim.js
   - Nepi_IF_Sim-Controls.js
+  - Nepi_IF_SimLauncher.js
   rui_main_file: NepiAppSimConnector.js
   rui_main_class: NepiAppSimConnector
 
@@ -51,6 +52,7 @@ SIM_VEHICLE_DICT:
     # bridge is connected. Verified safe: an all-None callback set answers
     # capabilities_query with all-False and no-ops every command.
     default:
+      display_name: Default
       description: No capabilities. Safe default until a robot config is selected.
       wheel_count: 0
       motor_count: 0
@@ -70,6 +72,7 @@ SIM_VEHICLE_DICT:
     # local position and yaw are commandable but attitude is not, and it has no
     # global location reference of its own.
     ground_robot_2_wheel:
+      display_name: 2-Wheel Rover
       description: Two-wheel differential-drive ground robot, local position control only
       wheel_count: 2
       motor_count: 2
@@ -93,6 +96,7 @@ SIM_VEHICLE_DICT:
     # two-wheel entry. Present to show that a robot's kind, not the simulator,
     # is what a config selects.
     ground_robot_4_wheel:
+      display_name: 4-Wheel Rover
       description: Four-wheel ground robot, local position control only
       wheel_count: 4
       motor_count: 4
@@ -112,9 +116,59 @@ SIM_VEHICLE_DICT:
       - ROBOT_CAMERA
       has_environment_controls: true
 
+    # Two-wheel ground robot with NO camera and NO environment control --
+    # added for MULTI_SIMULATOR_INTEGRATION_PLAN.md Phase 3 (ROS Stage), whose
+    # stock willow-erratic.world has only a LaserScan and no camera at all.
+    # Deliberately distinct from ground_robot_2_wheel: this is the contract's
+    # "sensor topic exists but has_camera stays False, has_environment_controls
+    # stays False" case, not a duplicate of an existing config.
+    stage_ground_robot:
+      display_name: 2-Wheel Rover (No Camera)
+      description: Two-wheel ground robot, local position control only, no camera or environment control
+      wheel_count: 2
+      motor_count: 2
+      has_goto_position: true
+      has_goto_pose: false
+      has_goto_location: false
+      has_go_home: true
+      has_set_home: true
+      has_go_stop: true
+      setup_actions: []
+      go_actions: []
+      has_camera_view_control: false
+      available_camera_view_modes: []
+      has_environment_controls: false
+
+    # Two-wheel ground robot with a real, working RESET but no camera/
+    # environment control -- added for MULTI_SIMULATOR_INTEGRATION_PLAN.md
+    # Phase 6 (WPILib HAL Sim). Distinct from stage_ground_robot: that config's
+    # empty setup_actions reflects Stage genuinely having no reset mechanism;
+    # this bridge's RESET is a real, working teleport
+    # (physics.py/shared_state.py's reset_requested flag), so it gets its own
+    # config rather than inheriting Stage's honest limitation.
+    wpilib_ground_robot:
+      display_name: 2-Wheel Rover (WPILib)
+      description: Two-wheel ground robot with a working RESET, no camera or environment control
+      wheel_count: 2
+      motor_count: 2
+      has_goto_position: true
+      has_goto_pose: false
+      has_goto_location: false
+      has_go_home: true
+      has_set_home: true
+      has_go_stop: true
+      setup_actions:
+      - RESET
+      - RETURN_HOME
+      go_actions: []
+      has_camera_view_control: false
+      available_camera_view_modes: []
+      has_environment_controls: false
+
     # Four-motor flight robot. No wheels, full attitude control, and a real
     # global location reference, so all three goto surfaces are commandable.
     flight_robot_4_motor:
+      display_name: Quadcopter
       description: Four-motor flight robot, full attitude plus local and global position control
       wheel_count: 0
       motor_count: 4

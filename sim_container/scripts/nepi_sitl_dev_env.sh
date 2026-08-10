@@ -40,6 +40,30 @@ gz_reset_listener() {
     echo "gz reset listener started on 127.0.0.1:$port"
 }
 
+# Tiny local trigger for "get the whole sim stack running": listens on
+# 127.0.0.1:<port> and fires sitl_gazebo_full() (idempotent -- only starts
+# whatever isn't already up) on any connection. Exists so the NEPI device --
+# which can't open a fresh connection into this VM, only reach ports this
+# VM's own reverse tunnel already forwards back -- can get Gazebo/SITL/the
+# camera-rig and AI-targeting controllers running without any SSH creds of
+# its own. See sim_launch_listener.py (installed alongside this script; copy
+# it to ~/.local/bin/). Started alongside gz_reset_listener from both
+# sitl_gazebo and sitl_gazebo_full, so it's available whenever either has
+# been run at least once -- there is no way to reach a genuinely cold VM
+# (nothing started here yet) from the device side; something has to be
+# launched here manually first.
+sim_launch_listener() {
+    local port="${1:-9028}"
+    if pgrep -f "sim_launch_listener.py $port" > /dev/null; then
+        echo "sim launch listener already running on 127.0.0.1:$port"
+        return 0
+    fi
+    nohup python3 -u ~/.local/bin/sim_launch_listener.py "$port" "$NEPI_DRONES_SIM_DIR/scripts/nepi_sitl_dev_env.sh" \
+        > /tmp/sim_launch_listener.log 2>&1 &
+    disown
+    echo "sim launch listener started on 127.0.0.1:$port"
+}
+
 # Keeps this VM linked to the real NEPI device so its RBX ArduPilot driver
 # (which runs on the NEPI device, not here) can reach this VM's SITL/reset
 # listener over their shared loopback. Persistent/idempotent on purpose --
@@ -69,7 +93,10 @@ gz_reset_listener() {
 # synthetic range/azimuth/elevation for sim_ai_targeting_bridge_script.py to
 # republish as Targets on the NEPI device, standing in for the
 # app_ai_targeting app drone_follow_object_mission_script.py otherwise has no
-# way to test against). This one tunnel serves both
+# way to test against), and 9028 (sim_launch_listener -- lets the device
+# trigger sitl_gazebo_full remotely to bring up whatever of this whole stack
+# isn't already running, since the device has no other way to reach this VM).
+# This one tunnel serves both
 # simulation workflows (ArduPilot SITL and the generic rover sim).
 # Uses autossh (not plain ssh) so the tunnel reconnects on its own whenever
 # either side restarts -- a power-cycle of the NEPI device kills its sshd and
@@ -84,7 +111,7 @@ nepi_tunnel() {
     fi
     AUTOSSH_GATETIME=0 nohup autossh -M 0 -p 2222 -i ~/.ssh/nepi_default_ssh_key \
         -o ConnectTimeout=5 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
-        -R 5760:127.0.0.1:5760 -R 5771:127.0.0.1:5771 -R 9021:127.0.0.1:9021 -R 9022:127.0.0.1:9022 -R 9023:127.0.0.1:9023 -R 9024:127.0.0.1:9024 -R 9025:127.0.0.1:9025 -R 9026:127.0.0.1:9026 -R 9027:127.0.0.1:9027 \
+        -R 5760:127.0.0.1:5760 -R 5771:127.0.0.1:5771 -R 9021:127.0.0.1:9021 -R 9022:127.0.0.1:9022 -R 9023:127.0.0.1:9023 -R 9024:127.0.0.1:9024 -R 9025:127.0.0.1:9025 -R 9026:127.0.0.1:9026 -R 9027:127.0.0.1:9027 -R 9028:127.0.0.1:9028 \
         -N nepi@nepi > /tmp/nepi_tunnel.log 2>&1 &
     disown
     sleep 2
@@ -138,6 +165,7 @@ sitl_gazebo() {
     sleep 8
 
     gz_reset_listener
+    sim_launch_listener
     nepi_tunnel
 
     # --out=tcpin:0.0.0.0:5771 gives MAVProxy a second, dedicated TCP port for
@@ -181,6 +209,83 @@ camera_rig_controller_ardupilot() {
 ai_targeting_controller_ardupilot() {
     source /opt/ros/noetic/setup.bash
     python3 "$NEPI_DRONES_SIM_DIR/scripts/ai_targeting_controller_ardupilot.py"
+}
+
+# One-command, fully-detached equivalent of running sitl_gazebo plus both
+# controllers in four separate terminals. sitl_gazebo itself stays
+# interactive/foreground on purpose (it's meant to hand you MAVProxy's own
+# console/map) -- this is for the opposite case: get the whole stack up and
+# just leave it running, e.g. so a NEPI drone script's full requirement chain
+# (RBX driver + camera feed + target-localization feed, see
+# drone_follow_object_mission_script.py's ScriptDocs entry) is satisfied
+# without babysitting multiple windows. Idempotent piece-by-piece -- safe to
+# re-run any time, only starts whatever isn't already up. Logs for anything
+# it starts land in /tmp/sitl_gazebo_full_*.log.
+sitl_gazebo_full() {
+    source /opt/ros/noetic/setup.bash
+    export GAZEBO_MODEL_PATH="$NEPI_DRONES_SIM_DIR/models:$GAZEBO_MODEL_PATH"
+
+    if pgrep -x gzserver > /dev/null && pgrep -f "sim_vehicle.py -v ArduCopter" > /dev/null; then
+        echo "Gazebo + SITL already running -- reusing"
+    else
+        if ! rostopic list > /dev/null 2>&1; then
+            echo "Starting local roscore..."
+            nohup roscore > /tmp/sitl_gazebo_full_roscore.log 2>&1 &
+            disown
+            until rostopic list > /dev/null 2>&1; do
+                sleep 1
+            done
+        else
+            echo "roscore already running -- reusing it"
+        fi
+
+        echo "Starting Gazebo..."
+        nohup rosrun gazebo_ros gazebo ~/ardupilot_gazebo/worlds/iris_arducopter_cmac.world \
+            > /tmp/sitl_gazebo_full_gazebo.log 2>&1 &
+        disown
+
+        echo "Waiting for Gazebo to finish loading..."
+        until pgrep -x gzserver > /dev/null; do
+            sleep 1
+        done
+        sleep 8
+
+        # Same --out=tcpin:0.0.0.0:5771 dedicated port as sitl_gazebo, for the
+        # same reason (mavros needs its own port alongside MAVProxy's
+        # primary one on 5760) -- just without --console/--map, since
+        # there's no terminal attached to show them to and they'd only try
+        # (and fail) to open GUI windows under nohup anyway. MAVProxy still
+        # runs and still serves both ports headlessly.
+        echo "Starting ArduPilot SITL..."
+        nohup sim_vehicle.py -v ArduCopter -f gazebo-iris --out=tcpin:0.0.0.0:5771 \
+            > /tmp/sitl_gazebo_full_sitl.log 2>&1 &
+        disown
+    fi
+
+    gz_reset_listener
+    sim_launch_listener
+    nepi_tunnel
+
+    if pgrep -f "camera_rig_controller_ardupilot.py" > /dev/null; then
+        echo "camera_rig_controller_ardupilot already running"
+    else
+        echo "Starting camera_rig_controller_ardupilot..."
+        nohup python3 "$NEPI_DRONES_SIM_DIR/scripts/camera_rig_controller_ardupilot.py" \
+            > /tmp/sitl_gazebo_full_camera_rig.log 2>&1 &
+        disown
+    fi
+
+    if pgrep -f "ai_targeting_controller_ardupilot.py" > /dev/null; then
+        echo "ai_targeting_controller_ardupilot already running"
+    else
+        echo "Starting ai_targeting_controller_ardupilot..."
+        nohup python3 "$NEPI_DRONES_SIM_DIR/scripts/ai_targeting_controller_ardupilot.py" \
+            > /tmp/sitl_gazebo_full_ai_targeting.log 2>&1 &
+        disown
+    fi
+
+    echo "sitl_gazebo_full: done -- check /tmp/sitl_gazebo_full_*.log if any piece didn't come up."
+    echo "Remember: sim_ai_targeting_bridge_script.py still needs to be launched separately, as a NEPI script on the device itself, to actually produce the target_localizations topic."
 }
 
 # Alias for typos / muscle memory -- identical to sitl_gazebo.

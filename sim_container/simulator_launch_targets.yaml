@@ -1,0 +1,219 @@
+# Per-simulator launch targets for the additive auto-launch capability -- see
+# docs/SIMULATOR_AUTO_LAUNCH_PLAN.md. Dev-only config: lives in nepi_drones,
+# not nepi_apps, because a real deployed device never needs to know how to
+# SSH into a dev VM to launch a simulator.
+#
+# No credentials here, ever. The SSH private key path comes from the
+# NEPI_SSH_KEY environment variable at launch time (same convention every
+# deploy_*.sh script in this repo already uses --
+# NEPI_SSH_KEY=${NEPI_SSH_KEY:-~/.ssh/nepi_default_ssh_key}). host/user/port
+# only below.
+#
+# Two independent network legs, confirmed separately (see
+# MULTI_SIMULATOR_INTEGRATION_PLAN.md Phase 1's "Real-device confirmation"):
+#   1. Bridge data path (VM's bridge script -> device's sim_connector_app_node.py
+#      listen port, 9030 by default): often works with NO tunnel -- the sim VM
+#      and the NEPI device just need to share a LAN, confirmed directly with
+#      `cat < /dev/null > /dev/tcp/<device_host>/9030`. device_bridge_host
+#      below is whatever address/hostname the VM can reach the device at.
+#   2. Launcher SSH path (this NEPI device -> the sim VM, to actually run the
+#      launch command): generally needs a reverse tunnel, since a NEPI device
+#      is rarely on a routable network the dev VM can be dialed into and vice
+#      versa isn't guaranteed either. host/ssh_port per launch target below
+#      should point at whatever the device can reach -- a reverse-tunnel
+#      loopback in the common case:
+#        autossh -M 0 -f -N -R <ssh_port>:127.0.0.1:22 -p <device_ssh_port> \
+#          -i ~/.ssh/nepi_default_ssh_key <device_user>@<device_host>
+#      (run FROM the VM). If your device and VM already share a routable
+#      network, use the VM's real LAN address instead and skip the tunnel.
+
+# Path to the SSH private key -- a PATH only, never a key, and safe to
+# commit. Needed because apps_mgr runs app nodes as root, so the launcher's
+# ~/.ssh default would expand to /root/.ssh rather than the user's own
+# .ssh where the key actually lives. NEPI_SSH_KEY still overrides this when
+# set (e.g. running the launcher standalone as a normal user).
+ssh_key_path: "/home/nepi/.ssh/nepi_default_ssh_key"
+
+# How the VM-side bridge script reaches this NEPI device (leg 1 above).
+# "nepi" here relies on the same /etc/hosts-style alias already used for SSH
+# access to the device from the VM -- substitute your device's real
+# hostname/IP if you don't have one.
+device_bridge_host: "nepi"
+device_bridge_port: 9030
+
+launch_targets:
+  gazebo_rover:
+    display_name: "Gazebo (generic rover)"
+    host: "127.0.0.1"
+    ssh_user: "suraj"
+    ssh_port: 12222
+    # Confirmed installed/working on the dev VM this was built against.
+    # check_installed_command only checks for the two binaries the
+    # launch_command below actually needs -- not a full ROS/Gazebo
+    # environment audit -- since that's what "can this even attempt to
+    # launch" means here.
+    check_installed_command: "bash -lc \"command -v gzserver > /dev/null && command -v roscore > /dev/null\""
+    install_command: "bash -lc \"sudo apt-get update && sudo apt-get install -y ros-noetic-gazebo-ros-pkgs ros-noetic-gazebo-ros-control\""
+    # Launches Gazebo (generic_rover.world) plus the *new* sim_connector
+    # bridge (sim_connector_bridge_gazebo.py) -- NOT sim_rover_gazebo, which
+    # launches the older sim_bridge_node.py for the separate RBX_SIM driver
+    # path. Both can point at the same Gazebo instance but must never run at
+    # once (they'd fight over /rover/cmd_vel) -- see
+    # MULTI_SIMULATOR_INTEGRATION_PLAN.md Phase 1's A/B sanity note.
+    # Every backgrounded process below redirects stdin from /dev/null as well
+    # as stdout/stderr -- without it, the child keeps the ssh channel's stdin
+    # pipe open and the ssh command that launched it never returns (learned
+    # the hard way: a first attempt without "< /dev/null" hung until the
+    # subprocess timeout killed it).
+    # NOTE: every line in this folded (">-") block scalar must stay at the
+    # SAME indentation -- YAML only folds newlines into spaces when
+    # indentation is uniform; a deeper-indented continuation line is kept
+    # literal (with its newline), which silently splits one intended
+    # argument list across two bash statements. Learned the hard way: an
+    # earlier draft indented wrapped lines two spaces deeper for
+    # readability, which turned "nohup foo\n  --host x --port y &" into two
+    # statements -- "nohup foo" (foreground, since the & landed on the
+    # *next*, separate, argument-less statement) followed by a bogus
+    # "--host x --port y" command -- and left bash blocked waiting on the
+    # foreground child instead of returning. Given that fragility, every
+    # line here is kept at the same indentation on purpose, folding to one
+    # line -- verify with `yaml.safe_load(...)["launch_targets"]["gazebo_rover"]["launch_command"]`
+    # before editing this block again.
+    #
+    # Also starts a local roscore first if one isn't already up -- gzserver's
+    # ROS API plugin needs one to register with, and without it gzserver
+    # just spins retrying "No ROS master" forever (learned by watching
+    # /tmp/sim_connector_gazebo_launch.log after a launch that reported
+    # "Ready: True" from a too-weak process-existence-only readiness check).
+    # Matches the existing sim_rover_gazebo() convention in
+    # sim_rover_dev_env.sh: `rostopic list` to detect, `until rostopic
+    # list` to wait -- reused here rather than inventing a new check.
+    #
+    # Deliberately NOT detached with nohup+background-and-forget: closing
+    # the ssh exec channel ends the remote login session, and on a
+    # systemd-managed host that tears down (kills) every process still in
+    # that session's cgroup regardless of nohup -- confirmed the hard way
+    # (gzserver died with "XmlRpcClient::writeRequest: Connection refused"
+    # seconds after a launch that had already returned "success"). The fix
+    # mirrors sim_rover_gazebo()'s own model: keep the remote script running
+    # in the foreground (ending in `wait $GZ_PID $BRIDGE_PID`) so the ssh
+    # session's lifetime IS the sim's lifetime -- simulator_launcher.py
+    # holds this ssh command open with Popen (not subprocess.run) instead of
+    # a human keeping a terminal open.
+    # A non-interactive ssh session inherits neither DISPLAY nor XAUTHORITY
+    # from the target user's desktop session -- confirmed directly (`ssh ...
+    # 'echo $DISPLAY $XAUTHORITY'` printed nothing) after gzserver kept
+    # aborting with "Connection refused" despite roscore/session-lifetime
+    # both being fine. gzclient needs both to attach to the desktop's actual
+    # X server; ":0" and the gdm Xauthority path are this target's specific
+    # single-display-desktop layout, not a generic default.
+    # REFUSES TO START if any gzserver is already running, rather than
+    # starting a second one. Two Gazebos cannot share the default gzserver
+    # port (11345): the second one's gzserver silently fails to bind and dies,
+    # while its gzclient happily attaches to the FIRST one's world. That
+    # failure is invisible from the outside -- confirmed the hard way against
+    # a live ArduPilot SITL session on the same VM, where this target reported
+    # a fully successful launch (launcher_state "running", bridge_connected
+    # true) while generic_rover.world had never loaded at all and
+    # /rover/odom had "Publishers: None", the bridge merely having registered
+    # itself as a subscriber. Failing loudly with a clear message is the only
+    # honest outcome here; silently driving someone else's simulation is not.
+    #
+    # Writes its own process-group id to a pidfile so stop_command can kill
+    # exactly this launch's processes -- see stop_command for why that matters.
+    # $$ is the PGID because ssh starts this shell as a process-group leader,
+    # and every child it spawns (the gazebo wrapper, gzserver, gzclient, the
+    # bridge) inherits that same PGID -- verified with `ps -o pid,pgid`.
+    launch_command: >-
+      bash -lc '
+      source /opt/ros/noetic/setup.bash;
+      export DISPLAY=:0;
+      export XAUTHORITY=/run/user/$(id -u)/gdm/Xauthority;
+      export GAZEBO_MODEL_PATH=$HOME/nepi_engine_ws/nepi_drones/sim_container/models:$GAZEBO_MODEL_PATH;
+      if pgrep -x gzserver > /dev/null; then echo "REFUSING TO LAUNCH: a gzserver is already running on this host. Gazebo instances collide on port 11345 -- a second one would silently attach to the running world instead of loading generic_rover.world. Stop the existing simulation first." >&2; exit 3; fi;
+      echo $$ > /tmp/sim_connector_launch.pgid;
+      rostopic list > /dev/null 2>&1 || {{ nohup roscore < /dev/null > /tmp/sim_connector_roscore_launch.log 2>&1 & until rostopic list > /dev/null 2>&1; do sleep 1; done; }};
+      rosrun gazebo_ros gazebo $HOME/nepi_engine_ws/nepi_drones/sim_container/worlds/generic_rover.world < /dev/null > /tmp/sim_connector_gazebo_launch.log 2>&1 & GZ_PID=$!;
+      sleep 8;
+      python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/gazebo/sim_connector_bridge_gazebo.py --host {device_bridge_host} --port {device_bridge_port} < /dev/null > /tmp/sim_connector_bridge_gazebo_launch.log 2>&1 & BRIDGE_PID=$!;
+      wait $GZ_PID $BRIDGE_PID
+      '
+    # Kills ONLY this launch's own process group, never Gazebo generally.
+    # An earlier version ran `pkill -x gzserver; pkill -x gzclient`, which
+    # would have torn down every unrelated Gazebo on the host -- including a
+    # live ArduPilot SITL session that was in fact running alongside it during
+    # testing. Process-group scoping is what makes stop precise: the pidfile
+    # holds the launching shell's PGID, and all of its children share it, so
+    # `kill -- -PGID` reaches the gazebo wrapper, gzserver, gzclient and the
+    # bridge, and reaches nothing else.
+    #
+    # Those exiting makes the `wait` above return, which ends the launch
+    # script naturally and closes its ssh session on its own -- no separate
+    # teardown of that session needed. Does not touch roscore: if
+    # launch_command found one already running, it isn't ours to kill; if
+    # launch_command started its own, it is in this same process group and so
+    # goes down with it.
+    stop_command: "bash -lc 'f=/tmp/sim_connector_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; pkill -f sim_connector_bridge_gazebo.py 2>/dev/null; true'"
+    # Verifies THIS target's own world is up, not just that some gazebo is.
+    # Two earlier versions were both false-positive-prone: process existence
+    # alone missed gzserver spinning on "No ROS master", and a bare
+    # `rostopic list | grep '^/gazebo'` passed off another world's gazebo
+    # topics as success (see launch_command's note). Matching the world file
+    # in gzserver's own command line is what ties readiness to this target,
+    # and /rover/odom having a real publisher is what proves the rover model
+    # actually loaded rather than the bridge merely having subscribed.
+    ready_check_command: "bash -lc \"source /opt/ros/noetic/setup.bash; pgrep -f 'gzserver.*generic_rover.world' > /dev/null && pgrep -f sim_connector_bridge_gazebo.py > /dev/null && rostopic info /rover/odom 2>/dev/null | grep -A1 '^Publishers:' | grep -q ' \\* /'\""
+    # Which sim_connector_app_params.yaml robot_configs entry this target's
+    # bridge expects -- auto-selected on successful launch.
+    default_robot_config: ground_robot_2_wheel
+
+  # webots_rover, stage_rover, and pybullet_rover below are checkable and
+  # installable, but NOT yet launchable -- launch_command/ready_check_command/
+  # stop_command are intentionally absent (launch() raises a clear
+  # LauncherError naming this if attempted, rather than silently doing
+  # nothing). Gazebo was the one target this session actually verified
+  # end-to-end against a real VM; these three exist so the "which simulators
+  # exist and are they installed" half of the picture is real and honest for
+  # all four simulators today, per the stated general vision, without
+  # overclaiming a launch path that hasn't been built and tested yet. The
+  # bridge scripts these will eventually shell out to already exist under
+  # sim_container/bridges/ -- wiring an actual launch_command through them is
+  # exactly steps 2-5 of docs/SIMULATOR_AUTO_LAUNCH_PLAN.md's own build order,
+  # repeated per simulator, once each is prioritized.
+  webots_rover:
+    display_name: "Webots"
+    host: "127.0.0.1"
+    ssh_user: "suraj"
+    ssh_port: 12222
+    check_installed_command: "bash -lc \"command -v webots > /dev/null\""
+    # Queries GitHub's own Releases API for whatever is actually latest at
+    # install time, rather than hardcoding a version string in this file
+    # that would silently go stale. cyberbotics/webots is the upstream
+    # project's own repo.
+    install_command: >-
+      bash -lc '
+      set -e;
+      DEB_URL=$(curl -fsSL https://api.github.com/repos/cyberbotics/webots/releases/latest
+      | grep -o "https://[^\"]*_amd64\.deb" | head -1);
+      test -n "$DEB_URL";
+      wget -q "$DEB_URL" -O /tmp/webots_latest_amd64.deb;
+      sudo apt-get update;
+      sudo apt-get install -y /tmp/webots_latest_amd64.deb;
+      rm -f /tmp/webots_latest_amd64.deb
+      '
+
+  stage_rover:
+    display_name: "Stage"
+    host: "127.0.0.1"
+    ssh_user: "suraj"
+    ssh_port: 12222
+    check_installed_command: "bash -lc \"source /opt/ros/noetic/setup.bash; rospack find stage_ros > /dev/null 2>&1\""
+    install_command: "bash -lc \"sudo apt-get update && sudo apt-get install -y ros-noetic-stage-ros\""
+
+  pybullet_rover:
+    display_name: "PyBullet"
+    host: "127.0.0.1"
+    ssh_user: "suraj"
+    ssh_port: 12222
+    check_installed_command: "bash -lc \"python3 -c 'import pybullet' > /dev/null 2>&1\""
+    install_command: "bash -lc \"pip3 install --user pybullet\""

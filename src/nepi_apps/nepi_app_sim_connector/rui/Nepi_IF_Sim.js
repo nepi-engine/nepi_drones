@@ -72,6 +72,7 @@ class NepiIFSim extends Component {
 
     this.renderSimulatorSelector = this.renderSimulatorSelector.bind(this)
     this.renderRobotConfigSelector = this.renderRobotConfigSelector.bind(this)
+    this.renderFieldPair = this.renderFieldPair.bind(this)
     this.renderData = this.renderData.bind(this)
   }
 
@@ -185,7 +186,11 @@ class NepiIFSim extends Component {
 
   // Robot config selector, backed by the status message's reported list of named
   // robot configs. Selecting one tells the simulator which kind of robot is
-  // wanted.
+  // wanted. Option value is always the raw config key (what select_robot_config
+  // actually takes, and what a bridge script matches against on the wire);
+  // available_robot_config_names is only ever used for the label shown, the
+  // same reported-list-plus-names shape the simulator selector above uses --
+  // so this can show "Quadcopter" without any wire-protocol string changing.
   renderRobotConfigSelector() {
     const status_msg = this.state.status_msg
     if (status_msg == null) {
@@ -194,6 +199,8 @@ class NepiIFSim extends Component {
 
     const available = (status_msg.available_robot_configs !== undefined)
       ? status_msg.available_robot_configs : []
+    const names = (status_msg.available_robot_config_names !== undefined)
+      ? status_msg.available_robot_config_names : []
     const selected = (status_msg.selected_robot_config !== undefined
                       && status_msg.selected_robot_config !== '')
       ? status_msg.selected_robot_config : 'None'
@@ -203,7 +210,8 @@ class NepiIFSim extends Component {
       items.push(<Option key={'None'} value={'None'}>{'None'}</Option>)
     }
     for (var i = 0; i < available.length; i++) {
-      items.push(<Option key={available[i]} value={available[i]}>{available[i]}</Option>)
+      const display = (names[i] !== undefined && names[i] !== '') ? names[i] : available[i]
+      items.push(<Option key={available[i]} value={available[i]}>{display}</Option>)
     }
 
     return (
@@ -215,6 +223,23 @@ class NepiIFSim extends Component {
           {items}
         </Select>
       </Label>
+    )
+  }
+
+  // Puts two Label fields side by side instead of each taking a full-width
+  // row on its own -- most of these values are a word, a number, or a single
+  // indicator square, so stacking them one per row (the default Label
+  // layout) leaves most of a wide panel's width empty. Label already splits
+  // its own container 50/50 between title and value, so two Labels each
+  // given ~49% of a shared flex row keeps that same title:value ratio
+  // within each half rather than skewing it.
+  renderFieldPair(fieldA, fieldB) {
+    return (
+      <div style={{ display: "flex" }}>
+        <div style={{ width: "49%" }}>{fieldA}</div>
+        <div style={{ width: "2%" }} />
+        <div style={{ width: "49%" }}>{fieldB}</div>
+      </div>
     )
   }
 
@@ -237,37 +262,41 @@ class NepiIFSim extends Component {
 
         <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
 
-        <Label title={"Device Name"}>
-          <Input disabled value={status_msg.device_name} />
-        </Label>
+        {this.renderFieldPair(
+          <Label title={"Device Name"}>
+            <Input disabled value={status_msg.device_name} />
+          </Label>,
+          <Label title={"Bridge Connected"}>
+            <BooleanIndicator value={status_msg.bridge_connected} />
+          </Label>
+        )}
 
-        <Label title={"Bridge Connected"}>
-          <BooleanIndicator value={status_msg.bridge_connected} />
-        </Label>
+        {this.renderFieldPair(
+          <Label title={"Telemetry Age (s)"}>
+            <Input disabled value={round(status_msg.telemetry_age_sec + .001, 2)} />
+          </Label>,
+          <Label title={"Ready"}>
+            <BooleanIndicator value={status_msg.ready} />
+          </Label>
+        )}
 
-        <Label title={"Telemetry Age (s)"}>
-          <Input disabled value={round(status_msg.telemetry_age_sec + .001, 2)} />
-        </Label>
+        {this.renderFieldPair(
+          <Label title={"Current Process"}>
+            <Input disabled value={status_msg.process_current} />
+          </Label>,
+          <Label title={"Last Process"}>
+            <Input disabled value={status_msg.process_last} />
+          </Label>
+        )}
 
-        <Label title={"Ready"}>
-          <BooleanIndicator value={status_msg.ready} />
-        </Label>
-
-        <Label title={"Current Process"}>
-          <Input disabled value={status_msg.process_current} />
-        </Label>
-
-        <Label title={"Last Process"}>
-          <Input disabled value={status_msg.process_last} />
-        </Label>
-
-        <Label title={"Last Cmd Success"}>
-          <BooleanIndicator value={status_msg.cmd_success} />
-        </Label>
-
-        <Label title={"Sensor Topics"}>
-          <Input disabled value={String(sensor_topics.length)} />
-        </Label>
+        {this.renderFieldPair(
+          <Label title={"Last Cmd Success"}>
+            <BooleanIndicator value={status_msg.cmd_success} />
+          </Label>,
+          <Label title={"Sensor Topics"}>
+            <Input disabled value={String(sensor_topics.length)} />
+          </Label>
+        )}
 
         <Label title={"Last Error"}>
           <Input disabled value={status_msg.last_error_message} />

@@ -114,6 +114,18 @@ class ArdupilotNode:
   CAMERA_RECONNECT_INTERVAL_SEC = 3.0
   CAMERA_SOCKET_TIMEOUT_SEC = 5.0
 
+  # Real-hardware camera relay: a real onboard camera (unlike the VM-side
+  # simulator) is already a normal local ROS topic on this same ROS master --
+  # no bridge protocol needed, just a subscriber. Runs independently of the
+  # sim camera bridge above; whichever source is actually present feeds
+  # image_pub. "idx/color_image" is the real IDX camera driver's own topic
+  # convention (device_if_idx.py), distinct from the color_2d_image name this
+  # driver publishes its own relayed output under -- searched for by
+  # substring the same way the rest of this codebase finds live topics
+  # (nepi_sdk.find_topic).
+  REAL_CAMERA_TOPIC_PATTERN = "idx/color_image"
+  REAL_CAMERA_WATCH_INTERVAL_SEC = 3.0
+
 
   # RBX State and Mode Dictionaries
   RBX_NAVPOSE_HAS_GPS = True
@@ -348,6 +360,14 @@ class ArdupilotNode:
     self.camera_bridge_thread = threading.Thread(target = self.cameraBridgeLoop)
     self.camera_bridge_thread.daemon = True
     self.camera_bridge_thread.start()
+
+    # Real-hardware camera relay -- see REAL_CAMERA_TOPIC_PATTERN above.
+    # Independent of the sim bridge thread; auto-detects a real onboard
+    # camera the moment one appears and needs no separate enable step.
+    self.real_camera_sub = None
+    self.real_camera_watch_thread = threading.Thread(target = self.realCameraWatchLoop)
+    self.real_camera_watch_thread.daemon = True
+    self.real_camera_watch_thread.start()
 
     # Initialize RBX Settings
     self.cap_settings = self.getCapSettings()
@@ -1157,6 +1177,30 @@ class ArdupilotNode:
 
 
 
+
+  #######################
+  # Real Camera Relay (a real onboard camera, unlike the VM-side simulator,
+  # is already a normal local ROS topic on this same ROS master -- no bridge
+  # protocol needed). Runs independently of the sim camera bridge below;
+  # whichever source is actually present feeds image_pub.
+
+  def realCameraWatchLoop(self):
+    # Polls for a live local IDX camera topic until one appears, then
+    # subscribes once and stops watching. A topic disappearing/reappearing
+    # mid-run isn't handled -- rare in practice, and left as a documented
+    # future improvement rather than solved here.
+    while not nepi_sdk.is_shutdown() and self.real_camera_sub is None:
+      found_topic = nepi_sdk.find_topic(self.REAL_CAMERA_TOPIC_PATTERN)
+      if found_topic != '' and found_topic != self.image_topic_name:
+        self.msg_if.pub_info("Found real camera topic: " + found_topic + " -- relaying to " + self.image_topic_name)
+        self.real_camera_sub = nepi_sdk.create_subscriber(found_topic, Image, self.realCameraImageCb, queue_size = 1)
+        break
+      time.sleep(self.REAL_CAMERA_WATCH_INTERVAL_SEC)
+
+  def realCameraImageCb(self, image_msg):
+    # Straight relay -- both ends are already sensor_msgs/Image, no
+    # decode/re-encode needed (unlike the sim bridge's base64-JPEG frames).
+    self.image_pub.publish(image_msg)
 
   #######################
   # Camera Bridge Processes (Universal Simulator Bridge camera feature,
