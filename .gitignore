@@ -2,6 +2,27 @@
 eeprom.bin
 mav.tlog
 mav.tlog.raw
+mav.parm
+
+# ArduPilot/SITL dataflash logs (.BIN + LASTLOG.TXT) pulled off the vehicle.
+# Regenerated per run and already ~27MB in this checkout.
+logs/
+
+# SRTM terrain tiles MAVProxy downloads on demand. No leading slash, so this
+# matches at any depth -- both ./terrain/ and
+# nepi_sample_auto_scripts/terrain/ exist today.
+terrain/
 
 __pycache__/
 *.pyc
+
+# Menuric session-continuity notes: supplementary context, not source. Same
+# convention (and same pattern) as the nepi_engine_ws root .gitignore, which
+# ignores the notes themselves rather than all of .claude/ -- so any real
+# shared .claude config stays committable.
+.claude/sessions/*.md
+
+# CodeGraph index: per-checkout, regenerated, ~7MB. It also ships its own
+# .gitignore containing "*", so it is already effectively ignored; listed
+# here too so that stays true if that inner file ever goes away.
+.codegraph/
