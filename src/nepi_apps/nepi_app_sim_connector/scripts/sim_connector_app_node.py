@@ -84,6 +84,8 @@ import os
 import socket
 import threading
 
+import yaml
+
 # nepi_api.device_if_sim (imported below) pulls in nepi_api.device_if_npx ->
 # nepi_api.system_if -> open3d transitively. On this aarch64 target, open3d's
 # native libs (via libgomp) grab static TLS at import time, and if cv2 (also
@@ -144,6 +146,15 @@ FACTORY_LISTEN_PORT = 9030
 # all. That is the intended safe default, not a broken state -- an operator
 # picks a real robot config from the selector, or edits SIM_VEHICLE_DICT.
 FACTORY_ROBOT_CONFIG_NAME = 'default'
+
+# Reserved robot_configs key for an operator-uploaded config (see
+# uploadRobotConfigCb) -- a single slot, not a growing list: uploading again
+# replaces whatever was there, matching "I'm iterating on my own robot's
+# config and want to try the latest version" rather than accumulating a
+# history of uploads. Chosen to be unlikely to collide with any real,
+# checked-in config key.
+UPLOADED_ROBOT_CONFIG_NAME = 'custom_uploaded'
+
 FACTORY_ROBOT_CONFIG = dict(
     description = 'No capabilities. Safe default until a robot config is selected.',
     wheel_count = 0,
@@ -185,6 +196,21 @@ TELEMETRY_AGE_IF_NEVER_CONNECTED = -1.0
 BRIDGE_RECV_BYTES = 4096
 
 STATUS_PUBLISH_RATE_HZ = 1.0
+
+# Text that identifies launch_command's own "a gzserver is already running"
+# refuse-to-launch guard (both gazebo_rover and gazebo_quadcopter's
+# launch_command raise this exact wording -- see simulator_launch_targets.yaml)
+# so runLaunch can offer the operator a real choice (attach to what's
+# already there, or force past it) instead of just reporting a generic
+# failure. Matched on the wording those two guards actually share, not on
+# any structured error code -- LauncherError carries plain text by design
+# (see its own docstring), and inventing a second, parallel signal just for
+# this one case isn't worth it while only these two targets can ever raise it.
+GAZEBO_ALREADY_RUNNING_ERROR_SIGNATURE = "a gzserver is already running"
+
+
+def isGazeboConflictError(error_message):
+  return GAZEBO_ALREADY_RUNNING_ERROR_SIGNATURE in str(error_message).lower()
 
 
 #########################################
@@ -354,6 +380,13 @@ class NepiSimConnectorApp:
     self.launcher_state = 'idle'
     self.launcher_last_error = ''
     self.selected_launch_target = ''
+    # The target actually running, once resolve_launch_target has done its
+    # work -- may differ from selected_launch_target (the operator's own
+    # pick, e.g. "gazebo_rover"/"Gazebo") when the current robot config
+    # redirects it to a different target entirely (e.g. gazebo_quadcopter
+    # for a flight profile). stop_command/ready_check_command always target
+    # THIS, since it's the one with real SSH-launched processes.
+    self.active_launch_target = ''
     # target_key -> bool / 'unknown'|'checking'|'installed'|'not_installed'.
     # Independent of launcher_state: every target's dependencies get checked
     # in the background regardless of which one (if any) is selected.
@@ -380,6 +413,40 @@ class NepiSimConnectorApp:
     nepi_sdk.create_subscriber(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/install_simulator'),
         String, self.installSimulatorCb, queue_size = 1)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/redeploy_simulator'),
+        String, self.redeploySimulatorCb, queue_size = 1)
+    # "Use Existing" -- explicit operator override of launch_command's own
+    # "a gzserver is already running" refuse-to-launch guard, offered
+    # specifically when that guard fires (launcher_state 'gazebo_conflict').
+    # See runLaunch's attach handling and SimulatorLauncher.launch's own
+    # attach_launch_command docstring.
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/attach_simulator'),
+        String, self.attachSimulatorCb, queue_size = 1)
+    # "Launch New" -- the other choice offered alongside Use Existing:
+    # force past the conflict by killing whatever gazebo is in the way
+    # first, then launching fresh. Distinct from redeploy_simulator, which
+    # assumes THIS app is what's currently running (stops via its own
+    # tracked pgid) -- here the blocking gzserver is by definition
+    # something this app never started, so there is nothing of its own to
+    # stop; kill_all_gazebo is the only mechanism that reaches it.
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/force_launch_simulator'),
+        String, self.forceLaunchSimulatorCb, queue_size = 1)
+    # Standalone escape hatch, not tied to any one target -- see
+    # SimulatorLauncher.kill_all_gazebo's own docstring for why this is
+    # deliberately separate from (and much blunter than) the ordinary,
+    # pgid-scoped stop_command path.
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/kill_all_gazebo'),
+        Empty, self.killAllGazeboCb, queue_size = 1)
+    # Lets an operator try their own robot without editing and redeploying
+    # sim_connector_app_params.yaml -- independent of self.launcher (that's
+    # only auto-launch), so this stays available on every deployment.
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/upload_robot_config'),
+        String, self.uploadRobotConfigCb, queue_size = 1)
     # Latched, so a client that subscribes after startup still gets a real
     # report (available targets, "idle") instead of waiting for the first
     # launch/stop -- the same reasoning SimStatus's own latch already uses.
@@ -458,6 +525,15 @@ class NepiSimConnectorApp:
     entry = self.robot_configs.get(config_name, dict())
     if not isinstance(entry, dict):
       entry = dict()
+    return self.buildProfileFromEntry(entry)
+
+  def buildProfileFromEntry(self, entry):
+    # The field-by-field coercion buildProfileFromConfig above applies to
+    # whatever entry it looks up -- split out so uploadRobotConfigCb can run
+    # the exact same coercion (and hit the exact same int()/bool() failures)
+    # against an uploaded entry BEFORE accepting it into self.robot_configs,
+    # instead of only finding out a field is bad the next time the config
+    # happens to get selected.
     return dict(
         wheel_count = int(entry.get('wheel_count', 0)),
         motor_count = int(entry.get('motor_count', 0)),
@@ -531,11 +607,21 @@ class NepiSimConnectorApp:
     # display_name (falling back to the key itself for any entry that
     # doesn't have one yet, e.g. an older or hand-written params file), and
     # exist purely for a UI to show something readable.
-    keys = sorted(self.robot_configs.keys())
+    #
+    # A config with hidden_from_selector skips this list -- it exists to be
+    # applied automatically (a launch target's own robot_config_overrides
+    # resolves a plain, offered choice like "2-Wheel Rover" to it for that
+    # specific simulator), not to be picked directly. It stays fully valid
+    # for setSelectedRobotConfig to accept -- only the offered list changes,
+    # not what selection is legal.
+    keys = []
     names = []
-    for key in keys:
+    for key in sorted(self.robot_configs.keys()):
       entry = self.robot_configs.get(key, dict())
+      if isinstance(entry, dict) and entry.get('hidden_from_selector', False):
+        continue
       display_name = entry.get('display_name', '') if isinstance(entry, dict) else ''
+      keys.append(key)
       names.append(display_name if display_name else key)
     return keys, names
 
@@ -569,6 +655,43 @@ class NepiSimConnectorApp:
     # Tell the simulator which kind of robot is wanted.
     self.sendLineToBridge({'type': 'robot_config', 'config': config_name}, "Robot config")
     self.msg_if.pub_info("Selected robot config: " + config_name)
+
+  def uploadRobotConfigCb(self, msg):
+    # Lets an operator try their own robot against the sim without editing
+    # and redeploying sim_connector_app_params.yaml -- the uploaded text is
+    # expected to be one robot_configs entry (the same field shape as e.g.
+    # ground_robot_2_wheel in that file, minus the wrapping key -- see the
+    # RUI's downloadable sample for the exact shape). Rejects clearly
+    # (pub_warn, same convention as an unrecognized config key in
+    # setSelectedRobotConfig above) rather than accepting something that
+    # would only fail later when the config gets selected or a field gets
+    # read.
+    try:
+      entry = yaml.safe_load(str(msg.data))
+    except yaml.YAMLError as e:
+      self.msg_if.pub_warn("Uploaded robot config is not valid YAML: " + str(e))
+      return
+    if not isinstance(entry, dict):
+      self.msg_if.pub_warn("Uploaded robot config must be a YAML mapping of fields "
+                           "(got " + type(entry).__name__ + ") -- see the downloadable "
+                           "sample config for the expected shape")
+      return
+    entry = copy.deepcopy(entry)
+    # An upload is always meant to be picked directly -- hidden_from_selector
+    # is a mechanism for checked-in configs reached only through a launch
+    # target's robot_config_overrides, not something an uploaded file should
+    # be able to set on itself.
+    entry.pop('hidden_from_selector', None)
+    try:
+      self.buildProfileFromEntry(entry)
+    except (TypeError, ValueError) as e:
+      self.msg_if.pub_warn("Uploaded robot config has an invalid field value: " + str(e))
+      return
+    display_name = str(entry.get('display_name') or 'Custom Robot')
+    entry['display_name'] = display_name
+    self.robot_configs[UPLOADED_ROBOT_CONFIG_NAME] = entry
+    self.msg_if.pub_info("Uploaded robot config '" + display_name + "', applying it now")
+    self.setSelectedRobotConfig(UPLOADED_ROBOT_CONFIG_NAME)
 
   #**********************
   # Simulator selector. Discovery is a timer scan of the live ROS graph, matched
@@ -710,20 +833,236 @@ class NepiSimConnectorApp:
       if self.launcher_thread is not None and self.launcher_thread.is_alive():
         self.msg_if.pub_warn("A launch/stop is already in progress, ignoring")
         return
-      self.launcher_thread = threading.Thread(target = self.runStop, args = (self.selected_launch_target,))
+      # active_launch_target -- the target with real SSH-launched processes
+      # -- may differ from selected_launch_target when the current robot
+      # config redirected the launch elsewhere (see runLaunch); falls back
+      # to selected_launch_target for the ordinary, unredirected case.
+      stop_target = self.active_launch_target or self.selected_launch_target
+      self.launcher_thread = threading.Thread(target = self.runStop, args = (stop_target,))
       self.launcher_thread.daemon = True
       self.launcher_thread.start()
 
-  def runLaunch(self, target_key):
+  def redeploySimulatorCb(self, msg):
+    # The explicit "start fresh" action offered alongside the reuse path (see
+    # runLaunch's own short-circuit below) when a client already knows a sim
+    # is up and wants a clean restart rather than reusing it -- e.g. to reset
+    # world state, or because it wants a DIFFERENT target than what's
+    # currently running. Shares the same busy-guard and thread as
+    # launch/stop, since it is just those two run back-to-back.
+    if self.launcher is None:
+      self.msg_if.pub_warn("Simulator auto-launch is not configured on this deployment "
+                           "(no launch-targets config found), ignoring redeploy request")
+      return
+    target_key = str(msg.data).strip()
+    with self.launcher_lock:
+      if self.launcher_thread is not None and self.launcher_thread.is_alive():
+        self.msg_if.pub_warn("A launch/stop/install is already in progress, ignoring")
+        return
+      self.launcher_thread = threading.Thread(target = self.runRedeploy, args = (target_key,))
+      self.launcher_thread.daemon = True
+      self.launcher_thread.start()
+
+  def runRedeploy(self, target_key):
+    # Stops whatever is currently tracked as running (if anything) then
+    # launches target_key fresh. Reuses runStop/runLaunch directly rather
+    # than duplicating their logic -- this method IS just those two run
+    # back-to-back on the one background thread redeploySimulatorCb already
+    # started.
+    if self.launcher_state == 'running' and self.selected_launch_target:
+      self.runStop(self.active_launch_target or self.selected_launch_target)
+      if self.launcher_state == 'failed':
+        return  # runStop already published the failure; nothing more to do
+    self.runLaunch(target_key)
+
+  def attachSimulatorCb(self, msg):
+    # "Use Existing" -- see runLaunch's attach handling.
+    if self.launcher is None:
+      self.msg_if.pub_warn("Simulator auto-launch is not configured on this deployment "
+                           "(no launch-targets config found), ignoring attach request")
+      return
+    target_key = str(msg.data).strip()
+    with self.launcher_lock:
+      if self.launcher_thread is not None and self.launcher_thread.is_alive():
+        self.msg_if.pub_warn("A launch/stop/install is already in progress, ignoring")
+        return
+      self.launcher_thread = threading.Thread(target = self.runLaunch, args = (target_key,),
+                                              kwargs = {'attach': True})
+      self.launcher_thread.daemon = True
+      self.launcher_thread.start()
+
+  def forceLaunchSimulatorCb(self, msg):
+    # "Launch New" -- see runForceLaunch.
+    if self.launcher is None:
+      self.msg_if.pub_warn("Simulator auto-launch is not configured on this deployment "
+                           "(no launch-targets config found), ignoring launch request")
+      return
+    target_key = str(msg.data).strip()
+    with self.launcher_lock:
+      if self.launcher_thread is not None and self.launcher_thread.is_alive():
+        self.msg_if.pub_warn("A launch/stop/install is already in progress, ignoring")
+        return
+      self.launcher_thread = threading.Thread(target = self.runForceLaunch, args = (target_key,))
+      self.launcher_thread.daemon = True
+      self.launcher_thread.start()
+
+  def runForceLaunch(self, target_key):
+    # Clears whatever gazebo is in the way first (see
+    # SimulatorLauncher.kill_all_gazebo's own docstring for why this, and
+    # not stop(), is the right tool here -- the blocking gzserver isn't
+    # tracked as any target's own launch), then launches target_key exactly
+    # as a normal Deploy click would. A kill_all_gazebo failure (host
+    # unreachable) is reported the same way a launch failure already is --
+    # there is nothing target-specific to fall back to.
+    try:
+      self.launcher.kill_all_gazebo()
+    except LauncherError as e:
+      self.launcher_state = 'failed'
+      self.launcher_last_error = "Could not clear the existing gazebo: " + str(e)
+      self.publishLauncherStatus()
+      return
+    self.runLaunch(target_key)
+
+  def killAllGazeboCb(self, msg):
+    if self.launcher is None:
+      self.msg_if.pub_warn("Simulator auto-launch is not configured on this deployment "
+                           "(no launch-targets config found), ignoring kill-all request")
+      return
+    with self.launcher_lock:
+      if self.launcher_thread is not None and self.launcher_thread.is_alive():
+        self.msg_if.pub_warn("A launch/stop/install is already in progress, ignoring")
+        return
+      self.launcher_thread = threading.Thread(target = self.runKillAllGazebo)
+      self.launcher_thread.daemon = True
+      self.launcher_thread.start()
+
+  def runKillAllGazebo(self):
+    # If this app has something tracked as running, stop it properly FIRST
+    # (its own stop_command cleans up SITL/the bridge/camera_rig, not just
+    # gazebo) -- confirmed the hard way: kill_all_gazebo alone pulls
+    # gzserver out from under a running SITL+bridge session without
+    # clearing them, and since it also resets selected_launch_target below,
+    # the ordinary Kill button has nothing left to stop afterward either
+    # (stopSimulatorCb no-ops with no target tracked). kill_all_gazebo
+    # itself still runs unconditionally after, for whatever stray instance
+    # this app was never tracking in the first place.
+    if self.launcher_state == 'running' and self.active_launch_target:
+      self.runStop(self.active_launch_target)
+      if self.launcher_state == 'failed':
+        return
+    try:
+      self.launcher.kill_all_gazebo()
+    except LauncherError as e:
+      self.launcher_state = 'failed'
+      self.launcher_last_error = str(e)
+      self.publishLauncherStatus()
+      return
+    # Not tied to any one target's launch/stop bookkeeping -- back to idle
+    # unconditionally, since kill_all_gazebo just cleared everything.
+    self.launcher_state = 'idle'
+    self.launcher_last_error = ''
+    self.selected_launch_target = ''
+    self.active_launch_target = ''
+    self.publishLauncherStatus()
+
+  def runLaunch(self, target_key, attach=False):
+    # attach=True skips the reuse-check below (nothing is tracked as
+    # running yet -- the gzserver in the way isn't this app's own, so there
+    # is no in-place config update to make), but target resolution still
+    # matters just as much as the normal path: the operator still only
+    # ever picks "Gazebo" (gazebo_rover), and which target's own
+    # attach_launch_command actually needs to run still depends on the
+    # currently selected robot config -- confirmed the hard way, an
+    # earlier version of this skipped resolution entirely and attached
+    # gazebo_rover's OWN rover bridge to an already-running
+    # iris_arducopter_cmac.world, which can never satisfy that bridge's own
+    # ready_check (no rover model in that world) regardless of how long it
+    # waits.
+    if attach:
+      robot_config = self.selected_robot_config
+      if not robot_config or robot_config == FACTORY_ROBOT_CONFIG_NAME:
+        robot_config = self.launcher.get_default_robot_config(target_key)
+      actual_target = (self.launcher.resolve_launch_target(target_key, robot_config)
+                       if robot_config else target_key)
+
+      self.selected_launch_target = target_key
+      self.active_launch_target = actual_target
+      self.launcher_state = 'launching'
+      self.launcher_last_error = ''
+      self.publishLauncherStatus()
+      try:
+        self.launcher.launch(actual_target, attach=True)
+        ready = self.launcher.wait_until_ready(actual_target)
+      except LauncherError as e:
+        self.launcher_state = 'failed'
+        self.launcher_last_error = str(e)
+        self.publishLauncherStatus()
+        return
+      if not ready:
+        self.launcher_state = 'failed'
+        self.launcher_last_error = ('Timed out waiting for the simulator to become ready -- '
+                                    'the gazebo that was already running may not have had the '
+                                    'right world loaded for this target')
+        self.publishLauncherStatus()
+        return
+      self.launcher_state = 'running'
+      self.publishLauncherStatus()
+      # Recomputed fresh (not reusing the pre-launch snapshot above), same
+      # race-safety reasoning as the non-attach path below.
+      robot_config = self.selected_robot_config
+      if not robot_config or robot_config == FACTORY_ROBOT_CONFIG_NAME:
+        robot_config = self.launcher.get_default_robot_config(actual_target)
+      if robot_config:
+        robot_config = self.launcher.resolve_robot_config(actual_target, robot_config)
+        self.setSelectedRobotConfig(robot_config)
+      return
+
+    # Resolved BEFORE the reuse check below, using whatever robot config is
+    # selected right now: a target whose own launch mechanics fundamentally
+    # can't serve that robot config (a 4-motor flight profile against the
+    # rover-only Gazebo world/bridge) needs a DIFFERENT target's
+    # launch_command entirely, not just a different config applied on top
+    # of the same one -- see resolve_launch_target's docstring. Most
+    # target/config combinations resolve to target_key unchanged.
+    pre_launch_robot_config = self.selected_robot_config
+    if not pre_launch_robot_config or pre_launch_robot_config == FACTORY_ROBOT_CONFIG_NAME:
+      pre_launch_robot_config = self.launcher.get_default_robot_config(target_key)
+    actual_target = (self.launcher.resolve_launch_target(target_key, pre_launch_robot_config)
+                     if pre_launch_robot_config else target_key)
+
+    # Reuse path: the operator's own pick (target_key) still matches what's
+    # tracked as selected, AND the real target this combination resolves to
+    # still matches what's actually running (active_launch_target) -- e.g.
+    # the operator picked a different robot model that resolves to the SAME
+    # real target. Nothing on the VM needs touching; only the
+    # already-connected bridge needs the new config, exactly as if
+    # select_robot_config had been published directly, resolved through the
+    # ACTIVE target's own robot_config_overrides first (see
+    # resolve_robot_config's docstring). If the resolved target differs
+    # instead (switching to a robot config that needs a different
+    # world/bridge while "Gazebo" stays picked), this is NOT a reuse --
+    # falls through to a real (re)launch below.
+    if (self.launcher_state == 'running' and self.selected_launch_target == target_key
+        and self.active_launch_target == actual_target):
+      if pre_launch_robot_config:
+        resolved_config = self.launcher.resolve_robot_config(actual_target, pre_launch_robot_config)
+        self.setSelectedRobotConfig(resolved_config)
+      return
+
     self.selected_launch_target = target_key
+    self.active_launch_target = actual_target
     self.launcher_state = 'launching'
     self.launcher_last_error = ''
     self.publishLauncherStatus()
     try:
-      self.launcher.launch(target_key)
-      ready = self.launcher.wait_until_ready(target_key)
+      self.launcher.launch(actual_target)
+      ready = self.launcher.wait_until_ready(actual_target)
     except LauncherError as e:
-      self.launcher_state = 'failed'
+      # A real choice, not just a failure: launch_command's own refuse
+      # guard means a gazebo is already up but not one this app started --
+      # offer to reuse it (Use Existing / sim/attach_simulator) or force
+      # past it (Launch New / sim/force_launch_simulator) rather than just
+      # reporting a dead end. Every other LauncherError stays plain 'failed'.
+      self.launcher_state = 'gazebo_conflict' if isGazeboConflictError(str(e)) else 'failed'
       self.launcher_last_error = str(e)
       self.publishLauncherStatus()
       return
@@ -743,10 +1082,20 @@ class NepiSimConnectorApp:
     # default meant only for an operator who hasn't picked anything yet.
     # FACTORY_ROBOT_CONFIG_NAME ('default', capability-empty) counts as
     # "hasn't picked anything" rather than a real choice worth preserving.
+    # Recomputed fresh here (not reusing pre_launch_robot_config) since
+    # launch()/wait_until_ready() block for real seconds, during which
+    # another callback could legitimately have changed the selection.
     robot_config = self.selected_robot_config
     if not robot_config or robot_config == FACTORY_ROBOT_CONFIG_NAME:
-      robot_config = self.launcher.get_default_robot_config(target_key)
+      robot_config = self.launcher.get_default_robot_config(actual_target)
+    # Resolves the plain, selector-offered choice (e.g. "2-Wheel Rover") to
+    # whatever profile the ACTUAL target needs -- most targets need no
+    # mapping (Gazebo's rover configs already match the generic keys), but
+    # Stage/WPILib-style targets redirect to their own hidden_from_selector
+    # profile here, so there is no separate "2-Wheel Rover (WPILib)" entry
+    # to pick.
     if robot_config:
+      robot_config = self.launcher.resolve_robot_config(actual_target, robot_config)
       self.setSelectedRobotConfig(robot_config)
 
   def runStop(self, target_key):
@@ -762,6 +1111,7 @@ class NepiSimConnectorApp:
     self.launcher_state = 'idle'
     self.launcher_last_error = ''
     self.selected_launch_target = ''
+    self.active_launch_target = ''
     self.publishLauncherStatus()
 
   def installSimulatorCb(self, msg):
@@ -825,7 +1175,12 @@ class NepiSimConnectorApp:
   def checkInstalledAllCb(self):
     if self.launcher is None:
       return
-    keys, _names = self.launcher.get_available_targets()
+    # ALL targets, hidden_from_selector or not -- a hidden target (e.g.
+    # gazebo_quadcopter, reached only through gazebo_rover's own
+    # launch_target_overrides) still needs its own dependency state tracked
+    # in the background, exactly like a hidden robot_configs entry stays
+    # fully valid/checked without being offered directly.
+    keys = self.launcher.list_all_target_keys()
     for key in keys:
       self.launch_target_installed_check_state[key] = 'checking'
     self.publishLauncherStatus()

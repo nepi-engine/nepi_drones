@@ -122,8 +122,19 @@ SIM_VEHICLE_DICT:
     # Deliberately distinct from ground_robot_2_wheel: this is the contract's
     # "sensor topic exists but has_camera stays False, has_environment_controls
     # stays False" case, not a duplicate of an existing config.
+    #
+    # hidden_from_selector: this is a SIMULATOR constraint (Stage's world has
+    # no camera model at all), not something an operator picks as a distinct
+    # "kind of robot" -- so it's not offered in the Robot Config selector.
+    # stage_rover's own robot_config_overrides in
+    # simulator_launch_targets.yaml maps the plain "2-Wheel Rover" pick to
+    # this profile automatically when deploying to Stage specifically; every
+    # other target keeps using ground_robot_2_wheel unchanged. Kept as a real
+    # entry here (not deleted) because it's still the profile that gets
+    # applied -- just never a direct selector choice.
     stage_ground_robot:
       display_name: 2-Wheel Rover (No Camera)
+      hidden_from_selector: true
       description: Two-wheel ground robot, local position control only, no camera or environment control
       wheel_count: 2
       motor_count: 2
@@ -146,8 +157,13 @@ SIM_VEHICLE_DICT:
     # this bridge's RESET is a real, working teleport
     # (physics.py/shared_state.py's reset_requested flag), so it gets its own
     # config rather than inheriting Stage's honest limitation.
+    # hidden_from_selector: same reasoning as stage_ground_robot above --
+    # this is what WPILib's own simulation stack supports, not a distinct
+    # robot an operator chooses. wpilib_rover's robot_config_overrides maps
+    # "2-Wheel Rover" to this profile automatically when deploying to WPILib.
     wpilib_ground_robot:
       display_name: 2-Wheel Rover (WPILib)
+      hidden_from_selector: true
       description: Two-wheel ground robot with a working RESET, no camera or environment control
       wheel_count: 2
       motor_count: 2

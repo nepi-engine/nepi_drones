@@ -26,6 +26,7 @@ import Label from "./Label"
 import Input from "./Input"
 import Button, { ButtonMenu } from "./Button"
 import BooleanIndicator from "./BooleanIndicator"
+import Styles from "./Styles"
 import { Columns, Column } from "./Columns"
 
 @inject("ros")
@@ -71,12 +72,15 @@ class NepiIFSimLauncher extends Component {
 
     this.onTargetSelected = this.onTargetSelected.bind(this)
     this.onDeployClicked = this.onDeployClicked.bind(this)
+    this.onNewSimClicked = this.onNewSimClicked.bind(this)
     this.onKillClicked = this.onKillClicked.bind(this)
     this.onInstallClicked = this.onInstallClicked.bind(this)
+    this.onLaunchNewClicked = this.onLaunchNewClicked.bind(this)
+    this.onUseExistingClicked = this.onUseExistingClicked.bind(this)
+    this.onKillAllGazeboClicked = this.onKillAllGazeboClicked.bind(this)
 
     this.renderTargetSelector = this.renderTargetSelector.bind(this)
-    this.renderInstallState = this.renderInstallState.bind(this)
-    this.renderStatus = this.renderStatus.bind(this)
+    this.renderDeployControls = this.renderDeployControls.bind(this)
   }
 
   getSimNamespace() {
@@ -141,11 +145,30 @@ class NepiIFSimLauncher extends Component {
   // unmodified select_robot_config flow) -- so choosing a simulator here and
   // a model over there, then clicking Deploy, applies both in one action.
   // Nothing here talks to the VM directly.
+  //
+  // Also doubles as "Use Open Sim" (same topic, same handler) when the
+  // selected target already matches what's running -- the app node itself
+  // short-circuits to just applying the new model to the already-connected
+  // bridge rather than touching the VM again, so this button never needs to
+  // know which case it's in.
   onDeployClicked() {
     const namespace = this.getSimNamespace()
     const target = this.state.selected_target
     if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
       this.props.ros.sendStringMsg(namespace + '/launch_simulator', target)
+    }
+  }
+
+  // "New Sim" -- explicit clean restart: stops whatever is currently
+  // running (if anything) and launches the selected target fresh, even if
+  // that's the very same target that's already up. Distinct from Deploy/
+  // "Use Open Sim" above, which never touches the VM when nothing needs to
+  // change on it.
+  onNewSimClicked() {
+    const namespace = this.getSimNamespace()
+    const target = this.state.selected_target
+    if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
+      this.props.ros.sendStringMsg(namespace + '/redeploy_simulator', target)
     }
   }
 
@@ -167,6 +190,49 @@ class NepiIFSimLauncher extends Component {
     }
   }
 
+  // Offered specifically when launcher_state is 'gazebo_conflict' -- see
+  // sim_connector_app_node.py's isGazeboConflictError/runLaunch. Force past
+  // the gazebo that's in the way by killing it (and anything else's gazebo
+  // on that host -- see SimulatorLauncher.kill_all_gazebo's own docstring
+  // for why this is deliberately blunt) and launching the selected target
+  // fresh.
+  onLaunchNewClicked() {
+    const namespace = this.getSimNamespace()
+    const target = this.state.selected_target
+    if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
+      this.props.ros.sendStringMsg(namespace + '/force_launch_simulator', target)
+    }
+  }
+
+  // The other conflict-resolution choice: skip starting a new gazebo
+  // entirely and just point this target's bridge (and, for the
+  // quadcopter target, SITL) at whatever's already running. Only works
+  // out if the already-running gazebo happens to have the right world
+  // loaded -- if not, the app's own ready_check reports a clean failure
+  // rather than a false success (see attach_launch_command's own comment
+  // in simulator_launch_targets.yaml).
+  onUseExistingClicked() {
+    const namespace = this.getSimNamespace()
+    const target = this.state.selected_target
+    if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
+      this.props.ros.sendStringMsg(namespace + '/attach_simulator', target)
+    }
+  }
+
+  // Standalone escape hatch, not specific to the currently selected
+  // target -- kills every gzclient/gzserver on every configured target's
+  // host, regardless of who started it. Offered here because the
+  // gazebo_conflict state is the situation this exists for, but it isn't
+  // itself part of resolving THIS target's own launch (Launch New already
+  // does this as its first step) -- it's for clearing a stray instance
+  // without immediately relaunching anything.
+  onKillAllGazeboClicked() {
+    const namespace = this.getSimNamespace()
+    if (namespace != null && namespace !== 'None') {
+      this.props.ros.sendTriggerMsg(namespace + '/kill_all_gazebo')
+    }
+  }
+
   // Launch-target selector, backed by the launcher status message's reported
   // list -- the same reported-list-plus-selection shape Nepi_IF_Sim's own
   // selectors already use.
@@ -183,7 +249,7 @@ class NepiIFSimLauncher extends Component {
 
     if (available.length === 0) {
       return (
-        <Label title={"Launch Target"}>
+        <Label title={"Simulator"}>
           <Input disabled value={"Not configured on this deployment"} />
         </Label>
       )
@@ -197,7 +263,7 @@ class NepiIFSimLauncher extends Component {
     }
 
     return (
-      <Label title={"Launch Target"}>
+      <Label title={"Simulator"}>
         <Select
           onChange={this.onTargetSelected}
           value={this.state.selected_target}
@@ -208,65 +274,27 @@ class NepiIFSimLauncher extends Component {
     )
   }
 
-  // Whether the currently selected target's dependencies are known to be
-  // present, plus an Install button when they're confirmed missing.
-  // Independent of launcher_state -- a target can be checked/installed
-  // whether or not anything is currently deployed. "checking"/"unknown"
-  // intentionally do NOT show the Install button: unknown means "couldn't
-  // reach the host to tell" (see SimulatorLauncher.is_installed), and
-  // offering to install onto a host you can't confirm is reachable invites
-  // a confusing failure rather than a useful one.
-  renderInstallState() {
+  // Everything below the target selector: dependency state, the running-sim
+  // message, and whichever button set applies. Four mutually-exclusive
+  // cases, checked in this order:
+  //   1. The last launch hit launch_command's own "a gzserver is already
+  //      running" refuse-to-launch guard -- show the error plus Launch New
+  //      / Use Existing / Kill All Gazebo instead of a dead-end failure.
+  //   2. Something is currently running (regardless of the selected
+  //      target's own install state -- it's running, so it's plainly
+  //      present) -- show "You have X open" plus Kill, New Sim, and (only
+  //      when the selection matches what's running) Use Open Sim.
+  //   3. Nothing running, and the SELECTED target is confirmed missing --
+  //      show Install instead of Deploy. "checking"/"unknown" intentionally
+  //      do NOT show Install: unknown means "couldn't reach the host to
+  //      tell" (see SimulatorLauncher.is_installed's docstring), and
+  //      offering to install onto a host that can't be confirmed reachable
+  //      invites a confusing failure rather than a useful one.
+  //   4. Otherwise (idle/installed/unknown, nothing running) -- plain Deploy.
+  renderDeployControls() {
     const status_msg = this.state.status_msg
     const target = this.state.selected_target
     if (status_msg == null || target === 'None' || target === '') {
-      return null
-    }
-
-    const available = (status_msg.available_launch_targets !== undefined)
-      ? status_msg.available_launch_targets : []
-    const check_states = (status_msg.available_launch_target_installed_check_state !== undefined)
-      ? status_msg.available_launch_target_installed_check_state : []
-    const target_ind = available.indexOf(target)
-    const check_state = (target_ind !== -1 && check_states[target_ind] !== undefined)
-      ? check_states[target_ind] : 'unknown'
-
-    const state = (status_msg.launcher_state !== undefined) ? status_msg.launcher_state : 'idle'
-    const busy = (state === 'launching') || (state === 'stopping') || (state === 'installing')
-
-    return (
-      <React.Fragment>
-
-        <Label title={"Dependencies Installed"}>
-          {(check_state === 'checking') ?
-            <Input disabled value={"Checking..."} />
-          : <BooleanIndicator value={check_state === 'installed'} />}
-        </Label>
-
-        {(check_state === 'not_installed') ?
-          <ButtonMenu>
-            <Button disabled={busy} onClick={this.onInstallClicked}>{"Install"}</Button>
-          </ButtonMenu>
-        : null}
-
-      </React.Fragment>
-    )
-  }
-
-  // Launcher state plus last error, and the Deploy/Kill buttons. Deploy is
-  // disabled while a launch/stop/install is already in progress, nothing is
-  // selected, or the target is confirmed not installed yet (Install is the
-  // action to take instead, see renderInstallState) -- "unknown"/"checking"
-  // do NOT block Deploy, since a target this app can't confirm the install
-  // state of might still be perfectly launchable (e.g. check_installed_command
-  // itself failing over a flaky connection shouldn't be mistaken for "this
-  // won't work"). Kill is disabled unless something is actually running or on
-  // its way up -- matching sim_connector_app_node.py's own launcher_thread
-  // busy-check, just surfaced so the buttons don't invite a request the node
-  // would ignore anyway.
-  renderStatus() {
-    const status_msg = this.state.status_msg
-    if (status_msg == null) {
       return null
     }
 
@@ -274,45 +302,125 @@ class NepiIFSimLauncher extends Component {
       ? status_msg.launcher_state : 'idle'
     const available = (status_msg.available_launch_targets !== undefined)
       ? status_msg.available_launch_targets : []
+    const names = (status_msg.available_launch_target_names !== undefined)
+      ? status_msg.available_launch_target_names : []
     const check_states = (status_msg.available_launch_target_installed_check_state !== undefined)
       ? status_msg.available_launch_target_installed_check_state : []
-    const target = this.state.selected_target
     const target_ind = available.indexOf(target)
     const check_state = (target_ind !== -1 && check_states[target_ind] !== undefined)
       ? check_states[target_ind] : 'unknown'
 
     const busy = (state === 'launching') || (state === 'stopping') || (state === 'installing')
-    const deploy_disabled = (available.length === 0) || (target === 'None') || (target === '')
-      || busy || (check_state === 'not_installed')
-    const kill_disabled = (state !== 'running') && (state !== 'launching')
+    const running = (state === 'running')
+    const last_error = (status_msg.last_error !== undefined) ? status_msg.last_error : ''
+
+    // Plain wrapping text, not an <Input> -- these messages run long (the
+    // launch_command refuse-guards in particular spell out exactly why and
+    // what to do about it), and a single-line input box just clips them
+    // instead of showing the whole thing.
+    const error_row = (last_error !== '') ?
+      <Label title={"Last Error"}>
+        <div style={{
+          textAlign: "left",
+          whiteSpace: "normal",
+          wordBreak: "break-word",
+          color: Styles.vars.colors.red,
+        }}>
+          {last_error}
+        </div>
+      </Label>
+    : null
+
+    // A real choice, not a dead end: launch_command's own refuse-to-launch
+    // guard means a gazebo is already up but isn't tracked as this app's
+    // own launch (see runLaunch's own comment). Checked before the
+    // running/not_installed branches below since it's mutually exclusive
+    // with both (a launch that hit this guard never got as far as
+    // "running", and never needed an install check to fail this way).
+    if (state === 'gazebo_conflict') {
+      return (
+        <React.Fragment>
+
+          {error_row}
+
+          <ButtonMenu>
+            <Button disabled={busy} onClick={this.onLaunchNewClicked}>{"Launch New"}</Button>
+            <Button disabled={busy} onClick={this.onUseExistingClicked}>{"Use Existing"}</Button>
+            <Button disabled={busy} onClick={this.onKillAllGazeboClicked}>{"Kill All Gazebo"}</Button>
+          </ButtonMenu>
+
+        </React.Fragment>
+      )
+    }
+
+    if (running) {
+      const running_target = status_msg.selected_launch_target
+      const running_ind = available.indexOf(running_target)
+      const running_name = (running_ind !== -1 && names[running_ind] !== undefined && names[running_ind] !== '')
+        ? names[running_ind] : running_target
+      const selection_matches_running = (running_target === target)
+
+      return (
+        <React.Fragment>
+
+          <Label title={"Status"}>
+            <Input disabled value={"You have " + running_name + " open"} />
+          </Label>
+
+          {error_row}
+
+          <ButtonMenu>
+            {selection_matches_running ?
+              <Button disabled={busy} onClick={this.onDeployClicked}>{"Use Open Sim"}</Button>
+            : null}
+            <Button disabled={busy} onClick={this.onNewSimClicked}>{"New Sim"}</Button>
+            <Button disabled={busy} onClick={this.onKillClicked}>{"Kill"}</Button>
+          </ButtonMenu>
+
+        </React.Fragment>
+      )
+    }
+
+    if (check_state === 'not_installed') {
+      return (
+        <React.Fragment>
+
+          <Label title={"Dependencies Installed"}>
+            <BooleanIndicator value={false} />
+          </Label>
+
+          {error_row}
+
+          <ButtonMenu>
+            <Button disabled={busy} onClick={this.onInstallClicked}>{"Install"}</Button>
+          </ButtonMenu>
+
+        </React.Fragment>
+      )
+    }
+
+    const deploy_disabled = (available.length === 0) || busy
 
     return (
       <React.Fragment>
-
-        <Label title={"Launcher State"}>
-          <Input disabled value={state} />
-        </Label>
-
-        {(status_msg.last_error !== undefined && status_msg.last_error !== '') ?
-          <Label title={"Last Error"}>
-            <Input disabled value={status_msg.last_error} />
-          </Label>
-        : null}
-
-        {this.renderInstallState()}
-
+        {error_row}
         <ButtonMenu>
           <Button disabled={deploy_disabled} onClick={this.onDeployClicked}>{"Deploy"}</Button>
-          <Button disabled={kill_disabled} onClick={this.onKillClicked}>{"Kill"}</Button>
         </ButtonMenu>
-
       </React.Fragment>
     )
   }
 
+  // make_section defaults to false here (the opposite of every other
+  // Nepi_IF_* component in this app): the normal mount point is directly
+  // inside Nepi_IF_Sim's own render, right under its Robot Config selector,
+  // with no separate "Simulator Launcher" heading of its own -- there is no
+  // longer a standalone panel for this at all. A caller that does want its
+  // own titled section (e.g. testing this component in isolation) can still
+  // pass make_section={true}.
   render() {
-    const make_section = (this.props.make_section !== undefined) ? this.props.make_section : true
-    const title = (this.props.title !== undefined) ? this.props.title : "Simulator Launcher"
+    const make_section = (this.props.make_section !== undefined) ? this.props.make_section : false
+    const title = (this.props.title !== undefined) ? this.props.title : "Simulator"
     const status_msg = this.state.status_msg
 
     // No status yet: render nothing, matching Nepi_IF_Sim's own not-ready
@@ -331,7 +439,7 @@ class NepiIFSimLauncher extends Component {
     const content = (
       <React.Fragment>
         {this.renderTargetSelector()}
-        {this.renderStatus()}
+        {this.renderDeployControls()}
       </React.Fragment>
     )
 

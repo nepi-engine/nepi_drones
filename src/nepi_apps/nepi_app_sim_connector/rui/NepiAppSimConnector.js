@@ -24,7 +24,6 @@ import { observer, inject } from "mobx-react"
 import { Columns, Column } from "./Columns"
 
 import NepiIFSim from "./Nepi_IF_Sim"
-import NepiIFSimLauncher from "./Nepi_IF_SimLauncher"
 
 @inject("ros")
 @observer
@@ -79,51 +78,23 @@ class NepiAppSimConnector extends Component {
   render() {
     const simNamespace = this.getSimNamespace()
 
-    // Two real panels, side by side, each using a comfortable share of the
-    // full width -- not the copy-pasted-from-NepiDeviceIDX.js 75/2/23 split
-    // this page shipped with, whose 75% pane was a placeholder
-    // (renderImageViewer(), in the IDX camera page this was templated from)
-    // that never got filled in here and just sat empty. Sim Connector has no
-    // second, independent camera feed of its own to put there -- the one
-    // camera view it has is already live inside Nepi_IF_Sim-Controls' own
-    // state/subscriptions, nested under Sim Connector on the right below --
-    // so relocating it would mean duplicating that subscription rather than
-    // fixing a layout number, for a change nobody asked for.
+    // One panel, full width. The Deploy/Kill/Install controls now render
+    // inline inside Nepi_IF_Sim itself, directly under Robot Config, so
+    // there's no separate "Simulator Launcher" panel to lay out beside it
+    // anymore -- see Nepi_IF_Sim.js's mount of NepiIFSimLauncher.
     return (
 
       <Columns>
         <Column>
 
-          <div style={{ display: 'flex' }}>
-
-            <div style={{ width: "49%" }}>
-
-              <NepiIFSimLauncher
-                namespace={simNamespace}
-                make_section={true}
-                title={"Simulator Launcher"}
-              />
-
-            </div>
-
-            <div style={{ width: '2%' }}>
-              {}
-            </div>
-
-            <div style={{ width: "49%" }}>
-
-              <NepiIFSim
-                namespace={simNamespace}
-                show_selectors={true}
-                show_data={true}
-                show_controls={true}
-                make_section={true}
-                title={"Sim Connector"}
-              />
-
-            </div>
-
-          </div>
+          <NepiIFSim
+            namespace={simNamespace}
+            show_selectors={true}
+            show_data={true}
+            show_controls={true}
+            make_section={true}
+            title={"Sim Connector"}
+          />
 
         </Column>
       </Columns>

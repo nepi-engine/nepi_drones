@@ -43,7 +43,7 @@ device_bridge_port: 9030
 
 launch_targets:
   gazebo_rover:
-    display_name: "Gazebo (generic rover)"
+    display_name: "Gazebo"
     host: "127.0.0.1"
     ssh_user: "suraj"
     ssh_port: 12222
@@ -144,6 +144,33 @@ launch_targets:
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/gazebo/sim_connector_bridge_gazebo.py --host {device_bridge_host} --port {device_bridge_port} < /dev/null > /tmp/sim_connector_bridge_gazebo_launch.log 2>&1 & BRIDGE_PID=$!;
       wait $GZ_PID $BRIDGE_PID
       '
+    # Used instead of launch_command when the operator explicitly chose
+    # "Use Existing" after hitting launch_command's own refuse-to-launch
+    # guard above -- an explicit, deliberate override of that guard, not a
+    # way around it. Skips the refuse check AND the `rosrun gazebo_ros
+    # gazebo ...` line entirely (assumes a gazebo the operator already
+    # knows about is up), then does everything else identically: roscore
+    # check, bridge launch, same pgid tracking. Two honest consequences of
+    # skipping the world-launch line, both intentional, not bugs:
+    #   - stop_command's pgid-kill naturally never reaches the pre-existing
+    #     gzserver either, since it was never part of THIS launch's process
+    #     group -- attaching never risks killing something this app didn't
+    #     start, with no special-casing needed.
+    #   - ready_check_command below still verifies generic_rover.world
+    #     specifically is what's loaded -- if the pre-existing gazebo has
+    #     the WRONG world up, this reports a clean "failed to become ready"
+    #     rather than a false success, exactly like a real launch would.
+    attach_launch_command: >-
+      bash -lc '
+      source /opt/ros/noetic/setup.bash;
+      export DISPLAY=:0;
+      export XAUTHORITY=/run/user/$(id -u)/gdm/Xauthority;
+      export GAZEBO_MODEL_PATH=$HOME/nepi_engine_ws/nepi_drones/sim_container/models:$GAZEBO_MODEL_PATH;
+      echo $$ > /tmp/sim_connector_launch.pgid;
+      rostopic list > /dev/null 2>&1 || {{ nohup roscore < /dev/null > /tmp/sim_connector_roscore_launch.log 2>&1 & until rostopic list > /dev/null 2>&1; do sleep 1; done; }};
+      python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/gazebo/sim_connector_bridge_gazebo.py --host {device_bridge_host} --port {device_bridge_port} < /dev/null > /tmp/sim_connector_bridge_gazebo_launch.log 2>&1 & BRIDGE_PID=$!;
+      wait $BRIDGE_PID
+      '
     # Kills ONLY this launch's own process group, never Gazebo generally.
     # An earlier version ran `pkill -x gzserver; pkill -x gzclient`, which
     # would have torn down every unrelated Gazebo on the host -- including a
@@ -159,7 +186,20 @@ launch_targets:
     # launch_command found one already running, it isn't ours to kill; if
     # launch_command started its own, it is in this same process group and so
     # goes down with it.
-    stop_command: "bash -lc 'f=/tmp/sim_connector_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; pkill -f sim_connector_bridge_gazebo.py 2>/dev/null; true'"
+    #
+    # "[s]im_connector_bridge_gazebo.py" (not "sim_connector_bridge_gazebo.py")
+    # is deliberate, not a typo -- found while debugging gazebo_quadcopter's
+    # own stop_command below: a plain `pkill -f pattern` always self-matches
+    # this SAME bash -lc invocation (its own argv literally contains the
+    # pattern text), killing this script before the trailing `; true` even
+    # runs. Silently harmless here specifically because the pgid kill just
+    # above is already the complete cleanup for this target (confirmed via
+    # `ps aux` before/after every stop this session) -- there is nothing
+    # left for this fallback pkill to catch regardless of whether it runs --
+    # but bracket-escaped anyway now that the bug is understood, rather than
+    # leaving a latent footgun for whoever next relies on this line actually
+    # executing.
+    stop_command: "bash -lc 'f=/tmp/sim_connector_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; pkill -f [s]im_connector_bridge_gazebo.py 2>/dev/null; true'"
     # Verifies THIS target's own world is up, not just that some gazebo is.
     # Two earlier versions were both false-positive-prone: process existence
     # alone missed gzserver spinning on "No ROS master", and a bare
@@ -172,6 +212,182 @@ launch_targets:
     # Which sim_connector_app_params.yaml robot_configs entry this target's
     # bridge expects -- auto-selected on successful launch.
     default_robot_config: ground_robot_2_wheel
+    # This target's own rover world/bridge has no way to serve a 4-motor
+    # flight profile (no altitude axis, no flight controller) -- redirect
+    # the ACTUAL launch to gazebo_quadcopter below instead, a different
+    # world (iris_arducopter_cmac.world), bridge (MAVLink, not the JSON
+    # Twist-mixer protocol), and install requirement (ArduCopter SITL)
+    # entirely. "Gazebo" stays the one thing picked in the Simulator
+    # selector -- see resolve_launch_target's docstring in
+    # simulator_launcher.py for why this is the mirror image of
+    # robot_config_overrides above (target-for-config instead of
+    # config-for-target).
+    launch_target_overrides:
+      flight_robot_4_motor: gazebo_quadcopter
+
+  # Reached only through gazebo_rover's own launch_target_overrides above --
+  # never offered directly in the Simulator selector (hidden_from_selector,
+  # the same flag/meaning a robot_configs entry uses). Gazebo + ArduCopter
+  # SITL, linked through the iris_with_ardupilot model's own ArduPilotPlugin
+  # FDM socket (built into ardupilot_gazebo, not something this launch
+  # orchestrates itself) -- confirmed working for the separate RBX ArduPilot
+  # SITL dev flow this reuses the world/camera-rig pieces from (see
+  # nepi_sitl_dev_env.sh's sitl_gazebo_full). Runs its OWN ArduCopter SITL
+  # instance on a dedicated MAVLink port (5772) distinct from that other
+  # flow's mavros port (5771), so the two can coexist -- but only one
+  # gzserver/one ArduCopter SITL process can run at a time regardless (see
+  # launch_command's own refuse-to-launch guards), so running this AND the
+  # separate RBX SITL dev flow simultaneously is not supported.
+  gazebo_quadcopter:
+    display_name: "Gazebo (Quadcopter/ArduCopter SITL)"
+    hidden_from_selector: true
+    host: "127.0.0.1"
+    ssh_user: "suraj"
+    ssh_port: 12222
+    # Checks for ArduCopter SITL + pymavlink + the ardupilot_gazebo world
+    # file, IN ADDITION to the plain gzserver/roscore check gazebo_rover's
+    # own command uses -- this target needs all of it, not just Gazebo
+    # itself. No install_command: unlike every other target's dependency
+    # (a package-manager or pip one-liner), ArduPilot SITL setup is a
+    # multi-step build from source with no honest single command to offer --
+    # see ardupilot's own install docs. Still checkable/status-tracked in
+    # the background like every hidden_from_selector entry; just not
+    # offered a matching Install button (there is no visible selector row
+    # for this target to show one on regardless).
+    check_installed_command: "bash -lc \"source /opt/ros/noetic/setup.bash; command -v gzserver > /dev/null && command -v roscore > /dev/null && command -v sim_vehicle.py > /dev/null && python3 -c 'import pymavlink' > /dev/null 2>&1 && test -f $HOME/ardupilot_gazebo/worlds/iris_arducopter_cmac.world\""
+    # Same fragile-YAML-folding caution as gazebo_rover's own launch_command
+    # above applies here verbatim -- every line stays at the SAME
+    # indentation on purpose. Verify with
+    # `yaml.safe_load(...)["launch_targets"]["gazebo_quadcopter"]["launch_command"]`
+    # before editing this block again.
+    #
+    # Refuses if EITHER a gzserver OR an ArduCopter SITL instance is already
+    # running -- the second guard matters here specifically because the
+    # separate RBX ArduPilot SITL dev flow (nepi_sitl_dev_env.sh) can leave
+    # one running on this same VM, and two ArduCopter instances cannot share
+    # the default MAVLink ports any more than two gzservers can share 11345.
+    #
+    # The ArduCopter guard checks port 5760 (SITL's own primary/default
+    # MAVLink port, opened by any ArduCopter instance regardless of this
+    # target's own extra --out port) rather than `pgrep -f` against the
+    # process's command line -- confirmed the hard way that a `pgrep -f`
+    # check HERE always matches, including the classic bracket-class
+    # self-match workaround (`"[s]im_vehicle.py..."`): `bash -c "<this whole
+    # multi-line script>"` shows its OWN cmdline, via ps/pgrep, as the
+    # ENTIRE script text for as long as it runs -- and that text contains
+    # the literal substring "sim_vehicle.py -v ArduCopter" later on, in the
+    # real launch line below. No `pgrep -f` pattern naming that program can
+    # ever avoid matching this script's own in-flight invocation, since the
+    # match comes from a DIFFERENT part of the same running script, not from
+    # the checking command's own argv (which is the case the bracket trick
+    # actually fixes). A port-liveness probe has no such problem: it reads
+    # the kernel's own listening-socket table, never this process's argv.
+    # gzserver's own guard above doesn't have this problem either way:
+    # `pgrep -x` matches the process NAME only ("bash", never "gzserver").
+    #
+    # camera_rig_controller_ardupilot.py is launched alongside (not by the
+    # bridge script itself) -- it already owns positioning/publishing the
+    # chase-cam feed for the separate RBX SITL dev flow; reused here as-is
+    # rather than re-deriving the same follow-camera math a second time,
+    # see sim_connector_bridge_gazebo_quadcopter.py's own module docstring.
+    #
+    # sim_vehicle.py's own --out=tcpin:0.0.0.0:5772 gives this bridge a
+    # DEDICATED MAVLink port, the same reasoning nepi_sitl_dev_env.sh's own
+    # --out=tcpin:0.0.0.0:5771 uses for mavros -- without it, sim_vehicle.py's
+    # own MAVProxy would be the SITL's only MAVLink client and this bridge
+    # could never connect.
+    #
+    # sim_vehicle.py/MAVProxy is the one child here that does NOT get
+    # `< /dev/null` on stdin, unlike every other line -- confirmed the hard
+    # way: MAVProxy is an interactive console that reads its own stdin as a
+    # command loop, and `< /dev/null` is an immediate EOF, which made it
+    # exit within the same second it started (silently, no error -- just
+    # "SIM_VEHICLE: MAVProxy exited" in its own log) every single launch.
+    # A real terminal never has this problem (a human's tty never spontaneously
+    # EOFs), which is exactly the difference between this fully-detached,
+    # no-pty ssh invocation and nepi_sitl_dev_env.sh's own sitl_gazebo_full(),
+    # always run from an actual logged-in shell. The fix: a FIFO opened
+    # read-write on its own fd (3) BEFORE launching MAVProxy and held open
+    # for this whole script's lifetime -- a FIFO with at least one open
+    # writer never signals EOF to a reader, so MAVProxy's stdin blocks
+    # (harmlessly; nothing needs to actually arrive on it) instead of
+    # hitting EOF and exiting. The fd (and so the FIFO's last writer) closes
+    # on its own when this script's own `wait` returns, i.e. exactly when
+    # MAVProxy should go down anyway. `rm -f` before `mkfifo` clears any
+    # stale FIFO a previous crashed launch left behind (a fresh mkfifo on an
+    # existing stale path errors and stops the whole script).
+    launch_command: >-
+      bash -lc '
+      source /opt/ros/noetic/setup.bash;
+      export DISPLAY=:0;
+      export XAUTHORITY=/run/user/$(id -u)/gdm/Xauthority;
+      export GAZEBO_MODEL_PATH=$HOME/nepi_engine_ws/nepi_drones/sim_container/models:$HOME/ardupilot_gazebo/models:$GAZEBO_MODEL_PATH;
+      if pgrep -x gzserver > /dev/null; then echo "REFUSING TO LAUNCH: a gzserver is already running on this host. A second one would silently attach to the running world instead of loading iris_arducopter_cmac.world. Stop the existing simulation first." >&2; exit 3; fi;
+      if timeout 1 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/5760" 2>/dev/null; then echo "REFUSING TO LAUNCH: ArduCopter SITL already appears to be running on this host (port 5760 is taken -- possibly the separate RBX ArduPilot SITL dev flow, see nepi_sitl_dev_env.sh). Only one instance can own the default MAVLink ports at a time. Stop it first." >&2; exit 3; fi;
+      echo $$ > /tmp/sim_connector_quadcopter_launch.pgid;
+      rostopic list > /dev/null 2>&1 || {{ nohup roscore < /dev/null > /tmp/sim_connector_quadcopter_roscore_launch.log 2>&1 & until rostopic list > /dev/null 2>&1; do sleep 1; done; }};
+      rosrun gazebo_ros gazebo $HOME/ardupilot_gazebo/worlds/iris_arducopter_cmac.world < /dev/null > /tmp/sim_connector_quadcopter_gazebo_launch.log 2>&1 & GZ_PID=$!;
+      sleep 8;
+      python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/camera_rig_controller_ardupilot.py < /dev/null > /tmp/sim_connector_quadcopter_camera_rig_launch.log 2>&1 & CAM_PID=$!;
+      rm -f /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo;
+      mkfifo /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo;
+      exec 3<>/tmp/sim_connector_quadcopter_mavproxy_stdin.fifo;
+      sim_vehicle.py -v ArduCopter -f gazebo-iris --out=tcpin:0.0.0.0:5772 < /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo > /tmp/sim_connector_quadcopter_sitl_launch.log 2>&1 & SITL_PID=$!;
+      python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/gazebo/sim_connector_bridge_gazebo_quadcopter.py --host {device_bridge_host} --port {device_bridge_port} --mavlink tcp:127.0.0.1:5772 < /dev/null > /tmp/sim_connector_quadcopter_bridge_launch.log 2>&1 & BRIDGE_PID=$!;
+      wait $GZ_PID $CAM_PID $SITL_PID $BRIDGE_PID
+      '
+    # Same "Use Existing" override as gazebo_rover's own attach_launch_command
+    # -- skips ONLY the gzserver refuse-guard and the `rosrun gazebo_ros
+    # gazebo ...` line, on the assumption the operator already knows a
+    # gazebo (hopefully with iris_arducopter_cmac.world loaded) is up.
+    # Keeps the ArduCopter-port (5760) refuse-guard, camera_rig, SITL, and
+    # bridge lines all unchanged -- a second SITL instance colliding on
+    # port 5760 is a genuinely different problem attach mode does nothing
+    # to solve, so still refuses on that specifically. Same two honest
+    # consequences as gazebo_rover's version: stop_command's pgid-kill
+    # still can't reach a gzserver this launch never started, and
+    # ready_check_command below still catches the wrong-world case as a
+    # clean "failed to become ready" rather than a false success.
+    attach_launch_command: >-
+      bash -lc '
+      source /opt/ros/noetic/setup.bash;
+      export DISPLAY=:0;
+      export XAUTHORITY=/run/user/$(id -u)/gdm/Xauthority;
+      export GAZEBO_MODEL_PATH=$HOME/nepi_engine_ws/nepi_drones/sim_container/models:$HOME/ardupilot_gazebo/models:$GAZEBO_MODEL_PATH;
+      if timeout 1 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/5760" 2>/dev/null; then echo "REFUSING TO LAUNCH: ArduCopter SITL already appears to be running on this host (port 5760 is taken -- possibly the separate RBX ArduPilot SITL dev flow, see nepi_sitl_dev_env.sh). Only one instance can own the default MAVLink ports at a time. Stop it first." >&2; exit 3; fi;
+      echo $$ > /tmp/sim_connector_quadcopter_launch.pgid;
+      rostopic list > /dev/null 2>&1 || {{ nohup roscore < /dev/null > /tmp/sim_connector_quadcopter_roscore_launch.log 2>&1 & until rostopic list > /dev/null 2>&1; do sleep 1; done; }};
+      python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/camera_rig_controller_ardupilot.py < /dev/null > /tmp/sim_connector_quadcopter_camera_rig_launch.log 2>&1 & CAM_PID=$!;
+      rm -f /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo;
+      mkfifo /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo;
+      exec 3<>/tmp/sim_connector_quadcopter_mavproxy_stdin.fifo;
+      sim_vehicle.py -v ArduCopter -f gazebo-iris --out=tcpin:0.0.0.0:5772 < /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo > /tmp/sim_connector_quadcopter_sitl_launch.log 2>&1 & SITL_PID=$!;
+      python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/gazebo/sim_connector_bridge_gazebo_quadcopter.py --host {device_bridge_host} --port {device_bridge_port} --mavlink tcp:127.0.0.1:5772 < /dev/null > /tmp/sim_connector_quadcopter_bridge_launch.log 2>&1 & BRIDGE_PID=$!;
+      wait $CAM_PID $SITL_PID $BRIDGE_PID
+      '
+    # Belt-and-suspenders like gazebo_rover's own stop_command: the pgid kill
+    # is the primary mechanism, but sim_vehicle.py is a much more complex
+    # process than a plain backgrounded shell job and may not faithfully
+    # preserve pgid inheritance for its own descendants (MAVProxy, the
+    # ArduCopter binary) -- the explicit pkill patterns are the fallback if
+    # it doesn't. "[s]im_vehicle.py" (not "sim_vehicle.py") is deliberate,
+    # not a typo -- confirmed the hard way: a plain `pkill -f
+    # "sim_vehicle.py -v ArduCopter"` matches THIS SAME bash -lc script's
+    # own invocation (its pattern argument is that literal text) and kills
+    # itself mid-script, before the later cleanup lines ever run. Unlike
+    # the launch_command's ArduCopter guard above, the bracket-class
+    # self-match-avoidance idiom genuinely fixes it here: this pattern
+    # exists exactly once in this script (the pkill argument itself), not a
+    # second time elsewhere the way launch_command's own text repeats it.
+    stop_command: "bash -lc 'f=/tmp/sim_connector_quadcopter_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; rm -f /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo; pkill -f \"[s]im_vehicle.py -v ArduCopter\" 2>/dev/null; pkill -f [c]amera_rig_controller_ardupilot.py 2>/dev/null; pkill -f [s]im_connector_bridge_gazebo_quadcopter.py 2>/dev/null; true'"
+    # Same "prove THIS target's own world is up" bar as gazebo_rover's own
+    # ready_check_command -- /camera_rig/camera/image_raw having a real
+    # publisher proves camera_rig_controller_ardupilot.py connected to a
+    # genuinely-loaded iris_arducopter_cmac.world (that script itself
+    # requires finding the iris_demo model in /gazebo/model_states before it
+    # publishes anything), not just that some gazebo process exists.
+    ready_check_command: "bash -lc \"source /opt/ros/noetic/setup.bash; pgrep -f 'gzserver.*iris_arducopter_cmac.world' > /dev/null && pgrep -f 'sim_vehicle.py -v ArduCopter' > /dev/null && pgrep -f sim_connector_bridge_gazebo_quadcopter.py > /dev/null && rostopic info /camera_rig/camera/image_raw 2>/dev/null | grep -A1 '^Publishers:' | grep -q ' \\* /'\""
+    default_robot_config: flight_robot_4_motor
 
   # webots_rover, stage_rover, and pybullet_rover below are checkable and
   # installable, but NOT yet launchable -- launch_command/ready_check_command/
@@ -215,6 +431,14 @@ launch_targets:
     ssh_port: 12222
     check_installed_command: "bash -lc \"source /opt/ros/noetic/setup.bash; rospack find stage_ros > /dev/null 2>&1\""
     install_command: "bash -lc \"sudo apt-get update && sudo apt-get install -y ros-noetic-stage-ros\""
+    # Stage's stock willow-erratic.world has no camera model at all -- a
+    # simulator constraint, not something an operator picks. Redirects the
+    # plain "2-Wheel Rover" choice to the hidden_from_selector profile that
+    # actually matches what Stage can provide; every other robot config
+    # (Quadcopter, 4-Wheel Rover -- neither of which Stage supports either,
+    # but that is unchanged/pre-existing scope) passes through unmapped.
+    robot_config_overrides:
+      ground_robot_2_wheel: stage_ground_robot
 
   pybullet_rover:
     display_name: "PyBullet"
@@ -223,3 +447,24 @@ launch_targets:
     ssh_port: 12222
     check_installed_command: "bash -lc \"python3 -c 'import pybullet' > /dev/null 2>&1\""
     install_command: "bash -lc \"pip3 install --user pybullet\""
+
+  # robotpy's WPILib HAL simulation stack (FIRST Robotics) -- see
+  # docs/MULTI_SIMULATOR_INTEGRATION_PLAN.md Phase 6. Its own bridge
+  # (sim_container/bridges/wpilib/{robot.py,physics.py,shared_state.py})
+  # already exists, confirmed working VM-side; launch_command is intentionally
+  # absent for the same reason as webots_rover/stage_rover/pybullet_rover
+  # above -- not yet wired through this launcher.
+  wpilib_rover:
+    display_name: "WPILib HAL Sim"
+    host: "127.0.0.1"
+    ssh_user: "suraj"
+    ssh_port: 12222
+    check_installed_command: "bash -lc \"python3 -c 'import wpilib' > /dev/null 2>&1\""
+    # Pinned per the plan doc's own finding: robotpy 2024.x needs GCC 10+/
+    # C++20, unavailable on this Ubuntu 20.04 target; 2022.4.8 is what was
+    # actually confirmed working.
+    install_command: "bash -lc \"pip3 install --user robotpy==2022.4.8\""
+    # WPILib's HAL sim has no camera or environment-control concept at all --
+    # same reasoning as stage_rover's override above.
+    robot_config_overrides:
+      ground_robot_2_wheel: wpilib_ground_robot

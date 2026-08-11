@@ -24,12 +24,68 @@ import Section from "./Section"
 import Select, { Option } from "./Select"
 import Label from "./Label"
 import Input from "./Input"
+import Button, { ButtonMenu } from "./Button"
 import Styles from "./Styles"
 import BooleanIndicator from "./BooleanIndicator"
 import { Columns, Column } from "./Columns"
 import { round } from "./Utilities"
 
 import NepiIFSimControls from "./Nepi_IF_Sim-Controls"
+import NepiIFSimLauncher from "./Nepi_IF_SimLauncher"
+
+// Downloadable reference for the "Upload Robot Config" option below --
+// every field a robot_configs entry understands (see
+// sim_connector_app_params.yaml's own robot_configs for the checked-in
+// equivalents), commented so an operator can see what each one does without
+// cross-referencing the app source. Kept as one flat mapping, matching what
+// uploadRobotConfigCb on the device actually expects: the raw fields, not a
+// name-wrapped entry -- display_name inside the file IS the name.
+const SAMPLE_ROBOT_CONFIG_YAML =
+`# Sample NEPI Sim Connector robot config.
+#
+# Edit the values below to match your own robot, then use "Upload Robot
+# Config" here to try it out -- it appears in the Robot Config selector as
+# whatever display_name you set below, and is applied immediately.
+#
+# Every field is optional; anything you omit is treated as capability-off
+# (false / 0 / empty list), same as an incomplete entry in
+# sim_connector_app_params.yaml.
+
+# Shown in the Robot Config selector dropdown.
+display_name: "Custom Test Rover"
+
+# Free-text, informational only -- not shown in the selector.
+description: "Example 2-wheel differential-drive rover, uploaded for testing."
+
+# wheel_count is informational; motor_count sizes the motor-ratio controls.
+wheel_count: 2
+motor_count: 2
+
+# Each has_* flag shows or hides the matching control in the RUI.
+has_goto_position: true
+has_goto_pose: false
+has_goto_location: false
+has_go_home: true
+has_set_home: true
+has_go_stop: true
+
+# Actions run on setup / on a "go" trigger. RESET + RETURN_HOME is what every
+# checked-in config uses; go_actions is empty on every current entry.
+setup_actions:
+  - RESET
+  - RETURN_HOME
+go_actions: []
+
+# If true, the RUI offers a camera view mode selector populated from
+# available_camera_view_modes.
+has_camera_view_control: true
+available_camera_view_modes:
+  - SCENE_CAMERA
+  - ROBOT_CAMERA
+
+# Environment controls (e.g. lighting/weather toggles the sim bridge exposes).
+has_environment_controls: true
+`
 
 @inject("ros")
 @observer
@@ -62,16 +118,23 @@ class NepiIFSim extends Component {
 
     }
 
+    // Hidden <input type="file"> target for the Upload Robot Config button
+    // -- a ref rather than state, since the input element itself is never
+    // rendered differently; only clicked programmatically.
+    this.uploadInputRef = React.createRef()
+
     this.getSimNamespace = this.getSimNamespace.bind(this)
 
     this.updateStatusListener = this.updateStatusListener.bind(this)
     this.statusListener = this.statusListener.bind(this)
 
-    this.onSimulatorSelected = this.onSimulatorSelected.bind(this)
     this.onRobotConfigSelected = this.onRobotConfigSelected.bind(this)
+    this.onUploadConfigClicked = this.onUploadConfigClicked.bind(this)
+    this.onUploadConfigFileChange = this.onUploadConfigFileChange.bind(this)
+    this.onDownloadSampleConfigClicked = this.onDownloadSampleConfigClicked.bind(this)
 
-    this.renderSimulatorSelector = this.renderSimulatorSelector.bind(this)
     this.renderRobotConfigSelector = this.renderRobotConfigSelector.bind(this)
+    this.renderRobotConfigUpload = this.renderRobotConfigUpload.bind(this)
     this.renderFieldPair = this.renderFieldPair.bind(this)
     this.renderData = this.renderData.bind(this)
   }
@@ -126,15 +189,6 @@ class NepiIFSim extends Component {
     this.setState({ status_msg: message })
   }
 
-  // Handler for the simulator Select. Publishes a std_msgs/String to the sim
-  // namespace select_simulator topic.
-  onSimulatorSelected(event) {
-    const namespace = this.getSimNamespace()
-    if (namespace != null && namespace !== 'None') {
-      this.props.ros.sendStringMsg(namespace + '/select_simulator', event.target.value)
-    }
-  }
-
   // Handler for the robot config Select. Publishes a std_msgs/String to the sim
   // namespace select_robot_config topic. Selecting a config selects a kind of
   // robot, so the device re-derives and republishes its capability report --
@@ -147,41 +201,48 @@ class NepiIFSim extends Component {
     }
   }
 
-  // Simulator selector, backed by the status message's reported lists. Populated
-  // from available_simulators / available_simulator_names, both of which the
-  // device fills by scanning live ROS state for devices that declare themselves
-  // simulators. An empty list means no simulator is running right now; the
-  // selector still renders, showing only None.
-  renderSimulatorSelector() {
-    const status_msg = this.state.status_msg
-    if (status_msg == null) {
-      return null
+  // Opens the hidden file picker below -- kept as a separate, visible Button
+  // rather than styling the raw <input type="file"> itself, matching every
+  // other control in this component.
+  onUploadConfigClicked() {
+    if (this.uploadInputRef.current != null) {
+      this.uploadInputRef.current.click()
     }
+  }
 
-    const available = (status_msg.available_simulators !== undefined)
-      ? status_msg.available_simulators : []
-    const names = (status_msg.available_simulator_names !== undefined)
-      ? status_msg.available_simulator_names : []
-    const selected = (status_msg.selected_simulator !== undefined && status_msg.selected_simulator !== '')
-      ? status_msg.selected_simulator : 'None'
-
-    var items = []
-    items.push(<Option key={'None'} value={'None'}>{'None'}</Option>)
-    for (var i = 0; i < available.length; i++) {
-      const display = (names[i] !== undefined && names[i] !== '') ? names[i] : available[i]
-      items.push(<Option key={available[i]} value={available[i]}>{display}</Option>)
+  // Reads the picked file as text and publishes it whole to
+  // sim/upload_robot_config (std_msgs/String) -- the device parses it as
+  // YAML, validates it, and applies it immediately on success (see
+  // uploadRobotConfigCb). Any parse/validation failure is reported the same
+  // way an unrecognized robot config selection already is: a pub_warn from
+  // the device, not a round trip back through this component.
+  onUploadConfigFileChange(event) {
+    const file = (event.target.files && event.target.files.length > 0)
+      ? event.target.files[0] : null
+    event.target.value = ''  // allow re-picking the same file next time
+    const namespace = this.getSimNamespace()
+    if (file == null || namespace == null || namespace === 'None') {
+      return
     }
+    const reader = new FileReader()
+    reader.onload = () => {
+      this.props.ros.sendStringMsg(namespace + '/upload_robot_config', String(reader.result))
+    }
+    reader.readAsText(file)
+  }
 
-    return (
-      <Label title={"Simulator"}>
-        <Select
-          onChange={this.onSimulatorSelected}
-          value={selected}
-        >
-          {items}
-        </Select>
-      </Label>
-    )
+  // Client-side only -- SAMPLE_ROBOT_CONFIG_YAML is a static reference file,
+  // not device state, so there is nothing to fetch over ROS for this.
+  onDownloadSampleConfigClicked() {
+    const blob = new Blob([SAMPLE_ROBOT_CONFIG_YAML], { type: 'text/yaml' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = 'sample_robot_config.yaml'
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    URL.revokeObjectURL(url)
   }
 
   // Robot config selector, backed by the status message's reported list of named
@@ -223,6 +284,31 @@ class NepiIFSim extends Component {
           {items}
         </Select>
       </Label>
+    )
+  }
+
+  // Upload-your-own-robot option, offered right alongside the Robot Config
+  // selector above rather than buried somewhere else -- uploading one both
+  // adds it to that selector (as whatever display_name it declares) and
+  // selects it immediately, so this and the selector are really one choice,
+  // not two features. Download Sample gives a concrete, correctly-shaped
+  // starting point instead of requiring a reference to the schema
+  // documented anywhere else.
+  renderRobotConfigUpload() {
+    return (
+      <React.Fragment>
+        <input
+          type="file"
+          accept=".yaml,.yml,text/yaml"
+          ref={this.uploadInputRef}
+          style={{ display: 'none' }}
+          onChange={this.onUploadConfigFileChange}
+        />
+        <ButtonMenu>
+          <Button onClick={this.onUploadConfigClicked}>{"Upload Robot Config"}</Button>
+          <Button onClick={this.onDownloadSampleConfigClicked}>{"Download Sample Config"}</Button>
+        </ButtonMenu>
+      </React.Fragment>
     )
   }
 
@@ -335,8 +421,36 @@ class NepiIFSim extends Component {
 
         {(show_selectors === true) ?
           <React.Fragment>
-            {this.renderSimulatorSelector()}
+            {/* NepiIFSimLauncher's own target selector below IS the
+                Simulator selector for this whole panel -- it already lists
+                every real option (Gazebo/Webots/Stage/PyBullet/WPILib).
+                This component used to render a SECOND "Simulator" selector
+                here, backed by available_simulators/select_simulator (live
+                discovery of OTHER NEPI devices that declare themselves
+                simulators -- see getAvailableSimulators/simDiscoveryCb in
+                sim_connector_app_node.py, a deliberately different axis
+                from the SSH launch-target list). That mechanism stays
+                intact server-side for a possible future use, but nothing
+                on this deployment ever populates it, so showing it here
+                just produced two same-titled, mostly-empty-vs-real
+                "Simulator" fields stacked on top of each other -- removed
+                rather than merged, since the two lists mean genuinely
+                different things (already-connected device vs.
+                launch-this-on-the-VM) and forcing them into one dropdown
+                would misrepresent both. */}
             {this.renderRobotConfigSelector()}
+            {this.renderRobotConfigUpload()}
+            {/* Deploy/Kill/Install for the additive simulator auto-launch
+                capability (see docs/SIMULATOR_AUTO_LAUNCH_PLAN.md) -- lives
+                directly under Robot Config rather than as its own titled
+                section, since choosing a model above and clicking Deploy
+                here is one flow, not two. make_section={false} is
+                NepiIFSimLauncher's own default now, but named explicitly
+                here since this IS the one place it's meant to render. */}
+            <NepiIFSimLauncher
+              namespace={namespace}
+              make_section={false}
+            />
           </React.Fragment>
         : null}
 
