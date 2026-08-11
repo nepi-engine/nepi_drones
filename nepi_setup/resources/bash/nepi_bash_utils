@@ -1,0 +1,5228 @@
+#!/bin/bash
+
+##
+## Copyright (c) 2024 Numurus <https://www.numurus.com>.
+##
+## This file is part of nepi setup tools (nepi_setup) repo
+## (see https://github.com/nepi-engine/nepi_setup)
+##
+## License: nepi setup tools are licensed under the "Numurus Software License", 
+## which can be found at: <https://numurus.com/wp-content/uploads/Numurus-Software-License-Terms.pdf>
+##
+## Redistributions in source code must retain this top-level comment block.
+## Plagiarizing this software to sidestep the license obligations is illegal.
+##
+## Contact Information:
+## ====================
+## - mailto:nepi@numurus.com
+##
+
+
+# This file contains nepi bash utility functions
+
+#echo "########################"
+#echo "STARTING NEPI Bash Utils"
+#echo "########################"
+
+
+
+
+if [[ ! -n $CONFIG_USER ]]; then
+    CONFIG_USER=$(id -un)
+    if [[ ${CONFIG_USER} == 'root' ]]; then
+        CONFIG_USER=$SUDO_USER
+    fi
+fi
+if [[ ! -n $CONFIG_USER ]]; then
+    id -nu 1000
+fi
+
+export CONFIG_USER=$CONFIG_USER
+export USER=$CONFIG_USER
+
+
+CURRENT_DIR=$(pwd)
+nepi_alias_file=$(basename "${BASH_SOURCE[1]}")
+export BASH_FOLDER=$(cd -P "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
+#echo "BASH_FOLDER ${BASH_FOLDER}"
+
+##############################
+##### NEPI SETTINGS #####
+export NEPI_BASH_UTILS=${BASH_FOLDER}/.nepi_bash_utils
+
+export NEPI_MODE=SYSTEM
+
+export NEPI_USER=nepi
+export NEPI_ADMIN_USER=nepiadmin
+export NEPI_HOST_USER=nepihost
+
+export NEPI_IP=192.168.179.103
+export NEPI_DEVICE_ID=device1
+export NEPI_RECOVERY_DEVICE_ID=device1
+export NEPI_RECOVERY_IP=192.168.179.103
+export NEPI_IN_CONTAINER=1
+export REMOTE_IP=192.168.179.5
+
+export NEPI_HOME=/home/$CONFIG_USER
+export NEPI_BASE='/opt/nepi'
+export NEPI_ENGINE=${NEPI_BASE}/nepi_engine
+export NEPI_STORAGE='/mnt/nepi_storage'
+export NEPI_FACTORY_CONFIG='/mnt/nepi_config/factory_cfg'
+export NEPI_SYSTEM_CONFIG='/mnt/nepi_config/system_cfg'
+export NEPI_DOCKER_CONFIG='/mnt/nepi_config/docker_cfg'
+
+export NEPI_SSH_FOLDER="/home/${CONFIG_USER}/.ssh"
+export SSH_ENV="$HOME/.ssh/environment"
+export NEPI_SSH_ENV="${NEPI_SSH_FOLDER}/environment"
+export NEPI_SSH_KEY_FILE=nepi_default_ssh_key
+export NEPI_SSH_KEY_PATH="${NEPI_SSH_FOLDER}/${NEPI_SSH_KEY_FILE}"
+
+if [ -f "${NEPI_SSH_ENV}" ]; then
+  run_ssh_env;
+  ps -ef | grep ${SSH_AGENT_PID} | grep ssh-agent$ > /dev/null || {
+    start_ssh_agent;
+  }
+else
+  : # Do Nothing
+fi
+
+
+export NEPI_TARGet_wired_ip=$NEPI_IP
+export NEPI_TARGET_USERNAME=$NEPI_USER
+export NEPI_TARGET_SRC_DIR=${NEPI_STORAGE}/nepi_src
+
+export NEPI_REPO_ADDRESS_DEFAULT='git@github.com:nepi-engine/nepi_engine_ws.git'
+export NEPI_REPO_ADDRESS='git@github.com:nepi-engine/nepi_engine_ws.git'
+export NEPI_REPO_NAME=$(basename "${NEPI_REPO_ADDRESS%.*}")
+export NEPI_REPO_FOLDER="/home/${CONFIG_USER}/${NEPI_REPO_NAME}"
+
+export NEPI_BUILD_REPO_NAME=${NEPI_REPO_NAME}
+export NEPI_BUILD_REPO_FOLDER="${NEPI_STORAGE}/nepi_src/${NEPI_BUILD_REPO_NAME}"
+
+export NEPI_SETUP_REPO_NAME='nepi_setup'
+export NEPI_SETUP_REPO_FOLDER="/home/${CONFIG_USER}/${NEPI_SETUP_REPO_NAME}"
+
+
+export HAILO_LOGGER_LEVEL=NONE
+
+
+
+alias nepimode="
+echo ${NEPI_MODE}
+"
+
+
+function NSETUP() {
+  if [[ -d $NEPI_REPO_FOLDER ]]; then
+    NEPI_SETUP_FOLDER="${NEPI_REPO_FOLDER}/nepi_setup"
+    # if [[ -d ${NEPI_SETUP_REPO_FOLDER} ]]; then
+    #   rm -r $NEPI_SETUP_REPO_FOLDER >/dev/null 2>&1
+    # fi
+  elif [[ -d $NEPI_BUILD_REPO_FOLDER ]]; then
+    NEPI_SETUP_FOLDER="${NEPI_BUILD_REPO_FOLDER}/nepi_setup"
+    # if [[ -d ${NEPI_SETUP_REPO_FOLDER} ]]; then
+    #   rm -r $NEPI_SETUP_REPO_FOLDER >/dev/null 2>&1
+    # fi
+  else
+    NEPI_SETUP_FOLDER="${NEPI_SETUP_REPO_FOLDER}"
+  fi
+  echo "${NEPI_SETUP_FOLDER}"
+}
+export -f NSETUP
+
+function NRUI_IP() {
+  rui_ip=$NEPI_IP
+  if [[ ${NEPI_MODE} == 'HOST' ]]; then
+    rui_ip=localhost
+  fi
+  echo "${rui_ip}"
+}
+export -f NRUI_IP
+
+
+
+
+###############################
+
+utilsn=""
+
+###################################
+# System Check Functions
+###################################
+
+# Function to check if a variable is not blank
+function is_not_blank() {
+  # Strip all whitespace characters using parameter expansion (Bash specific)
+  val=$1
+  if [[ -n $val ]]; then
+    local trimmed_var="${val//[[:space:]]/}"
+    
+    # Check if the length of the trimmed string is non-zero
+    if [[ -n "$trimmed_var" ]]; then
+      return 0
+    else
+      return 1
+    fi
+  else
+    return 1
+  fi
+}
+
+export -f is_not_blank
+
+
+
+function is_valid_uid() {
+    local input=$1
+
+    # Regular expression for a common Linux username format
+    # Starts with a lowercase letter or underscore, followed by 0-31 lowercase letters, numbers, hyphens, or underscores.
+    USERNAME_REGEX="^[a-z_][a-z0-9_-]{0,31}$"
+
+    if [[ ! "$input" =~ $USERNAME_REGEX ]]; then
+        echo "Variable '$input' is NOT a valid Linux username format."
+    fi
+    return 0
+    }
+export -f is_valid_uid
+
+function is_valid_pw() {
+    local input=$1
+
+    if [ -z "$input" ]; then
+        echo "Passwords can not be blank string."
+        return 1
+    fi
+
+    if [[ "$input" == "encrypted" ]]; then
+        echo "Password already encrypted"
+        return 1
+    fi
+
+  case "$input" in
+      *[[:space:]]*|*/*|*\\*)
+          echo "Passwords can not contain spaces or slashes."
+          ;;
+      *)
+  esac
+    return 0
+    }
+export -f is_valid_pw
+
+function is_valid_wpa2_pw() {
+    local pass="$1"
+    
+    # 1. Check length (8 to 63 chars)
+    if [[ ${#pass} -lt 8 || ${#pass} -gt 63 ]]; then
+        echo "Error: Password must be 8 to 63 characters long."
+        return 1
+    fi
+
+    # 2. Check for only printable ASCII characters
+    if [[ ! "$pass" =~ ^[\x20-\x7E]+$ ]]; then
+        echo "Error: Password contains invalid or non-ASCII characters."
+        return 1
+    fi
+
+    #echo "Valid WPA2 password."
+    return 0
+}
+
+export -f is_valid_wpa2_pw
+
+function is_valid_did() {
+    local input=$1
+
+    # Check for empty string
+    if [ -z "$input" ]; then
+        echo "NEPI Device ID's can not be blank string."
+        return 1
+    fi
+    # Check that first char is a letter
+    if [[ ! "$input" =~ ^[a-zA-Z] ]]; then
+        echo "The first character or NEPI Device ID must be a letter."
+        return 1
+    fi
+    # Check if input is only letters numbers and underscores with no spaces
+    if [[ ! "$input" =~ ^[a-zA-Z0-9_]+$ ]]; then
+        echo "NEPI Device ID's must be only letters, numbers, and underscores with no spaces."
+        return 1
+    fi
+    return 0
+    }
+export -f is_valid_did
+
+function is_valid_string() {
+    local input=$1
+
+    # Check for empty string
+    if [ -z "$input" ]; then
+        echo "NEPI Model Name can not be blank string."
+        return 1
+    fi
+    return 0
+    }
+export -f is_valid_string
+
+function is_valid_sn() {
+    local input=$1
+    # Check for empty string
+    if [ -z "$input" ]; then
+        echo "NEPI Serial Numbers can not be blank string."
+        return 1
+    fi
+    # Check if serial number is valid 6 digit number
+    if [[ ! "$input" =~ ^[0-9]{6}$ ]]; then
+        echo "'$input' is NOT a 6-digit number."
+        return 1
+    fi
+
+    if [[ ! "$input" =~ ^[1-9][0-9]* ]]; then
+        echo "'NEPI Serial Numbers must start with non-zero number."
+        return 1
+    fi
+
+    return 0
+    }
+export -f is_valid_sn
+
+function is_valid_ipv4() {
+    local input=$1
+
+    # Check if the format matches a general IP pattern (e.g., 1.2.3.4)
+    if ! [[ $input =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        echo "Not a valid IP Address format #.#.#.#"
+        return 1 # Invalid format
+    fi
+
+    # Split the IP address into octets and check their values
+    IFS='.' read -r -a octets <<< "$input"
+    for octet in "${octets[@]}"; do
+        if (( octet < 0 || octet > 255 )); then
+            return 1 # Octet out of range
+        fi
+    done
+
+
+    return 0 # Valid IP address
+}
+export -f is_valid_ipv4
+  
+
+function is_valid_netmask() {
+    local input=$1
+    if [[ -n "$input" ]]; then
+      if [[ "$input" -ge 0 && "$input" -le 32 ]]; then
+        return 0 # Valid Netmask address
+      else
+        echo "Not a valid Netmask between 0 and 32"
+        return 1 # Invalid format
+      fi
+    else
+        echo "Netmask empty, not valid"
+        return 1 # Invalid format
+    fi
+}
+export -f is_valid_netmask
+
+
+
+function is_valid_ipv4_netmask() {
+    local input=$1
+    ip="${input%%/*}"
+    nm=''
+    if [[ "$input" == *"/"* ]]; then
+      nm="${input#*/}"
+    fi
+    if is_valid_ipv4 $ip; then
+      if is_valid_netmask $nm; then
+        return 0 # Valid IP and Netmask
+      else
+        return 1 # Invalid Netmask
+      fi
+    else
+      return 1 # Invalid IP address format
+    fi
+}
+export -f is_valid_ipv4_netmask
+
+
+
+
+is_valid_net_hw() {
+    if [[ -d "/sys/class/net/$1" ]]; then
+        return 0  # True: interface exists
+    else
+        return 1  # False: interface does not exist
+    fi
+}
+export -f is_valid_net_hw
+
+is_valid_net_id() {
+    net_id="$1"
+    if [[ -z net_id ]]; then
+      echo "No Net ID name passed"
+      return 1
+    fi 
+    if nmcli -t connection show | grep -q "$net_id"; then
+        return 0  # True: id exists
+    else
+        return 1  # False: id does not exist
+    fi
+}
+export -f is_valid_net_id
+
+
+function is_wired_hw() {
+  net_wired=$(nmcli -t -f DEVICE,TYPE device status | grep ":ethernet$" | cut -d: -f1)
+  if [[  $? -eq 0 &&  -n $net_wired ]]; then
+    echo "Wired Hardware Found"
+    return 0
+  fi
+  echo "No Wired Hardware Found"
+  return 1
+}
+export -f is_wired_hw
+
+
+function is_wifi_hw() {
+  net_wifi=$(nmcli -t -f DEVICE,TYPE device status | grep ":wifi$" | cut -d: -f1)
+  if [[  $? -eq 0 &&  -n $net_wifi ]]; then
+    echo "Wifi Hardware Found"
+    return 0
+  fi
+  echo "No Wifi Hardware Found"
+  return 1
+}
+export -f is_wifi_hw
+
+
+
+
+function is_wifi_enabled() {
+    if ! is_wifi_hw; then
+        return 1
+    fi
+    if nmcli radio wifi | grep -q "enabled"; then
+        echo "WiFi is enabled."
+        return 0
+    else
+        echo "WiFi is disabled."
+        return 1
+    fi
+}
+
+export -f is_wifi_enabled
+
+function is_wifi_avalable() {
+    if is_wifi_enabled; then
+      net_wifi=$(nmcli -t -f SSID dev wifi > /dev/null 2>&1)
+      if [[ $? -eq 0 && -n $net_wifi ]]; then
+        return 1
+      fi
+    else
+      return 1
+    fi
+    return 0
+}
+
+export -f is_wifi_avalable
+
+function is_wifi_connected() {
+    if nmcli -t -f TYPE,STATE device | grep -q "wifi:connected"; then
+        echo "Wi-Fi is connected."
+        return 0
+    else
+        echo "Wi-Fi is disconnected."
+        return 1
+    fi
+}
+
+export -f is_wifi_connected
+
+function is_wifi_ap() {
+    local interface=""
+    local mode=""
+    local found=false
+
+    # Iterate through all available wifi interfaces
+    for interface in $(ls /sys/class/net/ 2>/dev/null); do
+        # Verify it is a wifi interface by checking for the wifi extension
+        if iwconfig "$interface" 2>/dev/null | grep -q "no wifi extensions"; then
+            continue
+        fi
+
+        # Check the current operational mode of the adapter
+        mode=$(iwconfig "$interface" 2>/dev/null | grep -o 'Mode:[A-Za-z]*' | cut -d: -f2)
+
+        # "Master" or "AP" indicates Access Point mode
+        if [[ "$mode" == "Master" ]]; then
+            echo "Access Point active on interface: $interface"
+            found=true
+        fi
+    done
+
+    if ! $found; then
+        echo "No Wi-Fi Access Point is currently set up on any adapter."
+        return 1
+    fi
+}
+
+export -f is_wifi_ap
+
+
+function is_valid_nepi() {
+    ip="${NEPI_IP%%/*}"
+    if ! timeout 1 ping -c 1 -W 1 ${ip} > /dev/null 2>&1; then
+        echo "No NEPI Connection at ${ip}"
+        return 1
+    else
+        echo "NEPI Connected at ${ip}"
+    fi
+}
+
+export -f is_valid_nepi
+
+function is_valid_internet(){
+    if ! ping -c 2 google.com; then
+        echo "No Internet Connection"
+        return 1
+    else
+        echo "Internet Connected"
+        return 0
+    fi
+}
+export -f is_valid_internet
+
+function is_valid_path() {
+    local input=$1
+    if [[ ! -e "$input" ]]; then
+        echo "'Path ${input} not found."
+        return 1
+    fi
+    return 0 # Valid folder
+}
+export -f is_valid_path
+
+function is_valid_folder() {
+    local input=$1
+    if [[ ! -d "$input" ]]; then
+        echo "'Path ${input} not found."
+        return 1
+    fi
+    return 0 # Valid folder
+}
+export -f is_valid_folder
+
+function is_valid_file() {
+    local input=$1
+    if [[ ! -f "$input" ]]; then
+        echo "'Path ${input} not found."
+        return 1
+    fi
+    return 0 # Valid folder
+}
+export -f is_valid_file
+
+function is_valid_bool() {
+    local input=$1
+    if [[ "$input" != "1" && "$input" != "0" ]]; then
+        echo "'Input not valid. Enter a 1 or 0"
+        return 1
+    fi
+    return 0 # Valid Bool
+}
+export -f is_valid_bool
+
+
+function is_in_string() {
+  substring="$1"
+  checkstring="$2"
+  if [[ -n $substring && -n $checkstring ]]; then
+    flatstring="${checkstring//$'\\n'/}"
+    if [[ "$flatstring" == *"substring"* ]]; then
+        return 0
+    fi
+  fi
+  return 1
+}
+
+
+function is_valid_arm64(){
+    arch_check="arm64"
+    arch_val=$(uname -m)
+    if [[ "$arch_val" == "aarch64" ]]; then
+        echo "System Arch is ${arch_check}"
+        return 0
+    else
+        return 1
+    fi
+}
+export -f is_valid_arm64
+
+
+function is_valid_jetson(){
+if [ -f /etc/nv_tegra_release ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+export -f is_valid_jetson
+
+function is_valid_amd64(){
+    arch_check="amd64"
+    arch_val=$(uname -m)
+    if [[ "$arch_val" == "x86_64" ]]; then
+        echo "System Arch is ${arch_check}"
+        return 0
+    else
+        return 1
+    fi
+}
+export -f is_valid_amd64
+
+
+function is_valid_ubuntu() {
+    if [[ -f /etc/os-release ]]; then
+        source /etc/os-release
+        if [[ "$ID" == "ubuntu" || "$ID_LIKE" == *"ubuntu"* ]]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+export -f is_valid_ubuntu
+
+function is_valid_rpi(){
+  if grep -q "Raspberry Pi" /proc/device-tree/model 2>/dev/null; then
+    return 0
+  else
+    return 1
+  fi
+}
+export -f is_valid_rpi
+
+
+function is_valid_cuda(){
+    no_cuda=1
+    lspci 2>/dev/null | grep -i nvidia
+    if [[ "$?" -eq 0 ]]; then
+      no_cuda=0
+    else
+      lspci 2>/dev/null | grep -i NVIDA
+      if [[ "$?" -eq 0 ]]; then
+        no_cuda=0
+      fi  
+    fi
+    return $no_cuda
+}
+export -f is_valid_cuda
+
+function is_valid_hailo_hw(){
+    if ! lspci -k 2>/dev/null | grep -iq "hailo"; then
+      echo "Hailo Device Not Found"
+      return 1
+    fi
+    echo "Hailo Device Found"
+}
+export -f is_valid_hailo_hw
+
+function is_valid_hailo_sw(){
+    if hailortcli fw-control identify >/dev/null 2>&1; then
+      echo "Hailo Software Found"
+      return 0
+    else
+      echo "Hailo Software Not Found"
+      return 1
+    fi
+}
+export -f is_valid_hailo_sw
+
+function is_valid_hailo(){
+    if ! is_valid_hailo_hw; then
+      return 1
+    fi
+    if ! is_valid_hailo_sw; then
+      retun 1
+    fi
+    hailo_info=$(hailortcli fw-control identify | tr -d '\0' 2>/dev/null)
+    if [[ $? -eq 0 && -n $hailo_info ]]; then
+      echo "Hailo Softwar Found Hailo Device"
+      return 0
+    else
+      echo "Hailo Software Failed to Find Hailo Device"
+      return 1
+    fi
+}
+export -f is_valid_hailo
+
+function is_space_avail_mb(){
+    local check_path=$1
+    local req_space=$2
+    if ! is_valid_folder $check_path; then
+      #echo "Not a valid folder ${check_path}"
+      return 1
+    else
+      avail_space=$(path_space_mb $check_path)
+      #echo "Aval Space: ${avail_space}"
+      #echo "Req Space: ${req_space}"
+      if [[ "$avail_space" -lt "$req_space" ]]; then
+        #echo "Not enough space ${check_path}"
+        return 1
+      else
+        return 0
+      fi
+    fi
+}
+export -f is_space_avail_mb
+
+function is_space_avail_gb(){
+    local check_path=$1
+    local req_space=$2
+    if ! is_valid_folder $check_path; then
+      #echo "Not a valid folder ${check_path}"
+      return 1
+    else
+      avail_space=$(path_space_gb $check_path)
+      #echo "Aval Space: ${avail_space}"
+      #echo "Req Space: ${req_space}"
+      if [[ "$avail_space" -lt "$req_space" ]]; then
+        #echo "Not enough space ${check_path}"
+        return 1
+      else
+        return 0
+      fi
+    fi
+}
+export -f is_space_avail_gb
+
+function is_nepi_path(){
+    local check_path=$1
+    if [[ ! -e "$check_path" ]]; then
+      echo "Path not found at ${check_path}"
+      return 1
+    fi
+
+    if [[ ":$check_path:" == *"${NEPI_BASE}"* ]]; then
+      return 0
+    fi
+
+    if [[ ":$check_path:" == *"/mnt/nepi_storage"* ]]; then
+      return 0
+    fi
+
+    if [[ ":$check_path:" == *"/mnt/nepi_config"* ]]; then
+      return 0
+    fi
+    if [[ ":$check_path:" == *"/mnt/nepi_config"* ]]; then
+      return 0
+    fi
+    if [[ ":$check_path:" == *"/home"* ]]; then
+      return 0
+    fi
+
+    return 2
+    
+}
+export -f is_nepi_path
+
+function is_valid_email() {
+    local email=$1
+    # A simple regex for email validation (approximates RFC 5322)
+    local regex="^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,4}$"
+
+    if [[ "$email" =~ $regex ]]; then
+        return 0  # Valid
+    else
+        return 1  # Invalid
+    fi
+}
+
+export -f is_valid_email
+
+
+utilsn="${utilsn}
+################################
+### SYSTEM CHECK FUNCTIONS
+################################
+*** These checks return 0 error value if true ***
+is_not_blank = Check if variable is blank
+is_valid_uid = Check for valid user id name
+is_valid_pw = Check for valid user password
+is_valid_wpa2_pw = Check for valid WPA2 password
+is_valid_did = Check for valid device id name
+is_valid_string = Check that string is not empty
+is_valid_sn = Check for valid nepi serial number
+is_valid_ipv4 = Check for valid ip address
+is_valid_netmask = Check for valid ip netmask
+is_valid_ipv4_netmask = Check for valid ip and netmask
+is_valid_net_hw = Check if passed network adapter exists
+is_valid_net_id = Check if passed network adapter id exists
+is_wired_hw = Check if a wired ethernet adapter installed
+is_wifi_hw = Check if a wifi adapter installed
+is_wifi_enabled = Check if WiFi hardware is enabled
+is_wifi_available = Check if WiFi hardware detects any WiFi networks
+is_wifi_connected = Check if WiFi hardware connected WiFi network
+is_wifi_ap = Check if WiFi Access Point is Enabled
+is_valid_internet = Check for internet connection
+is_valid_nepi = Check if system can ping nepi address at ${NEPI_IP}
+is_valid_path = Check for path
+is_valid_folder = Check for folder
+is_valid_file = Check for file
+is_valid_bool = Check for valid bash bool - 0 or 1
+is_in_string = Check if passed substring in passed string
+is_valid_jetson = Check if device is an NVIDIA Jetson system
+is_valid_ubuntu = Check if system is on a Ubuntu OS
+is_valid_rpi = Check if system is on a Raspberry Pi
+is_valid_arm64 = Check if device is arm64 arch
+is_valid_amd64 = Check if device is amd64 arch
+is_valid_cuda = Check if system has CUDA
+is_valid_hailo_hw = Check if system has Halio Module
+is_valid_hailo_sw = Check if system has Halio Software
+is_valid_hailo = Check if Hailo software found Hailo module
+is_space_avail_mb = Check folder for REQ_SPACE in MB
+is_space_avail_gb = Check folder for REQ_SPACE in GB
+is_nepi_path = Check if path in either a nepi managed folder
+is_valid_email = Check if email is valid format"
+
+
+
+###################################
+# System Util Functions
+###################################
+
+
+
+function echov(){
+    local var_name="$1"
+    echo "${!var_name}"
+}
+export -f echov
+
+function echonv(){
+    local var_name="$1"
+    echo "$var_name: ${!var_name}"
+}
+export -f echonv
+
+function echoce(){
+    local cmd="$1"
+    eval $cmd >/dev/null 2>&1 
+    error=$?
+    if [[ $error -ne 0 ]]; then
+      echo "error: ${error}"
+      return 0
+    fi
+}
+export -f echoce
+
+
+
+
+#######################
+
+
+# ping self
+function pinga(){
+    address=$1
+    if [[ -n $address ]]; then
+        ip="${address%%/*}"
+      if ! timeout 1 ping -c 1 -W 1 ${ip} > /dev/null 2>&1; then
+          echo "No Connection at ${ip}"
+          return 1
+      else
+          echo "Connected at ${ip}"
+      fi
+    else
+          echo "No IP Address Provide"
+          return 1
+    fi
+    
+}
+export -f pinga
+
+# ping internet
+function pingi(){
+    if ! timeout 1 ping -c 1 -W 1 google.com > /dev/null 2>&1; then
+        echo "No Internet Connection"
+        return 1
+    else
+        echo "Internet Connected"
+    fi
+}
+export -f pingi
+
+# ping self
+function pings(){
+    if [[ $NEPI_MODE == 'REMOTE' ]]; then
+      ip="${REMOTE_IP%%/*}"
+    else
+      ip="${NEPI_IP%%/*}"
+    fi
+    if ! timeout 1 ping -c 1 -W 1 ${ip} > /dev/null 2>&1; then
+        echo "No Connection at ${ip}"
+        return 1
+    else
+        echo "Connected at ${ip}"
+    fi
+}
+export -f pings
+
+
+
+# ping nepi
+function pingn(){
+    ip="${NEPI_IP%%/*}"
+    if ! timeout 1 ping -c 1 -W 1 ${ip} > /dev/null 2>&1; then
+        echo "No NEPI Connection at ${ip}"
+        return 1
+    else
+        echo "NEPI Connected at ${ip}"
+    fi
+}
+export -f pingn
+
+
+# ping nepi continously
+function pingnc(){
+  ping "${NEPI_IP%%/*}"
+}
+export -f pingnc
+
+
+alias sbrc="
+source /home/${CONFIG_USER}/.bashrc"
+
+
+## NEPI deploy complete
+function ubrc_remote() {
+sudo -v
+source $(NSETUP)/scripts/remote_bash_setup.sh $skip_software
+source /home/${CONFIG_USER}/.bashrc
+}
+
+function ubrc_host() {
+sudo -v
+source $(NSETUP)/scripts/docker_bash_setup.sh $skip_software
+source /home/${CONFIG_USER}/.bashrc
+}
+
+function ubrc_system() {
+sudo -v
+source $(NSETUP)/scripts/nepi_bash_setup.sh $skip_software
+source /home/${CONFIG_USER}/.bashrc
+}
+
+
+function ubrc() {
+sudo -v
+nepi_mode=${NEPI_MODE}
+echo "NEPI_MODE: ${nepi_mode}"
+if [[ ${nepi_mode} == 'REMOTE' ]]; then 
+  ubrc_remote
+elif [[ ${nepi_mode} == 'HOST' ]]; then 
+  ubrc_host
+elif [[ ${nepi_mode} == 'SYSTEM' ]]; then 
+  ubrc_system
+fi
+}
+
+
+function ask_yes_no {
+    read -p "$1 ([y]es or [N]o): " choice
+    case "$(echo "$choice" | tr '[:upper:]' '[:lower:]')" in
+        y|yes) echo "yes" ;;
+        *) echo "no" ;;
+    esac
+}
+export -f ask_yes_no
+
+
+function nnet(){
+    sudo -v
+    if ! pingn; then
+      echo "Restarting NetworkManager"
+      sudo systemctl restart NetworkManager
+
+      # echo "Restarting Network"
+      # sudo systemctl restart networking
+      wait
+      ping -c 1 -W 1 $nepi_ip > /dev/null 2>&1
+      if [ $? -ne 0 ]; then
+        echo "Failed to connect NEPI IP address: ${nepi_ip}"
+      fi
+    fi
+    
+}
+export -f nnet
+
+
+function ndhcp(){
+  sudo -v
+    # ping -c 1 -W 1 8.8.8.8 > /dev/null 2>&1
+
+    # # Check the exit status of the ping command
+    # # 0 indicates success (internet connection)
+    # # Non-zero indicates failure (no internet connection)
+    # if [ $? -ne 0 ]; then
+    #   echo "Can't Ping Internet t 8.8.8.8"
+    #   return 1
+    # else
+    #   ping -c 1 -W 1 google.com > /dev/null 2>&1
+    #   if [ $? -ne 0 ]; then
+    #     echo "Can't Ping google.com"
+    #   return 1
+          echo "Resetting DHCP Clients"
+          echo "Killing existing DHCP clients"
+          sudo kill $(ps aux | grep 'dhclient' | awk '{print $2}') >/dev/null 2>&1
+          echo "Renewing dhclient"
+          sudo dhclient -nw > /dev/null 2>&1
+          #sudo kill $(ps aux | grep 'dhclient' | awk '{print $2}') >/dev/null 2>&1
+    #   fi
+    # fi
+    
+}
+export -f ndhcp
+
+
+function netget_ntp_ip(){
+  sudo -v
+  file=/etc/chrony/chrony.conf
+  if [ ! -f "$file" ]; then
+      return 1
+  else
+    addrs=$(grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' "$file")
+    if [[ -n "$addrs" ]]; then
+      echo $addrs
+    else
+      return 1
+    fi
+  fi 
+
+}
+export -f netget_ntp_ip
+
+
+function nclock(){
+      sudo -v
+      # This file sets up nepi bash aliases and util functions
+      # Check for internet connection by pinging a reliable public DNS server (e.g., Google's 8.8.8.8)
+      # -c 1: Send only one ping packet
+      # -W 1: Wait for 1 second for a response
+      ping -c 1 -W 1 $(netget_ntp_ip) > /dev/null 2>&1
+      if [ $? -ne 0 ]; then
+        ping -c 1 -W 1 8.8.8.8 > /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            echo "No Internet or NTP Server connection detected. Can't sync clocks"
+            return 1 # Exit with a non-zero status to indicate an error
+        fi
+      fi
+
+      
+     
+      if [[ "$(date +%Y)" -lt 2025 ]]; then
+        echo "NTP Server connection detected. Will try to sync clocks"
+        echo "Restarting chrony time service"
+        sudo systemctl restart chronyd
+        sleep 1
+        sudo chronyc -a makestep > /dev/null 2>&1
+      fi
+      #chronyc waitsync 1
+      # sudo chronyc -a makestep > /dev/null 2>&1
+      # echo "Forcing clock sync"
+      #sudo chronyc -a makestep > /dev/null 2>&1
+
+
+    if [[ "$(date +%Y)" -lt 2025 ]]; then
+        echo "Clock Not Updated"
+        return 1
+    else
+        echo "Clock Updated"
+    fi
+}
+export -f nclock
+
+
+
+function ninet(){
+  sudo -v
+  nnet
+  ndhcp # Enable DHCP internet connection if needed
+  if [[ $? -eq 0 ]]; then
+      sleep 4
+      wait
+      if ! pingi; then
+        return 1
+      fi
+      wait
+      sleep 1
+  fi
+  if ! nclock; then # Connect to NTP server
+      return 1
+  fi
+}
+export function ninet
+
+######################
+function netenable_wifi(){
+  if is_wifi_hw; then
+    sudo nmcli radio wifi on
+  fi
+}
+export -f netenable_wifi
+
+function netdisable_wifi(){
+  if is_wifi_hw; then
+    sudo nmcli radio wifi off
+  fi
+}
+export -f netdisable_wifi
+
+
+
+
+######################
+function netlist() {
+    find_type="$1"
+    
+    if [[ "$find_type" == 'bridge' ]]; then
+      dlist=$(nmcli -t -f DEVICE,TYPE device status | grep -E 'bridge' | cut -d: -f1)
+    elif [[ "$find_type" == 'all' ]]; then
+      dlist=$(nmcli -t -f DEVICE,TYPE device status | cut -d: -f1)
+    elif [[ "$find_type" == 'wired' ]]; then
+      dlist=$(nmcli -t -f DEVICE,TYPE device status | grep -E 'ethernet' | cut -d: -f1)
+    elif [[ "$find_type" == 'wifi' ]]; then
+      dlist=$(nmcli -t -f DEVICE,TYPE device status | grep -E 'wifi' | grep  -v 'wifi-' | cut -d: -f1)
+    else
+      dlist=$(nmcli -t -f DEVICE,TYPE device status | grep -E 'ethernet|wifi' | grep  -v 'wifi-' | cut -d: -f1)
+    fi
+
+    for word in $dlist; do
+
+      n_device=$word
+      n_type=$(nmcli -g GENERAL.TYPE device show $n_device)
+
+      d_name=$(nmcli -g GENERAL.CONNECTION device show $n_device)
+      if [[ -n $d_name ]]; then
+        n_name="${d_name}"
+        #ips_line=$(ip -4 addr show dev "$n_device" 2>/dev/null | awk '/inet / {print $2; exit}')
+        ips_line=$(ip -4 addr show $n_device | grep -oP '(?<=inet\s)\d+(\.\d+){3}/\d+')
+        ips_list=${ips_line// | /,}
+        d_ip=$(echo $ips_list | tr ',' '\n' | tac | paste -sd, -)
+        if [[ -n $d_ip ]]; then
+          n_ip="${d_ip// /,}"
+        else
+          n_ip="--"
+        fi
+      else
+        n_name="--"
+        n_ip="--"
+      fi
+      #echo "${d_name} : ${n_name}"
+      #echo "${d_ip} : ${n_ip}"
+
+
+      d_state=$(nmcli -g GENERAL.STATE device show $n_device)
+      if [[  "$n_type" == 'ethernet' && "$d_state" == *"connected"* ]]; then
+        n_state=connected
+      elif [[  "$n_type" == 'wifi' && "$d_state" == *"connected"* && "$n_name" != "--" ]]; then
+        n_state=connected
+      # elif [[ "$n_type" == 'ethernet' && "$n_name" == '--' ]]; then
+      #   n_state=disabled
+      elif [[ "$n_type" == 'wifi' && "$d_state" == *"unavailable"* ]]; then
+        n_state=disabled
+      # elif [[ "$n_type" == 'ethernet' && "$n_name" != '--' ]]; then
+      #   n_state=disconnected
+      # elif [[ "$d_state" == *"disconnected"* ]]; then
+      #   n_state=disconnected
+      else
+        n_state=disconnected
+      fi
+      #echo "${d_state} : ${n_state}"
+
+
+
+      echo "${n_device} | ${n_type##*-} | ${n_state} | ${n_name} | ${n_ip}"
+    done
+
+}
+export -f netlist
+
+
+
+function netlist_wired(){
+  find_type=wired
+  netlist $find_type
+}
+export -f netlist_wired
+
+function netlist_wifi(){
+  find_type=wifi
+  netlist $find_type
+}
+export -f netlist_wifi
+
+
+######################
+
+function netget_info(){
+      check="$1"
+      match=''
+      if [[ -z $check ]]; then
+        return 1
+      else          
+          nlist=$(netlist)
+          while IFS= read -r line; do
+              # 3. Print or process each line
+              #echo "Processing: $line"
+              readarray -d '|' -t line_array < <(printf '%s' "$line")
+
+
+              read -rd '' text <<< "${line_array[0]}"
+              read -r text <<< "$text"
+              line_hw=$text
+
+              read -rd '' text <<< "${line_array[1]}"
+              read -r text <<< "$text"
+              line_type=$text
+              
+              read -rd '' text <<< "${line_array[2]}"
+              read -r text <<< "$text"
+              line_state=$text
+              
+              read -rd '' text <<< "${line_array[3]}"
+              read -r text <<< "$text"
+              line_name=$text
+
+              read -rd '' text <<< "${line_array[4]}"
+              read -r text <<< "$text"
+              line_ip=$text
+
+
+
+              #echo "${line_name},${line_hw},${check}"
+              if [[ ${line_name} == ${check} ||
+                    ${line_ip} == *"${check}"* ||
+                    ${line_hw} == ${check} ||
+                    ${line_type} == ${check} ]]; then
+                
+                match="$line"
+              fi
+          done <<< "$nlist"      
+
+          if [[ -n $match ]]; then
+            echo ${match}
+          else
+            return 1
+          fi    
+    fi
+}
+export -f netget_info
+
+
+function netget_name(){
+
+  check_name="$1"
+  check_return=""
+  if [[ -z $check_name ]]; then
+    return 1
+  else          
+      nlist=$(netlist)
+      while IFS= read -r line; do
+          # 3. Print or process each line
+          #echo "Processing: $line"
+          readarray -d '|' -t line_array < <(printf '%s' "$line")
+
+          
+          read -rd '' text <<< "${line_array[0]}"
+          read -r text <<< "$text"
+          line_hw=$text
+
+          read -rd '' text <<< "${line_array[1]}"
+          read -r text <<< "$text"
+          line_type=$text
+          
+          read -rd '' text <<< "${line_array[2]}"
+          read -r text <<< "$text"
+          line_state=$text
+          
+          read -rd '' text <<< "${line_array[3]}"
+          read -r text <<< "$text"
+          line_name=$text
+
+          read -rd '' text <<< "${line_array[4]}"
+          read -r text <<< "$text"
+          line_ip=$text
+          
+          #echo "${line_name},${line_hw},${check_name}"
+          if [[ ${line_name} == ${check_name} || ${line_hw} == ${check_name} ]]; then
+            check_return="$line_name"
+          fi
+      done <<< "$nlist"      
+
+      if [[ -n $check_return  &&  "$check_return" != '--' ]]; then
+        echo ${check_return}
+      else
+        return 1
+      fi     
+  fi
+
+}
+
+export -f netget_name
+
+function netget_state(){
+      check_name="$1"
+      check_return=""
+      if [[ -z $check_name ]]; then
+        return 1
+      else          
+          nlist=$(netlist)
+          while IFS= read -r line; do
+              # 3. Print or process each line
+              #echo "Processing: $line"
+              readarray -d '|' -t line_array < <(printf '%s' "$line")
+
+              
+              read -rd '' text <<< "${line_array[0]}"
+              read -r text <<< "$text"
+              line_hw=$text
+
+              read -rd '' text <<< "${line_array[1]}"
+              read -r text <<< "$text"
+              line_type=$text
+              
+              read -rd '' text <<< "${line_array[2]}"
+              read -r text <<< "$text"
+              line_state=$text
+              
+              read -rd '' text <<< "${line_array[3]}"
+              read -r text <<< "$text"
+              line_name=$text
+
+              read -rd '' text <<< "${line_array[4]}"
+              read -r text <<< "$text"
+              line_ip=$text
+              
+              #echo "${line_name},${line_hw},${check_name}"
+              if [[ ${line_name} == ${check_name} || ${line_hw} == ${check_name} ]]; then
+                check_return="$line_state"
+              fi
+          done <<< "$nlist"      
+
+          if [[ -n $check_return  &&  "$check_return" != '--' ]]; then
+            echo ${check_return}
+          else
+            return 1
+          fi     
+    fi
+}
+export -f netget_state
+
+
+function netget_hw(){
+      check_name="$1"
+      check_return=""
+      if [[ -z $check_name ]]; then
+        return 1
+      else          
+          nlist=$(netlist)
+          while IFS= read -r line; do
+              # 3. Print or process each line
+              #echo "Processing: $line"
+              readarray -d '|' -t line_array < <(printf '%s' "$line")
+
+              
+              read -rd '' text <<< "${line_array[0]}"
+              read -r text <<< "$text"
+              line_hw=$text
+
+              read -rd '' text <<< "${line_array[1]}"
+              read -r text <<< "$text"
+              line_type=$text
+              
+              read -rd '' text <<< "${line_array[2]}"
+              read -r text <<< "$text"
+              line_state=$text
+              
+              read -rd '' text <<< "${line_array[3]}"
+              read -r text <<< "$text"
+              line_name=$text
+
+              read -rd '' text <<< "${line_array[4]}"
+              read -r text <<< "$text"
+              line_ip=$text
+              
+              #echo "${line_name},${line_hw},${check_name}"
+              if [[ ${line_name} == ${check_name} || ${line_hw} == ${check_name} ]]; then
+                check_return="$line_hw"
+              fi
+          done <<< "$nlist"      
+
+          if [[ -n $check_return  &&  "$check_return" != '--' ]]; then
+            echo ${check_return}
+          else
+            return 1
+          fi         
+    fi
+}
+export -f netget_hw
+
+
+
+
+function netget_wired_ipn(){
+      check_name="$1"
+      check_return=""
+      if [[ -z $check_name ]]; then
+        return 1
+      else          
+          nlist=$(netlist)
+          while IFS= read -r line; do
+              # 3. Print or process each line
+              #echo "Processing: $line"
+              readarray -d '|' -t line_array < <(printf '%s' "$line")
+
+              
+              read -rd '' text <<< "${line_array[0]}"
+              read -r text <<< "$text"
+              line_hw=$text
+
+              read -rd '' text <<< "${line_array[1]}"
+              read -r text <<< "$text"
+              line_type=$text
+              
+              read -rd '' text <<< "${line_array[2]}"
+              read -r text <<< "$text"
+              line_state=$text
+              
+              read -rd '' text <<< "${line_array[3]}"
+              read -r text <<< "$text"
+              line_name=$text
+
+              read -rd '' text <<< "${line_array[4]}"
+              read -r text <<< "$text"
+              line_ip=$text
+              
+              #echo "${line_name},${line_ip},${check_name}"
+              if [[ ${line_name} == ${check_name} || ${line_hw} == ${check_name} ]]; then
+                check_return="${line_ip%%,*}"
+              fi
+          done <<< "$nlist"      
+
+          if [[ -n $check_return  &&  "$check_return" != '--' ]]; then
+            echo ${check_return}
+          else
+            return 1
+          fi           
+    fi
+}
+export -f netget_wired_ipn
+
+
+
+function netget_wired_ip(){
+      check_name="$1"
+      ipn=$(netget_wired_ipn $check_name)
+      if [[ -z ipn ]]; then
+        return 1
+      fi
+      echo "${ipn%%/*}"
+
+}
+export -f netget_wired_ip
+
+
+function netget_aliases(){
+  check_name=$1
+  check_return=''
+  #echo $check_name
+  if [[ -n $check_name ]]; then
+    r_line=$(nmcli connection show $check_name | grep ipv4.addresses)
+    #echo $r_line
+    ipn_line=$(echo "${r_line#*ipv4.addresses:}" | sed -s 's/^[[:space:]]*//')
+    #echo $ip_line
+    if [[ "$ipn_line" != *","* ]]; then
+      return 1
+    fi
+    a_line="${ipn_line#*,}"
+    #echo $a_line
+    if [[ -n $a_line ]]; then
+              readarray -d ',' -t a_array < <(printf '%s' "$a_line")
+              for item in "${a_array[@]}"; do
+                  read -r ipn <<< "$item"
+                  #ip="${ipn%%/*}"
+                  if [[ "$ipn" != *"10.0.0"* ]]; then
+                    echo "$ipn"
+                  fi
+              done
+    else
+      return 1
+    fi 
+  fi
+
+}
+
+export -f netget_aliases
+
+function netget_wired_ip_aliases(){
+  check_name=$1
+  ipn_list=$(netget_aliases $check_name)
+  #echo $ipn_list
+  if [[ -n $ipns ]]; then
+          while IFS= read -r line; do
+              read -r text <<< "$line"
+              ip="${text%%/*}"
+              if [[ "$ip" != *"10.0.0"* ]]; then
+                echo "$ip"
+              fi
+          done <<< "$ipn_list"      
+
+  else
+    return 1
+  fi 
+}
+
+export -f netget_wired_ip_aliases
+
+
+function netget_router_ip(){
+    # Get the default gateway IP address
+    local router_ip=$(ip route | awk '/default/ {print $3; exit}')
+    if [[ -z $router_ip ]]; then
+      return 1
+    fi
+    if [[ "$router_ip" == *"192.168"* ]]; then
+      return 2
+    fi
+    echo $router_ip
+}
+export netget_router_ip
+
+
+function netget_wifi_networks(){
+  sudo nmcli dev wifi rescan
+  wifi_list=$(nmcli -t -f SSID dev wifi)
+  #echo $wifi_list
+  wifis=''
+  for wifi_avail in $wifi_list; do
+    if [[ "$wifis" != *"$wifi_avail"* ]]; then
+      #echo $wifis
+      echo "$wifi_avail"
+    fi
+    wifis="${wifis},${wifi_avail}"
+  done
+}
+export -f netget_wifi_networks
+
+
+
+
+
+
+######################
+function netselect(){
+        adapter_type=$1
+        selected_net=""
+        # Use 'ip -4 -o addr show' for a consistent, machine-readable output for IPv4 addresses only
+        # 'awk' is then used to parse the output and format it
+        if [[ "$adapter_type" == "all" ]]; then
+          nslist=$(netlist 'all') 
+        elif [[ "$adapter_type" == "wired" ]]; then
+          nslist=$(netlist_wired) 
+        elif [[ "$adapter_type" == "wifi" ]]; then
+          nslist=$(netlist_wifi) 
+        else
+          nslist=$(netlist) 
+        fi
+
+        if ! is_not_blank $nslist; then
+            return 1
+        fi
+        #echo $nslist
+        # Set IFS to | and read into an array
+        readarray -t adapters <<< "$nslist"
+        # adapters=("${adapters[@]:1}")
+        num_adapters=${#adapters[@]}
+        #echo "Found ${num_adapters} : ${adapters}"
+        
+        # Check if there are any adapters
+        if [[ $num_adapters -eq 0 ]]; then
+            #echo "No Networks Found"
+            return 1
+        fi
+
+        # Check if there are any adapters
+        if [[ $num_adapters -eq 1 ]]; then
+            adapter=${adapters[0]}
+            delimiter=" |"
+            selected_net=${adapter%%$delimiter*}
+            #echo "Using adapter ${selected_net}"
+        fi
+
+        if [[ -z $selected_net ]]; then
+          COLUMNS=1
+          select adapter in "${adapters[@]}"; do
+              if [[ -n "$adapter" ]]; then
+                  delimiter=" |"
+                  selected_net=${adapter%%$delimiter*}
+                  break
+              else
+                  selected_net=""
+                  echo "Invalid selection. Please try again."
+              fi
+          done
+        fi
+
+        
+        if [[ -n $selected_net ]]; then
+          echo "${selected_net}"
+          return 0
+        else
+          
+          return 1
+        fi
+
+}
+export -f netselect
+
+function netselect_wired(){
+        if ! is_wired_hw; then
+          return 1
+        else
+          selected_net=$(netselect "wired" | tail -n1 )
+          echo $selected_net
+        fi
+}
+export -f netselect_wired
+
+function netselect_wifi(){
+        if ! is_wifi_hw; then
+          return 1
+        else
+          selected_net=$(netselect "wifi" | tail -n1 )
+          echo $selected_net
+        fi
+}
+export -f netselect_wifi
+
+function netselect_wifi_network(){
+        # Use 'ip -4 -o addr show' for a consistent, machine-readable output for IPv4 addresses only
+        # 'awk' is then used to parse the output and format it
+        wlist=$(netget_wifi_networks) 
+       
+        if ! is_not_blank $wlist; then
+            echo ""
+            return 1
+        fi
+
+
+        selected_wifi=''
+     
+        readarray -t wifis <<< "$wlist"
+     
+        COLUMNS=1
+        select wifi in "${wifis[@]}"; do
+            if [[ -n "$wifi" ]]; then
+                selected_wifi=${wifi}
+                break
+            else
+                selected_wifi=""
+                echo "Invalid selection. Please try again."
+            fi
+        done
+
+        
+        if [[ -n $selected_wifi ]]; then
+          echo "${selected_wifi}"
+          return 0
+        else
+          echo ""
+          return 1
+        fi
+
+}
+export -f netselect_wifi_network
+
+######################
+function netdelete() {
+  selected_net="$1"
+  if ! systemctl is-active --quiet NetworkManager; then
+    echo "NetworkManager not running"
+    return 1
+  fi
+
+  # if ! is_wired_hw; then
+  #   return 1
+  # fi
+
+  if [[ -z $selected_net ]]; then
+    echo ""
+    echo "Select a Network to Delete"
+    echo "--------------------"
+    echo ""
+    selected_net=$(netselect 'all'  | tail -n1)
+    #echo "Selected adpater ${selected_net}"
+  fi
+  
+  # Output the full path of the selected file
+  if [[ -z "$selected_net" ]]; then
+      echo "No Network Selected"
+  else
+      # nslist=$(netlist_wired) 
+      
+      # if ! is_not_blank $nslist; then
+      #     echo "No Networks Found"
+      #     return 1
+      # fi
+      # if ! is_in_string $nslist $selected_net; then
+      #     echo "Wired Network ${selected_net} NOT Found"
+      #     return 1
+      # fi
+
+      if systemctl is-active --quiet NetworkManager; then
+
+          echo "Deleting Network ${selected_net}"
+
+          cmd='sudo nmcli connection delete "'${selected_net}'"'
+          #echo $cmd
+          eval "$cmd"     
+
+      fi
+  fi
+
+}
+export -f netdelete
+
+
+
+function netcreate_wired() {
+    net_name="$1"
+    selected_hw="$2"
+    ip_netmask="$3"
+    ip_netmask=$(fix_ipv4_netmask $ip_netmask)
+    # gateway="$4"
+    
+
+    if ! systemctl is-active --quiet NetworkManager; then
+      echo "NetworkManager not running"
+      return 1
+    fi
+
+    if ! is_wired_hw; then
+      return 1
+    fi
+
+    if [[ -z $selected_hw ]]; then
+      echo ""
+      echo "Select Wired Network to Update"
+      echo "--------------------"
+      echo ""
+      selected_net=$(netselect_wired  | tail -n1)
+      selected_hw=$(getnet_hw "$selected_net")
+      #echo "Selected adpater ${selected_hw}"
+    fi
+    
+    # Output the full path of the selected file
+    if [[ -z "$selected_hw" ]]; then
+        echo "Wired Hardware Not Provided"
+        return 1
+    else
+        nslist=$(netlist_wired) 
+        
+        if ! is_not_blank $nslist; then
+            echo "No Networks Found"
+            return 1
+        fi
+
+        # exist_network=$(netget_info "$net_name")
+        # if [[ -z $exist_network ]]; then
+        #     echo "Wired Network ${net_name} Exists"
+        #     echo "${exist_network}"
+        #     return 1
+        # fi
+
+        if systemctl is-active --quiet NetworkManager; then
+
+
+            echo ""
+            echo "Configuring Connection ${net_name} on ${selected_hw} with IP Address ${ip_netmask}"
+            echo "--------------------------"
+            echo ""
+      
+            echo "Setting managed on ${selected_hw}"
+            cmd='sudo nmcli device set '${selected_hw}' managed yes'
+            echo $cmd
+            eval "$cmd" 
+            echo ""
+
+
+            echo "disabling low-power mode on ${selected_hw}"
+            cmd='sudo ethtool -s '${selected_hw}' wol d'
+            echo $cmd
+            eval "$cmd" 
+            echo ""
+            
+            # net_hw=$(netget_hw  ${net_name})
+            # if [[ -n $net_hw ]]; then
+            #     net_hw=$(netget_hw  ${net_name})
+            #     if [[ "$net_hw" != "$selected_hw" ]]; then
+            #       echo "Deleting existing connection for ${net_name} on ${selected_hw}"
+            #       sudo nmcli connection delete $net_name
+            #       sleep 1
+            #     fi
+            # fi
+
+            while netget_hw  ${net_name}; do
+                net_hw=$(netget_hw  ${net_name})
+                echo "Deleting existing connection for ${net_name} on ${selected_hw}"
+                sudo nmcli connection delete $net_name
+            done
+
+            # net_hw=$(netget_hw  ${net_name})
+            # if [[ "$net_hw" != "$selected_hw" ]]; then
+
+            #   echo "Creating connection name ${net_name} to ${selected_hw}"
+            #   cmd='sudo nmcli connection modify "'${net_name}'" connection.interface-name "'${selected_hw}'"'
+            #   echo $cmd
+            #   eval "$cmd" 
+            #   echo ""
+
+            # fi
+
+
+            # net_hw=$(netget_hw  ${net_name})
+            # if [[ -z $net_hw ]]; then
+            #     echo "No connection found with name ${net_name}"
+            # else
+                echo "Bringin up ${net_name} on ${selected_hw}"
+
+                if [[ ${ip_netmask} == 'auto' ]]; then
+                  echo "Adding wired hw connection"
+                  cmd='sudo nmcli connection add type ethernet con-name "'${net_name}'" ifname '${selected_hw}' '
+                  echo $cmd
+                  eval "$cmd" 
+                  echo ""
+
+                elif [[ -n $ip_netmask ]]; then
+                        
+                        if [[ ${ip_netmask} != 'auto' ]]; then
+                          ip_netmask=$(fix_ipv4_netmask $ip_netmask)
+                          if ! is_valid_ipv4_netmask $ip_netmask; then
+                            echo "Invalid Address/Netmask Combination ${selected_hw}"
+                            return 1
+                          fi
+                        fi
+                        echo "Updating static ip to ${ip_netmask}"
+
+                        # if ! is_valid_ipv4 $gateway; then
+                        #     new_ip="${ip_netmask%%/*}"
+                        #     new_octet=1
+                        #     gateway="${new_ip%.*}.$new_octet"
+                        #     disable_dns=1
+                        # fi
+                        # echo "Using Gateway ${gateway}"
+
+                        cmd='sudo nmcli connection add type ethernet ifname '${selected_hw}' \
+                            con-name "'${net_name}'" \
+                            ipv4.address '${nepi_static_ip}' \
+                            ipv4.method manual \
+                            # ipv4.gateway '${gateway}
+                        echo $cmd
+                        eval "$cmd"     
+                        echo ""
+
+
+
+
+
+                fi
+      
+                echo "Disabling auto-dns for ${net_name} on ${selected_hw}"
+                cmd='sudo nmcli connection modify "'${net_name}'" \
+                  ipv4.ignore-auto-dns yes ipv6.ignore-auto-dns yes'
+                echo $cmd
+                eval "$cmd"     
+                echo ""
+
+                echo "Setting auto-negotiate on ${net_name}"
+                cmd='sudo nmcli connection modify '${net_name}' connection.autoconnect yes 802-3-ethernet.auto-negotiate yes'
+                echo $cmd
+                eval "$cmd"
+                echo ""
+
+
+                echo "Reading hardware MAC for ${selected_hw}"
+                hw_mac=$(sudo ethtool -P "${selected_hw}" 2>/dev/null | awk '{print $NF}')
+                if [[ -z "$hw_mac" || "$hw_mac" == "00:00:00:00:00:00" ]]; then
+                    hw_mac=$(cat /sys/class/net/"${selected_hw}"/address 2>/dev/null)
+                fi
+                echo "Got hardware MAC ${hw_mac}"
+
+                if [[ -n "$hw_mac" && "$hw_mac" != "00:00:00:00:00:00" ]]; then
+                    echo "Pinning ${net_name} to hardware MAC ${hw_mac} on ${selected_hw}"
+                    cmd='sudo nmcli connection modify "'${net_name}'" 802-3-ethernet.mac-address '${hw_mac}
+                    echo $cmd
+                    eval "$cmd"
+                    echo ""
+                else
+                    echo "Could not read hardware MAC for ${selected_hw}; skipping MAC pinning"
+                fi
+
+
+
+                echo "Setting highest priority for ${net_name} on ${selected_hw}"
+                cmd='sudo nmcli connection modify "'${net_name}'" connection.autoconnect-priority 100'
+                echo $cmd
+                eval "$cmd"     
+                echo ""
+
+
+                echo "Disablong ipv6 for ${net_name} on ${selected_hw}"
+                cmd='sudo nmcli connection modify "'${net_name}'" ipv6.method disabled'
+                echo $cmd
+                eval "$cmd"     
+                echo ""
+
+                cmd='sudo nmcli connection modify "'${net_name}'" ipv6.method ignore'
+                echo $cmd
+                eval "$cmd"     
+                echo ""
+
+
+                echo "Bringin up ${net_name} on ${selected_hw}"
+                cmd='sudo nmcli connection up "'${net_name}'"'
+                echo $cmd
+                eval "$cmd"     
+                echo ""
+
+                sleep 3
+            # fi
+            
+        fi
+    fi
+}
+
+export -f netcreate_wired
+
+
+
+function netconnect_wifi() {
+  wifi_ssid="$1"
+  if [[  "$wifi_ssid" == 'NONE' ]]; then
+    return 1
+  fi
+
+  wifi_pw="$2"
+  wifi_hw="$3"
+  
+  if ! is_wifi_hw; then
+    echo "No Wifi Hardware Detected"
+    return 1
+  fi
+
+    ##############
+    wifi_list=$(netget_wifi_networks)
+
+    if [[ -z wifi_list ]]; then
+      echo "No Available WiFi Networks"
+      return 1
+    fi
+
+    if [[ -z $wifi_ssid ]]; then
+      echo ""
+      echo "Select a WiFi Network to Connect"
+      echo "--------------------"
+      echo ""
+      selection=$(echo $(netselect_wifi_network))
+      wifi_ssid="${selection##*$'\n'}"
+    elif [[ "$wifi_list" != *"$wifi_ssid"* ]]; then
+      echo "WiFi SSID ${wifi_ssid} Not Found"
+      return 1
+    fi
+
+    echo "Selected Network ${wifi_ssid}"
+
+    if [[ -z wifi_ssid ]]; then
+      echo "WiFi SSID empty"
+      return 1
+    fi
+
+    echo "Using SSID ${wifi_ssid}"
+    wifi_info=$(netget_info $wifi_ssid)
+    echo "Checking for existing connection to ${wifi_ssid} returned ${wifi_info}"
+    if [[ -n $wifi_info && "$wifi_pw" != "DELETE" ]]; then
+      echo "WiFi SSID ${wifi_ssid} Already Connected"
+      return 0
+    fi
+
+    # ##############
+
+    if [[ -z $wifi_pw || "$wifi_pw" == 'ENTER' ]]; then
+      echo ""
+      read -p $'\n'"Enter WiFi Password for ${wifi_ssid}: " USER_INPUT
+      wifi_pw=$USER_INPUT
+      echo ""
+    fi
+
+
+    if [[ -z $wifi_pw || "$wifi_pw" == 'NONE' || "$wifi_pw" == 'encrypted' ]]; then
+      echo "WiFi Password Not Provided"
+      return 1
+    fi
+
+    if [[ "$wifi_pw" == "DELETE" ]]; then
+      wifi_pw=''
+    fi
+
+
+
+
+    ##############
+    if [[ -z $wifi_hw ]]; then
+      if [[ -n $NEPI_WIFI_INTERFACE ]]; then
+        wifi_hw=$NEPI_WIFI_INTERFACE
+      else
+        wifis=$(netlist_wifi)
+        if [[ -n wifis ]]; then
+          first_line="${wifis%%$'\n'*}"
+          read -r first_word _ <<< "$first_line"
+          wifi_hw=$first_word
+        fi
+      fi
+    else
+      wifi_hw=$(netget_hw $wifi_hw)
+    fi
+
+    if [[ -z $wifi_hw ]]; then
+      echo "WiFi Device ${wifi_hw} Not Found"
+      return 1
+    fi
+
+
+    ##############
+
+
+    net_name=$(netget_name $wifi_ssid)
+    if [[ -n $net_name ]]; then
+      if [[ -z $wifi_pw ]]; then
+        # nmcli connection down id "$net_name"
+        echo "Disconnecting from current ${net_name} connection"
+        sudo nmcli connection delete "$net_name" 2> /dev/null
+      else
+        echo "WiFi SSID ${wifi_ssid} Connected"
+      fi
+      return 0
+    fi
+
+    
+    if [[ -n $wifi_pw ]]; then
+      # Disconnect the Device SSID Connection if exists
+      wifi_name=$(netget_name $wifi_hw)
+      if [[ -n $wifi_name ]]; then
+        echo "Disconnecting from current ${wifi_name} connection"
+        sudo nmcli connection delete "$wifi_name" 2> /dev/null
+        sleep 1
+      fi
+      #sudo nmcli connection delete "$wifi_ssid" 2> /dev/null
+      echo "Connecting to WiFi SSID ${wifi_ssid} with password ${wifi_pw} on ${wifi_hw}"
+      if sudo nmcli --wait 30 device wifi connect "$wifi_ssid" password "$wifi_pw" ifname $wifi_hw; then        
+        sleep 3
+        # Reset Network
+        nnet
+        sleep 1
+        ndhcp 2> /dev/null
+        echo $wifi_ssid
+      else
+       return 2
+      fi
+     
+    fi
+    
+
+}
+
+export -f netconnect_wifi
+
+
+
+
+
+
+function netcreate_hotspot() {
+  wifi_name="$1"
+  wifi_ssid="$2"
+  wifi_pw="$3"
+  wifi_hw="$4"
+  
+  if [[  "$wifi_ssid" == 'NONE' ]]; then
+    return 1
+  fi
+
+  if ! is_wifi_hw; then
+    echo "No Wifi Hardware Detected"
+    return 1
+  fi
+
+  if ! is_wifi_enabled; then
+      echo "NEPI Wifi not enabled"
+      return 1
+  fi
+
+    #####################
+  if [[ -z wifi_name ]]; then
+    wifi_name=NEPI_HOSTSPOT
+  fi
+
+    #####################
+  if [[ -z wifi_ssid ]]; then
+    echo "Hotspot SSID empty"
+    return 1
+  fi
+
+
+  # ##############
+
+  if [[ -z $wifi_pw || "$wifi_pw" == 'NONE' ]]; then
+    echo "Hotspot Password Not Provided"
+    return 1
+  fi
+
+  if [[ "$wifi_pw" == "DELETE" ]]; then
+    wifi_pw=''
+  fi
+
+
+
+
+  ##############
+  if [[ -z $wifi_hw ]]; then
+    wifis=$(netlist_wifi)
+    if [[ -n wifis ]]; then
+      first_line="${wifis%%$'\n'*}"
+      read -r first_word _ <<< "$first_line"
+      wifi_hw=$first_word
+    fi
+  else
+    wifi_hw=$(netget_hw $wifi_hw)
+  fi
+
+  if [[ -z $wifi_hw ]]; then
+    echo "WiFi Device ${wifi_hw} Not Found"
+    return 1
+  fi
+
+
+  ##############
+  #REF: 'https://raspberrypi.stackexchange.com/questions/114213/creating-a-hotspot-and-connecting-pi-to-the-internet-over-wifi'
+  #REF: 'https://raspberrypi.stackexchange.com/a/89804/79866'
+  # Add the script below with the name 00-virtualwlan1 in /etc/NetworkManager/dispatcher.d with execution rights for the file
+  # (restart the machine to activate)
+  # and thus to have a wlan1 virtual card at each startup (see iw command)
+
+  #TEST
+  # netcreate_wifi_ap NEPI 2065255002
+
+
+  while nmcli connection show hotspot > /dev/null 2>&1; do
+      echo "Disconnecting from current hotspot connection"
+      sudo nmcli connection delete "hotspot"
+      sleep 1
+  done
+
+
+  if [[ -n $wifi_pw ]]; then
+
+
+
+    # wifi_hw="${wifi_hw}_nepi"
+    # # Create virtual wifi network for wifi_hw
+    # if ! netget_info $wifi_hw; then
+    #   sudo iw phy phy0 interface add $wifi_hw type managed
+    #   #sudo iw dev $wifi_hw del
+    #   sleep 1
+    # fi
+
+
+    if netget_info $wifi_hw; then
+
+
+      del_name=$(netget_name $wifi_hw)
+      if [[ -n $del_name ]]; then
+        echo "Disconnecting from current ${del_name} connection"
+        sudo nmcli connection delete "$del_name" 2> /dev/null
+        sleep 1
+      fi
+
+      nmcli connection show
+
+      echo ""
+      echo "Configuring WiFi Access Point with SSID ${wifi_ssid} password ${wifi_pw} on ${wifi_hw}"
+
+            
+          file=/etc/network/create_ap
+          if [[ -f "$file" ]]; then
+
+              sudo ${file} --stop ${wifi_hw}
+
+
+                echo "Starting WiFi Access Point Settings Files with AP ID: ${wifi_ssid} with PW: ${wifi_pw}"
+                if [[ "$wifi_ssid" != '' ]]; then
+                    # if [[ ${wifi_ssid} == 'NONE' ]]; then
+                    #     wifi_ssid="nepi_"${NEPI_DEVICE_SN}
+                    # fi
+
+                    if [[ "$wifi_pw" != '' && "$wifi_pw" != 'NONE' ]]; then
+                        echo "Calling create access point file ${file}"
+                        echo "Updating WiFi Access Point Settings in /etc/hostapd/hostapd.conf with AP ID: ${wifi_ssid} with PW: ${wifi_pw}"
+                        cmd="sudo nmcli connection add type wifi ifname ${wifi_hw} con-name ${wifi_name} autoconnect yes ssid ${wifi_ssid}"
+                        echo $cmd
+                        sudo ${cmd}
+                        sleep 1
+
+                        
+                        cmd='sudo nmcli connection modify '${wifi_name}' 802-11-wireless.mode ap 802-11-wireless.band bg ipv4.method shared'
+                        echo $cmd
+                        eval "$cmd" 
+
+                        cmd='sudo nmcli connection modify '${wifi_name}' wifi-sec.key-mgmt wpa-psk wifi-sec.psk  "'${wifi_pw}'"'
+                        echo $cmd
+                        eval "$cmd" 
+
+                        cmd='sudo nmcli connection up '${wifi_name}''
+                        echo $cmd
+                        eval "$cmd"     
+                        echo ""
+
+                  else
+                      echo "WiFi Access Point ID not set"
+                  fi
+              else
+                  echo "WiFi Access Point Disabled"
+              fi
+          else
+              echo "NEPI Wifi Access Point Create file not found ${file}"
+          fi
+
+
+
+
+        # #nmcli dev wifi show-password  ### shows the Wi-Fi name and password.
+
+        #   cmd='sudo nmcli con add con-name hotspot ifname '${wifi_hw}' type wifi ssid "'${wifi_ssid}'"'
+        #   echo $cmd
+        #   eval "$cmd" 
+
+        #   cmd='sudo nmcli con modify hotspot wifi-sec.key-mgmt wpa-psk'
+        #   echo $cmd
+        #   eval "$cmd"     
+        #   echo ""
+
+        #   cmd='sudo nmcli con modify hotspot wifi-sec.psk "'${wifi_pw}'"'
+        #   echo $cmd
+        #   eval "$cmd"     
+        #   echo ""
+
+
+        #   cmd='sudo nmcli con modify hotspot 802-11-wireless.mode ap 802-11-wireless.band bg ipv4.method shared'
+        #   echo $cmd
+        #   eval "$cmd"     
+        #   echo ""
+
+
+
+        #   cmd='sudo nmcli con modify hotspot connection.autoconnect yes'
+        #   echo $cmd
+        #   eval "$cmd"     
+        #   echo ""
+
+        #   cmd='sudo nmcli connection up hotspot'
+        #   echo $cmd
+        #   eval "$cmd"     
+        #   echo ""
+
+        #   sleep 3
+        #   # Reset Network
+        #   nnet
+        #   sleep 1
+        #   ndhcp 2> /dev/null
+
+    fi
+    
+  fi
+}
+
+export -f netcreate_hotspot
+
+
+# function netset_wifi_ap() {
+#   wifi_ssid="$1"
+#   wifi_pw="$2"
+#   wifi_hw="$3"
+  
+
+#   if ! is_wifi_hw; then
+#     return 1
+#   fi
+
+#   ##############
+#   if [[ -z $wifi_hw ]]; then
+#     wifis=$(netlist_wifi)
+#     if [[ -n wifis ]]; then
+#       first_line="${wifis%%$'\n'*}"
+#       read -r first_word _ <<< "$first_line"
+#       wifi_hw=$first_word
+#     fi
+#   else
+#     wifi_hw=$(netget_hw $wifi_hw)
+#   fi
+#   echo $wifi_hw
+
+#   if [[ -z $wifi_hw ]]; then
+#     echo "WiFi Device ${wifi_hw} Not Found"
+#     return 1
+#   fi
+
+#   if [[ -z $wifi_ssid ]]; then
+#     echo "AP SSID Not Provided"
+#     return 1
+#   fi
+
+# echo "Configuring WiFi Access Point with SSID ${wifi_ssid} password ${wifi_pw} on ${wifi_hw}"
+#   if [[ "$wifi_pw" == 'DELETE' ]]; then
+#     echo $wifi_pw
+#   else
+#     if ! is_valid_wpa2_pw $wifi_pw; then
+#       echo "AP Password Not WPA2 Valid"
+#       return 1
+#     fi
+
+#     wifi_name=$(netget_name $wifi_hw)
+#     if [[ -n $wifi_name ]]; then
+#       echo "Disconnecting from current ${wifi_name} connection"
+#       sudo nmcli connection delete "$wifi_name" 2> /dev/null
+#       sleep 1
+#     fi
+
+
+
+
+
+#     #sudo nmcli connection delete "Wi-Fi_Network_Name"
+#     echo "Configuring WiFi Access Point with SSID ${wifi_ssid} password ${wifi_pw} on ${wifi_hw}"
+#     sudo nmcli --wait 30 device wifi hotspot ifname $wifi_hw ssid "$wifi_ssid" password "$wifi_pw"
+
+#     # Reset Network
+#     nnet
+#   fi
+
+
+
+# }
+
+# export -f netset_wifi_ap
+
+
+
+
+
+######################
+function netset_wired_ipn() {
+    ip_netmask="$1"
+    gateway="$2"
+    selected_net="$3"
+
+    if ! systemctl is-active --quiet NetworkManager; then
+      echo "NetworkManager not running"
+      return 1
+    fi
+
+    if ! is_wired_hw; then
+      return 1
+    fi
+
+    if [[ -z $selected_net ]]; then
+      echo ""
+      echo "Select a Network to Update"
+      echo "--------------------"
+      echo ""
+      selected_net=$(netselect_wired  | tail -n1)
+      #echo "Selected adpater ${selected_net}"
+    fi
+    
+    # Output the full path of the selected file
+    if [[ -z "$selected_net" ]]; then
+        echo "No Network Selected"
+    else
+        nslist=$(netlist_wired) 
+        
+        if ! is_not_blank $nslist; then
+            echo "No Networks Found"
+            return 1
+        fi
+        if ! netget_name $selected_net; then
+            echo "Wired Network ${selected_net} NOT Found"
+            return 1
+        fi
+        selected_net=$(netget_name $selected_net)
+        if systemctl is-active --quiet NetworkManager; then
+            cmd=""
+
+            echo "Updating Network ${selected_net} with IP Address ${ip_netmask}"
+            if [[ ${ip_netmask} == 'auto' ]]; then
+              cmd='sudo nmcli con mod "'${selected_net}'" ipv4.method auto '
+              echo $cmd
+              eval "$cmd"     
+
+              cmd='sudo nmcli con mod "'${selected_net}'" connection.autoconnect yes '
+              echo $cmd
+              eval "$cmd" 
+
+              cmd='sudo nmcli connection up "'${selected_net}'"'
+              #echo $cmd
+              eval "$cmd"     
+              echo ""
+
+            elif [[ -n $ip_netmask ]]; then
+                    
+                    if [[ ${ip_netmask} != 'auto' ]]; then
+                      ip_netmask=$(fix_ipv4_netmask $ip_netmask)
+                      if ! is_valid_ipv4_netmask $ip_netmask; then
+                        echo "Invalid Address/Netmask Combination ${net_wired_ip}"
+                        return 1
+                      fi
+                    fi
+                    echo "Updating static ip to ${ip_netmask}"
+
+
+                    if ! is_valid_ipv4 $gateway; then
+                        gateway=$(netget_router_ip)
+                        if ! is_valid_ipv4 $gateway; then
+                          new_ip="${ip_netmask%%/*}"
+                          new_octet=1
+                          gateway="${new_ip%.*}.$new_octet"
+                        fi
+                    fi
+                    echo "Using Gateway ${gateway}"
+
+
+                    cmd='sudo nmcli connection modify "'${selected_net}'" \
+                        ipv4.addresses '${ip_netmask}' \
+                        ipv4.dns 8.8.8.8,8.8.4.4 \
+                        ipv4.method manual \
+                        ipv4.gateway '${gateway}
+                  
+
+                    echo $cmd
+                    eval "$cmd"     
+
+                    cmd='sudo nmcli connection up "'${selected_net}'"'
+                    echo $cmd
+                    eval "$cmd" 
+
+                    # Reset Network
+                    nnet
+                    sleep 1
+                    #ndhcp 2> /dev/null
+            fi
+        fi
+    fi
+}
+
+export -f netset_wired_ipn
+
+
+
+function netset_auto() {
+  netset_wired_ipn 'auto' $1
+  return $?
+}
+
+export -f netset_auto
+
+function netset_custom() {
+  netset_wired_ipn $1 $2
+  return $?
+}
+
+export -f netset_custom
+
+function netset_nepi() {
+  if [[ $NEPI_MODE == 'REMOTE' ]]; then
+    ip="${REMOTE_IP%%/*}"
+  else
+    ip="${NEPI_IP%%/*}"
+  fi
+  netset_wired_ipn $ip $1
+  return $?
+}
+
+export -f netset_nepi
+
+
+
+function netadd_ipn_alias(){
+  net_ref=$1
+  ipn_alias=$2
+  ipn_alias=$(fix_ipv4_netmask "${ipn_alias}")
+  ip_alias="${ipn_alias%%/*}"
+  skip_update=$3
+  if [[ "$skip_update" -ne 1 ]]; then
+    skip_update=0
+  fi
+  net_name=$(netget_name $net_ref)
+  #echo $net_name
+  if [[ -n $net_name ]]; then
+    if is_valid_ipv4_netmask $ipn_alias; then
+      if netget_info $ip_alias 2> /dev/null; then
+        echo "IP address allready in use ${ipn_alias}"
+        netget_info $net_name
+        return 1
+      else
+        sudo nmcli connection modify "$net_name" +ipv4.addresses "$ipn_alias"
+        if [[ $skip_update -eq 0 ]]; then
+          sudo nmcli connection up "$net_name"
+        fi
+        # Reset Network
+        nnet
+      fi
+    else
+      echo "Not a valid IP address ${ipn_alias}"
+      return 1
+    fi 
+  else
+    echo "Network reference ${net_ref} not found"
+    return 1
+  fi 
+}
+
+export -f netadd_ipn_alias
+
+
+function netremove_ipn_alias(){
+  net_ref=$1
+  ipn_alias=$2
+  ipn_alias=$(fix_ipv4_netmask "${ipn_alias}")
+  ip_alias="${ipn_alias%%/*}"
+  skip_update=$3
+  if [[ "$skip_update" -ne 1 ]]; then
+    skip_update=0
+  fi
+  net_name=$(netget_name $net_ref)
+  if [[ -n $net_name ]]; then
+    if is_valid_ipv4_netmask $ipn_alias; then
+      if ! netget_info $ip_alias 2> /dev/null; then
+        echo "IP address does not exist ${ipn_alias} for ${net_name}"
+        netget_info $net_name
+        return 1
+      else
+        sudo nmcli connection modify "$net_name" -ipv4.addresses "$ipn_alias"
+        if [[ $skip_update -eq 0 ]]; then
+          sudo nmcli connection up "$net_name"
+        fi
+        # Reset Network
+        nnet
+      fi
+    else
+      echo "Not a valid IP address ${ipn_alias}"
+      return 1
+    fi 
+  else
+    echo "Network reference ${net_ref} not found"
+    return 1
+  fi 
+}
+
+export -f netremove_ipn_alias
+
+function netset_ip_ntp(){
+  ntp_ip=$1
+  if ! is_valid_ipv4 $ntp_ip; then
+    echo "Not a valid IP address ${ntp_ip}"
+    return 1
+  fi
+
+
+
+  # Update ETC files if systemd is running (Not in Container)
+  systemctl&> /dev/null
+  if [[ "$?" -eq 0 ]]; then
+      echo ""
+      echo "UPDATING NTP TIME SOURCE"
+
+
+        echo " "
+        echo "Configuring chrony.conf"
+
+        sudo systemctl stop chrony
+
+        source_file=${NEPI_SYSTEM_CONFIG}/etc/chrony/chrony.conf.blank
+        file=/etc/chrony/chrony.conf
+        echo "Updating etc file: ${file}"
+        if [[ ! -d "/etc/chrony" ]]; then
+            sudo mkdir /etc/chrony
+        fi
+        if [[ -f "${source_file}" ]]; then
+            sudo cp -a ${source_file} $file
+            sudo chown ${CONFIG_USER}:${CONFIG_USER} $file
+      
+
+
+            if [[ "$ntp_ip" != "NONE" &&  "$ntp_ip" != "None" ]]; then
+                echo "Updating NEPI IP in ${file} with NTP Server ${ntp_ip}"
+                # update with NTP IP address
+APPEND_SECTION="#### NEPI NTP SOURCES #### 
+allow ${ntp_ip%.*}/24 
+server ${ntp_ip} iburst minpoll 2"
+                sudo echo "$APPEND_SECTION" >> $file
+
+            fi
+        else
+            echo "FAILED TO FIND SOURCE ${source_file}"
+        fi  
+        ###
+        sudo systemctl restart chrony
+
+  else
+    echo "SYSTEMCTL not present"
+    return 1
+
+  fi
+
+
+}
+
+
+
+
+function check_password() {
+    local username=$1
+    local pcheck=$2
+    echo "$pcheck" | su -c true "$username" >/dev/null 2>&1
+    local error=$?
+    if [[ $error -eq 0 ]]; then
+        return 0
+    else
+        ret=$(echo "$pcheck" | su -c true "$username" 2>/dev/null)
+        if [[ ${ret} == 'This account is currently not available.' ]]; then
+            return 0
+        else
+            return 1
+        fi
+    fi
+}
+
+export check_password
+
+
+function change_password() {
+        username=$1
+        password=$2
+
+        if [[ ${password} == "encrypted" ]]; then
+            echo "Password for ${username} encrypted" 
+            return 1
+        fi
+        if check_password ${username} ${password} ; then
+            echo "Password unchanged" 
+            return 1
+        fi        
+
+        if is_valid_pw $password; then
+
+            OLD_HASH=$(sudo grep "^${username}:" /etc/shadow | cut -d: -f2)
+
+            echo "${username}:${password}" | sudo chpasswd
+
+            # After chpasswd
+            NEW_HASH=$(sudo grep "^${username}:" /etc/shadow | cut -d: -f2)
+
+            if [ "$OLD_HASH" != "$NEW_HASH" ]; then
+                echo "Updated password for user ${username}"
+                return 0
+            else
+                return 1
+            fi
+        else
+            echo "Password update for user ${username} failed. Not valid password" 
+            return 1
+        fi
+}
+
+export change_password
+
+function fix_chromium(){
+  sudo -v
+  echo "Locating Chromium profile"
+  if [[ -d "/home/${CONFIG_USER}/snap/chromium/common/chromium" ]]; then
+      CHROMIUM_PROFILE="/home/${CONFIG_USER}/snap/chromium/common/chromium"
+  elif [[ -d "/home/${CONFIG_USER}/.config/chromium" ]]; then
+      CHROMIUM_PROFILE="/home/${CONFIG_USER}/.config/chromium"
+  else
+      echo "Chromium profile directory not found"
+      return 1
+  fi
+
+  sudo rm -rf ${CHROMIUM_PROFILE}/Singleton* > /dev/null 2>&1
+  sudo rm -rf /home/${CONFIG_USER}/.cache/chromium > /dev/null 2>&1
+
+}
+export function fix_chromium
+
+
+function fix_ipv4_netmask() {
+    local input=$1
+    ip="${input%%/*}"
+    nm=''
+    if [[ "$input" == *"/"* ]]; then
+      nm="${input#*/}"
+    fi
+    if is_valid_ipv4 $ip > /dev/null 2>&1; then
+      if is_valid_netmask $nm > /dev/null 2>&1; then
+        echo "${ip}/${nm}"
+      else
+        echo "${ip}/24"
+        return 2 # Invalid IP address format
+      fi
+    else
+      echo ${input}
+      return 1 # Invalid IP address format
+    fi
+
+    return 0 # Valid IP address
+}
+export -f fix_ipv4_netmask
+
+
+function nls(){
+  ls -l -a $1
+}
+export function nls
+
+
+
+
+utilsn="${utilsn}
+################################
+### SYSTEM UTIL FUNCTIONS
+################################
+echov = Echo variable value
+echonv = Echo variable name and value
+echoce = Echo command error
+
+pinga = Check connection to provided IP address
+pingi = Check connection to internet
+pings = Check connection to Self IP address
+pingn = Check connection to NEPI IP
+pingnc = Ping NEPI IP address continously
+nnet = Restart the network
+nclock = Sync clock
+ninet = check connection and sync clock
+
+netenable_wifi = Enable WiFi on passed device name
+netdisable_wifi = Disable Wifi on passed device name
+
+netlist = Echo a list of ethernet and wifi devices and info, pass 'all' for all devices
+netlist_wired = Echo a list of ethernet devices and info
+netlist_wifi = Echo a list of wifi devices and info
+
+netget_info = Echo device info for passed device, name, or ip if found. last found is returned
+netget_name = Echo name for passed device or name if found. last found is returned
+netget_state = Echo state for passed device or name if found. last found is returned
+netget_hw = Echo device for passed device or name if. last found is returned
+netget_wired_ipn = Echo primary ip/netmask for passed device or name if found. last found is returned
+netget_wired_ip = Echo primary ip for passed device or name if found. last found is returned
+netget_aliases = Echo list of ip/netmask aliases for passed device or name if found. last found is returned
+netget_wired_ip_aliases = Echo list of ip aliases for passed device or name if found. last found is returned
+netget_router_ip = Echo ip of router if connected
+netget_ntp_ip = Echo current set NTP server address
+netget_wifi_networks = Echo list of available wifi networks
+
+netselect = Select from list available ethernet or wifi hardware devices
+netselect_wired = Select from list available ethernet hardware devices
+netselect_wifi = Select from list available wifi hardware devices
+netselect_wifi_network = Select from list available wifi networks
+netdelete = Delete passed or selected device ethernet or wifi connection
+
+netcreate_wired = Create a connection with passed name, device, ip/netmask
+netonnect_wifi = Connect to WiFi network with name, password, (optional device). 
+  Use password ENTER to manually enter, Use password DELETE to disconnect
+netcreate_hotspot = Configure a WiFi access point with  with name, password, (optional device). 
+  Use password DELETE to disconnect
+
+netset_wired_ipn = Set primary wired network config with passed ip/netmask, gateway, name
+netset_auto = Set primary wired network config to auto
+netset_custom = Set primary wired network config to ip/netmask
+netset_nepi = Set primary wired network config to NEPI_IP/24
+netadd_ipn_alias = Add alias to wired network config with passed ip/netmask, name
+netremove_ipn_alias = Remove alias from wired network config with passed ip/netmask, name
+
+nls = Run ls with -l -a for current folder, or pass FOLDER_PATH
+check_passord = Check username and password combination
+fix_chromium = Fix any Chromium config issues
+fix_ipv4_netmask = Check valid IP and add 24 netmask if not provided
+ubrc = Update and source the current user's bashrc files
+sbrc = Source the current user's bashrc files" 
+
+###################################
+# File Util Functions
+###################################
+
+# Function to search for text
+# Example call: find 'nepi_sdk.parse_header_msg'
+function ftext(){
+grep -r "$@" ./*
+}
+export -f ftext
+
+# Function to search for text
+# Example call: find 'nepi_sdk.parse_header_msg'
+function ffile(){
+find ./* -iname  "*$@*" 
+}
+export -f ffile
+
+function update_text_value(){
+  FILE=$1
+  KEY=$2
+  UPDATE=$3
+  if [ -f "$FILE" ]; then
+    if grep -q "$KEY" "$FILE"; then
+      sed -i "/^$KEY/c\\$UPDATE" "$FILE"
+    else
+      echo -e "$UPDATE" | sudo tee -a $FILE
+    fi
+  else
+    echo "File not found ${FILE}"
+  fi
+}
+export -f update_text_value
+
+
+
+
+function fix_path(){
+  sudo -v
+  if [[ ! -v "$1" && -n "$1" ]]; then
+      target_path=$1
+      if [[ ! -e "$target_path" ]]; then
+        sudo mkdir -p $target_path
+        sudo chmod 0664 ${target_path} > /dev/null 2>&1
+      elif is_nepi_path $target_path; then
+        echo "Fixing permissions for path: ${target_path}"
+        sudo chown ${CONFIG_USER}:${CONFIG_USER} ${target_path} > /dev/null 2>&1
+        if [[ ! -v "$2" && "$2" =~ ^[0-7]{3,4}$ ]]; then
+          sudo chmod ${2} ${target_path} > /dev/null 2>&1
+        fi
+
+      else
+          echo "NEPI Folder not found at ${target_path}"
+          return 1
+      fi
+  else
+    echo "No Path Provided"
+    return 1
+  fi
+}
+export -f fix_path
+
+function fix_folder(){
+  sudo -v
+  if [[ ! -v "$1" && -n "$1" ]]; then
+      target_path=$1
+      if [[ ! -e "$target_path" ]]; then
+        sudo chmod 0664 ${target_path} > /dev/null 2>&1
+      elif is_nepi_path $target_path; then
+        echo "Fixing permissions for path: ${target_path}"
+         if [[ -d $target_path && -n $target_path ]]; then  
+            sudo chown -R ${CONFIG_USER}:${CONFIG_USER} ${target_path} > /dev/null 2>&1
+            if [[ ! -v "$2" && "$2" =~ ^[0-7]{3,4}$ ]]; then
+              sudo chmod -R ${2} ${target_path} > /dev/null 2>&1
+            fi
+         fi
+      else
+          echo "NEPI Folder not found at ${target_path}"
+          return 1
+      fi
+  else
+    echo "No Path Provided"
+    return 1
+  fi
+}
+export -f fix_folder
+
+
+function fix_scripts(){
+  sudo -v
+  if [[ -v "$1" || -z "$1" ]]; then
+    target_path=$(pwd)
+  else
+    target_path=$1
+  fi
+  if [[ -n "$target_path" ]]; then
+    if [[ ! -e "$target_path" ]]; then
+      sudo mkdir -p $target_path
+    elif [[ ! -d "$target_path" ]]; then
+      echo "Script path is not a found: ${target_path}"
+      return 1
+    fi
+
+    if is_nepi_path $target_path; then
+      echo "Fixing permissions in script folder: ${target_path}"
+      sudo chown ${CONFIG_USER}:${CONFIG_USER} ${target_path}/* > /dev/null 2>&1
+      sudo chmod 0776 ${target_path}/* > /dev/null 2>&1
+
+    else
+        echo "NEPI Script folder not found at ${target_path}"
+        return 1
+    fi
+  else
+    echo "No Script Path Provided"
+    return 1
+  fi
+}
+export -f fix_scripts
+
+
+
+clean_yaml_file() {
+    local input_file="$1"
+    if [[ -f "$input_file" ]]; then
+        # Strips only blank lines and full-line comments, preserving every
+        # substantive YAML line verbatim (including bare parent keys like
+        # "RUI_DICT:" with no value on their own line, and list items like
+        # "  - foo.js"). The previous pattern, grep -E '^.+:.+$', kept ONLY
+        # lines matching "something : something" and silently DELETED any
+        # line that didn't -- which is every bare key-with-nested-value line
+        # and every list item in the file. That corrupts, in place (this
+        # function overwrites $input_file), any YAML using real structure
+        # (nested mappings, lists) rather than a flat key:value table.
+        # Confirmed the hard way: it silently destroyed
+        # nepi_app_sim_connector's params yaml on every call -- RUI_DICT:,
+        # rui_files:, and its list items all vanished -- and, since a
+        # trailing inline comment containing its own colon-plus-text
+        # happened to still match the old pattern, a comment could survive
+        # while the real key it was documenting did not.
+        sudo grep -vE '^[[:space:]]*(#.*)?$' "$input_file" > "$input_file.clean" && sudo mv "$input_file.clean" "$input_file"
+        sudo chown ${CONFIG_USER}:${CONFIG_USER} $input_file > /dev/null 2>&1
+        sudo chmod +x $input_file > /dev/null 2>&1
+    else
+        echo "Error: File '$input_file' not found." >&2
+        return 1
+    fi
+}
+export -f clean_yaml_file
+
+
+function update_yaml_value(){
+    export UPDATE_YAML_KEY=$1
+    #echo $UPDATE_YAML_KEY
+    export UPDATE_YAML_VAL=$2
+    #echo $UPDATE_YAML_VAL
+    export UPDATE_YAML_FILE=$3
+    #echo $UPDATE_YAML_FILE
+
+    if [[ ${NEPI_MODE} == 'REMOTE' ]]; then
+      eval_cmd="success=$(python3 ${BASH_FOLDER}/nepi_utils/update_yaml_value.py $UPDATE_YAML_KEY $UPDATE_YAML_VAL $UPDATE_YAML_FILE)"  #2>/dev/null"
+      eval "$eval_cmd" 
+      success=$(echo ${success})
+      if [[ "$success" -ne 1 ]]; then
+          echo "Success = ${success}"
+          return 1
+      fi
+    else
+      yq e -i '.'"$UPDATE_YAML_KEY"' = env(UPDATE_YAML_VAL)' $UPDATE_YAML_FILE
+    fi
+    eval "export $UPDATE_YAML_KEY=\"$UPDATE_YAML_VAL\""
+}
+export -f update_yaml_value
+
+
+function update_json_value(){
+    local JSON_FILE=$1
+    local JSON_KEY=$2
+    local JSON_VAL=$3
+    if [ -z "$JSON_FILE" ] || [ -z "$JSON_KEY" ] || [ -z "$JSON_VAL" ]; then
+        echo " KEY supports dot notation for nested keys, e.g. browser.show_home_button"
+        return 1
+    fi
+    python3 ${BASH_FOLDER}/nepi_utils/update_json_value.py "$JSON_FILE" "$JSON_KEY" "$JSON_VAL"
+}
+export -f update_json_value
+
+
+function sync_yaml_files(){
+    SOURCE_FILE=$1
+    TARGET_FILE=$2
+    REPLACE_ENTRIES=0
+    # if [[ -v "$3" ]]; then
+    #   REPLACE_ENTRIES=$3
+    # fi
+
+    if [[ ! -f "$SOURCE_FILE" ]]; then
+        echo "Source file does not exist: ${SOURCE_FILE}"
+        return 1
+    fi
+
+    if [[ ! -f "$TARGET_FILE" ]]; then
+        echo "Target file does not exist: ${TARGET_FILE}"
+        target_path=$(dirname $TARGET_FILE)
+        
+        if fix_path $target_path; then
+            sudo cp $SOURCE_FILE $TARGET_FILE
+            fix_path $TARGET_FILE
+            return 0
+        elif [[ ! -d "$target_path" ]]; then
+          echo "Failed to create path: ${target_path}"
+          return 1
+        fi
+    fi
+
+    eval_cmd="success=$(python3 ${BASH_FOLDER}/nepi_utils/sync_yaml_files.py $SOURCE_FILE $TARGET_FILE $REPLACE_ENTRIES)"  #2>/dev/null"
+    eval "$eval_cmd" 
+    success=$(echo ${success})
+    
+
+    if [[ "$success" -ne 1 ]]; then
+        echo "Success = ${success}"
+        return 1
+    fi
+
+}
+export -f sync_yaml_files
+
+
+function load_yaml_file(){
+    yaml_file=$1
+    #echo $yaml_file
+    if [ -f "$yaml_file" ]; then
+    
+      success=0
+      clean_yaml_file $yaml_file
+      eval_cmd="load_vals=$(python3 ${BASH_FOLDER}/nepi_utils/load_yaml_file.py $yaml_file)"  #2>/dev/null"
+      eval "$eval_cmd"
+      
+      for entry in $load_vals; do
+         export ${entry} 2> /dev/null
+      done
+
+      if [[ "$success" -ne 1 ]]; then
+          echo "Success = ${success}"
+          return 1
+      fi
+
+    else
+        echo "Yaml file not found ${yaml_file}"
+        return 1
+    fi
+}
+export -f load_yaml_file
+
+function print_yaml_file(){
+    #echo $1
+    yaml_file=$1
+    if [ -f "$yaml_file" ]; then
+
+      success=0
+      eval_cmd="load_vals=$(python3 ${BASH_FOLDER}/nepi_utils/load_yaml_file.py $yaml_file)"  #2>/dev/null"
+      eval "$eval_cmd"
+
+      for entry in $load_vals; do
+         export ${entry}
+        if [[ "$entry" != *"success="* ]]; then
+          echo ${entry}
+        fi
+      done
+
+    if [[ "$success" -ne 1 ]]; then
+        echo "Success = ${success}"
+        return 1
+    fi
+
+    else
+        echo "Yaml file not found ${yaml_file}"
+        return 1
+    fi
+}
+export -f print_yaml_file
+
+
+function path_backup(){
+    source_path=$1
+    #echo $source_path
+    backup_path=${1}.bak
+    if [[ -n "$2" ]]; then
+      backup_path=$2
+    fi  
+    #echo $backup_path
+
+    overwrite=0
+    if [[ -n "$3" ]]; then
+      overwrite=$3
+    fi
+    #echo $overwrite
+
+    if [[ -d "$source_path" || -f "$source_path" ]]; then
+        if [[ -d "$source_path" ]]; then
+          if find "$source_path" -maxdepth 0 -empty | read; then
+            echo "Source folder is empty, nothing to backup ${source_path}"
+            return 3
+          elif [[ ! -d "${backup_path}" ]]; then
+              echo "Creating  ${source_path} path copy at ${backup_path}"
+              sudo mkdir -p ${backup_path}
+              sudo cp -R -a ${source_path} ${backup_path}
+          elif [[ -d "${backup_path}" && "overwrite" -eq 1 ]]; then
+              echo "Copying ${source_path} to ${backup_path}"
+              sudo rm -r $backup_path
+              sudo cp -R -a $source_path $backup_path
+          fi
+        elif [[ -f "$source_path" ]]; then
+          if [ ! -f "${backup_path}" ]; then
+              echo "Creating  ${source_path} path copy at ${backup_path}"
+              sudo cp -R -a ${source_path} ${backup_path}
+          elif [[ -f "${backup_path}"  && "overwrite" -eq 1 ]]; then
+            echo "Copying ${source_path} to ${backup_path}"
+            sudo rm -r ${backup_path}
+            sudo cp -R -a ${source_path} ${backup_path}
+          fi
+    
+        else
+          echo "Failed to backup path ${backup_path}"
+          return 2
+        fi
+    else
+      echo "Failed to find source path ${source_path}"
+      return 1
+    fi
+    if [[ -d "$backup_path" || -f "$backup_path" ]]; then
+        echo "Created ${source_path} path copy at ${backup_path}"
+    else
+        echo "Failed to backup path ${backup_path}"
+        return 1
+    fi
+}
+export -f path_backup
+
+
+function path_sync(){
+    source_path=$1
+    target_path=$2
+    delete=1
+    if [[ -n "$3" ]]; then
+    	delete=$3
+    fi
+    if [[ -d "$source_path" ]]; then
+      if find "$source_folder" -maxdepth 0 -empty | read; then
+          echo "Source folder is empty, nothing to sync ${source_folder}"
+          return 3
+      else
+        if [[ ! -d "${target_path}" ]]; then
+          echo "Creating target path ${target_path}"
+          sudo mkdir -p ${target_path}
+        fi
+        if [[ -d "${target_path}" ]]; then
+          echo "Syncing Folder ${source_path} to ${target_path}"
+          if [[ "$delete" -eq 1 ]]; then
+          	sudo rsync -avhr ${source_path}/ ${target_path}/ --delete
+          else
+          	sudo rsync -avhr ${source_path}/ ${target_path}/
+          fi
+        else
+          echo "Failed to create target path ${target_path}"
+          return 2
+        fi
+      fi
+    elif [[ -f "$source_path" ]]; then
+      echo "Syncing File ${source_path} to ${target_path}"
+      sudo rsync -avhr ${source_path} ${target_path}
+    elif [[ -L "$source_path" ]]; then
+      echo "Syncing Symlink ${source_path} to ${target_path}"
+      if [[ -d "${target_path}" ]]; then
+          echo "Deleting existing target file ${target_path}"
+          sudo rm ${target_path}
+      fi
+      echo "Copying Symlink ${source_path} to ${target_path}"
+      sudo cp -a ${source_path} ${target_path}
+    else
+      echo "Failed to find source path ${source_path}"
+      return 1
+    fi
+    echo echo "Sync complete ${source_path} to ${target_path}"
+}
+export -f path_sync
+
+function path_delete(){
+    source_path=$1
+    if [[ ! -v "$source_path" || -z "$source_path" ]]; then
+      source_path=$(pwd)
+    fi
+    if [[ -d "$source_path" || -f "$source_path" || -L "$source_path" ]]; then
+          if is_nepi_path ${source_folder}; then
+            echo "Deleting path ${source_folder}"
+            sudo rm -r $source_path
+          else
+            return 1
+          fi
+    else
+      echo "Path not found: ${source_path}"
+      return 1
+    fi
+}
+export -f path_delete
+
+function path_usage(){
+    source_path=$1
+    if [[ -z "$source_path" ]]; then
+      source_path=$(pwd)
+    fi
+    if is_valid_folder $source_path >/dev/null 2>&1; then
+      cur_path=$(pwd)
+      cd $source_path
+      sudo ncdu
+      cd $cur_path
+    else
+      echo "Not a valid path ${source_path}"
+      return 1
+    fi
+}
+export -f path_usage
+
+
+function path_space_mb(){
+    source_path=$1
+    if [[ -z "$source_path" ]]; then
+      source_path=$(pwd)
+    fi
+    if is_valid_folder $source_path >/dev/null 2>&1; then
+      if space=$(sudo df -BM --output=avail "$source_path" | tail -n1 | sed 's/M//'); then
+        avail_space=$space
+      fi
+    fi
+    if [[ -n "$avail_space" ]]; then
+      echo $avail_space
+    else
+      echo 0
+      return 1
+    fi
+}
+export -f path_space_mb
+
+
+function path_space_gb(){
+    source_path=$1
+    if [[ -z "$source_path" ]]; then
+      source_path=$(pwd)
+    fi
+    if [[ ! $source_path == /* ]]; then
+      source_path=$(pwd)/${source_path}
+    fi
+    if is_valid_folder $source_path >/dev/null 2>&1; then
+      if space=$(sudo df -BG --output=avail "$source_path" | tail -n1 | sed 's/M//'); then
+        avail_space=${space%?}
+      fi
+    fi
+    if [[ -n "$avail_space" ]]; then
+      echo $avail_space
+    else
+      echo 0
+      return 1
+    fi
+}
+export -f path_space_gb
+
+function path_size_kb(){
+    source_path=$1
+    if [[ -z "$source_path" ]]; then
+      source_path=$(pwd)
+    fi
+    if [[ ! $source_path == /* ]]; then
+      source_path=$(pwd)/${source_path}
+    fi
+
+    if is_valid_folder $source_path >/dev/null 2>&1; then
+      path_size=$(sudo du -s "$source_path" | awk '{print $1}')
+    fi
+    if is_valid_file $source_path >/dev/null 2>&1; then
+      path_size=$(sudo stat -c %s "$source_path")
+      path_size=$((path_size / 1024))
+    fi
+
+    if [[ -n "$path_size" ]]; then
+      path_size=$((path_size + 1))
+      echo $path_size
+    else
+      echo 0
+      return 1
+    fi
+}
+export -f path_size_kb
+
+
+function path_size_mb(){
+    source_path=$1
+    path_size=$(path_size_kb $source_path)
+    
+    if [[ -n "$path_size" ]]; then
+      path_size=$((path_size / 1000))
+      echo $path_size
+    else
+      echo 0
+      return 1
+    fi
+}
+export -f path_size_mb
+
+
+function path_size_gb(){
+    source_path=$1
+    path_size=$(path_size_mb $source_path)
+
+    if [[ -n "$path_size" ]]; then
+      path_size=$((path_size / 1000))
+      echo $path_size
+    else
+      echo 0
+      return 1
+    fi
+}
+export -f path_size_gb
+
+
+function empty_trash(){
+  trash-empty
+  sudo rm -rf ${NEPI_HOME}.local/share/Trash/files/* >/dev/null 2>&1
+}
+export -f empty_trash
+
+
+function select_file_from_folder() {
+    local folder_path="$1"
+    local selected_file=""
+
+    # Check if the folder path is provided
+    if [[ -z "$folder_path" ]]; then
+        echo "Error: Please provide a folder path."
+        return 1
+    fi
+
+    # Check if the folder exists
+    if [[ ! -d "$folder_path" ]]; then
+        echo "Error: Folder '$folder_path' not found."
+        return 1
+    fi
+
+    # Change to the specified directory
+    pushd "$folder_path" > /dev/null || return 1
+
+    declare -a files
+    for file in "$folder_path"/*; do
+        if [[ -f "$file" ]]; then # Check if the item is a regular file
+            filename=$(basename "$file")
+            files+=( "$filename" ) # Add it to the array
+            echo $filename
+        fi
+    done
+
+    # Check if there are any files
+    if [[ ${#files[@]} -eq 0 ]]; then
+        popd > /dev/null
+        return 1
+    fi
+
+    # Check if one file
+    if [[ ${#files[@]} -eq 1 ]]; then
+        echo "${files[0]}"
+        popd > /dev/null
+        return 0
+    fi
+    echo ""
+    echo "Select a file from "${folder_path}":"
+    echo "--------------------"
+    echo ""
+    select filename in "${files[@]}"; do
+        if [[ -n "$filename" ]]; then
+            selected_file="$filename"
+            break
+        else
+            echo "Invalid selection. Please try again."
+        fi
+    done
+    echo "You selected ${selected_file}"
+    
+    # Return to the original directory
+    popd > /dev/null
+
+    # Output the full path of the selected file
+    if [[ -n "$selected_file" ]]; then
+        echo "${selected_file}"
+    fi
+}
+export -f select_file_from_folder
+
+function run_script(){
+  if [[ ! -v "$1" && -n "$1" ]]; then
+    script_path=$1
+    if [[ -f "$script_path" ]]; then
+      echo "Running script $(basename $script_path)"
+      bash ${script_path}
+      script_error=$?
+      if [[ "$script_error" -ne 0 ]]; then
+        echo "Script $(basename $script_path) returned error ${script_error}"
+        return $script_error
+      fi
+    else
+        echo "Script not found at ${script_path}"
+        return 1
+    fi
+  else
+    echo "No Script Path Provided"
+    return 1
+  fi
+}
+export -f run_script
+
+function source_script(){
+  if [[ ! -v "$1" && -n "$1" ]]; then
+    script_path=$1
+    if [[ -f "$script_path" ]]; then
+      echo "Sourcing script: ${script_path}"
+      arg=$2
+      if [[ -n $arg ]]; then
+        echo "Passing arg ${arg}"
+        source $script_path $arg
+      else 
+        echo "Passing no args"
+        source ${script_path}
+      fi
+      script_error=$?
+      if [[ "$script_error" -ne 0 ]]; then
+        echo "Script $(basename $script_path) returned error ${script_error}"
+        return $script_error
+      fi
+    else
+        echo "Script not found at ${script_path}"
+        return 1
+    fi
+  else
+    echo "No Script Path Provided"
+    return 1
+  fi
+}
+export -f source_script
+
+
+
+
+function process_count(){
+  pname=$1
+  pcount=$(ps aux | grep "${pname}" | grep -v grep | wc -l)
+  echo $pcount
+}
+export -f process_count
+
+function clean_tag_string(){
+  cstring=$1
+  cstring="${cstring// /_}"
+  cstring="${cstring//\//_}"
+  cstring="${cstring//-/_}"
+  cstring="${cstring//./p}"
+  cstring="${cstring,,}"
+  echo $cstring
+}
+export -f clean_tag_string
+
+
+function clean_version_string(){
+  cstring=$1
+  cstring="${cstring// /_}"
+  cstring="${cstring//-/_}"
+  cstring="${cstring//./p}"
+  echo $cstring
+}
+export -f clean_version_string
+
+function dev_version_string(){
+  dstring=$(clean_version_string $1)
+  dstring=${dstring}-$(date +%Y%m%d-%H%M)
+  echo $dstring
+}
+export -f dev_version_string
+
+
+
+function get_hw_type() {
+  if is_valid_jetson >/dev/null 2>&1; then
+      hw_type=jetson
+  elif is_valid_rpi >/dev/null 2>&1; then
+      hw_type=rpi
+  elif is_valid_arm64 >/dev/null 2>&1; then
+      hw_type=arm64
+  elif is_valid_amd64 >/dev/null 2>&1; then
+      hw_type=amd64
+  else
+      hw_type=$(uname -m)
+  fi
+  echo $hw_type
+}
+export -f get_hw_type
+
+
+function get_hw_arch() {
+  if is_valid_jetson >/dev/null 2>&1; then
+      hw_type=arm64
+  elif is_valid_rpi >/dev/null 2>&1; then
+      hw_type=rpi
+  elif is_valid_arm64 >/dev/null 2>&1; then
+      hw_type=arm64
+  elif is_valid_amd64 >/dev/null 2>&1; then
+      hw_type=amd64
+  else
+      hw_type=$(uname -m)
+  fi
+  echo $hw_type
+}
+export -f get_hw_arch
+
+
+function get_os_info() {
+  sw_desc=''
+  os_name=$(grep '^NAME=' /etc/os-release | cut -d'=' -f2 | tr -d '"')
+  os_version=$(grep '^VERSION_ID=' /etc/os-release | cut -d'=' -f2 | tr -d '"')
+  os_info="${os_name}${os_version}"
+  echo $os_info
+}
+export -f get_os_info
+
+
+function get_python_version() {
+    # Check if python3 command exists
+    if ! command -v python3 &> /dev/null; then
+        echo "0"
+        return 1
+    fi
+
+    # Extract the version number only
+    pswv_long=$(python3 -V 2>&1 | awk '{print $2}')
+    #echo $pswv_long
+    pswv_short=$(echo "$pswv_long" | awk -F. '{print $1 "." $2}')
+    echo $pswv_short
+}
+
+export -f get_python_version
+
+
+function get_cuda_version(){
+
+        if nvcc --version  >/dev/null 2>&1; then
+          string=$(nvcc --version) 
+          key=release
+          value=$(echo "$string" | grep "${key}" | awk '{print $NF}' | cut -d'.' -f1-2)
+          echo "${value#V}"
+        else
+          cuda_version=0
+          cuda_path=/usr/local
+          declare -a files
+          for file in "$cuda_path"/*; do
+              if [[ -d "$file" && "$file" == *cuda-* ]]; then # Check if the item is a regular file
+                  cuda_version=${file##*-}
+              fi
+          done
+          echo $cuda_version
+        fi
+}
+export -f get_cuda_version
+
+
+function get_hailo_hw_version(){
+        hailo_version=0
+        pci_list=$(lspci)
+        hailo_split="${pci_list#*Hailo-}"
+        if [[ -n $hailo_split ]]; then
+          hailo_version="${hailo_split%% *}"
+        else
+          hailo_version=0
+        fi
+        echo $hailo_version
+}
+export -f get_hailo_hw_version
+
+
+function get_hailo_sw_version(){
+        hailo_version=0
+        hailo_info=$(hailortcli -version >/dev/null 2>&1)
+        if [[ -n $hailo_info ]] ; then
+          hailo_sw="${hailo_info##* }"
+          if [[ -n hailo_sw ]]; then
+            hailo_version=$hailo_sw
+          fi
+        fi
+      
+        echo $hailo_version
+}
+export -f get_hailo_sw_version
+
+function get_hailo_fw_version(){
+        hailo_version=0
+        if is_valid_hailo_hw  >/dev/null 2>&1; then
+          hailo_info=$(hailortcli fw-control identify  2> /dev/null | tr -d '\0' 2>/dev/null)
+          hailo_sw=$(echo $hailo_info | grep -oP 'Firmware Version: \K[0-9]+\.[0-9]+\.[0-9]+')
+          hailo_sw=${hailo_sw// /}
+          if [[ -n $hailo_sw ]]; then
+            hailo_version=$hailo_sw
+          else
+            hailo_info=$(hailortcli fw-control identify 2>&1 >/dev/null | head -n 1)
+            tmp="${hailo_info#*\(}"
+            hailo_sw="${tmp%%\)*}"
+            if [[ -n 4hailo_sw ]]; then
+              hailo_version=$hailo_sw
+            fi
+          fi
+
+        fi
+      
+        echo $hailo_version
+}
+export -f get_hailo_fw_version
+
+# function get_hailo_installed_version(){
+#         hailo_version=0
+#         hailo_folder="/lib/firmware/hailo"
+#         if [[ -d $hailo_folder ]]; then
+#           if [[ -L "${hailo_folder}/hailo8_fw.bin" ]]; then
+#             hailo_path=$(readlink "${hailo_folder}/hailo8_fw.bin")
+#           elif [[ -L "${hailo_folder}/hailo10_fw.bin" ]]; then
+#             hailo_path=$(readlink "${hailo_folder}/hailo10_fw.bin")
+#           fi
+#           if [[ -n $hailo_path ]]; then
+#             hailo_file="${hailo_path#*fw.}"
+#             version="${hailo_file%.bin*}"
+#             if [[ -n $version ]]; then
+#               hailo_version=$version
+#             fi
+#           fi
+#         fi
+#         echo $hailo_version
+# }
+# export -f get_hailo_installed_version
+
+
+function get_openvpn_version(){
+        if openvpn --version >/dev/null 2>&1; then
+          value=$(openvpn --version 2>&1 | head -1 | awk '{print $2}')
+          echo "${value}"
+        else
+          echo 0
+        fi
+}
+export -f get_openvpn_version
+
+
+function get_sw_desc() {
+  os_desc=$(get_os_info)
+  sw_desc=${os_desc}
+  cuda_ver=$(get_cuda_version 2> /dev/null) 
+  if [[ -n $cuda_ver && "$cuda_ver" != '0' ]]; then
+    sw_desc="${sw_desc}_cuda${cuda_ver}"
+  fi
+  hailo_ver=$(get_hailo_sw_version 2> /dev/null) 
+  if [[ -n $hailo_ver && "$hailo_ver" != '0' ]]; then
+    sw_desc="${sw_desc}_hailo${hailo_ver}"
+  fi
+  sw_desc=$(clean_tag_string "$sw_desc")
+  echo "${sw_desc}"
+}
+export -f get_sw_desc
+
+
+function cmd_loop() {
+  if [[ ! -v "$1" && -n "$1" ]]; then
+    SECONDS=0
+    while $1; do 
+      echo "$SECONDS"
+      sleep 1
+    done
+  else
+    echo "No command string provided"
+  fi
+}
+export -f cmd_loop
+
+
+
+function create_ssh_key {
+        sudo -v
+
+        key_type=ed25519
+
+        key_folder=$1
+        if [[ -z $key_folder ]]; then
+          key_folder=/home/${CONFIG_USER}/.ssh
+        fi
+        if [[ ! -d $key_folder ]]; then
+          sudo mkdir -p $key_folder
+        fi
+
+        key_name=$2
+        if [[ -z "$key_name" ]]; then
+            key_name="nepi_$(hostname)_${CONFIG_USER}_ssh_key"
+        fi 
+
+        user_email=$3
+        if [[ -z "$user_email" ]]; then
+            user_email=${CONFIG_USER}@nepi.com
+        fi     
+
+
+        if [[ -d $key_folder && -n $key_folder ]]; then          
+
+              key_file=${key_name}
+              key_path=${key_folder}/${key_file}
+
+             if [[ -d $key_folder && -n $key_folder ]]; then   
+                      sudo chmod 0700 $key_folder
+                      sudo chmod  0600 $key_folder/*
+                      sudo chown -R ${CONFIG_USER}:${CONFIG_USER} $key_folder
+              fi
+
+              if [[ -f $key_path ]]; then
+                  echo "Key already exists ${key_path}"
+                  return 0
+              fi
+
+              ssh-keygen -t ${key_type} -f ${key_path} -q -N "" -C "${user_email}"
+              eval "$(ssh-agent -s)"
+              if ssh-add ${key_path} > /dev/null; then
+                echo "Added key: ${key_file}"
+                cat ${key_path}.pub
+              else
+                echo "Failed to add SSH key: ${key_file}"
+              fi
+
+
+              config_file=${key_folder}/config
+              touch ${config_file}
+
+              if [[ -d $key_folder && -n $key_folder ]]; then   
+                sudo chmod 0700 $key_folder
+                sudo chmod  0600 $key_folder/*
+                sudo chown -R ${CONFIG_USER}:${CONFIG_USER} $key_folder
+              fi
+
+
+              if [[ -f $key_path ]]; then
+                  echo "Created ssh_key ${key_file}"
+                  echo "${key_path}"
+                  return 0
+
+              else
+                echo "NEPI Failed to create ssh_key ${key_file}"
+                return 1
+              fi
+
+
+        else
+          echo "SSH Key folder not found ${key_folder}"
+          return 2
+        fi
+
+}
+
+export -f create_ssh_key
+
+
+
+function add_ssh_key {
+  sudo -v
+  key_path=$1
+  if [[ -n $key_path ]]; then
+
+      # Output the full path of the selected file
+      if [[ -f $key_path ]]; then
+          if ssh-add ${key_path} > /dev/null; then
+              echo "Added SSH key: ${key_path}"
+          else
+            echo "Failed to add SSH key: ${key_path}"
+            return 3
+          fi
+            key_folder=$(dirname ${key_path})
+            if [[ -d $key_folder && -n $key_folder ]]; then   
+              sudo chmod 0700 $key_folder
+              sudo chmod  0600 $key_folder/*
+              sudo chown -R ${CONFIG_USER}:${CONFIG_USER} $key_folder
+            fi
+
+          return 0
+      else
+        echo "File not found at key path: ${key_path}"
+        return 2
+      fi
+  else
+    echo "No Key Path Provided"
+    return 1
+  fi
+
+
+
+}
+
+export -f add_ssh_key
+
+
+function select_ssh_key {
+        sudo -v
+        key_folder=$1
+        if [[ -z $key_folder ]]; then
+          key_folder="/home/${CONFIG_USER}/.ssh"
+        fi
+        sel_ssh_file=''
+        echo "Checking for available key options in folder: ${key_folder}"
+
+        if [[ -d $key_folder ]]; then
+                ###############
+                #echo "Checking for available key options"
+                # Change to the specified directory
+           
+            if [[ -d $key_folder && -n $key_folder ]]; then   
+              sudo chmod 0700 $key_folder
+              sudo chmod  0600 $key_folder/*
+              sudo chown -R ${CONFIG_USER}:${CONFIG_USER} $key_folder
+            fi
+
+                pushd "$key_folder" > /dev/null || return 1
+
+                declare -a files
+                for file in "$key_folder"/*; do
+                    pub_file="${file}.pub"
+                    #echo "Checking file: ${file}"
+                    #echo "Looking for public key file: ${pub_file}"
+                    filename=$(basename "$file")
+                    if [[ -f "$file" ]]; then # Check if the item is a regular file
+                        if [[ -f $pub_file ]]; then
+                          files+=( "$filename" ) # Add it to the array
+                          echo $filename
+                        fi
+                    fi
+                done
+
+            if [[ -d $key_folder && -n $key_folder ]]; then   
+              sudo chmod 0700 $key_folder
+              sudo chmod  0600 $key_folder/*
+              sudo chown -R ${CONFIG_USER}:${CONFIG_USER} $key_folder
+            fi
+                
+
+                # Check if there are any files
+                if [[ ${#files[@]} -eq 0 ]]; then
+                    echo "No SSH Key files found in folder: ${key_folder}"
+                    popd > /dev/null
+                    return 1
+                fi
+
+                # # Check if one file
+                # if [[ ${#files[@]} -eq 1 ]]; then
+                #     echo "${files[0]}"
+                #     popd > /dev/null
+                #     return 0
+                # fi
+                echo ""
+                echo "Select a file from "${folder_path}":"
+                echo "--------------------"
+                echo ""
+                select filename in "${files[@]}"; do
+                    if [[ -n "$filename" ]]; then
+                        sel_ssh_file="$filename"
+                        break
+                    else
+                        echo "Invalid selection. Please try again."
+                    fi
+                done
+                
+                # Return to the original directory
+                popd > /dev/null
+
+                # Output the full path of the selected file
+                if [[ -n "$sel_ssh_file" ]]; then
+                    sel_ssh_path=${key_folder}/$sel_ssh_file
+                    add_ssh_key $sel_ssh_path
+                    return $?
+                else
+                  return 2
+                fi
+
+        else
+          echo "SSH Key folder not found ${key_folder}"
+          return 1
+        fi
+
+}
+
+export -f select_ssh_key
+
+
+
+
+function run_ssh_env {
+  . "${NEPI_SSH_ENV}" > /dev/null
+}
+
+function start_ssh_agent {
+  echo "Initializing new SSH agent..."
+  ssh-agent | sed 's/^echo/#echo/' > "${NEPI_SSH_ENV}"
+  echo "succeeded"
+  if [[ -n $NEPI_SSH_ENV ]]; then 
+    chmod 600 "${NEPI_SSH_ENV}"
+  fi
+
+  run_ssh_env;
+
+  ssh-add ~/.ssh/id_rsa;
+}
+
+
+
+# Clear Known Host Keys
+function clear_known_hosts(){
+  kh_file=/home/${CONFIG_USER}/.ssh/known_hosts
+  if [[ -f "$kh_file" ]]; then
+    rm $kh_file
+  fi
+}
+export -f clear_known_hosts
+
+function get_path_type() {
+    check_path="${1}"
+    if [[ -n $check_path ]]; then
+      local target_path=$check_path
+    else
+      local target_path=$(pwd)
+    fi
+    
+    # Get the parent block device name (e.g., sda, nvme0n1, mmcblk0)
+    local dev_name
+    dev_name=$(lsblk -no PKNAME "$(findmnt -nvo SOURCE -T "$target_path")")
+    if [[ -z $dev_name ]]; then
+        dev_info=$(lsblk "$(findmnt -nvo SOURCE -T "$target_path")" | sed -n '2p')
+        dev_name=$(echo "$dev_info" | cut -d' ' -f1)
+    fi
+    #echo "dev_name at ${target_path} is ${dev_name}"
+    if [[ -z "$dev_name" ]]; then
+        echo "unknown"
+        return 1
+    fi
+
+    # Check Transport (USB/NVMe/SATA) and Rotational status
+    local transport rotational
+    transport=$(lsblk -no TRAN "/dev/$dev_name" | xargs)
+    tran=$(echo "$transport" | cut -d' ' -f1)
+    rotational=$(lsblk -no ROTA "/dev/$dev_name" | xargs)
+    rot=$(echo "$rotational" | cut -d' ' -f1)
+
+    #echo "transport at ${dev_name} is ${transport}"
+    #echo "rotational at ${dev_name} is ${rotational}"
+    # Logic to distinguish media type
+    if [[ "$tran" == "usb" ]]; then
+        echo "usb"
+    elif [[ "$dev_name" == mmcblk* ]]; then
+        echo "sd"
+    elif [[ "$rot" == "0" ]]; then
+        echo "ssd"
+    elif [[ "$rot" == "1" ]]; then
+        echo "hdd"
+    else
+        echo "unknown"
+    fi
+}
+export function get_path_type
+
+function get_dfi(){
+  df -h  -x squashfs -x tmpfs -x devtmpfs -x cifs | grep -v "/boot*"
+}
+export function get_dfi
+
+function get_dfbi(){
+  df -h | grep 'boot'
+}
+export function get_dfbi
+
+function service_running() {
+    local service_name="$1"
+    
+    if systemctl is-active --quiet "$service_name"; then
+        return 0 # Running
+    else
+        return 1 # Not running
+    fi
+}
+
+export service_running
+
+#### Update Help Test
+utilsn="${utilsn}
+################################
+### NEPI SYSTEM UTIL FUNCTIONS
+################################
+ftext = Find text in files recursively
+ffile = Find filenames with text match recursively
+cmd_loop = Runs the COMMAND_STRING until Ctrl-C every second
+update_text_value = Adds or Replaces value in text file given FILE KEY UPDATE_STRING FILE
+update_yaml_value = Update entry in yaml file given KEY VAL FILE
+update_json_value = Update entry in json file given FILE KEY VAL. KEY supports dot notation for nested keys (e.g. browser.show_home_button)
+print_yaml_file = Prints all of the yaml entries in given FILE
+sync_yaml_files = Sync missing keys between given SOURCE_FILE TARGET_FILE. Add '1' to replace existing values 
+load_yaml_file = Exports all of the yaml entries to system variables in given FILE
+path_backup = Backup SOURCE_PATH TARGET_PATH with safe checks. Optional 0 or 1 to overwrite if exists. 
+path_sync = Sync SOURCE_PATH to TARGET_PATH with safe checks. Optional 0 or 1 to delete files.
+select_file_from_folder = Selection menu of files in provided SOURCE_PATH.  Echos selected path name
+fix_path = Update file or folder owner to 1000 at provided FIX_PATH, and update access permissions with PERM_NUMBER if provided.
+fix_folder = Update or Make folder and contents with owner to 1000 for provided FIX_PATH, and update access permissions with PERM_NUMBER if provided.
+fix_scripts = Update files in provided FIX_PATH (or current path if not provided) with owner 1000 and +x access permissions.
+get_dfi = Return filtered list of not boot drive info
+get_dfbi = return filterd list of boot drive info
+get_path_type = Return type of media at provided path or defaults to current path
+path_delete = Deletes TARGET_PATH with safe checks
+path_usage = Analyze provided path for usage
+path_space_mb = Echos available MB space for SOURCE_PATH. Echos 0 if path not vald folder
+path_space_gb = Echos available GB space for SOURCE_PATH. Echos 0 if path not vald folder
+path_size_kb = Echos size of path (file or folder) in KB space for SOURCE_PATH. Echos 0 if path not vald folder
+path_size_mb = Echos size of path (file or folder) in MB space for SOURCE_PATH. Echos 0 if path not vald folder
+path_size_gb = Echos size of path (file or folder) in GB space for SOURCE_PATH. Echos 0 if path not vald folder
+empty_trash = Empty Trash for current User
+run_script = Uses 'bash' to run script at provided SCRIPT_PATH
+source_script = Uses 'source' to run script at provided SCRIPT_PATH, with an optional SCRIPT_OPTION passed to script
+process_count = Echos number of processes running for provide PROCESS_NAME
+clean_tag_string = Echos a NEPI Info formated version of the provided STRING
+clean_version_string = Echos a NEPI Version formated version of the provided VERSION_STRING
+dev_version_string = Echos a NEPI Dev Version formated version of the provided VERSION_STRING
+get_hw_type = Echos the current hardware type string (ie. jetson, arm64, amd64, or uname)
+get_hw_arch = Echos the current hardware arch string (ie. arm64, amd64, or uname)
+get_os_info = Echos the current OS NameVersion
+get_python_version = Echos the current python3 version
+get_cuda_version = Echos CUDA version number if nvcc --version availble or 0
+get_openvpn_version = Echos OpenVPN version number if openvpn installed or 0
+get_hailo_hw_version = Echos Hailo hardware version if software finds Hailo Device or 0
+get_hailo_sw_version = Echos Hailo software version if software finds Hailo Device or 0
+get_sw_desc = Echos NEPI formated software vesion tag
+add_ssh_key = Add the ssh key in the provided full path ssh_key file
+create_ssh_key = Create a new SSH key key pair in provided key_folder
+select_ssh_key = Select SSH key from available keys in provided key_folder
+run_ssh_env = Run ssh environment
+start_ssh_agent = Start the system ssh agent process
+clear_known_hosts = Clear ssh known hosts file
+service_running = Returns error 0 if service is running"
+
+
+
+
+
+
+###################################
+# Command Line Confi Util Functions
+###################################
+
+
+head_name=$(git rev-parse --abbrev-ref HEAD >/dev/null 2>&1)
+if [ "$?" -eq 0 ]; then #$(is_git_repo $PWD) -eq 1 ]; then
+  export PS1="\u@\h \[\e[32m\]\w \[\e[91m\]\$(parse_git_branch)\[\e[00m\]$ "
+
+  #GIT Command Line Branch Display
+  parse_git_branch() {
+      git branch 2> /dev/null | sed -e '/^[^*]/d' -e 's/* \(.*\)/(\1)/'
+  }
+fi
+
+###################################
+# ROS Util Functions
+###################################
+NROS=${NEPI_BASE}/nepi_engine/setup.bash
+ROS=/opt/ros/noetic/setup.bash
+HAS_ROS=$(dpkg -l | grep ros-)
+if [ 1 ]; then # [[ -z "$HAS_ROS" ]]; then
+
+    export NEEDS_ROS=1
+
+    # Function to search for topic containing string
+    function sros(){
+      # Source ROS Env
+      if [[ -f "$NROS" ]]; then
+        echo "Sourcing ros bash ${NROS}"
+        source ${NROS}
+      elif [[ -f "$ROS" ]]; then
+        echo "Sourcing ros bash ${ROS}" 
+        source ${ROS}
+      else
+        echo "No Ros Setup File Found"
+      fi
+      export NEEDS_ROS=0
+    }
+
+    export -f sros
+
+    # Function to search for topic containing string
+    function ftopic(){
+    if [ "$NEEDS_ROS" -eq 1 ]; then
+      sros
+      wait
+    fi
+    rostopic list | grep "$@" 
+    }
+
+    # Function to print all topics out
+    function ltopics(){
+    if [ "$NEEDS_ROS" -eq 1 ]; then
+      sleep 1 & sros
+      wait
+    fi
+    rostopic list
+    }
+
+    # Function to listen to topic
+    function etopic(){
+    if [ "$NEEDS_ROS" -eq 1 ]; then
+      sleep 1 & sros
+      wait
+    fi
+    rostopic echo "$@" 
+    }
+
+    # Function to search for service containing string
+    function fservice(){
+    if [ "$NEEDS_ROS" -eq 1 ]; then
+      sleep 1 & sros
+      wait
+    fi
+    rosservice list | grep "$@" 
+    }
+
+    # Function to print all services out
+    function lservices(){
+    if [ "$NEEDS_ROS" -eq 1 ]; then
+      sleep 1 & sros
+      wait
+    fi
+    rosservice list
+    }
+
+    # to call service
+    function cservice(){
+    if [ "$NEEDS_ROS" -eq 1 ]; then
+      sleep 1 & sros
+      wait
+    fi
+    rosservice call "$@"
+    }
+
+utilsn="${utilsn}
+###########################
+### NEPI ROS UTIL FUNCTIONS
+###########################
+sros = source ros bash setup
+snros = source nepi ros bash setup
+ltopics = List all active topics
+ftopic = Find topics containing provided string
+etopic = Echo to provided topic
+lservices = List all active services
+fservice = Find services containing provided string
+cservice = Call service"
+
+fi
+
+###################################
+# Docker Util Functions
+###################################
+
+if which docker &> /dev/null; then
+  function dimg(){
+    sudo docker images
+  }
+
+  function dps(){
+    sudo docker ps -a
+  }
+
+  
+utilsn="${utilsn}
+###########################
+### Docker UTIL FUNCTIONS
+###########################
+dimg = sudo docker images
+dps = sudo docker ps -a"
+
+fi
+
+###################################
+# NEPI Dev Functions
+###################################
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+
+alias nepihome="
+cd ${NEPI_HOME}"
+
+
+alias nsetup="cd $(NSETUP)/scripts"
+
+alias nssh="cd ${NEPI_HOME}/.ssh"
+
+
+function nepirui() {
+  if [[ -n "$DISPLAY" ]]; then
+    if [[ ${NEPI_MODE} != 'SYSTEM' ]]; then
+      rui_ip=$(NRUI_IP)
+      echo "Will Connect to NEPI RUI at: ${rui_ip}"
+      if [[ ${NEPI_MODE} == 'REMOTE' ]]; then
+        if ! pingn; then
+          return
+        fi
+      fi
+      
+      if command -v chromium-browser &>/dev/null; then
+                chromium-browser http://${rui_ip}:5003/
+      else
+          # Check for an alternative common name if the first one fails
+          if command -v chromium &>/dev/null; then
+                chromium http://${rui_ip}:5003/
+          else
+              echo "Chromium Browser not Installed"
+              echo "INSTALL WITH: sudo snap install chromium"
+          fi
+      fi
+    fi
+  else
+    echo "No Display Detected"
+  fi
+
+}
+
+export -f nepirui
+
+
+function nepistorage() {
+  sudo -v
+  shfolder=nepi_storage
+  if [[ ${NEPI_MODE} == 'REMOTE' ]]; then
+    if pingn; then
+      
+      shdrive=/mnt/nepi_share_storage
+
+      #echo "Checking for mountpoint at: ${shdrive}"
+      sudo umount -l $shdrive >/dev/null
+      # timeout 1 mountpoint -q $shdrive
+      # if [[ $? -eq 0 ]]; then
+      #   echo "Unmounting mountpoint at: ${shdrive}"
+      #   timeout 1 sudo umount $shdrivelib
+      # fi
+
+      echo "Checking for mount folder at: ${shdrive}"
+      if [[ ! -d $shdrive ]]; then
+          echo "Creating mount folder: ${shdrive}"
+          sudo mkdir $shdrive
+      fi
+      
+
+      echo "Setting mount folder permissions: ${shdrive}"
+      sudo chown ${CONFIG_USER}:${CONFIG_USER} $shdrive
+      echo "Mounting shared drive at: //${NEPI_IP}/${shfolder} to ${shdrive}"
+      sudo mount.cifs //${NEPI_IP}/${shfolder} $shdrive -o user=$NEPI_USER,uid=$(id -u),gid=$(id -g)
+    
+      if timeout 1 mountpoint -q $shdrive; then
+        cd $shdrive
+        echo $shdrive
+        return 0
+      else
+        echo "Failed to mount and connect nepi shared folder: ${shdrive}"
+        return 1
+      fi
+    else
+        return 1
+    fi
+  else
+    shdrive=/mnt/${shfolder}
+    if [[ -d $shdrive ]]; then
+      cd $shdrive
+      echo $shdrive
+      return 0
+    else
+      echo "Failed to mount and connect nepi shared folder: ${shdrive}"
+      
+      return 1
+    fi
+  fi
+}
+
+export -f nepistorage
+
+function nepistorage_open() {
+  sudo -v
+  if nepistorage; then
+    if [[ ${NEPI_MODE} == 'REMOTE' ]]; then
+      if pingn; then
+        shdrive=/mnt/nepi_share_storage
+        xdg-open $shdrive
+      fi
+    else
+      shdrive=/mnt/nepi_storage
+      xdg-open $shdrive
+    fi
+      
+  fi
+}
+
+export -f nepistorage_open
+
+
+function nepiconfig() {
+  sudo -v
+  shfolder=nepi_config
+  if [[ ${NEPI_MODE} == 'REMOTE' ]]; then
+    if pingn; then
+
+      shdrive=/mnt/nepi_share_config
+
+
+      #echo "Checking for mountpoint at: ${shdrive}"
+      sudo umount -l $shdrive >/dev/null
+      # timeout 1 mountpoint -q $shdrive
+      # if [[ $? -eq 0 ]]; then
+      #   echo "Unmounting mountpoint at: ${shdrive}"
+      #   timeout 1 sudo umount $shdrivelib
+      # fi
+
+      echo "Checking for mount folder at: ${shdrive}"
+      if [[ ! -d $shdrive ]]; then
+          echo "Creating mount folder: ${shdrive}"
+          sudo mkdir $shdrive
+      fi
+      
+
+      echo "Setting mount folder permissions: ${shdrive}"
+      sudo chown ${CONFIG_USER}:${CONFIG_USER} $shdrive
+      echo "Mounting shared drive at: //${NEPI_IP}/${shfolder} to ${shdrive}"
+      sudo mount.cifs //${NEPI_IP}/${shfolder} $shdrive -o user=$NEPI_ADMIN_USER,uid=$(id -u),gid=$(id -g)
+    
+      if timeout 1 mountpoint -q $shdrive; then
+        cd $shdrive
+        echo $shdrive
+        return 0
+      else
+        echo "Failed to mount and connect nepi shared folder: ${shdrive}"
+        
+        return 1
+      fi
+    else
+        
+        return 1
+    fi
+  else
+    shdrive=/mnt/${shfolder}
+    if [[ -d $shdrive ]]; then
+      cd $shdrive
+      echo $shdrive
+      return 0
+    else
+      echo "Failed to mount and connect nepi shared folder: ${shdrive}"
+      
+      return 1
+    fi
+  fi
+}
+
+export -f nepiconfig
+
+function nepiconfig_open() {
+  sudo -v
+  if nepiconfig; then
+    if [[ ${NEPI_MODE} == 'REMOTE' ]]; then
+      if pingn; then
+        shdrive=/mnt/nepi_share_config
+        xdg-open $shdrive
+      fi
+    else
+      shdrive=/mnt/nepi_config
+      xdg-open $shdrive
+    fi
+
+      
+  fi
+}
+
+export -f nepiconfig_open
+
+
+function nepisync {
+    sudo -v
+    # Sync SSH Keys
+    echo ""
+    echo "Syncing NEPI System Config Files"
+    cur_folder=$(pwd)
+
+    # Sync SSH Keys
+    echo ""
+    echo "Syncing SSH Keys"
+
+    NEPI_SSH_KEYS_SOURCE=${RESOURCES_FOLDER}/etc/ssh/ssh_keys
+    NEPI_SSH_KEYS_DEST=/home/${CONFIG_USER}/.ssh
+
+
+    if [[ ! -d "$NEPI_SSH_KEYS_DEST" ]]; then
+        mkdir -p $NEPI_SSH_KEYS_DEST
+    fi
+    # Sync keys with nepi system config key folder
+
+    
+
+    if [ -d $NEPI_SSH_KEYS_SOURCE ]; then
+        echo "Copying NEPI SSH Keys from: ${NEPI_SSH_KEYS_SOURCE} to ${NEPI_SSH_KEYS_DEST}"
+        sudo cp -p ${NEPI_SSH_KEYS_SOURCE}/*nepi_* ${NEPI_SSH_KEYS_DEST}/
+    fi
+
+
+    if nepiconfig > /dev/null 2>&1 ; then
+        if [[ ${NEPI_MODE} == 'REMOTE' ]]; then
+          NEPI_CONFIG_SOURCE="$(pwd)/system_cfg/etc/nepi_system_config.yaml"
+          NEPI_CONFIG_DEST=/home/${CONFIG_USER}/nepi_system_config.yaml
+          echo "Copying NEPI SYSTEM CONFIG from: ${NEPI_CONFIG_SOURCE}  to ${NEPI_CONFIG_DEST}"
+          if [[ -f $NEPI_CONFIG_SOURCE ]]; then
+              if [[ ${NEPI_MODE} == 'REMOTE' ]]; then
+                sudo cp -p ${NEPI_CONFIG_SOURCE} ${NEPI_CONFIG_DEST}
+              fi
+              echo "Loading synced NEPI config file"
+              source $(pwd)/system_cfg/etc/load_system_config.sh
+          else
+            echo "NEPI SYSTEM CONFIG file not found at: ${NEPI_CONFIG_SOURCE} "
+          fi
+        fi
+
+        NEPI_SSH_KEYS_SHARE="$(pwd)/system_cfg/ssh_keys"
+        if [[ ! -d $NEPI_SSH_KEYS_SHARE ]]; then
+          sudo mkdir -p $NEPI_SSH_KEYS_SHARE
+        fi
+        if [ -d $NEPI_SSH_KEYS_SHARE ]; then
+            sudo chown ${CONFIG_USER}:${CONFIG_USER} $NEPI_SSH_KEYS_SHARE
+            if [[ ${NEPI_MODE} == 'HOST' ]]; then
+              echo "Copying NEPI SSH Keys from: ${NEPI_SSH_KEYS_DEST} to ${NEPI_SSH_KEYS_SHARE}"
+              sudo cp -p ${NEPI_SSH_KEYS_DEST}/nepi_* ${NEPI_SSH_KEYS_SHARE}/ 2> /dev/null
+              echo "Copying NEPI SSH Keys from: ${NEPI_SSH_KEYS_SHARE} to ${NEPI_SSH_KEYS_DEST}"
+              sudo cp -p ${NEPI_SSH_KEYS_SHARE}/nepi_* ${NEPI_SSH_KEYS_DEST}/ 2> /dev/null
+            else
+              echo "Copying NEPI SSH Keys from: ${NEPI_SSH_KEYS_SHARE} to ${NEPI_SSH_KEYS_DEST}"
+              sudo cp -p ${NEPI_SSH_KEYS_SHARE}/nepi_* ${NEPI_SSH_KEYS_DEST}/ 2> /dev/null
+              echo "Copying NEPI SSH Keys from: ${NEPI_SSH_KEYS_DEST} to ${NEPI_SSH_KEYS_SHARE}"
+              sudo cp -p ${NEPI_SSH_KEYS_DEST}/nepi_* ${NEPI_SSH_KEYS_SHARE}/ 2> /dev/null
+            fi
+        else
+          echo "NEPI SYSTEM SSH folder not found at: ${NEPI_SSH_KEYS_SHARE} "
+        fi
+
+
+    else
+      echo "Failed to connect to NEPI CONFIG"
+    fi
+
+if [[ -d $NEPI_SSH_KEYS_DEST && -n $NEPI_SSH_KEYS_DEST ]]; then   
+    sudo chmod 0700 $NEPI_SSH_KEYS_DEST
+    sudo chmod  0600 $NEPI_SSH_KEYS_DEST/*
+    sudo chown -R ${CONFIG_USER}:${CONFIG_USER} $NEPI_SSH_KEYS_DEST
+fi
+    cd $cur_folder
+
+}
+
+export -f nepisync
+
+
+function nepisetkey {
+    sudo -v
+
+    key_file=$1
+
+    if [[ -z $key_file ]]; then
+      key_file=$NEPI_SSH_KEY_FILE
+    fi
+    key_folder="/home/${CONFIG_USER}/.ssh"
+    key_path="${key_folder}/${key_file}"
+
+    if [[ ! -f $key_path ]]; then
+      echo "Private Key not found at ${key_path}"
+      return 1
+    fi
+
+    pub_path="${key_path}.pub"
+    if [[ ! -f $pub_path ]]; then
+      echo "Public Key not found at ${pub_path}"
+      return 2
+    fi
+
+    key_folder=$(dirname ${key_path})
+    if [[ -d $key_folder && -n $key_folder ]]; then   
+      sudo chmod 0700 $key_folder
+      sudo chmod  0600 $key_folder/*
+      sudo chown -R ${CONFIG_USER}:${CONFIG_USER} $key_folder
+    fi
+    eval "$(ssh-agent -s)"
+    if ssh-add ${key_path} > /dev/null; then
+      echo "Added key: ${key_file}"
+      cat ${key_path}.pub
+      export NEPI_SSH_KEY=$key_file
+      echo "NEPI SSH Key updated to key file ${NEPI_SSH_KEY_FILE}"
+    else
+      echo "Failed to add SSH key: ${key_file}"
+    fi
+
+
+
+    return 0
+
+}
+
+export -f nepisetkey
+
+
+function nepisshkey {
+    sudo -v
+
+    setkey=$1
+
+    key_folder="/home/${CONFIG_USER}/.ssh"
+
+    if [[ ! -d $key_folder ]]; then
+      sudo mkdir -p $key_folder
+    fi    
+
+    PS3=$'\n'"Please enter your choice by NUMBER: "
+    options=(  "Select SSH Key" "Create SSH Key")
+
+    while true; do
+        #clear # Optional: Clear the screen before displaying the menu
+
+        COLUMNS=1
+        select opt in "${options[@]}" ; do
+            case $opt in
+
+                "Select SSH Key")
+                    ret=$(select_ssh_key $key_folder)
+                    sel_error=$?
+                    sel_file=$(echo $ret | awk '{print $NF}')
+                    #echo "Got select SSH Key file error: ${sel_error}"
+                    if [[ $sel_error -eq 0 && -n sel_file ]]; then
+                      echo ''
+                      echo "Got selected SSH Key file: ${sel_file}"
+                      key_path=$sel_file
+                      exist_key='yes'
+                      break 2 # Exit both the select and the while loop
+                    else
+                      echo ''
+                      echo "No SSH Key files found in folder: ${key_folder}"
+                      echo ''
+                    fi     
+                    break # Exit the select statement
+                    ;;
+                "Create SSH Key")
+                    key_email='nepi@numurus'
+                    key_name="nepi_$(hostname)_${CONFIG_USER}_ssh_key"
+                    key_path="${key_folder}/key_name"
+                    if [[ -f $key_path ]]; then
+                      echo "NEPI SSH Key with name allready exists: ${key_name}"
+                      check_key=$(ask_yes_no "Do you want to replace this key?")
+                      if [[ ${check_key} == 'yes' ]]; then
+                        sudo rm -r ${key_path}*
+                      else
+                        key_path=''
+                        break
+                      fi
+
+                    fi
+
+                    ret=$(create_ssh_key $key_folder $key_name $key_email)
+                    sel_error=$?
+                    sel_file=$(echo $ret | awk '{print $NF}')
+                    #echo "Got select SSH Key file error: ${sel_error}"
+                    
+                    if [[ $? -eq 0 && -n sel_file ]]; then
+                      echo ''
+                      echo "Got New SSH Key file: ${sel_file}"
+                      key_path=$sel_file
+                      break 2 # Exit both the select and the while loop
+                    fi     
+                    break # Exit the select statement
+                    ;;
+                *)
+                    echo "Invalid option, please try again."
+                    ;;
+            esac
+        done
+    done
+    echo ""
+
+    if [[ -n $key_path ]]; then
+      key_name=$(basename "$key_path")
+      ret_val=0
+      if [[ $setkey -eq 1 ]]; then
+
+        nepisetkey $key_name
+        ret_val=$?
+      fi
+
+      if [[ $ret_val -eq 0 ]]; then
+
+         echo $key_name
+         return 0
+      else
+          echo "NEPI SSH Key FAILED TO SET"
+         echo ''
+         return 2
+      fi
+
+    else
+        echo "NEPI SSH Key NOT CHANGED"
+         echo ''
+         return 1
+    fi
+
+
+
+}
+
+export -f nepisshkey
+
+
+function nepiauthrm {
+    sudo -v
+    key_file=$1
+
+    
+    if [[ -n $key_file ]]; then
+
+        key_folder=$NEPI_SSH_FOLDER
+        key_path=${key_folder}/${key_file}
+
+        if [[ -f $key_path ]]; then
+
+            key_folder=$(dirname ${key_path})
+            if [[ -d $key_folder && -n $key_folder ]]; then   
+              sudo chmod 0700 $key_folder
+              sudo chmod  0600 $key_folder/*
+              sudo chown -R ${CONFIG_USER}:${CONFIG_USER} $key_folder
+            fi
+
+          authorized_keys_path="${key_folder}/authorized_keys"
+          touch ${authorized_keys_path}
+
+          key_pub=$(cat ${key_path}.pub)
+          key_email="${key_pub##* }"
+          echo "Removing existing key for id ${key_email}"
+          if [[ -n $key_email ]]; then   
+            sudo chmod 0777 $authorized_keys_path
+            echo "Editing file ${authorized_keys_path}"   
+            sed -i "/$key_email/d" "$authorized_keys_path"
+          fi
+
+          if sudo systemctl status >/dev/null 2>&1;  then
+            sudo systemctl restart sshd
+          elif sudo supervisorctl status >/dev/null 2>&1; then
+            sudo supervisorctl restart nepi_ssh
+          fi
+
+          return 0
+          
+        else
+          echo "Remove Key File Not Found: ${key_path}"
+          return 1
+        fi
+
+    else
+        echo "Remove Key File Not Provided"
+        return 1
+    fi
+}
+
+export -f nepiauthrm
+
+
+function nepiauthadd {
+    sudo -v
+    key_file=$1
+
+    
+    if [[ -n $key_file ]]; then
+
+        key_folder=$NEPI_SSH_FOLDER
+        key_path=${key_folder}/${key_file}
+
+        if [[ -f $key_path ]]; then
+
+          if [[ -d $key_folder && -n $key_folder ]]; then   
+            sudo chmod 0700 $key_folder
+            sudo chmod  0600 $key_folder/*
+            sudo chown -R ${CONFIG_USER}:${CONFIG_USER} $key_folder
+          fi
+
+          authorized_keys_path="${key_folder}/authorized_keys"
+          if [[ -f $authorized_keys_path ]]; then
+            sudo rm $authorized_keys_path
+          fi
+          touch ${authorized_keys_path}
+
+          key_pub=$(cat ${key_path}.pub)
+          key_email="${key_pub##* }"
+          echo "Removing existing key for id ${key_email}"
+          if [[ -n $key_email ]]; then     
+            sudo chmod 0777 $authorized_keys_path
+            echo "Editing file ${authorized_keys_path}"   
+            sed -i "/$key_email/d" "$authorized_keys_path"
+          fi
+
+          echo "Adding key ${key_file}"
+          sudo echo $(cat ${key_path}.pub) >> $authorized_keys_path
+          echo "Autherized Key file Updated"
+
+        if [[ -d $key_folder && -n $key_folder ]]; then   
+          sudo chmod 0700 $key_folder
+          sudo chmod  0600 $key_folder/*
+          sudo chown -R ${CONFIG_USER}:${CONFIG_USER} $key_folder
+        fi
+          echo "Key folder permissions set"
+          if sudo systemctl status >/dev/null 2>&1;  then
+            echo "Restarting systemctl SSH agent"
+            sudo systemctl restart sshd
+          elif sudo supervisorctl status >/dev/null 2>&1; then
+            echo "Restarting supervisorctl SSH agent"
+            sudo supervisorctl restart nepi_ssh
+          fi
+          echo "Key Autherization Complete"
+          return 0
+          
+        else
+          echo "Add Key File Not Found: ${key_path}"
+          return 1
+        fi
+
+    else
+        echo "Add Key File Not Provided"
+        return 1
+    fi
+}
+
+export -f nepiauthadd
+
+
+
+function nepigithub {
+    sudo -v
+    key_folder="/home/${CONFIG_USER}/.ssh"
+
+    if [[ ! -d $key_folder ]]; then
+      sudo mkdir -p $key_folder
+    fi    
+
+    if is_valid_internet >/dev/null 2>&1; then
+
+        echo " "
+        echo "################################# "
+        echo "Checking Github SSH Key"
+        echo ""
+
+
+        needs_key='yes'
+        exist_key='no'
+        add_key='no'
+        ghub_email=''
+
+        while [[ "$needs_key" == 'yes' ]]; do
+
+
+            if ! is_valid_internet >/dev/null 2>&1; then
+                echo "NO INTERNET CONNECTION DETECTED.  "
+                echo ""
+                needs_key=$(ask_yes_no "Do you want to connect to internet and try again?")
+            else
+                ssh -T git@github.com >/dev/null 2>&1
+                if [[ "$?" -lt 2 ]]; then
+                    key_path=$(ssh -G git@github.com 2>/dev/null | grep -im1 '^IdentityFile' | cut -d' ' -f2) >/dev/null
+                    key_name=$(basename "$key_path")
+                    needs_key='no'
+                else
+                    key_path=''
+                    echo ""
+                    echo "NO VALID GITHUB SSH KEY FOUND"
+                    echo ""
+
+                    PS3=$'\n'"Please enter your choice by NUMBER: "
+                    options=(  "Select SSH Key" "Create SSH Key")
+
+                    while true; do
+                        #clear # Optional: Clear the screen before displaying the menu
+
+                        COLUMNS=1
+                        select opt in "${options[@]}" ; do
+                            case $opt in
+
+                                "Select SSH Key")
+                                    ret=$(select_ssh_key $key_folder)
+                                    sel_error=$?
+                                    sel_file=$(echo $ret | awk '{print $NF}')
+                                    #echo "Got select SSH Key file error: ${sel_error}"
+                                    if [[ $sel_error -eq 0 && -n sel_file ]]; then
+                                      echo ''
+                                      echo "Got selected SSH Key file: ${sel_file}"
+                                      key_path=$sel_file
+                                      exist_key='yes'
+                                      break 2 # Exit both the select and the while loop
+                                    else
+                                      echo ''
+                                      echo "No SSH Key files found in folder: ${key_folder}"
+                                      echo ''
+                                    fi     
+                                    break # Exit the select statement
+                                    ;;
+                                "Create SSH Key")
+                                    key_path=''
+                                    key_name="$(hostname)_${CONFIG_USER}_github"
+                                    echo "Creating NEPI GitHub ssh_key ${key_name}"
+                                    echo ""
+
+                                    while [[ -z "$ghub_email" ]]; do
+                                        read -p "Enter your GitHub email address: " USER_INPUT
+                                        if is_valid_email "$USER_INPUT"; then
+                                            echo "Using email ${USER_INPUT}"
+                                            ghub_email=$USER_INPUT
+                                        else
+                                            echo "Not A Valid Email"
+                                            return 1
+                                        fi  
+                                    done   
+                                        
+
+                                    
+
+                                    
+                                    ret=$(create_ssh_key $key_folder $key_name $ghub_email)
+                                    sel_error=$?
+                                    sel_file=$(echo $ret | awk '{print $NF}')
+                                    #echo "Got select SSH Key file error: ${sel_error}"
+                                    
+                                    if [[ $? -eq 0 && -n sel_file ]]; then
+                                      echo ''
+                                      echo "Got selected SSH Key file: ${sel_file}"
+                                      key_path=$sel_file
+                                      break 2 # Exit both the select and the while loop
+                                    elif [[ $? -eq 1 ]]; then
+                                      echo ''
+                                      echo "SSH Github Key for this user allready exists: ${key_name}"
+                                      check_key=$(ask_yes_no "Do you want to use this key?")
+                                      if [[ ${check_key} == 'yes' ]]; then
+                                        key_path=$sel_file
+                                        break 2 # Exit both the select and the while loop
+                                      fi
+                                    fi     
+                                    break # Exit the select statement
+                                    ;;
+                                *)
+                                    echo "Invalid option, please try again."
+                                    ;;
+                            esac
+                        done
+                    done
+                    echo ""
+
+
+
+
+
+
+
+                    if [[ -n $key_path ]]; then
+
+                    if [[ -d $key_folder && -n $key_folder ]]; then   
+                      sudo chmod 0700 $key_folder
+                      sudo chmod  0600 $key_folder/*
+                      sudo chown -R ${CONFIG_USER}:${CONFIG_USER} $key_folder
+                    fi
+
+                        config_file=/home/${CONFIG_USER}/.ssh/config
+                        touch ${config_file}
+                        if grep -qnw $config_file -e ${key_name}; then
+                            : #echo "Already Done"
+                        else
+                            
+                            NAME=$(echo "$ghub_email" | sed -E 's/"?([^"]+)"? <.*>/\1/')
+
+                            echo 'Host github.com' | sudo tee -a $config_file
+                            echo '   AddKeysToAgent yes' | sudo tee -a $config_file
+                            echo '   IdentityFile '${key_path} | sudo tee -a $config_file
+                            echo ''
+
+
+                        fi
+
+                    if [[ -d $key_folder && -n $key_folder ]]; then   
+                      sudo chmod 0700 $key_folder
+                      sudo chmod  0600 $key_folder/*
+                      sudo chown -R ${CONFIG_USER}:${CONFIG_USER} $key_folder
+                    fi
+                        needs_key='no'
+                        add_key='yes'
+
+                        break 2 # Exit both the select and the while loop
+                        
+                    fi
+
+                fi
+
+            fi
+        done
+
+        if [[ -n $key_path && ${add_key} == 'yes' ]]; then
+            key_name=$(basename "${key_path}")
+
+
+                ssh -T git@github.com >/dev/null 2>&1
+                if [[ "$?" -gt 1 ]]; then
+
+                    echo "*** ADD YOUR NEW NEPI GITHUB SSH KEY TO YOUR GITHUB ACCOUNT BEFORE PROCEEDING ***"
+                    echo ""
+                    echo "1) Log Into Your GitHub Account at www.github.com"
+                    echo "2) Click on your User Icon, and select 'Settings"
+                    echo "3) Select 'SSH and GPG keys' from the left sidebar menu"
+                    echo "4) Click the 'New SSH key' button in the top right"
+                    echo "5) Enter the following information in the boxes provided,"
+                    echo "   Then click the 'Add SSH key' button"
+                    echo ""
+                    echo "<< TITLE >>"
+                    echo ${key_name}
+                    echo ""
+                    echo "<< KEY_TYPE >>"
+                    echo "Authentication Key"
+                    echo ""
+                    echo "<< KEY >>"
+                    echo $(sudo cat ${key_path}.pub)
+                    echo ""
+                    echo "6) Rerun this script to test that your GitHub SSH Key Authenticates"
+
+                    echo ""
+                    read -p "Press enter after configuring your GitHub account with new ssh key"
+
+              fi
+
+        fi
+
+        g_email=$(git config user.email)
+        g_name=$(git config user.name)
+
+        if [[ -z $g_email || -z $g_name ]]; then
+          if [[ -z $ghub_email ]]; then
+                              while [[ -z "$ghub_email" ]]; do
+                                  read -p "Enter your GitHub email address: " USER_INPUT
+                                  if is_valid_email "$USER_INPUT"; then
+                                      echo "Using email ${USER_INPUT}"
+                                      ghub_email=$USER_INPUT
+                                  else
+                                      echo "Not A Valid Email"
+                                      return 1
+                                  fi  
+                              done   
+          fi
+
+          if [[ -n $ghub_email ]]; then
+                  ghub_name=$(echo "$ghub_email" | sed -E 's/"?([^"]+)"? <.*>/\1/')
+                  git config --global user.email "$ghub_email"
+                  git config --global user.name "$ghub_name"
+          
+          fi
+        fi
+
+
+
+        ssh -T git@github.com >/dev/null 2>&1
+        if [[ "$?" -lt 2 ]]; then
+            echo ''
+            echo '#######################'
+            echo "GitHub SSH Key authenticated with key file ${key_path}"
+            echo '#######################'
+            echo ''
+
+
+
+            # nepi_repo_address=$NEPI_REPO_ADDRESS_DEFAULT
+            # echo ""
+            # PS3=$'\n'"Please enter your choice by NUMBER: "
+            # options=(  "Use Default NEPI Repo" "Fork Default NEPI Repo" "Set Custom NEPI Repo")
+
+            # while true; do
+            #     #clear # Optional: Clear the screen before displaying the menu
+
+            #     COLUMNS=1
+            #     select opt in "${options[@]}" ; do
+            #         case $opt in
+
+            #             "Use Default NEPI Repo")
+            #                 NEPI_REPO_ADDRESS=$nepi_repo_address
+            #                 break 2 # Exit both the select and the while loop
+
+            #                 ;;
+            #             "Fork Default NEPI Repo")
+            #                  NEPI_REPO_ADDRESS=$nepi_repo_address
+            #                 break 2 # Exit both the select and the while loop
+
+            #                 ;;
+            #             "Set Custom NEPI Repo")
+            #                 NEPI_REPO_ADDRESS=$nepi_repo_address
+            #                 break 2 # Exit both the select and the while loop
+
+            #                 ;;
+            #             *)
+            #                 echo "Invalid option, please try again."
+            #                 ;;
+            #         esac
+            #     done
+            # done
+            # echo ""
+
+            nepi_repo_name=$(basename "${NEPI_REPO_ADDRESS%.*}")
+            if [[ -n $NEPI_REPO_ADDRESS && -n $nepi_repo_name ]]; then
+              export NEPI_REPO_ADDRESS=$NEPI_REPO_ADDRESS
+              export NEPI_REPO_NAME=$nepi_repo_name
+
+              update_text_value $NEPI_BASH_UTILS "export NEPI_REPO_ADDRESS=" "export NEPI_REPO_ADDRESS=${NEPI_REPO_ADDRESS}"
+
+
+              echo "Using NEPI Repo ${nepi_repo_name}"
+              echo ""
+   
+              nepi_repo_folder="/home/${CONFIG_USER}/${nepi_repo_name}"
+              if [[ ! -d $nepi_repo_folder ]]; then
+                echo "Cloning NEPI Repo to ${nepi_repo_folder}"
+                echo "" 
+                nepiclone
+              fi
+
+            fi
+
+
+
+            echo " "
+            echo "################################# "
+            echo "NEPI GITHUB SETUP COMPLETE"
+            echo "################################# "
+            echo " "
+
+
+        else
+            echo "GitHub SSH Key NOT AUTHENTICATED"
+            echo "Fix errors and try again"
+        fi
+
+    fi
+
+}
+
+export -f nepigithub
+
+
+
+
+function pulln {
+  if is_valid_internet ; then
+    repo_folder=/home/${CONFIG_USER}/${NEPI_REPO_NAME}
+    if [[ -d ${repo_folder} ]]; then
+      cd $repo_folder
+      git pull --recurse-submodules
+      git submodule foreach --recursive "git checkout main && git pull origin main" 2> /dev/null
+    fi
+  fi
+}
+
+export -f pulln
+
+
+function nepiclone {
+  if is_valid_internet ; then
+    cd ~/
+    git clone ${NEPI_REPO_ADDRESS} 
+    if [[ $? -eq 0 ]]; then
+      cd ${NEPI_REPO_NAME}
+      git checkout main
+      git submodule update --init --recursive
+    else
+      echo "Failed to clone NEPI Repo from ${NEPI_REPO_ADDRESS}"
+    fi
+  fi
+}
+
+export -f nepiclone
+
+function nepiclonedev {
+  if is_valid_internet ; then
+    cd ~/
+    git clone ${NEPI_REPO_ADDRESS} 
+    if [[ $? -eq 0 ]]; then
+      cd ${NEPI_REPO_NAME}
+      git checkout develop
+      git submodule update --init --recursive 
+    else
+      echo "Failed to clone NEPI Repo from ${NEPI_REPO_ADDRESS}"
+    fi
+  fi
+}
+
+export -f nepiclonedev
+
+
+
+
+
+
+
+
+## NEPI deploy complete
+alias nepidpl="
+cd $NEPI_REPO_FOLDER
+source ./deploy_nepi_complete.sh"
+
+# NEPI deploy repos
+alias repodpl="
+cd $NEPI_REPO_FOLDER
+source ./deploy_nepi_repos.sh"
+
+function gitmain {
+  git checkout main
+  git pull
+}
+
+function pushn(){
+  cur_path=$(pwd)
+  cur_folder=${PWD##*/}
+  # IFS='/' read -r -a path_parts <<< "$cur_path"
+  # if [[ ${#path_parts[@]} -lt 4 ]]; then
+  #     echo "Current folder is not in the NEPI Repo folder: ${cur_path}"
+  #     return 1
+  # fi
+  # third_folder="${path_parts[3]}"
+  # if [[ ${third_folder} != ${NEPI_REPO_NAME} ]]; then
+  #     echo "Current folder is not in the NEPI Repo folder: ${cur_path}"
+  #     return 1
+  # fi
+  git add --all
+  git commit -m "*$@*" 
+  git push >/dev/null 2>&1
+
+  par_path=$(dirname "$(pwd)")
+  par_folder=$(basename "$par_path")
+  #echo $cur_folder
+  #echo $par_folder
+  head_name=$(git rev-parse --abbrev-ref HEAD >/dev/null 2>&1)
+  if [ "$?" -eq 0 ]; then #$(is_git_repo $PWD) -eq 1 ]; then
+    echo -e "${GREEN}Clearing __pycache__ folders"
+    find ./ -type d -name "__pycache__" -exec rm -rf {} +
+    if [[ ("$(pwd)" == "${NEPI_REPO_FOLDER}"  || "$(pwd)" == "${NEPI_REPO_FOLDER}/src") ]]; then
+        echo -e "${GREEN}Pushing to repo ${PWD##*/} Head develop"
+        git push origin HEAD:develop
+
+    else
+        echo -e "${GREEN}Pushing to repo ${PWD##*/} Head main"
+        git push origin HEAD:main
+        #git checkout main
+    fi
+    if [ ! $? -eq 0 ]; then
+      echo -e "${RED}Push Failed"
+      return 1 # Failed
+    fi
+    echo -e "${GREEN}Push Successfully"
+  else
+    echo -e "${RED}Not in Git Repo"
+  fi
+}
+
+
+## NEPI deploy complete
+function nepisetup_remote() {
+sudo -v
+skip_software=1
+source $(NSETUP)/scripts/remote_env_setup.sh $skip_software
+source /home/${CONFIG_USER}/.bashrc
+}
+
+function nepisetup_host() {
+sudo -v
+nepistop
+source $(NSETUP)/scripts/docker_bash_setup.sh
+source /home/${CONFIG_USER}/.bashrc
+echo "Running NEPI Setup in NEPI_MODE: ${NEPI_MODE}"
+SHOW_CONFIG_MENU=1
+echo ${SHOW_CONFIG_MENU}
+source ${NEPI_SYSTEM_CONFIG}/etc/nepi_system_config.sh ${SHOW_CONFIG_MENU}
+source /home/${CONFIG_USER}/.bashrc
+}
+
+function nepisetup_system() {
+sudo -v
+source $(NSETUP)/scripts/nepi_bash_setup.sh
+source /home/${CONFIG_USER}/.bashrc
+SHOW_CONFIG_MENU=1
+echo ${SHOW_CONFIG_MENU}
+source ${NEPI_SYSTEM_CONFIG}/etc/nepi_system_config.sh ${SHOW_CONFIG_MENU}
+source /home/${CONFIG_USER}/.bashrc
+}
+
+
+function nepisetup() {
+sudo -v
+nepi_mode=${NEPI_MODE}
+echo "NEPI_MODE: ${nepi_mode}"
+if [[ ${nepi_mode} == 'REMOTE' ]]; then 
+  nepisetup_remote
+elif [[ ${nepi_mode} == 'HOST' ]]; then 
+  nepisetup_host
+elif [[ ${nepi_mode} == 'SYSTEM' ]]; then 
+  nepisetup_system
+fi
+}
+
+
+
+
+
+
+utilsn="${utilsn}
+################################
+### NEPI Dev FUNCTIONS
+################################
+nepisetup_remote = Setup the current NEPI environment MODE as REMOTE
+nepisetup_host = Setup the current NEPI environment MODE as HOST
+nepisetup_system = Setup the current NEPI environment MODE as SYSTEM
+nepimode = Echo the current NEPI environment MODE
+nepisetup = Run the environment setup script for the current NEPI environment MODE
+nepihome = Change to users home folder
+nepirui = Open Chromium to NEPI RUI Dashboard page
+nsetup = Change Dir to the NEPI setup scripts folder
+nssh = Change Dir to the User .ssh folder folder
+nepirui = Open Chromium to RUI Dashboard page
+nepistorage = Change dir to NEPI shared Storage Drive if accessable
+nepistorage_open = Open file manager to NEPI shared Storage Drive if accessable
+nepiconfig = Change dir to NEPI shared Config Drive if accessable
+nepiconfig_open = Open file manager to NEPI shared Config Drive if accessable
+nepisync = Sync NEPI SSH Key files
+nepisetkey = Set provided key name as NEPI device key
+nepisshkey = NEPI SSH key setup function
+nepiauthadd = Add provide key name to SSH authorized_key file
+nepiauthrm = Remove provide key name from SSH authorized_key file
+nepigithub = Check and Setup a GitHub SSH key for your GitHub account
+nepiclone = Clone the latest NEPI source-code repo
+nepiclonedev = Clone the latest NEPI Development branch source-code repo
+pulln = Update to the latest NEPI source-code repo
+nepidpl = Deploy nepi complete to nepi device
+gitmain = Change to main branch in current repo or submodule folder
+pushn = Add,commit,push repo changes with optional comment msg in current repo or submodule folder"
+
+
+
+
+
+
+
+export UTILSN=${utilsn}
+
+
+
