@@ -52,7 +52,13 @@ launch_targets:
     # launch_command below actually needs -- not a full ROS/Gazebo
     # environment audit -- since that's what "can this even attempt to
     # launch" means here.
-    check_installed_command: "bash -lc \"command -v gzserver > /dev/null && command -v roscore > /dev/null\""
+    # ROS binaries live under /opt/ros/noetic, which is only on PATH after
+    # sourcing setup.bash -- a plain `command -v gzserver` over a
+    # non-interactive ssh session reported "not installed" despite gzserver
+    # genuinely being present, for exactly that reason. Every other command
+    # on this target already sources setup.bash first; this one just hadn't
+    # caught up yet.
+    check_installed_command: "bash -lc \"source /opt/ros/noetic/setup.bash; command -v gzserver > /dev/null && command -v roscore > /dev/null\""
     install_command: "bash -lc \"sudo apt-get update && sudo apt-get install -y ros-noetic-gazebo-ros-pkgs ros-noetic-gazebo-ros-control\""
     # Launches Gazebo (generic_rover.world) plus the *new* sim_connector
     # bridge (sim_connector_bridge_gazebo.py) -- NOT sim_rover_gazebo, which
