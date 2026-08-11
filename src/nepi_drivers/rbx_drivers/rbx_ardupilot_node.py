@@ -41,7 +41,7 @@ from std_msgs.msg import Empty, Int8, UInt8, UInt32, Bool, String, Float32, Floa
 from geometry_msgs.msg import Point, Pose, Quaternion, Twist, Vector3, PoseStamped
 from geographic_msgs.msg import GeoPoint, GeoPose, GeoPoseStamped
 from mavros_msgs.msg import State, AttitudeTarget, StatusText
-from mavros_msgs.srv import CommandBool, CommandBoolRequest, SetMode, SetModeRequest, CommandTOL, CommandTOLRequest, CommandHome, CommandHomeRequest, CommandLong, CommandLongRequest
+from mavros_msgs.srv import CommandBool, CommandBoolRequest, SetMode, SetModeRequest, CommandTOL, CommandTOLRequest, CommandHome, CommandHomeRequest, CommandLong, CommandLongRequest, StreamRate, StreamRateRequest
 
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Image, NavSatFix, BatteryState
@@ -296,12 +296,29 @@ class ArdupilotNode:
     MAVLINK_ARMING_SERVICE = MAVLINK_NAMESPACE + "cmd/arming"
     MAVLINK_TAKEOFF_SERVICE = MAVLINK_NAMESPACE + "cmd/takeoff"
     MAVLINK_COMMAND_SERVICE = MAVLINK_NAMESPACE + "cmd/command"
+    MAVLINK_SET_STREAM_RATE_SERVICE = MAVLINK_NAMESPACE + "set_stream_rate"
 
     self.set_home_client = nepi_sdk.connect_service(MAVLINK_SET_HOME_SERVICE, CommandHome)
     self.mode_client = nepi_sdk.connect_service(MAVLINK_SET_MODE_SERVICE, SetMode)
     self.arming_client = nepi_sdk.connect_service(MAVLINK_ARMING_SERVICE, CommandBool)
     self.takeoff_client = nepi_sdk.connect_service(MAVLINK_TAKEOFF_SERVICE, CommandTOL)
     self.command_client = nepi_sdk.connect_service(MAVLINK_COMMAND_SERVICE, CommandLong)
+    self.set_stream_rate_client = nepi_sdk.connect_service(MAVLINK_SET_STREAM_RATE_SERVICE, StreamRate)
+
+    # mavros reporting "connected" only means heartbeat/timesync are flowing --
+    # ArduCopter must be explicitly asked to stream the rest (GPS, IMU,
+    # global/local position, etc.) or global_position_wgs84_geo etc. below stay
+    # permanently stale, silently breaking every altitude/position-based
+    # completion check (takeoff climb, goto_location/goto_position) with a
+    # timeout that looks like the vehicle never moved, even when it did.
+    # STREAM_ALL (stream_id=0) at 10Hz mirrors the working manual fix confirmed
+    # in SITL testing (rosservice call .../set_stream_rate).
+    self.msg_if.pub_info("Requesting full MAVLink telemetry stream (STREAM_ALL @ 10Hz)")
+    stream_rate_req = StreamRateRequest()
+    stream_rate_req.stream_id = 0
+    stream_rate_req.message_rate = 10
+    stream_rate_req.on_off = True
+    nepi_sdk.call_service(self.set_stream_rate_client, stream_rate_req)
 
 
     # Subscribe to MAVLink topics

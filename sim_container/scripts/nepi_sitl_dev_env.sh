@@ -225,20 +225,27 @@ sitl_gazebo_full() {
     source /opt/ros/noetic/setup.bash
     export GAZEBO_MODEL_PATH="$NEPI_DRONES_SIM_DIR/models:$GAZEBO_MODEL_PATH"
 
-    if pgrep -x gzserver > /dev/null && pgrep -f "sim_vehicle.py -v ArduCopter" > /dev/null; then
-        echo "Gazebo + SITL already running -- reusing"
+    # Checked independently (not as one combined condition) -- Gazebo can be
+    # up while SITL isn't (e.g. a prior SITL crash/exit left gzserver
+    # running), and re-running `rosrun gazebo_ros gazebo` in that case is a
+    # wasted, risky duplicate launch attempt: Gazebo's own singleton lock
+    # blocks the second gzserver from actually binding, but the redundant
+    # wrapper process still spins up and adds needless load. Confirmed live
+    # (2026-08-11) this exact case happens after a headless SITL failure.
+    if ! rostopic list > /dev/null 2>&1; then
+        echo "Starting local roscore..."
+        nohup roscore > /tmp/sitl_gazebo_full_roscore.log 2>&1 &
+        disown
+        until rostopic list > /dev/null 2>&1; do
+            sleep 1
+        done
     else
-        if ! rostopic list > /dev/null 2>&1; then
-            echo "Starting local roscore..."
-            nohup roscore > /tmp/sitl_gazebo_full_roscore.log 2>&1 &
-            disown
-            until rostopic list > /dev/null 2>&1; do
-                sleep 1
-            done
-        else
-            echo "roscore already running -- reusing it"
-        fi
+        echo "roscore already running -- reusing it"
+    fi
 
+    if pgrep -x gzserver > /dev/null; then
+        echo "Gazebo already running -- reusing"
+    else
         echo "Starting Gazebo..."
         nohup rosrun gazebo_ros gazebo ~/ardupilot_gazebo/worlds/iris_arducopter_cmac.world \
             > /tmp/sitl_gazebo_full_gazebo.log 2>&1 &
@@ -249,15 +256,35 @@ sitl_gazebo_full() {
             sleep 1
         done
         sleep 8
+    fi
 
+    if pgrep -f "sim_vehicle.py -v ArduCopter" > /dev/null; then
+        echo "ArduPilot SITL already running -- reusing"
+    else
         # Same --out=tcpin:0.0.0.0:5771 dedicated port as sitl_gazebo, for the
         # same reason (mavros needs its own port alongside MAVProxy's
         # primary one on 5760) -- just without --console/--map, since
         # there's no terminal attached to show them to and they'd only try
-        # (and fail) to open GUI windows under nohup anyway. MAVProxy still
-        # runs and still serves both ports headlessly.
+        # (and fail) to open GUI windows under nohup anyway.
+        #
+        # --mavproxy-args="--daemon" is required, not optional, for a nohup'd
+        # headless launch: without it, MavProxy's main loop calls
+        # input_loop() (mavproxy.py's main()), which blocks reading from
+        # stdin. Under nohup with no controlling terminal, stdin is
+        # immediately at EOF, so MavProxy treats that as "user quit" and runs
+        # its full unload-every-module-and-exit shutdown sequence within
+        # seconds of starting -- ArduCopter itself boots fine (confirmed by
+        # running it standalone), but MavProxy tears the whole session down
+        # before mavros/the RBX driver ever gets a chance to connect, so
+        # "Gazebo comes up but ArduPilot SITL never does" (confirmed live,
+        # 2026-08-11). --daemon skips input_loop() entirely (mpstate.status
+        # loop just sleeps instead of blocking on stdin), which is exactly
+        # what a nohup'd/headless launch needs -- confirmed fixed live: with
+        # this flag, ArduCopter reaches full EKF/AHRS-active boot and keeps
+        # running indefinitely instead of exiting within ~5s.
         echo "Starting ArduPilot SITL..."
         nohup sim_vehicle.py -v ArduCopter -f gazebo-iris --out=tcpin:0.0.0.0:5771 \
+            --mavproxy-args="--daemon" \
             > /tmp/sitl_gazebo_full_sitl.log 2>&1 &
         disown
     fi
