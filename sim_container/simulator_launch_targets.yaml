@@ -41,6 +41,17 @@ ssh_key_path: "/home/nepi/.ssh/nepi_default_ssh_key"
 device_bridge_host: "nepi"
 device_bridge_port: 9030
 
+# Every launch_command/attach_launch_command below exports DISPLAY explicitly
+# because a non-interactive SSH session (no controlling tty, no login shell
+# X11 setup) inherits neither DISPLAY nor XAUTHORITY on its own -- unlike
+# nepi_sitl_dev_env.sh's own sitl_gazebo(), always run from an actual
+# logged-in shell where both are already correct. :1, not :0: confirmed via
+# `who` that gdm's own greeter/manager session owns :0 on this VM, while the
+# real logged-in user session (the one whose Xauthority actually authenticates
+# gazebo/xterm) is :1 -- :0 fails every X11 connection with "Invalid
+# MIT-MAGIC-COOKIE-1 key" and gazebo/ArduCopter's xterm silently never start.
+# Re-check with `who` (look for the session whose TTY column reads `:N`) if
+# this VM's session layout ever changes and launches start failing again.
 launch_targets:
   gazebo_rover:
     display_name: "Gazebo"
@@ -133,7 +144,7 @@ launch_targets:
     launch_command: >-
       bash -lc '
       source /opt/ros/noetic/setup.bash;
-      export DISPLAY=:0;
+      export DISPLAY=:1;
       export XAUTHORITY=/run/user/$(id -u)/gdm/Xauthority;
       export GAZEBO_MODEL_PATH=$HOME/nepi_engine_ws/nepi_drones/sim_container/models:$GAZEBO_MODEL_PATH;
       if pgrep -x gzserver > /dev/null; then echo "REFUSING TO LAUNCH: a gzserver is already running on this host. Gazebo instances collide on port 11345 -- a second one would silently attach to the running world instead of loading generic_rover.world. Stop the existing simulation first." >&2; exit 3; fi;
@@ -163,7 +174,7 @@ launch_targets:
     attach_launch_command: >-
       bash -lc '
       source /opt/ros/noetic/setup.bash;
-      export DISPLAY=:0;
+      export DISPLAY=:1;
       export XAUTHORITY=/run/user/$(id -u)/gdm/Xauthority;
       export GAZEBO_MODEL_PATH=$HOME/nepi_engine_ws/nepi_drones/sim_container/models:$GAZEBO_MODEL_PATH;
       echo $$ > /tmp/sim_connector_launch.pgid;
@@ -319,7 +330,7 @@ launch_targets:
     launch_command: >-
       bash -lc '
       source /opt/ros/noetic/setup.bash;
-      export DISPLAY=:0;
+      export DISPLAY=:1;
       export XAUTHORITY=/run/user/$(id -u)/gdm/Xauthority;
       export GAZEBO_MODEL_PATH=$HOME/nepi_engine_ws/nepi_drones/sim_container/models:$HOME/ardupilot_gazebo/models:$GAZEBO_MODEL_PATH;
       if pgrep -x gzserver > /dev/null; then echo "REFUSING TO LAUNCH: a gzserver is already running on this host. A second one would silently attach to the running world instead of loading iris_arducopter_cmac.world. Stop the existing simulation first." >&2; exit 3; fi;
@@ -351,7 +362,7 @@ launch_targets:
     attach_launch_command: >-
       bash -lc '
       source /opt/ros/noetic/setup.bash;
-      export DISPLAY=:0;
+      export DISPLAY=:1;
       export XAUTHORITY=/run/user/$(id -u)/gdm/Xauthority;
       export GAZEBO_MODEL_PATH=$HOME/nepi_engine_ws/nepi_drones/sim_container/models:$HOME/ardupilot_gazebo/models:$GAZEBO_MODEL_PATH;
       if timeout 1 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/5760" 2>/dev/null; then echo "REFUSING TO LAUNCH: ArduCopter SITL already appears to be running on this host (port 5760 is taken -- possibly the separate RBX ArduPilot SITL dev flow, see nepi_sitl_dev_env.sh). Only one instance can own the default MAVLink ports at a time. Stop it first." >&2; exit 3; fi;
