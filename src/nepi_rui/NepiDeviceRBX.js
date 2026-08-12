@@ -319,24 +319,54 @@ class NepiDeviceRBX extends Component {
     const image_topics = this.props.ros.imageTopics
     var img_topics = []
 
-    // RBXDeviceNamespace ends in "/rbx", but RBXRobotIF's own republished
-    // output (this.image_if, fed BY whatever image_source is selected here)
-    // publishes to "<node_namespace>/image" -- a sibling of "/rbx", not a
-    // child of it, so startsWith(RBXDeviceNamespace) never matched it and it
-    // always leaked into this list as if it were some unrelated device's
-    // camera. Selecting your own output as your own input is never a real
-    // choice, so exclude that one topic specifically -- NOT the whole
-    // node_namespace prefix, which would also wrongly hide this device's
-    // actual raw camera feed (<node_namespace>/color_2d_image for the
-    // ArduPilot driver), the one legitimate default source for this device.
-    const ownImageTopic = RBXDeviceNamespace.split('/rbx')[0] + "/image"
+    // Scope this list to THIS robot's own cameras.
+    //
+    // props.ros.imageTopics is the RUI-wide list of every sensor_msgs/Image
+    // topic on the system (Store.js updateImageTopics), shared by every image
+    // selector in the app. Offering all of it here listed things that have
+    // nothing to do with the selected robot -- on this device: another app's
+    // feed (app_sim_connector/color_2d_image) and a physical USB camera
+    // (nexigo_02/idx/color_image) -- and createShortValuesFromNamespaces
+    // renders only the last two path segments, so unrelated topics could even
+    // display under identical-looking labels. For a robot panel the useful
+    // answer is "this robot's camera".
+    //
+    // RBXDeviceNamespace ends in "/rbx"; the device's own image topics are
+    // siblings of it under the plain node namespace (RBXRobotIF's
+    // self.namespace is a CHILD of self.node_namespace -- see
+    // device_if_rbx.py), so match on the node namespace, not on
+    // RBXDeviceNamespace itself.
+    //
+    // ownImageTopic is RBXRobotIF's own republished output, fed BY whatever
+    // is selected here -- selecting your own output as your own input is
+    // never a real choice, so it stays excluded even though it lives in the
+    // right namespace.
+    const nodeNamespace = RBXDeviceNamespace.split('/rbx')[0]
+    const ownImageTopic = nodeNamespace + "/image"
 
     for (var i = 0; i < image_topics.length; i++) {
       const topic = image_topics[i]
       if (topic === ownImageTopic || topic.includes('zed_node') === true) {
         continue
       }
-      img_topics.push(topic)
+      if (topic.startsWith(nodeNamespace + "/") === true) {
+        img_topics.push(topic)
+      }
+    }
+
+    // Fall back to the unscoped list rather than offering nothing but "None":
+    // a robot driver that publishes no camera of its own would otherwise have
+    // no selectable source at all, which is strictly worse than a longer
+    // list. Robots that DO publish their own camera (the ArduPilot driver's
+    // color_2d_image, the sim rover's) never reach this.
+    if (img_topics.length === 0) {
+      for (var j = 0; j < image_topics.length; j++) {
+        const other = image_topics[j]
+        if (other === ownImageTopic || other.includes('zed_node') === true) {
+          continue
+        }
+        img_topics.push(other)
+      }
     }
 
     const img_topics_short = createShortValuesFromNamespaces(img_topics)
