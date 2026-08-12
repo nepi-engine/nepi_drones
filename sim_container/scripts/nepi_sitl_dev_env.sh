@@ -109,7 +109,24 @@ sim_launch_listener() {
 # With autossh, it doesn't matter which of sitl_gazebo / the NEPI device
 # comes up first or restarts later -- autossh just keeps retrying the
 # connection until the other side is reachable again.
+#
+# NOTE: the tunnel is now normally owned by the nepi-tunnel systemd USER
+# service (../systemd/nepi-tunnel.service), which starts it at boot and
+# restarts it if it dies -- the two failure modes this function's own
+# `nohup ... &` could never survive. Confirmed the hard way twice: a VM
+# reboot silently dropped the tunnel, and every sim connector Deploy then
+# failed with "connect to host 127.0.0.1 port 12222: Connection refused"
+# until someone re-ran this by hand. This function is kept for manual/ad-hoc
+# use and defers to the service when it's active, rather than starting a
+# SECOND autossh that would race the first for the same forwards (the loser
+# exits on ExitOnForwardFailure, but which one loses is a coin flip).
 nepi_tunnel() {
+    if systemctl --user is-active nepi-tunnel.service > /dev/null 2>&1; then
+        echo "NEPI reverse tunnel is managed by the nepi-tunnel systemd service (already active)"
+        echo "  status: systemctl --user status nepi-tunnel.service"
+        echo "  restart: systemctl --user restart nepi-tunnel.service"
+        return 0
+    fi
     if pgrep -f "autossh.*R 5771:127.0.0.1:5771.*nepi@nepi" > /dev/null; then
         echo "NEPI reverse tunnel already running"
         return 0
