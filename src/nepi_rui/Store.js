@@ -523,6 +523,27 @@ class ROSConnectionStore {
         listener.unsubscribe()
       })
       this.resetStates()
+
+      // resetStates() sets rosAutoReconnect = false, and checkROSConnection()
+      // only re-arms its own setTimeout `if (this.rosAutoReconnect)`. Since
+      // App.js starts that loop exactly ONCE on mount, letting it stay false
+      // here permanently killed the reconnect loop: the RUI dropped to
+      // "Connecting" and never came back on its own, no matter how healthy
+      // rosbridge and the device got again, until someone reloaded the page
+      // or the host-side watchdog power-cycled the whole container. That is
+      // the "the RUI keeps disconnecting" failure -- the disconnect itself is
+      // recoverable, but the recovery path was disabling itself. Restore the
+      // flag and re-arm the loop so a teardown is always followed by retries.
+      // (The commented-out line above shows this was already the intent; it
+      // just could not survive resetStates() clobbering the flag.)
+      //
+      // Setting the flag is the WHOLE fix -- deliberately no setTimeout here.
+      // This method's only caller is checkROSConnection() itself, and that
+      // caller's own tail already does `if (this.rosAutoReconnect) setTimeout(
+      // checkROSConnection )` a few lines later. Re-arming here as well would
+      // leave TWO self-rescheduling loops running after one teardown, four
+      // after the next, and so on -- each also re-querying every topic.
+      this.rosAutoReconnect = true
     }
   }
 
@@ -668,7 +689,18 @@ class ROSConnectionStore {
 
   @observable connectedToNepi = false
   @observable hearbeatNepi = false
-  @observable watchdogNepiMax = 5
+  // Ticks of NEPI_TIMEOUT_MSEC (3 s) without a /nepi/device1/status message
+  // before the client declares the device gone and tears the whole websocket
+  // down (see checkROSConnection/destroyROSConnection). Was 5, i.e. a mere
+  // ~15 s stall in that ONE topic dropped every subscription in the RUI.
+  // system_mgr publishes it at only ~1-1.7 Hz measured, and this is a loaded
+  // ARM device -- a CPU spike from Gazebo/SITL/AI work or a slow disk check
+  // inside system_mgr can plausibly starve it past 15 s without anything
+  // actually being wrong. 20 ticks (~60 s) keeps the genuine-outage detection
+  // this is for while no longer firing on ordinary load. Raising it is safe
+  // now that a teardown reliably re-arms the reconnect loop; before that fix
+  // every trip of this counter was effectively permanent.
+  @observable watchdogNepiMax = 20
   @observable watchdogNepiCounter = 0
 
 
