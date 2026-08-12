@@ -95,7 +95,12 @@ sim_launch_listener() {
 # app_ai_targeting app drone_follow_object_mission_script.py otherwise has no
 # way to test against), and 9028 (sim_launch_listener -- lets the device
 # trigger sitl_gazebo_full remotely to bring up whatever of this whole stack
-# isn't already running, since the device has no other way to reach this VM).
+# isn't already running, since the device has no other way to reach this VM),
+# and 12222 (this VM's own sshd -- the sim connector app's launch/stop/install
+# flow SSHes out from the device to 127.0.0.1:12222 as configured in each
+# launch target's host/ssh_port in simulator_launch_targets.yaml, since that
+# app drives gazebo_rover/gazebo_quadcopter directly by command rather than
+# through sim_launch_listener's own narrower remote-trigger protocol).
 # This one tunnel serves both
 # simulation workflows (ArduPilot SITL and the generic rover sim).
 # Uses autossh (not plain ssh) so the tunnel reconnects on its own whenever
@@ -111,7 +116,7 @@ nepi_tunnel() {
     fi
     AUTOSSH_GATETIME=0 nohup autossh -M 0 -p 2222 -i ~/.ssh/nepi_default_ssh_key \
         -o ConnectTimeout=5 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
-        -R 5760:127.0.0.1:5760 -R 5771:127.0.0.1:5771 -R 9021:127.0.0.1:9021 -R 9022:127.0.0.1:9022 -R 9023:127.0.0.1:9023 -R 9024:127.0.0.1:9024 -R 9025:127.0.0.1:9025 -R 9026:127.0.0.1:9026 -R 9027:127.0.0.1:9027 -R 9028:127.0.0.1:9028 \
+        -R 5760:127.0.0.1:5760 -R 5771:127.0.0.1:5771 -R 9021:127.0.0.1:9021 -R 9022:127.0.0.1:9022 -R 9023:127.0.0.1:9023 -R 9024:127.0.0.1:9024 -R 9025:127.0.0.1:9025 -R 9026:127.0.0.1:9026 -R 9027:127.0.0.1:9027 -R 9028:127.0.0.1:9028 -R 12222:127.0.0.1:22 \
         -N nepi@nepi > /tmp/nepi_tunnel.log 2>&1 &
     disown
     sleep 2
