@@ -362,50 +362,25 @@ launch_targets:
     # own MAVProxy would be the SITL's only MAVLink client and this bridge
     # could never connect.
     #
-    # sim_vehicle.py/MAVProxy is the one child here that does NOT get
-    # `< /dev/null` on stdin, unlike every other line -- confirmed the hard
-    # way: MAVProxy is an interactive console that reads its own stdin as a
-    # command loop, and `< /dev/null` is an immediate EOF, which made it
-    # exit within the same second it started (silently, no error -- just
-    # "SIM_VEHICLE: MAVProxy exited" in its own log) every single launch.
-    # A real terminal never has this problem (a human's tty never spontaneously
-    # EOFs), which is exactly the difference between this fully-detached,
-    # no-pty ssh invocation and nepi_sitl_dev_env.sh's own sitl_gazebo_full(),
-    # always run from an actual logged-in shell. The fix: a FIFO opened
-    # read-write on its own fd (3) BEFORE launching MAVProxy and held open
-    # for this whole script's lifetime -- a FIFO with at least one open
-    # writer never signals EOF to a reader, so MAVProxy's stdin blocks
-    # (harmlessly; nothing needs to actually arrive on it) instead of
-    # hitting EOF and exiting. The fd (and so the FIFO's last writer) closes
-    # on its own when this script's own `wait` returns, i.e. exactly when
-    # MAVProxy should go down anyway. `rm -f` before `mkfifo` clears any
-    # stale FIFO a previous crashed launch left behind (a fresh mkfifo on an
-    # existing stale path errors and stops the whole script).
+    # MAVProxy MUST get --mavproxy-args="--daemon". Without it, MAVProxy's
+    # main loop calls input_loop(), which blocks reading stdin; with no
+    # controlling terminal (this is a detached ssh exec channel) stdin is at
+    # EOF immediately, MAVProxy treats that as "user quit" and runs its full
+    # unload-every-module-and-exit sequence, sim_vehicle.py then kills the
+    # ArduCopter binary, and the launch script's `wait` returns -- taking
+    # gzserver down with the process group. The whole simulation collapses
+    # seconds to minutes after a launch that reported success.
     #
-    # The pkill for ai_targeting_controller_ardupilot.py right after the
-    # refuse-guards is NOT this target's own cleanup (it never starts that
-    # script itself) -- it exists because that script is a plain background
-    # process, invisible to the RUI's Scripts panel, that keeps calling
-    # gazebo's spawn/set_model_state services on a timer for as long as it
-    # lives. A stray instance left over from a manual nepi_sitl_dev_env.sh
-    # sitl_gazebo_full session reconnects to whatever gzserver this launch
-    # brings up next (same persistent roscore) and silently re-adds its
-    # chair target to a plain quadcopter+Gazebo world that never asked for
-    # it -- confirmed the hard way. Unlike the gzserver/port-5760 guards
-    # above, this is unconditional cleanup, not a refuse-and-exit: nothing
-    # about this target's own launch conflicts with that script still
-    # running, so there is nothing to warn about, just something to clear.
-    #
-    # sim_vehicle.py's --out list has both 5771 and 5772: 5771 is the same
-    # dedicated mavros/discovery port nepi_sitl_dev_env.sh's plain
-    # sitl_gazebo always exposes (rbx_ardupilot_discovery.py's
-    # sitl_tcp_port_list hardcodes checking 127.0.0.1:5771 only -- see that
-    # file), needed so this target's robot shows up under Devices ->
-    # Robots exactly like the manual dev flow's does; 5772 is this target's
-    # own dedicated port for sim_connector_bridge_gazebo_quadcopter.py's
-    # separate MAVLink connection below. Confirmed the hard way: shipping
-    # only 5772 left mavros with nothing to connect to, so the RBX panel
-    # never appeared even though the sim itself launched and ran fine.
+    # This block previously tried to solve the same problem with a FIFO held
+    # open read-write on fd 3, so MAVProxy's stdin would never signal EOF.
+    # That did not hold: captured live 2026-08-12, MAVProxy still died with
+    # "raise EOFError / EOFError" in its own log followed by
+    # "Unloading module ..." for every module, and gzserver logged
+    # "Terminated". --daemon skips input_loop() entirely (the status loop just
+    # sleeps), so there is no stdin to lose in the first place -- which is why
+    # nepi_sitl_dev_env.sh's own sitl_gazebo_full() already passes it for its
+    # nohup'd headless launch and calls it "required, not optional". Same
+    # reasoning applies verbatim here; stdin is plain /dev/null now.
     launch_command: >-
       bash -lc '
       source /opt/ros/noetic/setup.bash;
@@ -419,10 +394,7 @@ launch_targets:
       rosrun gazebo_ros gazebo $HOME/ardupilot_gazebo/worlds/iris_arducopter_cmac.world < /dev/null > /tmp/sim_connector_quadcopter_gazebo_launch.log 2>&1 & GZ_PID=$!;
       sleep 8;
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/camera_rig_controller_ardupilot.py < /dev/null > /tmp/sim_connector_quadcopter_camera_rig_launch.log 2>&1 & CAM_PID=$!;
-      rm -f /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo;
-      mkfifo /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo;
-      exec 3<>/tmp/sim_connector_quadcopter_mavproxy_stdin.fifo;
-      sim_vehicle.py -v ArduCopter -f gazebo-iris --out=tcpin:0.0.0.0:5771 --out=tcpin:0.0.0.0:5772 < /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo > /tmp/sim_connector_quadcopter_sitl_launch.log 2>&1 & SITL_PID=$!;
+      sim_vehicle.py -v ArduCopter -f gazebo-iris --out=tcpin:0.0.0.0:5771 --out=tcpin:0.0.0.0:5772 --mavproxy-args="--daemon" < /dev/null > /tmp/sim_connector_quadcopter_sitl_launch.log 2>&1 & SITL_PID=$!;
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/gazebo/sim_connector_bridge_gazebo_quadcopter.py --host {device_bridge_host} --port {device_bridge_port} --mavlink tcp:127.0.0.1:5772 < /dev/null > /tmp/sim_connector_quadcopter_bridge_launch.log 2>&1 & BRIDGE_PID=$!;
       wait $GZ_PID $CAM_PID $SITL_PID $BRIDGE_PID
       '
@@ -448,10 +420,7 @@ launch_targets:
       echo $$ > /tmp/sim_connector_quadcopter_launch.pgid;
       rostopic list > /dev/null 2>&1 || {{ nohup roscore < /dev/null > /tmp/sim_connector_quadcopter_roscore_launch.log 2>&1 & until rostopic list > /dev/null 2>&1; do sleep 1; done; }};
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/camera_rig_controller_ardupilot.py < /dev/null > /tmp/sim_connector_quadcopter_camera_rig_launch.log 2>&1 & CAM_PID=$!;
-      rm -f /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo;
-      mkfifo /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo;
-      exec 3<>/tmp/sim_connector_quadcopter_mavproxy_stdin.fifo;
-      sim_vehicle.py -v ArduCopter -f gazebo-iris --out=tcpin:0.0.0.0:5771 --out=tcpin:0.0.0.0:5772 < /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo > /tmp/sim_connector_quadcopter_sitl_launch.log 2>&1 & SITL_PID=$!;
+      sim_vehicle.py -v ArduCopter -f gazebo-iris --out=tcpin:0.0.0.0:5771 --out=tcpin:0.0.0.0:5772 --mavproxy-args="--daemon" < /dev/null > /tmp/sim_connector_quadcopter_sitl_launch.log 2>&1 & SITL_PID=$!;
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/gazebo/sim_connector_bridge_gazebo_quadcopter.py --host {device_bridge_host} --port {device_bridge_port} --mavlink tcp:127.0.0.1:5772 < /dev/null > /tmp/sim_connector_quadcopter_bridge_launch.log 2>&1 & BRIDGE_PID=$!;
       wait $CAM_PID $SITL_PID $BRIDGE_PID
       '
