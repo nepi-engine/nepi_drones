@@ -91,7 +91,7 @@ class NepiAppSimConnector extends Component {
             namespace={simNamespace}
             show_selectors={true}
             show_data={true}
-            show_controls={true}
+            show_controls={false}
             make_section={true}
             title={"Sim Connector"}
           />
