@@ -436,6 +436,48 @@ class SimulatorLauncher(object):
     if errors:
       raise LauncherError("; ".join(errors))
 
+  def detect_running_gazebo(self):
+    """Returns True when a gzserver is alive on any configured sim host.
+
+    Exists so the app can NOTICE a simulator this app did not launch --
+    started manually on the VM, left over from a crashed session, or from a
+    launch this app has since forgotten (its own launch bookkeeping resets
+    whenever the app node restarts, e.g. across a container restart, while
+    the VM-side sim keeps running). Without this the app reported 'idle' with
+    a fully-running sim on the other end, so the RUI offered a plain Deploy
+    that could only ever fail on the refuse-to-launch guard, and never
+    surfaced the Kill All Gazebo escape hatch that actually resolves it.
+
+    Deliberately a cheap, generic `pgrep -x gzserver` rather than per-target
+    ready_check_commands: this is called on a slow poll for every host, so it
+    must cost ONE ssh, and the question being asked is only "is something in
+    the way", not "which target is it". `pgrep -x` matches the process NAME
+    exactly, so unlike a `pgrep -f` pattern it cannot self-match the ssh
+    command carrying it (a trap this repo has hit repeatedly -- see
+    gazebo_quadcopter's own launch_command comments).
+
+    Same unique-host iteration as kill_all_gazebo, so the two agree about
+    which hosts are in scope. Returns False (never raises) on an unreachable
+    host: "can't tell" must not be reported to the operator as "something is
+    running", which would strand them in a conflict state they cannot clear.
+    """
+    seen_hosts = set()
+    for target_key, target in self.config["launch_targets"].items():
+      if not target or "host" not in target or "ssh_user" not in target:
+        continue
+      host_key = (target["host"], target["ssh_user"], target.get("ssh_port", 22))
+      if host_key in seen_hosts:
+        continue
+      seen_hosts.add(host_key)
+      try:
+        result = self._run_remote(target, "pgrep -x gzserver > /dev/null && echo RUNNING || echo NONE",
+                                  timeout_sec=SSH_CONNECT_TIMEOUT_SEC + 2)
+      except LauncherError:
+        continue
+      if result.returncode == 0 and "RUNNING" in (result.stdout or ""):
+        return True
+    return False
+
   #**********************
   # Per-target dependency check/install. Independent of launch/stop above --
   # a target's dependencies can be checked (and installed) whether or not

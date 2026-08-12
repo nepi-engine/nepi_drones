@@ -207,6 +207,13 @@ STATUS_PUBLISH_RATE_HZ = 1.0
 # rather than once a second.
 UNREACHABLE_RECHECK_SEC = 60.0
 
+# How often to ask the sim host "is a gzserver already running?" while this
+# app has nothing of its own tracked as running -- see
+# detectExternalSimCb. One ssh per host per poll, and what it detects
+# (someone else's simulator) changes on human timescales, so this is
+# deliberately slow.
+EXTERNAL_SIM_DETECT_SEC = 20.0
+
 # Text that identifies launch_command's own "a gzserver is already running"
 # refuse-to-launch guard (both gazebo_rover and gazebo_quadcopter's
 # launch_command raise this exact wording -- see simulator_launch_targets.yaml)
@@ -405,6 +412,8 @@ class NepiSimConnectorApp:
     # Timestamp of the last dependency/reachability sweep, for the
     # self-healing retry in refreshLauncherConfigCb. 0 = never swept.
     self.last_installed_check_time = 0
+    # Timestamp of the last external-simulator probe (see detectExternalSimCb).
+    self.last_external_detect_time = 0
     launcher_config_path = find_config_path()
     if launcher_config_path:
       try:
@@ -1543,6 +1552,74 @@ class NepiSimConnectorApp:
     if self.sim_if is not None:
       self.sim_if.publish_status()
     self.refreshLauncherConfigCb()
+    self.detectExternalSimCb()
+
+  def detectExternalSimCb(self):
+    """Notices a simulator running on the sim host that this app is not
+    tracking, and reports it as a gazebo_conflict so the RUI offers the
+    Launch New / Use Existing / Kill All Gazebo choice instead of a bare
+    Deploy button that could only fail.
+
+    The gap this closes: launch bookkeeping (launcher_state,
+    active_launch_target) lives only in this node's memory, so it resets
+    whenever the app node restarts -- an app restart, or a container restart
+    from nepicommit -- while the VM-side simulator keeps running untouched.
+    The app then reported 'idle' against a fully-running sim, and the only
+    way to find out was to click Deploy and watch it refuse. Reported live
+    2026-08-12: a Gazebo/SITL was up on the VM and the RUI showed no sign of
+    it and no way to kill it.
+
+    Reuses the existing 'gazebo_conflict' state deliberately rather than
+    adding a new one: that state already means "something is running that we
+    do not own, here are your options", and the RUI already renders exactly
+    the three buttons for it (including the Kill All Gazebo escape hatch),
+    so no SimLauncherStatus schema change or RUI rebuild is needed.
+
+    Only runs while genuinely idle -- never during launching/stopping/
+    installing (the launcher_lock holder is mid-operation and its own state
+    is authoritative), never while this app already tracks something running
+    (then the sim IS ours and Kill already works), and never once already in
+    gazebo_conflict (nothing to re-decide). That also keeps it from fighting
+    runStop/runLaunch over launcher_state."""
+    if self.launcher is None:
+      return
+    if self.launcher_state != 'idle' or self.active_launch_target:
+      return
+    if self.launcher_thread is not None and self.launcher_thread.is_alive():
+      return
+    if (nepi_utils.get_time() - self.last_external_detect_time) < EXTERNAL_SIM_DETECT_SEC:
+      return
+    self.last_external_detect_time = nepi_utils.get_time()
+    # Probed on a worker thread: this runs from the 1 Hz status tick, and an
+    # ssh to an unreachable host blocks for the connect timeout, which would
+    # stall status publication for every other consumer.
+    thread = threading.Thread(target = self.runExternalSimDetect)
+    thread.daemon = True
+    thread.start()
+
+  def runExternalSimDetect(self):
+    try:
+      detected = self.launcher.detect_running_gazebo()
+    except Exception as e:
+      self.msg_if.pub_warn("External simulator detection failed: " + str(e), throttle_s = 300.0)
+      return
+    if not detected:
+      return
+    # Re-check the guards: this ran on a worker thread, so a launch/stop may
+    # have started (and taken ownership of launcher_state) while the ssh was
+    # in flight.
+    if self.launcher_state != 'idle' or self.active_launch_target:
+      return
+    if self.launcher_thread is not None and self.launcher_thread.is_alive():
+      return
+    self.msg_if.pub_info("Detected a simulator already running on the sim host "
+                         "that this app did not launch", throttle_s = 300.0)
+    self.launcher_state = 'gazebo_conflict'
+    self.launcher_last_error = ("A Gazebo simulator is already running on the sim host, and this app "
+                                "is not tracking it (it was started outside this app, or before this "
+                                "app last restarted). Use Kill All Gazebo to clear it, Launch New to "
+                                "replace it, or Use Existing to connect to it as-is.")
+    self.publishLauncherStatus()
 
   def refreshLauncherConfigCb(self):
     # Picks up launch-target config changes (an edited file, or a file that
