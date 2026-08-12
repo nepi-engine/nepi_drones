@@ -426,13 +426,63 @@ class ArdupilotDiscovery:
     self.logger.log_warn("Mavlink_AD: Checking TCP connection: " + ip_addr_str + " " + ip_port_str)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(2)
-    result = sock.connect_ex((ip_addr_str, int(ip_port_str)))
-    if result == 0:
-      found_device = True
-      self.logger.log_warn("Mavlink_AD: Found TCP device on ip address: " + ip_addr_str + " port: " + ip_port_str + " is open")
-      sock.close()
-    else:
-      self.logger.log_warn("Mavlink_AD: Did not find TCP device on ip address: " + ip_addr_str + " port: " + ip_port_str)
+    try:
+      result = sock.connect_ex((ip_addr_str, int(ip_port_str)))
+      if result == 0:
+        # A successful connect is NOT proof the SITL is there. These addresses
+        # are reached through a reverse SSH tunnel, where the listening socket
+        # belongs to the local sshd: sshd accepts first and only then tries to
+        # reach the far end, so connect() succeeds against a completely dead
+        # simulator. rbx_sim_discovery.py already learned this and requires a
+        # real reply from its heartbeat listener; this probe never got the same
+        # treatment, and the consequences were severe.
+        #
+        # With connect-only, a dead SITL looked present forever, so discovery
+        # relaunched mavros into a dead endpoint in an endless ~2 s loop:
+        # mavros hit "tcp0: receive: End of file" and aborted with
+        # "std::system_error: Resource deadlock avoided", checkOnDevice saw the
+        # dead mavlink process and purged, taking the ardupilot RBX node with
+        # it, then relaunched both. The RBX node never survived long enough to
+        # finish RBXRobotIF init, so it never registered its own subscribers --
+        # /rbx/setup_action had "Subscribers: None" -- and every LAUNCH/TAKEOFF
+        # published from the RUI went nowhere at all, silently. Quick one-shot
+        # motor commands could still land in a lucky window, which is exactly
+        # the reported symptom: "the manual motor commands seem to work, but
+        # the command to actually make it fly in the air doesn't". Autonomous
+        # controls then stay locked too, since autonomousControlsReady()
+        # requires takeoff_complete.
+        #
+        # Requiring actual MAVLink traffic distinguishes the two. A live
+        # SITL/MAVProxy endpoint streams heartbeats continuously, so bytes
+        # arrive within the socket timeout without us sending anything, and
+        # every frame starts with a MAVLink magic byte (0xFE v1 / 0xFD v2).
+        # A tunnel to a dead far end gives EOF (b"") or a timeout instead.
+        try:
+          data = sock.recv(1)
+        except Exception:
+          data = b""
+        if data[:1] in (b'\xfe', b'\xfd'):
+          found_device = True
+          self.logger.log_warn("Mavlink_AD: Found live MAVLink endpoint on " + ip_addr_str + ":" + ip_port_str)
+        elif len(data) > 0:
+          # Mid-frame bytes: still a live stream, just not aligned to a frame
+          # start. Accept it -- the alternative is rejecting a working SITL
+          # over probe timing.
+          found_device = True
+          self.logger.log_warn("Mavlink_AD: Found live TCP stream (non-magic first byte) on " + ip_addr_str + ":" + ip_port_str)
+        else:
+          self.logger.log_warn("Mavlink_AD: Port " + ip_addr_str + ":" + ip_port_str +
+                               " accepted the connection but sent no MAVLink data -- treating as absent "
+                               "(a reverse-tunnel port accepts even when the far-end simulator is gone)")
+      else:
+        self.logger.log_warn("Mavlink_AD: Did not find TCP device on ip address: " + ip_addr_str + " port: " + ip_port_str)
+    except Exception as e:
+      self.logger.log_warn("Mavlink_AD: TCP probe failed for " + ip_addr_str + ":" + ip_port_str + ": " + str(e))
+    finally:
+      try:
+        sock.close()
+      except Exception:
+        pass
     return found_device, path_str
 
 

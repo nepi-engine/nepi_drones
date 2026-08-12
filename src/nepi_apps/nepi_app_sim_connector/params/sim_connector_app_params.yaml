@@ -54,6 +54,19 @@ SIM_VEHICLE_DICT:
     default:
       display_name: Default
       description: No capabilities. Safe default until a robot config is selected.
+      # Not offered in the Robot Config selector -- "Default" is a meaningless
+      # thing for an operator to pick (it renders no controls at all), and it
+      # was cluttering the list of real robots. Requested 2026-08-12: "there is
+      # no 'default' robot config - remove that option".
+      #
+      # hidden_from_selector rather than deleting the entry: the app injects
+      # this profile as its startup selection and its always-valid fallback
+      # (see FACTORY_ROBOT_CONFIG_NAME in sim_connector_app_node.py, which
+      # re-adds it whatever the yaml says), so there is never a state with no
+      # legal selection. Hiding changes only what is OFFERED -- the profile
+      # stays fully valid for setSelectedRobotConfig to accept, exactly like
+      # stage_ground_robot/wpilib_ground_robot below.
+      hidden_from_selector: true
       wheel_count: 0
       motor_count: 0
       has_goto_position: false

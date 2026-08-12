@@ -766,8 +766,8 @@ class NepiDeviceRBX extends Component {
             />
             <div hidden={!has_camera_pov_toggle}>
               <ButtonMenu>
-                <Button onClick={() => updateSetting(namespace + "/settings", "camera_view_mode", "Discrete", "FIRST_PERSON")}>{"1st Person POV"}</Button>
-                <Button onClick={() => updateSetting(namespace + "/settings", "camera_view_mode", "Discrete", "THIRD_PERSON")}>{"3rd Person POV"}</Button>
+                <Button onClick={() => updateSetting(namespace + "/settings", "camera_view_mode", "Discrete", "FIRST_PERSON")}>{"Robot View"}</Button>
+                <Button onClick={() => updateSetting(namespace + "/settings", "camera_view_mode", "Discrete", "THIRD_PERSON")}>{"Scene View"}</Button>
               </ButtonMenu>
             </div>
             <div hidden={!has_camera_offsets}>
