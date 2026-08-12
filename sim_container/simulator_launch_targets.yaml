@@ -141,6 +141,14 @@ launch_targets:
     # $$ is the PGID because ssh starts this shell as a process-group leader,
     # and every child it spawns (the gazebo wrapper, gzserver, gzclient, the
     # bridge) inherits that same PGID -- verified with `ps -o pid,pgid`.
+    #
+    # The pkill for ai_targeting_controller_ardupilot.py is unconditional
+    # cleanup, not specific to this target -- see gazebo_quadcopter's own
+    # launch_command comment below for the full mechanism (a stray instance
+    # left running from an unrelated manual SITL session reconnects to
+    # whatever gzserver comes up next off the same persistent roscore and
+    # silently re-adds its chair target, even to a plain rover world that
+    # never asked for it).
     launch_command: >-
       bash -lc '
       source /opt/ros/noetic/setup.bash;
@@ -148,6 +156,7 @@ launch_targets:
       export XAUTHORITY=/run/user/$(id -u)/gdm/Xauthority;
       export GAZEBO_MODEL_PATH=$HOME/nepi_engine_ws/nepi_drones/sim_container/models:$GAZEBO_MODEL_PATH;
       if pgrep -x gzserver > /dev/null; then echo "REFUSING TO LAUNCH: a gzserver is already running on this host. Gazebo instances collide on port 11345 -- a second one would silently attach to the running world instead of loading generic_rover.world. Stop the existing simulation first." >&2; exit 3; fi;
+      pkill -f "[a]i_targeting_controller_ardupilot.py" 2>/dev/null;
       echo $$ > /tmp/sim_connector_launch.pgid;
       rostopic list > /dev/null 2>&1 || {{ nohup roscore < /dev/null > /tmp/sim_connector_roscore_launch.log 2>&1 & until rostopic list > /dev/null 2>&1; do sleep 1; done; }};
       rosrun gazebo_ros gazebo $HOME/nepi_engine_ws/nepi_drones/sim_container/worlds/generic_rover.world < /dev/null > /tmp/sim_connector_gazebo_launch.log 2>&1 & GZ_PID=$!;
@@ -177,6 +186,7 @@ launch_targets:
       export DISPLAY=:1;
       export XAUTHORITY=/run/user/$(id -u)/gdm/Xauthority;
       export GAZEBO_MODEL_PATH=$HOME/nepi_engine_ws/nepi_drones/sim_container/models:$GAZEBO_MODEL_PATH;
+      pkill -f "[a]i_targeting_controller_ardupilot.py" 2>/dev/null;
       echo $$ > /tmp/sim_connector_launch.pgid;
       rostopic list > /dev/null 2>&1 || {{ nohup roscore < /dev/null > /tmp/sim_connector_roscore_launch.log 2>&1 & until rostopic list > /dev/null 2>&1; do sleep 1; done; }};
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/gazebo/sim_connector_bridge_gazebo.py --host {device_bridge_host} --port {device_bridge_port} < /dev/null > /tmp/sim_connector_bridge_gazebo_launch.log 2>&1 & BRIDGE_PID=$!;
@@ -327,6 +337,31 @@ launch_targets:
     # MAVProxy should go down anyway. `rm -f` before `mkfifo` clears any
     # stale FIFO a previous crashed launch left behind (a fresh mkfifo on an
     # existing stale path errors and stops the whole script).
+    #
+    # The pkill for ai_targeting_controller_ardupilot.py right after the
+    # refuse-guards is NOT this target's own cleanup (it never starts that
+    # script itself) -- it exists because that script is a plain background
+    # process, invisible to the RUI's Scripts panel, that keeps calling
+    # gazebo's spawn/set_model_state services on a timer for as long as it
+    # lives. A stray instance left over from a manual nepi_sitl_dev_env.sh
+    # sitl_gazebo_full session reconnects to whatever gzserver this launch
+    # brings up next (same persistent roscore) and silently re-adds its
+    # chair target to a plain quadcopter+Gazebo world that never asked for
+    # it -- confirmed the hard way. Unlike the gzserver/port-5760 guards
+    # above, this is unconditional cleanup, not a refuse-and-exit: nothing
+    # about this target's own launch conflicts with that script still
+    # running, so there is nothing to warn about, just something to clear.
+    #
+    # sim_vehicle.py's --out list has both 5771 and 5772: 5771 is the same
+    # dedicated mavros/discovery port nepi_sitl_dev_env.sh's plain
+    # sitl_gazebo always exposes (rbx_ardupilot_discovery.py's
+    # sitl_tcp_port_list hardcodes checking 127.0.0.1:5771 only -- see that
+    # file), needed so this target's robot shows up under Devices ->
+    # Robots exactly like the manual dev flow's does; 5772 is this target's
+    # own dedicated port for sim_connector_bridge_gazebo_quadcopter.py's
+    # separate MAVLink connection below. Confirmed the hard way: shipping
+    # only 5772 left mavros with nothing to connect to, so the RBX panel
+    # never appeared even though the sim itself launched and ran fine.
     launch_command: >-
       bash -lc '
       source /opt/ros/noetic/setup.bash;
@@ -335,6 +370,7 @@ launch_targets:
       export GAZEBO_MODEL_PATH=$HOME/nepi_engine_ws/nepi_drones/sim_container/models:$HOME/ardupilot_gazebo/models:$GAZEBO_MODEL_PATH;
       if pgrep -x gzserver > /dev/null; then echo "REFUSING TO LAUNCH: a gzserver is already running on this host. A second one would silently attach to the running world instead of loading iris_arducopter_cmac.world. Stop the existing simulation first." >&2; exit 3; fi;
       if timeout 1 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/5760" 2>/dev/null; then echo "REFUSING TO LAUNCH: ArduCopter SITL already appears to be running on this host (port 5760 is taken -- possibly the separate RBX ArduPilot SITL dev flow, see nepi_sitl_dev_env.sh). Only one instance can own the default MAVLink ports at a time. Stop it first." >&2; exit 3; fi;
+      pkill -f "[a]i_targeting_controller_ardupilot.py" 2>/dev/null;
       echo $$ > /tmp/sim_connector_quadcopter_launch.pgid;
       rostopic list > /dev/null 2>&1 || {{ nohup roscore < /dev/null > /tmp/sim_connector_quadcopter_roscore_launch.log 2>&1 & until rostopic list > /dev/null 2>&1; do sleep 1; done; }};
       rosrun gazebo_ros gazebo $HOME/ardupilot_gazebo/worlds/iris_arducopter_cmac.world < /dev/null > /tmp/sim_connector_quadcopter_gazebo_launch.log 2>&1 & GZ_PID=$!;
@@ -343,7 +379,7 @@ launch_targets:
       rm -f /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo;
       mkfifo /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo;
       exec 3<>/tmp/sim_connector_quadcopter_mavproxy_stdin.fifo;
-      sim_vehicle.py -v ArduCopter -f gazebo-iris --out=tcpin:0.0.0.0:5772 < /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo > /tmp/sim_connector_quadcopter_sitl_launch.log 2>&1 & SITL_PID=$!;
+      sim_vehicle.py -v ArduCopter -f gazebo-iris --out=tcpin:0.0.0.0:5771 --out=tcpin:0.0.0.0:5772 < /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo > /tmp/sim_connector_quadcopter_sitl_launch.log 2>&1 & SITL_PID=$!;
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/gazebo/sim_connector_bridge_gazebo_quadcopter.py --host {device_bridge_host} --port {device_bridge_port} --mavlink tcp:127.0.0.1:5772 < /dev/null > /tmp/sim_connector_quadcopter_bridge_launch.log 2>&1 & BRIDGE_PID=$!;
       wait $GZ_PID $CAM_PID $SITL_PID $BRIDGE_PID
       '
@@ -366,13 +402,14 @@ launch_targets:
       export XAUTHORITY=/run/user/$(id -u)/gdm/Xauthority;
       export GAZEBO_MODEL_PATH=$HOME/nepi_engine_ws/nepi_drones/sim_container/models:$HOME/ardupilot_gazebo/models:$GAZEBO_MODEL_PATH;
       if timeout 1 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/5760" 2>/dev/null; then echo "REFUSING TO LAUNCH: ArduCopter SITL already appears to be running on this host (port 5760 is taken -- possibly the separate RBX ArduPilot SITL dev flow, see nepi_sitl_dev_env.sh). Only one instance can own the default MAVLink ports at a time. Stop it first." >&2; exit 3; fi;
+      pkill -f "[a]i_targeting_controller_ardupilot.py" 2>/dev/null;
       echo $$ > /tmp/sim_connector_quadcopter_launch.pgid;
       rostopic list > /dev/null 2>&1 || {{ nohup roscore < /dev/null > /tmp/sim_connector_quadcopter_roscore_launch.log 2>&1 & until rostopic list > /dev/null 2>&1; do sleep 1; done; }};
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/camera_rig_controller_ardupilot.py < /dev/null > /tmp/sim_connector_quadcopter_camera_rig_launch.log 2>&1 & CAM_PID=$!;
       rm -f /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo;
       mkfifo /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo;
       exec 3<>/tmp/sim_connector_quadcopter_mavproxy_stdin.fifo;
-      sim_vehicle.py -v ArduCopter -f gazebo-iris --out=tcpin:0.0.0.0:5772 < /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo > /tmp/sim_connector_quadcopter_sitl_launch.log 2>&1 & SITL_PID=$!;
+      sim_vehicle.py -v ArduCopter -f gazebo-iris --out=tcpin:0.0.0.0:5771 --out=tcpin:0.0.0.0:5772 < /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo > /tmp/sim_connector_quadcopter_sitl_launch.log 2>&1 & SITL_PID=$!;
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/gazebo/sim_connector_bridge_gazebo_quadcopter.py --host {device_bridge_host} --port {device_bridge_port} --mavlink tcp:127.0.0.1:5772 < /dev/null > /tmp/sim_connector_quadcopter_bridge_launch.log 2>&1 & BRIDGE_PID=$!;
       wait $CAM_PID $SITL_PID $BRIDGE_PID
       '
