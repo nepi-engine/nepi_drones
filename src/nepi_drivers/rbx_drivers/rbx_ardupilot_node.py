@@ -314,6 +314,14 @@ class ArdupilotNode:
     nepi_sdk.wait_for_service(MAVLINK_ARMING_SERVICE)
     nepi_sdk.wait_for_service(MAVLINK_TAKEOFF_SERVICE)
 
+    # Remembered purely so a failed call can name the service it was trying to
+    # reach. connect_service is a bare ServiceProxy that validates nothing, so
+    # a wrong namespace produces a client that fails every call silently --
+    # naming the path in the warning is what makes that case identifiable
+    # instead of looking like an FCU problem.
+    self.mode_client_name = MAVLINK_SET_MODE_SERVICE
+    self.arming_client_name = MAVLINK_ARMING_SERVICE
+
     self.set_home_client = nepi_sdk.connect_service(MAVLINK_SET_HOME_SERVICE, CommandHome)
     self.mode_client = nepi_sdk.connect_service(MAVLINK_SET_MODE_SERVICE, SetMode)
     self.arming_client = nepi_sdk.connect_service(MAVLINK_ARMING_SERVICE, CommandBool)
@@ -927,8 +935,23 @@ class ArdupilotNode:
       timeout_sec = self.rbx_if.rbx_info.cmd_timeout
       check_interval_s = 0.25
       check_timer = 0
+      # Same response-checking as set_mavlink_mode -- see its comment. mavros'
+      # CommandBool replies success=False when the FCU rejects arming (failed
+      # pre-arm checks being the usual reason), which is the single most useful
+      # thing to tell an operator and was previously thrown away.
+      no_response_count = 0
+      refused_count = 0
       while self.mavlink_state.armed != arm_value and check_timer < timeout_sec and not nepi_sdk.is_shutdown():
-        nepi_sdk.call_service(self.arming_client, arm_cmd)
+        response = nepi_sdk.call_service(self.arming_client, arm_cmd)
+        if response is None:
+          no_response_count += 1
+          if no_response_count == 1:
+            self.msg_if.pub_warn("arming service call to " + str(self.arming_client_name) +
+                                 " returned nothing -- the call itself is failing, not the FCU")
+        elif getattr(response, 'success', True) == False:
+          refused_count += 1
+          if refused_count == 1:
+            self.msg_if.pub_warn("FCU refused arming (success=False) -- usually a failed pre-arm check")
         time.sleep(check_interval_s)
         check_timer += check_interval_s
         #self.msg_if.pub_info("Waiting for armed value to set")
@@ -944,7 +967,11 @@ class ArdupilotNode:
           self.home_location = home_loc
       else:
         action = "Arm" if arm_value == True else "Disarm"
-        fail_msg = action + " command timed out"
+        fail_msg = action + " command timed out after " + str(timeout_sec) + "s"
+        if no_response_count > 0:
+          fail_msg = fail_msg + "; " + str(no_response_count) + " arming calls returned nothing"
+        if refused_count > 0:
+          fail_msg = fail_msg + "; " + str(refused_count) + " refused by the FCU (pre-arm check?)"
         reason = self.get_recent_fcu_reason()
         if reason != "":
           fail_msg = fail_msg + " (FCU: " + reason + ")"
@@ -966,17 +993,48 @@ class ArdupilotNode:
     timeout_sec = self.rbx_if.rbx_info.cmd_timeout
     check_interval_s = 0.25
     check_timer = 0
+    # The service RESPONSE is checked now rather than discarded. mavros'
+    # SetMode replies mode_sent=False when it refuses to forward the request
+    # at all, and nepi_sdk.call_service returns None when the call itself
+    # failed (it catches every exception and logs only at DEBUG, which ROS
+    # suppresses by default). Ignoring both meant a mode change that was
+    # never even sent looked exactly like one the FCU was still working on:
+    # this loop just spun for the full cmd_timeout and the operator saw a
+    # LAUNCH that sat there and then quietly gave up. Reported repeatedly as
+    # "the launch command doesn't work" with nothing in last_error_message.
+    #
+    # Logged once per distinct outcome rather than every 0.25 s tick, so a
+    # genuinely-slow-but-working mode change doesn't spam the message topic.
+    no_response_count = 0
+    refused_count = 0
     while self.mavlink_state.mode != mode_new and check_timer < timeout_sec and not nepi_sdk.is_shutdown():
-      nepi_sdk.call_service(self.mode_client, new_mode)
+      response = nepi_sdk.call_service(self.mode_client, new_mode)
+      if response is None:
+        no_response_count += 1
+        if no_response_count == 1:
+          self.msg_if.pub_warn("set_mode service call to " + str(self.mode_client_name) +
+                               " returned nothing -- the service call itself is failing, "
+                               "not the FCU (check the service exists and the request type matches)")
+      elif getattr(response, 'mode_sent', True) == False:
+        refused_count += 1
+        if refused_count == 1:
+          self.msg_if.pub_warn("mavros refused to send mode " + mode_new +
+                               " (mode_sent=False) -- it is rejecting the request before the FCU sees it")
       time.sleep(check_interval_s)
       check_timer += check_interval_s
-      #self.msg_if.pub_info("Waiting for mode to set")
-      #self.msg_if.pub_info("Set Value: " + mode_new)
-      #self.msg_if.pub_info("Cur Value: " + str(self.mavlink_state.mode))
     if self.mavlink_state.mode == mode_new:
       self.msg_if.pub_info("Mode set to " + mode_new)
     else:
-      fail_msg = "Setting mode to " + mode_new + " timed out"
+      # Include what the vehicle's mode ACTUALLY is, plus whether the calls
+      # were even getting through -- "timed out" alone gave no way to tell a
+      # rejected request from an unreachable service from an FCU that simply
+      # would not change mode.
+      fail_msg = ("Setting mode to " + mode_new + " timed out after " + str(timeout_sec) +
+                  "s (vehicle still reports " + str(self.mavlink_state.mode) + ")")
+      if no_response_count > 0:
+        fail_msg = fail_msg + "; " + str(no_response_count) + " set_mode calls returned nothing"
+      if refused_count > 0:
+        fail_msg = fail_msg + "; " + str(refused_count) + " refused by mavros (mode_sent=False)"
       reason = self.get_recent_fcu_reason()
       if reason != "":
         fail_msg = fail_msg + " (FCU: " + reason + ")"
@@ -1008,17 +1066,44 @@ class ArdupilotNode:
   ## Action Function for setting arm state and sending takeoff command
   global launch
   def launch(self):
+    # LAUNCH is guided-mode -> arm -> takeoff, and it aborts at the first step
+    # that fails. Each abort now says WHICH step and reports it to the RUI.
+    # Previously a failure anywhere here returned a bare False: the RUI showed
+    # the action finish with an empty last_error_message and the vehicle simply
+    # never moved, which is unactionable ("the launch command doesn't work").
+    # The step functions surface their own reasons too (see set_mavlink_mode /
+    # set_mavlink_arm_state); this adds which stage of LAUNCH was reached.
     self.msg_if.pub_info("Recieved Launch cmd")
     cmd_success = False
-    if "guided" in self.RBX_MODE_FUNCTIONS:
-      cmd_success = self.setModeInd(self.RBX_MODE_FUNCTIONS.index("guided"))
-    if cmd_success:
-      if "arm" in self.RBX_STATE_FUNCTIONS:
-        cmd_success = self.setStateInd(self.RBX_STATE_FUNCTIONS.index("arm"))
-    if cmd_success:
-      nepi_sdk.sleep(2,20)
-      cmd_success = self.takeoff_action()
+
+    if "guided" not in self.RBX_MODE_FUNCTIONS:
+      self.reportLaunchFailure("this driver has no GUIDED mode function registered")
+      return False
+    if "arm" not in self.RBX_STATE_FUNCTIONS:
+      self.reportLaunchFailure("this driver has no ARM state function registered")
+      return False
+
+    cmd_success = self.setModeInd(self.RBX_MODE_FUNCTIONS.index("guided"))
+    if not cmd_success:
+      self.reportLaunchFailure("could not switch to GUIDED mode -- not arming or taking off")
+      return False
+
+    cmd_success = self.setStateInd(self.RBX_STATE_FUNCTIONS.index("arm"))
+    if not cmd_success:
+      self.reportLaunchFailure("GUIDED mode was set but the vehicle would not ARM -- not taking off")
+      return False
+
+    nepi_sdk.sleep(2,20)
+    cmd_success = self.takeoff_action()
+    if not cmd_success:
+      self.reportLaunchFailure("armed in GUIDED mode but the takeoff did not complete")
     return cmd_success
+
+  def reportLaunchFailure(self, why):
+    msg = "LAUNCH failed: " + why
+    self.msg_if.pub_warn(msg)
+    if self.rbx_if is not None:
+      self.rbx_if.update_error_msg(msg)
 
   ## Function for sending takeoff command
   global takeoff
