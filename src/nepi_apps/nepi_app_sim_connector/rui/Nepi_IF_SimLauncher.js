@@ -312,6 +312,7 @@ class NepiIFSimLauncher extends Component {
 
     const busy = (state === 'launching') || (state === 'stopping') || (state === 'installing')
     const running = (state === 'running')
+    const launching = (state === 'launching')
     const last_error = (status_msg.last_error !== undefined) ? status_msg.last_error : ''
 
     // Plain wrapping text, not an <Input> -- these messages run long (the
@@ -371,9 +372,9 @@ class NepiIFSimLauncher extends Component {
 
           <ButtonMenu>
             {selection_matches_running ?
-              <Button disabled={busy} onClick={this.onDeployClicked}>{"Use Open Sim"}</Button>
+              <Button disabled={busy} onClick={this.onDeployClicked}>{launching ? "Deploying..." : "Use Open Sim"}</Button>
             : null}
-            <Button disabled={busy} onClick={this.onNewSimClicked}>{"New Sim"}</Button>
+            <Button disabled={busy} onClick={this.onNewSimClicked}>{launching ? "Deploying..." : "New Sim"}</Button>
             <Button disabled={busy} onClick={this.onKillClicked}>{"Kill"}</Button>
           </ButtonMenu>
 
@@ -405,7 +406,7 @@ class NepiIFSimLauncher extends Component {
       <React.Fragment>
         {error_row}
         <ButtonMenu>
-          <Button disabled={deploy_disabled} onClick={this.onDeployClicked}>{"Deploy"}</Button>
+          <Button disabled={deploy_disabled} onClick={this.onDeployClicked}>{launching ? "Deploying..." : "Deploy"}</Button>
         </ButtonMenu>
       </React.Fragment>
     )

@@ -298,6 +298,22 @@ class ArdupilotNode:
     MAVLINK_COMMAND_SERVICE = MAVLINK_NAMESPACE + "cmd/command"
     MAVLINK_SET_STREAM_RATE_SERVICE = MAVLINK_NAMESPACE + "set_stream_rate"
 
+    # Waiting for these services to actually be advertised (not just
+    # connect_service's bare rospy.ServiceProxy, which never checks the ROS
+    # graph) matters because mavros's state TOPIC above starts flowing
+    # before its service servers finish registering -- a Launch/Arm/Takeoff
+    # click landing in that gap called call_service against a not-yet-live
+    # service, which fails silently (nepi_sdk.call_service logs failures at
+    # DEBUG only) and just retries every check_interval_s for the entire
+    # cmd_timeout before anything is ever shown in the RUI. Waiting here
+    # instead, before this node reports Initialization Complete, closes
+    # that window at startup rather than on whichever command happens to be
+    # the first one clicked.
+    self.msg_if.pub_info("Waiting for mavlink services under: " + MAVLINK_NAMESPACE)
+    nepi_sdk.wait_for_service(MAVLINK_SET_MODE_SERVICE)
+    nepi_sdk.wait_for_service(MAVLINK_ARMING_SERVICE)
+    nepi_sdk.wait_for_service(MAVLINK_TAKEOFF_SERVICE)
+
     self.set_home_client = nepi_sdk.connect_service(MAVLINK_SET_HOME_SERVICE, CommandHome)
     self.mode_client = nepi_sdk.connect_service(MAVLINK_SET_MODE_SERVICE, SetMode)
     self.arming_client = nepi_sdk.connect_service(MAVLINK_ARMING_SERVICE, CommandBool)
@@ -936,7 +952,8 @@ class ArdupilotNode:
         if self.rbx_if is not None:
           self.rbx_if.update_error_msg(fail_msg)
       self.msg_if.pub_info("Armed value set to " + str(arm_value))
-  
+    return self.mavlink_state.armed == arm_value
+
 
   ### Function to set mavlink mode
   def set_mavlink_mode(self,mode_new):
@@ -959,7 +976,14 @@ class ArdupilotNode:
     if self.mavlink_state.mode == mode_new:
       self.msg_if.pub_info("Mode set to " + mode_new)
     else:
-      self.msg_if.pub_info("Setting mode value timed-out")
+      fail_msg = "Setting mode to " + mode_new + " timed out"
+      reason = self.get_recent_fcu_reason()
+      if reason != "":
+        fail_msg = fail_msg + " (FCU: " + reason + ")"
+      self.msg_if.pub_warn(fail_msg)
+      if self.rbx_if is not None:
+        self.rbx_if.update_error_msg(fail_msg)
+    return self.mavlink_state.mode == mode_new
 
 
 
@@ -974,16 +998,12 @@ class ArdupilotNode:
   ### Function for switching to arm state
   global arm
   def arm(self):
-    self.set_mavlink_arm_state(True)
-    success = True
-    return success
+    return self.set_mavlink_arm_state(True)
 
   ### Function for switching to disarm state
   global disarm
   def disarm(self):
-    self.set_mavlink_arm_state(False)
-    success = True
-    return success
+    return self.set_mavlink_arm_state(False)
 
   ## Action Function for setting arm state and sending takeoff command
   global launch
@@ -1053,9 +1073,15 @@ class ArdupilotNode:
         self.msg_if.pub_info("Takeoff action completed with error: " + str(alt_error) + " meters")
       else:
         self.takeoff_complete = False
-        self.msg_if.pub_info("Takeoff action timed-out with error: " + str(alt_error) + " meters")
+        fail_msg = "Takeoff action timed out with error: " + str(alt_error) + " meters"
+        self.msg_if.pub_warn(fail_msg)
+        if self.rbx_if is not None:
+          self.rbx_if.update_error_msg(fail_msg)
     else:
-      self.msg_if.pub_info("Ignoring Takeoff command as system is not Armed")
+      fail_msg = "Ignoring Takeoff command as system is not Armed"
+      self.msg_if.pub_warn(fail_msg)
+      if self.rbx_if is not None:
+        self.rbx_if.update_error_msg(fail_msg)
     return cmd_success
 
   ## Action Function for force-disarming then teleporting the sim back to its
@@ -1084,10 +1110,8 @@ class ArdupilotNode:
   ### Function for switching to STABILIZE mode
   global stabilize
   def stabilize(self):
-    cmd_success = False
-    self.set_mavlink_mode('STABILIZE')
+    cmd_success = self.set_mavlink_mode('STABILIZE')
     self.fake_gps_go_stop_pub.publish(Empty())
-    cmd_success = True
     return cmd_success
       
   ### Function for switching to LAND mode
@@ -1147,31 +1171,24 @@ class ArdupilotNode:
   ### Function for switching to LOITER mode
   global loiter
   def loiter(self):
-    cmd_success = False
-    self.set_mavlink_mode('LOITER')
+    cmd_success = self.set_mavlink_mode('LOITER')
     self.fake_gps_go_stop_pub.publish(Empty())
-    cmd_success = True
     return cmd_success
 
 
   ### Function for switching to Guided mode
   global guided
   def guided(self):
-    cmd_success = False
-    self.set_mavlink_mode('GUIDED')
+    cmd_success = self.set_mavlink_mode('GUIDED')
     self.fake_gps_go_stop_pub.publish(Empty())
-    cmd_success = True
     return cmd_success
 
   ### Function for switching back to current mission
   global resume
   def resume(self):
-    cmd_success = False
     # Reset mode to last
     self.msg_if.pub_info("Switching mavlink mode from " + self.mode_current + " back to " + self.mode_last)
-    self.set_mavlink_mode(self.mode_last)
-    cmd_success = True
-    return cmd_success
+    return self.set_mavlink_mode(self.mode_last)
 
 
   ### Function for setting home location

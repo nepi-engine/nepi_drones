@@ -186,18 +186,46 @@ class ArdupilotDiscovery:
   ##########  Shared Processes
 
   def checkOnDevice(self, path_str):
-    # Returns True if the device's mavlink process is still alive and its path is still present
+    # Returns True if the device's mavlink AND ardupilot processes are both
+    # still alive and its path is still present.
+    #
+    # Originally checked mavlink_subproc alone -- confirmed live (2026-08-11)
+    # that this misses a real, repeatable failure mode: mavros can stay up
+    # and perfectly healthy while the ardupilot RBX node itself exits (the
+    # exact mechanism wasn't pinned down -- rospy's own signal_shutdown
+    # [atexit] with no exception logged beforehand, i.e. a clean shutdown
+    # from *something*, not a crash) minutes after a successful launch. With
+    # only the mavlink check, that leaves active_devices_dict believing
+    # everything is fine forever after -- nothing purges the stale entry, so
+    # nothing ever retries the launch, and the RBX device panel that
+    # appeared briefly in the RUI's Devices list never comes back on its
+    # own. Checking ardu_subproc (and fake_gps, if this launch enabled it)
+    # the same way closes that gap: any one of the three dying now purges
+    # and retries the whole device, exactly like a mavlink death always did.
     active = True
     if path_str not in self.active_devices_dict.keys():
       return False
 
     device_entry = self.active_devices_dict[path_str]
     mavlink_subproc = device_entry["mavlink_subproc"]
+    ardu_subproc = device_entry.get("ardu_subproc")
+    fgps_subproc = device_entry.get("fgps_subproc")
 
     purge_node = False
     # Check that the mavlink process is still running
     if mavlink_subproc is None or mavlink_subproc.poll() is not None:
       self.logger.log_warn("Mavlink process for " + path_str + " is no longer running... purging from managed list")
+      purge_node = True
+    # Check that the ardupilot RBX node itself is still running -- see this
+    # method's own docstring for why this can't be inferred from mavlink
+    # alone.
+    elif ardu_subproc is None or ardu_subproc.poll() is not None:
+      self.logger.log_warn("Ardupilot RBX node for " + path_str + " is no longer running... purging from managed list")
+      purge_node = True
+    # Only present when fake_gps was enabled for this launch -- absence is
+    # normal, not a failure.
+    elif fgps_subproc is not None and fgps_subproc.poll() is not None:
+      self.logger.log_warn("Fake GPS node for " + path_str + " is no longer running... purging from managed list")
       purge_node = True
     # For serial connections, check that the port still exists
     elif path_str.startswith('/dev/') and path_str not in self.available_paths_list:

@@ -39,7 +39,8 @@ import NepiIFSaveData from "./Nepi_IF_SaveData"
 import NepiIFConfig from "./Nepi_IF_Config"
 
 import { createShortValuesFromNamespaces, createMenuListFromStrList,
-  onDropdownSelectedSendIndex, onUpdateSetStateValue } from "./Utilities"
+  onDropdownSelectedSendIndex, onUpdateSetStateValue,
+  setElementStyleModified, clearElementStyleModified } from "./Utilities"
 
 
 @inject("ros")
@@ -87,11 +88,33 @@ class NepiDeviceRBX extends Component {
       currentRBXNamespace: null,
       currentRBXNamespaceText: "No device selected",
 
-      rbxInfoListener: null
+      rbxInfoListener: null,
+
+      // Which Settings this device's driver actually registers -- e.g.
+      // camera_view_mode, camera_offset_x/y/z (ArduPilot's chase-cam
+      // feature) are driver-specific, not present on every RBX driver, so
+      // controls built on top of them are gated on this list rather than
+      // an unrelated capability flag that would silently no-op for drivers
+      // that don't define them.
+      rbxSettingsListener: null,
+      settingsNamesList: [],
+      settingsValuesDict: {},
+
+      // Local edit buffers for the camera offset inputs -- kept separate
+      // from settingsValuesDict so an in-progress edit isn't clobbered by
+      // the next settings/status message mid-typing. Synced from the device
+      // whenever the device's own reported value changes.
+      camera_offset_x: "",
+      camera_offset_y: "",
+      camera_offset_z: ""
     }
 
     this.updateInfoListener = this.updateInfoListener.bind(this)
     this.infoListener = this.infoListener.bind(this)
+    this.updateRBXSettingsListener = this.updateRBXSettingsListener.bind(this)
+    this.rbxSettingsListener = this.rbxSettingsListener.bind(this)
+    this.onEnterSetCameraOffset = this.onEnterSetCameraOffset.bind(this)
+    this.renderCameraOffsetControls = this.renderCameraOffsetControls.bind(this)
 
     this.onTopicRBXSelected = this.onTopicRBXSelected.bind(this)
     this.clearTopicRBXSelection = this.clearTopicRBXSelection.bind(this)
@@ -181,6 +204,7 @@ class NepiDeviceRBX extends Component {
       if (currentRBXNamespace.indexOf('null') === -1) {
         this.setState({ image_topic: currentRBXNamespace.split('/rbx')[0] + "/image" })
         this.updateInfoListener()
+        this.updateRBXSettingsListener()
       }
     }
   }
@@ -191,6 +215,82 @@ class NepiDeviceRBX extends Component {
   componentWillUnmount() {
     if (this.state.rbxInfoListener) {
       this.state.rbxInfoListener.unsubscribe()
+    }
+    if (this.state.rbxSettingsListener) {
+      this.state.rbxSettingsListener.unsubscribe()
+    }
+  }
+
+
+  // Callback for handling nepi_interfaces/SettingsStatus messages -- tracks
+  // just the setting NAMES this device's driver actually registers, so
+  // driver-specific controls (camera POV toggle, camera offset) can gate
+  // their own visibility on whether the underlying Setting exists at all,
+  // the same way has_manual_controls/has_fake_gps already gate on a real
+  // capability rather than assuming every RBX driver looks alike.
+  rbxSettingsListener(message) {
+    const settings = (message.settings_list !== undefined) ? message.settings_list : []
+    var namesList = []
+    var valuesDict = {}
+    for (let ind = 0; ind < settings.length; ind++) {
+      namesList.push(settings[ind].name_str)
+      valuesDict[settings[ind].name_str] = settings[ind].value_str
+    }
+    this.setState({ settingsNamesList: namesList, settingsValuesDict: valuesDict })
+
+    // Seed/resync each offset edit buffer only when the DEVICE's own value
+    // changed (or on first sight), never on every status tick -- otherwise
+    // a 1Hz status message overwrites whatever is being typed.
+    const offsetNames = ["camera_offset_x", "camera_offset_y", "camera_offset_z"]
+    var updates = {}
+    for (let i = 0; i < offsetNames.length; i++) {
+      const name = offsetNames[i]
+      const deviceVal = valuesDict[name]
+      if (deviceVal !== undefined && deviceVal !== this.state.settingsValuesDict[name]) {
+        updates[name] = deviceVal
+      }
+    }
+    if (Object.keys(updates).length > 0) {
+      this.setState(updates)
+    }
+  }
+
+
+  // Enter-to-apply for a camera offset input. Publishes the single Setting
+  // being edited (Float, matching rbx_ardupilot_node.py's own CAP_SETTINGS
+  // type for camera_offset_x/y/z) via the same updateSetting path the POV
+  // toggle buttons use -- camera_rig_controller_ardupilot.py picks the new
+  // offset up on its next aim cycle, for whichever view mode is active.
+  onEnterSetCameraOffset(event, settingName) {
+    if (event.key === 'Enter') {
+      const value = parseFloat(event.target.value)
+      if (!isNaN(value)) {
+        const { updateSetting } = this.props.ros
+        const namespace = this.state.currentRBXNamespace + "/settings"
+        updateSetting(namespace, settingName, "Float", String(value))
+      }
+      const el = document.getElementById(event.target.id)
+      if (el) {
+        clearElementStyleModified(el)
+      }
+    }
+  }
+
+
+  // Function for configuring and subscribing to this device's settings/status
+  updateRBXSettingsListener() {
+    const deviceNamespace = this.state.currentRBXNamespace
+
+    if (this.state.rbxSettingsListener) {
+      this.state.rbxSettingsListener.unsubscribe()
+      this.setState({ rbxSettingsListener: null, settingsNamesList: [] })
+    }
+    if (deviceNamespace !== null && deviceNamespace.indexOf('null') === -1) {
+      var listener = this.props.ros.setupSettingsStatusListener(
+        deviceNamespace + "/settings/status",
+        this.rbxSettingsListener
+      )
+      this.setState({ rbxSettingsListener: listener })
     }
   }
 
@@ -219,9 +319,21 @@ class NepiDeviceRBX extends Component {
     const image_topics = this.props.ros.imageTopics
     var img_topics = []
 
+    // RBXDeviceNamespace ends in "/rbx", but RBXRobotIF's own republished
+    // output (this.image_if, fed BY whatever image_source is selected here)
+    // publishes to "<node_namespace>/image" -- a sibling of "/rbx", not a
+    // child of it, so startsWith(RBXDeviceNamespace) never matched it and it
+    // always leaked into this list as if it were some unrelated device's
+    // camera. Selecting your own output as your own input is never a real
+    // choice, so exclude that one topic specifically -- NOT the whole
+    // node_namespace prefix, which would also wrongly hide this device's
+    // actual raw camera feed (<node_namespace>/color_2d_image for the
+    // ArduPilot driver), the one legitimate default source for this device.
+    const ownImageTopic = RBXDeviceNamespace.split('/rbx')[0] + "/image"
+
     for (var i = 0; i < image_topics.length; i++) {
       const topic = image_topics[i]
-      if (topic.startsWith(RBXDeviceNamespace) === true || topic.includes('zed_node') === true) {
+      if (topic === ownImageTopic || topic.includes('zed_node') === true) {
         continue
       }
       img_topics.push(topic)
@@ -536,18 +648,58 @@ class NepiDeviceRBX extends Component {
     )
   }
 
+  // Camera offset X/Y/Z, shown only for drivers that actually define these
+  // Settings (ArduPilot's camera-rig chase cam). Same offset triple applies
+  // to both view modes -- switching FIRST_PERSON/THIRD_PERSON only changes
+  // how camera_rig_controller_ardupilot.py aims the camera, not which
+  // offset it reads (see that driver's own CAMERA_SETTING_NAMES comment),
+  // so this renders as one shared block under the POV buttons rather than a
+  // per-mode set.
+  renderCameraOffsetControls() {
+    const offsets = [
+      { name: "camera_offset_x", title: "Camera Offset X (m)" },
+      { name: "camera_offset_y", title: "Camera Offset Y (m)" },
+      { name: "camera_offset_z", title: "Camera Offset Z (m)" },
+    ]
+    return (
+      <React.Fragment>
+        {offsets.map((offset) => (
+          <Label key={offset.name} title={offset.title}>
+            <Input
+              id={"rbx_" + offset.name}
+              value={this.state[offset.name]}
+              onChange={(event) => {
+                const el = document.getElementById("rbx_" + offset.name)
+                if (el) {
+                  setElementStyleModified(el)
+                }
+                var obj = {}
+                obj[offset.name] = event.target.value
+                this.setState(obj)
+              }}
+              onKeyDown={(event) => this.onEnterSetCameraOffset(event, offset.name)}
+            />
+          </Label>
+        ))}
+      </React.Fragment>
+    )
+  }
+
   renderImageViewer() {
     const { updateSetting } = this.props.ros
     const namespace = this.state.currentRBXNamespace
     // The camera_view_mode Setting (FIRST_PERSON/THIRD_PERSON) only exists on
-    // robots with an onboard-camera POV to switch to/from (e.g. RBX_SIM's
-    // rover) -- gate the toggle on that capability rather than always
-    // showing a button that would silently no-op for robots without it.
-    // Reuses the has_goto_location capability the same way home_is_local_frame
-    // does elsewhere in this file: a robot with no WGS84 goto has no real
-    // geographic reference, which for the sim robots this feature targets
-    // means it's the fixed front/chase-camera rover, not a drone.
-    const has_camera_pov_toggle = (this.state.rbx_capabilities !== null) ? (this.state.rbx_capabilities.has_goto_location !== true) : false
+    // drivers that actually define it -- gate on the real Settings list
+    // (settingsNamesList, from this device's own settings/status) rather
+    // than a capability flag that would silently no-op for a driver
+    // without it. Previously reused has_goto_location on the assumption
+    // that only the goto_location-less rover sim has a chase cam to
+    // switch, but rbx_ardupilot_node.py (a real goto_location drone) also
+    // defines camera_view_mode for its own camera-rig chase-cam feature --
+    // that assumption hid this toggle for exactly the driver it was built
+    // for.
+    const has_camera_pov_toggle = this.state.settingsNamesList.includes("camera_view_mode")
+    const has_camera_offsets = this.state.settingsNamesList.includes("camera_offset_x")
     return (
       <React.Fragment>
         <Columns>
@@ -587,6 +739,9 @@ class NepiDeviceRBX extends Component {
                 <Button onClick={() => updateSetting(namespace + "/settings", "camera_view_mode", "Discrete", "FIRST_PERSON")}>{"1st Person POV"}</Button>
                 <Button onClick={() => updateSetting(namespace + "/settings", "camera_view_mode", "Discrete", "THIRD_PERSON")}>{"3rd Person POV"}</Button>
               </ButtonMenu>
+            </div>
+            <div hidden={!has_camera_offsets}>
+              {this.renderCameraOffsetControls()}
             </div>
           </Column>
         </Columns>
