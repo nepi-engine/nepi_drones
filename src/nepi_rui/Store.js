@@ -1831,8 +1831,23 @@ class ROSConnectionStore {
       }
 
       // sort the image topics for comparison to work
-      newImageTopics.sort()    
-    }  
+      newImageTopics.sort()
+
+      // Drop duplicate topic names. The upstream list (system_mgr's published
+      // topic list, or rosapi getTopics) can carry the same topic more than
+      // once -- a ROS topic that has both a publisher and a subscriber is
+      // reported once per role by pub/sub-oriented listings, the same way
+      // `rostopic list -v` prints it under both headings. Every image selector
+      // built from this then rendered the same camera twice, and because
+      // createShortValuesFromNamespaces shows only the last two path segments
+      // the two entries were visually identical with no way to tell them apart
+      // (reported live 2026-08-12: "There's still two of the same image").
+      // Deduping here rather than in one dropdown fixes every consumer of this
+      // list at once. Sorted first, so equal names are adjacent.
+      newImageTopics = newImageTopics.filter(function (topic, ind, arr) {
+        return ind === 0 || topic !== arr[ind - 1]
+      })
+    }
     else {
       newImageTopics = []
     }

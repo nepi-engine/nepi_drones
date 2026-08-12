@@ -79,12 +79,31 @@ launch_targets:
     # caught up yet.
     check_installed_command: "bash -lc \"source /opt/ros/noetic/setup.bash; command -v gzserver > /dev/null && command -v roscore > /dev/null\""
     install_command: "bash -lc \"sudo apt-get update && sudo apt-get install -y ros-noetic-gazebo-ros-pkgs ros-noetic-gazebo-ros-control\""
-    # Launches Gazebo (generic_rover.world) plus the *new* sim_connector
-    # bridge (sim_connector_bridge_gazebo.py) -- NOT sim_rover_gazebo, which
-    # launches the older sim_bridge_node.py for the separate RBX_SIM driver
-    # path. Both can point at the same Gazebo instance but must never run at
-    # once (they'd fight over /rover/cmd_vel) -- see
-    # MULTI_SIMULATOR_INTEGRATION_PLAN.md Phase 1's A/B sanity note.
+    # Launches Gazebo (generic_rover.world) plus the RBX_SIM stack --
+    # sim_heartbeat_listener.py (9022), camera_rig_controller.py and
+    # sim_bridge_node.py (9023) -- i.e. exactly what sim_rover_gazebo() in
+    # sim_rover_dev_env.sh starts.
+    #
+    # This used to launch sim_connector_bridge_gazebo.py (the app's own bridge
+    # to sim_connector_app_node's port 9030) INSTEAD. That worked for the app's
+    # own panel but meant the rover never appeared under Devices -> Robots at
+    # all: that list is populated by RBX drivers, and rbx_sim_discovery.py finds
+    # a robot ONLY by probing the heartbeat port (9022) and then holding the
+    # bridge port (9023) -- neither of which anything was starting. So the sim
+    # came up, drove fine on the VM, and was completely uncontrollable from the
+    # RUI. Reported live 2026-08-12: "since nothing shows up in devices->robots,
+    # i cant even control it. this is supposed to basically be doing the same as
+    # summoning sim_rover_gazebo".
+    #
+    # The two bridges are swapped, NOT both started: they would fight over
+    # /rover/cmd_vel (see MULTI_SIMULATOR_INTEGRATION_PLAN.md Phase 1's A/B
+    # sanity note). Choosing the RBX_SIM one matches how this app is meant to
+    # divide responsibility -- the sim connector picks the sim and robot config,
+    # and Devices -> Robots does the actual controlling -- which is also why the
+    # app's own manual robot controls were removed (see NepiAppSimConnector.js
+    # show_controls). Consequence to know: the Sim Connector panel's own
+    # bridge_connected/telemetry fields stay unset for this target, because
+    # nothing is talking to port 9030 for it any more.
     # Every backgrounded process below redirects stdin from /dev/null as well
     # as stdout/stderr -- without it, the child keeps the ssh channel's stdin
     # pipe open and the ssh command that launched it never returns (learned
@@ -168,8 +187,10 @@ launch_targets:
       rostopic list > /dev/null 2>&1 || {{ nohup roscore < /dev/null > /tmp/sim_connector_roscore_launch.log 2>&1 & until rostopic list > /dev/null 2>&1; do sleep 1; done; }};
       rosrun gazebo_ros gazebo $HOME/nepi_engine_ws/nepi_drones/sim_container/worlds/generic_rover.world < /dev/null > /tmp/sim_connector_gazebo_launch.log 2>&1 & GZ_PID=$!;
       sleep 8;
-      python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/gazebo/sim_connector_bridge_gazebo.py --host {device_bridge_host} --port {device_bridge_port} < /dev/null > /tmp/sim_connector_bridge_gazebo_launch.log 2>&1 & BRIDGE_PID=$!;
-      wait $GZ_PID $BRIDGE_PID
+      python3 -u $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/sim_heartbeat_listener.py 9022 < /dev/null > /tmp/sim_heartbeat_listener.log 2>&1 & HB_PID=$!;
+      python3 -u $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/camera_rig_controller.py < /dev/null > /tmp/camera_rig_controller.log 2>&1 & CAM_PID=$!;
+      python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/sim_bridge_node.py < /dev/null > /tmp/sim_bridge_node.log 2>&1 & BRIDGE_PID=$!;
+      wait $GZ_PID $HB_PID $CAM_PID $BRIDGE_PID
       '
     # Used instead of launch_command when the operator explicitly chose
     # "Use Existing" after hitting launch_command's own refuse-to-launch
@@ -195,8 +216,10 @@ launch_targets:
       pkill -f "[a]i_targeting_controller_ardupilot.py" 2>/dev/null;
       echo $$ > /tmp/sim_connector_launch.pgid;
       rostopic list > /dev/null 2>&1 || {{ nohup roscore < /dev/null > /tmp/sim_connector_roscore_launch.log 2>&1 & until rostopic list > /dev/null 2>&1; do sleep 1; done; }};
-      python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/gazebo/sim_connector_bridge_gazebo.py --host {device_bridge_host} --port {device_bridge_port} < /dev/null > /tmp/sim_connector_bridge_gazebo_launch.log 2>&1 & BRIDGE_PID=$!;
-      wait $BRIDGE_PID
+      python3 -u $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/sim_heartbeat_listener.py 9022 < /dev/null > /tmp/sim_heartbeat_listener.log 2>&1 & HB_PID=$!;
+      python3 -u $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/camera_rig_controller.py < /dev/null > /tmp/camera_rig_controller.log 2>&1 & CAM_PID=$!;
+      python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/sim_bridge_node.py < /dev/null > /tmp/sim_bridge_node.log 2>&1 & BRIDGE_PID=$!;
+      wait $HB_PID $CAM_PID $BRIDGE_PID
       '
     # Kills ONLY this launch's own process group, never Gazebo generally.
     # An earlier version ran `pkill -x gzserver; pkill -x gzclient`, which
@@ -226,7 +249,7 @@ launch_targets:
     # but bracket-escaped anyway now that the bug is understood, rather than
     # leaving a latent footgun for whoever next relies on this line actually
     # executing.
-    stop_command: "bash -lc 'f=/tmp/sim_connector_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; pkill -f [s]im_connector_bridge_gazebo.py 2>/dev/null; true'"
+    stop_command: "bash -lc 'f=/tmp/sim_connector_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; pkill -f [s]im_bridge_node.py 2>/dev/null; pkill -f [s]im_heartbeat_listener.py 2>/dev/null; pkill -f [c]amera_rig_controller.py 2>/dev/null; true'"
     # Verifies THIS target's own world is up, not just that some gazebo is.
     # Two earlier versions were both false-positive-prone: process existence
     # alone missed gzserver spinning on "No ROS master", and a bare
@@ -235,10 +258,25 @@ launch_targets:
     # in gzserver's own command line is what ties readiness to this target,
     # and /rover/odom having a real publisher is what proves the rover model
     # actually loaded rather than the bridge merely having subscribed.
-    ready_check_command: "bash -lc \"source /opt/ros/noetic/setup.bash; pgrep -f 'gzserver.*generic_rover.world' > /dev/null && pgrep -f sim_connector_bridge_gazebo.py > /dev/null && rostopic info /rover/odom 2>/dev/null | grep -A1 '^Publishers:' | grep -q ' \\* /'\""
+    ready_check_command: "bash -lc \"source /opt/ros/noetic/setup.bash; pgrep -f 'gzserver.*generic_rover.world' > /dev/null && pgrep -f sim_bridge_node.py > /dev/null && pgrep -f sim_heartbeat_listener.py > /dev/null && rostopic info /rover/odom 2>/dev/null | grep -A1 '^Publishers:' | grep -q ' \\* /'\""
     # Which sim_connector_app_params.yaml robot_configs entry this target's
     # bridge expects -- auto-selected on successful launch.
-    default_robot_config: ground_robot_2_wheel
+    #
+    # ground_robot_4_wheel, not ground_robot_2_wheel: generic_rover.world's
+    # only rover model (models/generic_rover) has FOUR wheels --
+    # front_left/front_right/rear_left/rear_right. Defaulting to the 2-wheel
+    # entry meant picking "2-wheel rover" and being handed the 4-wheel robot,
+    # reported live 2026-08-12 ("deploying the 2-wheel rover + gazebo actually
+    # deploys the 4 wheel rover instead").
+    #
+    # NOTE: a robot_configs entry only describes the CONTROL SURFACE the app
+    # and RUI expose (wheel/motor counts, which axes exist) -- it does not
+    # choose the Gazebo model. So selecting ground_robot_2_wheel cannot make
+    # this world spawn a two-wheeled robot; there is no 2-wheel model in
+    # models/ to spawn. Genuinely supporting a 2-wheel rover means authoring
+    # that model plus a world for it and giving it its own launch target, not
+    # changing this line.
+    default_robot_config: ground_robot_4_wheel
     # This target's own rover world/bridge has no way to serve a 4-motor
     # flight profile (no altitude axis, no flight controller) -- redirect
     # the ACTUAL launch to gazebo_quadcopter below instead, a different

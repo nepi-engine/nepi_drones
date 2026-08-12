@@ -752,9 +752,38 @@ class NepiSimConnectorApp:
           continue
         self.sim_device_subs[topic] = sub
 
-      # Drop candidates whose status topic has gone away entirely.
+      # Drop candidates whose status topic has gone away entirely, OR whose
+      # status messages have gone stale.
+      #
+      # The staleness half is not redundant with the vanished half -- without
+      # it the two form a self-sustaining loop that never releases a dead
+      # robot. A ROS topic exists in the master for as long as it has EITHER a
+      # publisher or a subscriber, so when a robot's node dies its status topic
+      # stays listed purely because THIS app is still subscribed to it. The
+      # scan above then keeps "finding" it, so `topic in found` stays true, so
+      # this loop never unregisters, so the topic never goes away: the app's
+      # own subscription is the only thing keeping it alive.
+      #
+      # That leaked out into the RUI, which builds its Devices -> Robots list
+      # from topic NAMES: a killed simulator's robot stayed listed forever,
+      # unselectable and uncontrollable, until the whole app restarted.
+      # Confirmed live 2026-08-12 -- after killing the sim, both the rbx node
+      # AND its discovery were gone, yet .../sim_rover1/rbx/status still
+      # listed with "Publishers: None" and this app as the sole subscriber
+      # (reported as "even after killing the quadcopter and gazebo,
+      # ardupilot_sitl still shows up in the devices -> robot section").
+      #
+      # SIM_DEVICE_STALE_SEC is the same threshold getAvailableSimulators
+      # already uses to hide a stale device from the selector; this makes the
+      # subscription itself follow the same rule instead of outliving it. A
+      # candidate with no entry yet (subscribed this scan, no message received)
+      # is NOT stale -- it has no 'time' to judge and gets the next scan to
+      # report in.
+      now = nepi_utils.get_time()
       for topic in list(self.sim_device_subs.keys()):
-        if topic in found:
+        entry = self.sim_device_info.get(topic)
+        stale = (entry is not None and (now - entry['time']) > SIM_DEVICE_STALE_SEC)
+        if topic in found and not stale:
           continue
         sub = self.sim_device_subs.pop(topic)
         self.sim_device_info.pop(topic, None)
@@ -762,6 +791,10 @@ class NepiSimConnectorApp:
           sub.unregister()
         except Exception:
           pass
+        if stale:
+          self.msg_if.pub_info("Dropping stale simulator device " + topic +
+                               " (no status for " + str(SIM_DEVICE_STALE_SEC) + "s)",
+                               throttle_s = 60.0)
 
     # A selection that is no longer available falls back to no selection rather
     # than silently pointing at a device that is gone.
