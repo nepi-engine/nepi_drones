@@ -197,6 +197,16 @@ BRIDGE_RECV_BYTES = 4096
 
 STATUS_PUBLISH_RATE_HZ = 1.0
 
+# How long to wait between re-running the per-target dependency sweep while
+# any target is still 'unknown' (i.e. ssh could not reach the sim host) --
+# see refreshLauncherConfigCb. Deliberately slow: each sweep costs one ssh
+# per configured target, and the condition it recovers from (the VM or the
+# reverse tunnel not up yet when this app started) resolves on human
+# timescales, not sub-second ones. 60 s means a VM that comes up is usable
+# without touching the app, while an offline VM is probed once a minute
+# rather than once a second.
+UNREACHABLE_RECHECK_SEC = 60.0
+
 # Text that identifies launch_command's own "a gzserver is already running"
 # refuse-to-launch guard (both gazebo_rover and gazebo_quadcopter's
 # launch_command raise this exact wording -- see simulator_launch_targets.yaml)
@@ -392,6 +402,9 @@ class NepiSimConnectorApp:
     # in the background regardless of which one (if any) is selected.
     self.launch_target_installed = {}
     self.launch_target_installed_check_state = {}
+    # Timestamp of the last dependency/reachability sweep, for the
+    # self-healing retry in refreshLauncherConfigCb. 0 = never swept.
+    self.last_installed_check_time = 0
     launcher_config_path = find_config_path()
     if launcher_config_path:
       try:
@@ -1163,14 +1176,26 @@ class NepiSimConnectorApp:
       self.launch_target_installed_check_state[target_key] = 'unknown'
 
   def startInstalledCheckAll(self):
-    # Runs once at startup and once per config reload (see
-    # refreshLauncherConfigCb) -- NOT on the launcher_thread/launcher_lock
+    # Runs at startup, on config reload, and from the unreachable-retry in
+    # refreshLauncherConfigCb -- NOT on the launcher_thread/launcher_lock
     # launch/stop/install share, since checking is a read-only, low-stakes
     # operation against every target and shouldn't be blocked by (or block)
     # an in-flight launch/stop/install of one specific target.
+    self.last_installed_check_time = nepi_utils.get_time()
     thread = threading.Thread(target = self.checkInstalledAllCb)
     thread.daemon = True
     thread.start()
+
+  def anyTargetUnreachable(self):
+    # True when at least one target's dependency state is 'unknown', which
+    # is_installed()/checkInstalledOne() use specifically to mean "ssh never
+    # reached the host" (as opposed to 'not_installed', a confirmed answer) --
+    # see SimulatorLauncher.is_installed's own docstring. An empty dict counts
+    # too: it means no sweep has ever produced a result.
+    if not self.launch_target_installed_check_state:
+      return True
+    return any(state == 'unknown'
+               for state in self.launch_target_installed_check_state.values())
 
   def checkInstalledAllCb(self):
     if self.launcher is None:
@@ -1551,6 +1576,23 @@ class NepiSimConnectorApp:
         # Targets may have been added/edited -- re-check all of them rather
         # than trying to diff what changed.
         self.startInstalledCheckAll()
+      elif self.anyTargetUnreachable():
+        # Self-heal the "app came up before the VM/tunnel did" case. The
+        # startup and config-reload sweeps above were the ONLY things that
+        # ever refreshed reachability, so a target that was unreachable at
+        # app start stayed 'unknown' indefinitely -- the app sat there
+        # believing the VM was unreachable even after it came back, and the
+        # operator had to restart the app (or touch the config) before a
+        # Deploy could work. Since 'unknown' specifically means "couldn't
+        # reach the host", retrying it on a slow cadence is exactly the
+        # recovery that was missing. Rate-limited because each sweep is one
+        # ssh per target: at 1 Hz (this callback's own rate, via
+        # statusPublishCb) an unthrottled retry would hammer the VM.
+        # Confirmed states settle to 'installed'/'not_installed' once the
+        # host answers, so this stops retrying on its own.
+        if (nepi_utils.get_time() - self.last_installed_check_time) >= UNREACHABLE_RECHECK_SEC:
+          self.msg_if.pub_info("Re-checking simulator host reachability", throttle_s = 300.0)
+          self.startInstalledCheckAll()
     except LauncherError as e:
       # throttle_s alone is correct here: pub_warn derives the throttle uid
       # itself from the caller's file/function/line, and takes no uid argument
