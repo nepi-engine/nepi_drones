@@ -1080,6 +1080,15 @@ class RBXRobotIF:
                 self.status_msg.process_current = self.setup_actions[action_ind]
                 self.status_msg.ready = False
                 self.rbx_cmd_success_current = False
+                # Clear the previous run's error before starting. Nothing else ever
+                # clears last_error_message, so a failed LAUNCH left "LAUNCH failed:
+                # ... would not ARM" on the RUI even after a LATER attempt flew
+                # successfully -- confirmed live 2026-08-12: vehicle armed, GUIDED,
+                # holding 5.0m, cmd_success True, and the panel still read "failed".
+                # Cleared at action START (not on success) so that any error raised
+                # DURING the action -- including FCU prearm text relayed by
+                # update_error_msg -- still survives to be read afterwards.
+                self.status_msg.last_error_message = ""
                 self.msg_if.pub_info("Starting action: " + self.setup_actions[action_ind])
                 success = self.setSetupActionIndFunction(action_ind)
                 self.rbx_cmd_success_current = success

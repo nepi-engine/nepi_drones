@@ -321,6 +321,7 @@ class ArdupilotNode:
     # instead of looking like an FCU problem.
     self.mode_client_name = MAVLINK_SET_MODE_SERVICE
     self.arming_client_name = MAVLINK_ARMING_SERVICE
+    self.mavlink_namespace = MAVLINK_NAMESPACE
 
     self.set_home_client = nepi_sdk.connect_service(MAVLINK_SET_HOME_SERVICE, CommandHome)
     self.mode_client = nepi_sdk.connect_service(MAVLINK_SET_MODE_SERVICE, SetMode)
@@ -343,7 +344,6 @@ class ArdupilotNode:
     stream_rate_req.message_rate = 10
     stream_rate_req.on_off = True
     nepi_sdk.call_service(self.set_stream_rate_client, stream_rate_req)
-
 
     # Subscribe to MAVLink topics
     MAVLINK_BATTERY_TOPIC = MAVLINK_NAMESPACE + "battery"
@@ -445,6 +445,17 @@ class ArdupilotNode:
     self.fake_gps_go_stop_pub = nepi_sdk.create_publisher(FAKE_GPS_NAMESPACE + "/go_stop", Empty, queue_size=1)
     self.fake_gps_goto_position_pub = nepi_sdk.create_publisher(FAKE_GPS_NAMESPACE + "/goto_position", Point, queue_size=1)
     self.fake_gps_goto_location_pub = nepi_sdk.create_publisher(FAKE_GPS_NAMESPACE + "/goto_location", GeoPoint, queue_size=1)
+    self.fake_gps_select_pub = nepi_sdk.create_publisher(FAKE_GPS_NAMESPACE + "/select_mavros_node", String, queue_size=1)
+
+    # Reconcile the Fake GPS app against what kind of vehicle this actually is.
+    # Placed here, after the fake_gps publishers exist, rather than earlier next
+    # to the mavros service setup: an earlier attempt built its own publisher
+    # from self.base_namespace + "app_fake_gps/" and silently published into
+    # "/nepi/device1app_fake_gps/enable" -- get_base_namespace() returns the
+    # namespace with NO trailing slash, which is exactly why the block above
+    # uses os.path.join. Reusing these publishers means one namespace
+    # convention, proven by the existing goto/home callbacks, instead of two.
+    self.reconcileFakeGpsApp()
 
 
 
@@ -1090,7 +1101,8 @@ class ArdupilotNode:
 
     cmd_success = self.setStateInd(self.RBX_STATE_FUNCTIONS.index("arm"))
     if not cmd_success:
-      self.reportLaunchFailure("GUIDED mode was set but the vehicle would not ARM -- not taking off")
+      self.reportLaunchFailure("GUIDED mode was set but the vehicle would not ARM -- not taking off"
+                               + self.describeArmRefusalCause())
       return False
 
     nepi_sdk.sleep(2,20)
@@ -1104,6 +1116,129 @@ class ArdupilotNode:
     self.msg_if.pub_warn(msg)
     if self.rbx_if is not None:
       self.rbx_if.update_error_msg(msg)
+
+  def waitForPubConnection(self, pub, timeout_sec = 10.0):
+    # Returns True once at least one subscriber is connected. Absence of a
+    # subscriber is not an error -- the Fake GPS app simply may not be installed
+    # or running on this deployment -- so a timeout just returns False and the
+    # caller still publishes (latched, so a late subscriber picks it up).
+    waited = 0.0
+    while waited < timeout_sec:
+      try:
+        if pub.get_num_connections() > 0:
+          return True
+      except Exception:
+        return False
+      nepi_sdk.sleep(0.25,1)
+      waited += 0.25
+    return False
+
+  def reconcileFakeGpsApp(self):
+    # A simulated vehicle brings its own GPS; a real airframe on this deployment
+    # may not have one at all. The Fake GPS app cannot know which it is looking
+    # at, so this driver -- which does -- tells it.
+    #
+    # Why this exists: confirmed live 2026-08-12, app_fake_gps left enabled from
+    # earlier real-hardware testing kept injecting GPS_INPUT at 41 Hz from its
+    # configured start point (46.654, -122.319) while the ArduCopter SITL's own
+    # simulated GPS sat at (-35.363, 149.165). Two GPS sources ~13000 km apart,
+    # both claiming gps_id 0, so the EKF never converged on a position estimate,
+    # ArduPilot answered "PreArm: Need Position Estimate", and every LAUNCH
+    # aborted at the ARM step with the vehicle never leaving the ground.
+    # Nothing in the system reconciled the two, and the app's enabled state
+    # persists in /mnt/nepi_storage/user_cfg/app_fake_gps.yaml across reboots --
+    # so once it was on, it stayed on and every subsequent sim silently could
+    # not fly.
+    #
+    # Direction of the reconcile is decided by device_path, which discovery
+    # builds as connection_type + "_" + address (see discoveryFunction): a SITL
+    # connection is always "SITL_<addr>_<port>", every real connection type
+    # (SERIAL/USB/TCP/UDP to an actual FCU) is not.
+    #   SITL  -> disable Fake GPS (the sim has its own GPS; injection breaks it)
+    #   real  -> point Fake GPS at this vehicle's mavros node and enable it
+    #
+    # Ordering matters on the enable path: select_mavros_node is published and
+    # allowed to land BEFORE enable, otherwise the app can start publishing
+    # against a stale/None selection. Both publishers are latched so the app
+    # still receives them if it comes up after this driver.
+    #
+    # Timing note: this runs once, here, rather than on a timer. Discovery
+    # relaunches this whole node whenever the vehicle is re-detected (see
+    # checkOnDevice), so "once per detected vehicle" is exactly the right
+    # granularity, and it deliberately does NOT fight a human who later toggles
+    # Fake GPS by hand in the RUI for that same vehicle.
+    is_sitl = str(self.device_path).upper().startswith("SITL")
+    try:
+      # Wait for the app's subscriber to actually connect before publishing.
+      # These publishers are created immediately above, and a rospy publish
+      # issued before the subscriber connection completes is dropped on the
+      # floor with no error -- confirmed live 2026-08-12, an earlier version
+      # published straight after create_publisher and the app's enabled flag
+      # never changed. Absence of a subscriber is not an error (the Fake GPS app
+      # need not be installed), so waitForPubConnection just times out and we
+      # publish anyway.
+      if is_sitl == False:
+        self.waitForPubConnection(self.fake_gps_select_pub)
+        nepi_sdk.publish_pub(self.fake_gps_select_pub, String(self.mavlink_namespace.rstrip('/')))
+        nepi_sdk.sleep(1,10)
+      self.waitForPubConnection(self.fake_gps_enable_pub)
+      nepi_sdk.publish_pub(self.fake_gps_enable_pub, Bool(not is_sitl))
+      if is_sitl:
+        self.msg_if.pub_warn("Simulated vehicle detected (device_path " + str(self.device_path)
+                             + ") -- disabling the Fake GPS app so its injected GPS_INPUT cannot"
+                             + " prevent this vehicle's EKF from getting a position estimate")
+      else:
+        self.msg_if.pub_warn("Real vehicle detected (device_path " + str(self.device_path)
+                             + ") -- pointing the Fake GPS app at " + str(self.mavlink_namespace)
+                             + " and enabling it")
+    except Exception as e:
+      # Never fatal: a deployment without the Fake GPS app installed is entirely
+      # legitimate, and this is a convenience reconcile, not a requirement for
+      # this driver to operate.
+      self.msg_if.pub_warn("Could not reconcile the Fake GPS app state: " + str(e))
+
+  def describeArmRefusalCause(self):
+    # ArduPilot refusing to ARM is almost never a NEPI-side problem, so the raw
+    # refusal is unactionable on its own. The one cause this deployment has
+    # actually hit -- and it cost most of a debugging session to find -- is the
+    # Fake GPS app injecting GPS_INPUT into this same mavros node while the
+    # vehicle (a SITL, or any FCU with a real GPS) already has its own GPS.
+    # Confirmed live 2026-08-12: app_fake_gps published GPS_INPUT at 41 Hz with
+    # its factory start point (46.654, -122.319, Washington State) while the
+    # ArduCopter SITL's simulated GPS sat at (-35.363, 149.165, Canberra) --
+    # two sources ~13000 km apart both claiming gps_id 0. The EKF never formed
+    # a position estimate, ArduPilot answered "PreArm: Need Position Estimate",
+    # and LAUNCH aborted here every time. Disabling Fake GPS was the only change
+    # needed to make the vehicle arm, take off and hold 5 m.
+    #
+    # So: on an arm refusal, look for a foreign publisher on this mavros node's
+    # gps_input topic and name it. Any failure to inspect the graph is swallowed
+    # -- this is diagnostic text appended to an already-failing path and must
+    # never be what breaks it.
+    try:
+      ns = getattr(self, 'mavlink_namespace', None)
+      if ns is None:
+        return ""
+      gps_input_topic = ns + "gps_input/gps_input"
+      # rosgraph.Master().getSystemState() rather than a nepi_sdk helper: the SDK
+      # exposes topic/type listings and a has-subscribers check, but nothing that
+      # returns a topic's PUBLISHER names, which is exactly what identifies the
+      # offending node here. Same access path nepi_sdk uses internally.
+      import rosgraph
+      state = rosgraph.Master('/rbx_ardupilot_gps_conflict_check').getSystemState()
+      pub_names = []
+      for pub_topic, node_names in state[0]:
+        if pub_topic == gps_input_topic:
+          pub_names = list(node_names)
+      if len(pub_names) > 0:
+        return (". NOTE: " + str(pub_names) + " is publishing " + gps_input_topic
+                + " -- an injected GPS fighting this vehicle's own GPS prevents the"
+                + " EKF from forming a position estimate, which makes ArduPilot"
+                + " refuse to arm (PreArm: Need Position Estimate). Disable the"
+                + " Fake GPS app for a vehicle that already has its own GPS.")
+    except Exception as e:
+      self.msg_if.pub_debug("Could not check for a conflicting GPS_INPUT publisher: " + str(e))
+    return ""
 
   ## Function for sending takeoff command
   global takeoff
