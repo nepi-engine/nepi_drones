@@ -58,6 +58,7 @@
 
 import rospy
 import sys
+import os
 import time
 import math
 from nepi_sdk import nepi_ros
@@ -90,9 +91,38 @@ TARGET_OFFSET_GOAL_M = 0.1 # How close to set setpoint to target
 TRIGGER_RESET_DELAY_S = 5 # Time between detect/move checks
 
 # Set Home Poistion
-ENABLE_FAKE_GPS = True
-SET_HOME = True
-HOME_LOCATION = [47.6540828,-122.3187578,0.0]
+#
+# ENABLE_FAKE_GPS was True, and that is exactly what stopped this script from
+# ever flying. Root cause confirmed live 2026-08-12: the Fake GPS app injects
+# GPS_INPUT at ~41 Hz from HOME_LOCATION while an ArduPilot SITL already has its
+# own simulated GPS at the CMAC default below. Two GPS sources ~13000 km apart,
+# both claiming gps_id 0, so the EKF never forms a position estimate, ArduPilot
+# answers "PreArm: Need Position Estimate", and LAUNCH aborts at the ARM step.
+# This is precisely the "LAUNCH's takeoff step times out before reaching
+# altitude ... pre-existing ArduPilot SITL fake-GPS takeoff-climb issue" noted in
+# this module's own header -- it was never a takeoff-climb issue, it was this.
+#
+# Fake GPS exists for a real airframe with no GPS of its own. A SITL has one, so
+# it must stay OFF here. rbx_ardupilot_node.py's reconcileFakeGpsApp() now also
+# auto-disables it whenever it detects a SITL, so leaving this True would have
+# the script fighting the driver.
+ENABLE_FAKE_GPS = False
+# SET_HOME was True, and with Fake GPS off it is actively harmful against a SITL.
+# Confirmed live 2026-08-12: publishing a home with altitude 0.0 m moved the
+# EKF's home reference to sea level, so global_position/rel_alt read 583.9 m
+# (the CMAC field sits ~603 m AMSL) and the vehicle believed it was already
+# 584 m above home. It armed, then the 10 m takeoff never completed --
+# "LAUNCH failed: armed in GUIDED mode but the takeoff did not complete" --
+# because the climb target was already far below the reported current altitude.
+#
+# Setting home explicitly is what a FAKE-GPS deployment needs (the injected
+# position has no meaningful home of its own). A SITL spawns with a correct home
+# exactly where it sits, so the right move is to leave it alone. HOME_LOCATION
+# is kept below, corrected to the SITL's own CMAC location including its real
+# ~603 m AMSL field elevation, so flipping SET_HOME back on for a fake-GPS run
+# does not silently reintroduce the sea-level bug.
+SET_HOME = False
+HOME_LOCATION = [-35.3632621,149.1652374,603.44]
 
 # Goto Error Settings
 GOTO_MAX_ERROR_M = 2.0 # Goal reached when all translation move errors are less than this value
@@ -102,8 +132,17 @@ GOTO_STABILIZED_SEC = 1.0 # Window of time that setpoint error values must be go
 # CMD Timeout Values
 CMD_STATE_TIMEOUT_SEC = 5
 CMD_MODE_TIMEOUT_SEC = 5
-CMD_ACTION_TIMEOUT_SEC = 20
-CMD_GOTO_TIMEOUT_SEC = 20
+# CMD_ACTION_TIMEOUT_SEC was 20, which is the whole budget the driver's takeoff
+# completion check gets. Measured live 2026-08-12 on the dev VM: a 10 m
+# TAKEOFF_HEIGHT_M climb took ~20 s wall-clock, because SITL plus Gazebo on a
+# loaded 4-core VM runs slower than realtime -- so the climb finished right on
+# the timeout and was scored a failure. 60 s leaves real headroom without
+# masking an actually-stuck takeoff.
+CMD_ACTION_TIMEOUT_SEC = 60
+# Raised from 20 for the same slower-than-realtime reason, and because the follow
+# target is a MOVING one -- see the call site in move_to_object_callback, which
+# also had to be fixed to actually pass this value.
+CMD_GOTO_TIMEOUT_SEC = 30
 
 #########################################
 # Node Class
@@ -317,7 +356,13 @@ class drone_follow_object_mission(object):
     # Fake GPS is a standalone app now (nepi_app_fake_gps), not a per-robot rbx/ topic --
     # a single instance at the base namespace injects HilGPS into whichever mavros node
     # the driver is attached to.
-    FAKE_GPS_NAMESPACE = self.base_namespace + "app_fake_gps/"
+    # os.path.join, not string concatenation: get_base_namespace() returns the
+    # namespace with NO trailing slash, so "base + 'app_fake_gps/'" built the
+    # topic "/nepi/device1app_fake_gps/enable" -- confirmed live 2026-08-12 in
+    # this node's own advertised-topic list. Harmless only because
+    # ENABLE_FAKE_GPS is now False; with it True the enable publish went to a
+    # topic nothing subscribes to, silently doing nothing.
+    FAKE_GPS_NAMESPACE = os.path.join(self.base_namespace, "app_fake_gps")
     self.fake_gps_enable_pub = nepi_ros.create_publisher(FAKE_GPS_NAMESPACE + "enable", Bool, queue_size=1)
 
     self.msg_if.pub_info("RBX initialize process complete")
@@ -529,7 +574,16 @@ class drone_follow_object_mission(object):
   def move_to_object_callback(self,targets_data_msg):
     # Check for the object of interest and take appropriate actions
     for target_data_msg in targets_data_msg.targets:
-      target_class = target_data_msg.target_name
+      # nepi_interfaces/Target's class field is "name". This read "target_name",
+      # which raised AttributeError inside the subscriber callback on EVERY
+      # incoming Targets message -- confirmed live 2026-08-12: rospy caught it
+      # and logged "bad callback ... 'Target' object has no attribute
+      # 'target_name'" to /rosout, then carried on, so the script looked healthy
+      # and simply never followed anything. The vehicle sat at its takeoff
+      # altitude with local x/y pinned at 0.01 m while valid targets streamed in
+      # at ~1 Hz. (This module's own header claims the rename went "Class ->
+      # target_name"; the actual field is plain "name".)
+      target_class = target_data_msg.name
       target_range_m = target_data_msg.range_m # [x,y,z]
       target_yaw_d = target_data_msg.azimuth_deg  # dz
       target_pitch_d = target_data_msg.elevation_deg # dy
@@ -547,7 +601,15 @@ class drone_follow_object_mission(object):
         # Send poisition update
         self.msg_if.pub_info("Sending setpoint position body command")
         self.msg_if.pub_info(str(setpoint_position_body_m))
-        success = self.goto_rbx_position(setpoint_position_body_m)
+        # Pass CMD_GOTO_TIMEOUT_SEC explicitly. It is defined up in USER SETTINGS
+        # but was never used -- goto_rbx_position's own default of 10 s applied
+        # instead, so the configured value was silently ignored. 10 s is not
+        # enough to close 10+ m on a target that is itself circling (radius
+        # 2.5 m, 50 s period) to within GOTO_MAX_ERROR_M = 2.0 m, especially with
+        # SITL running slower than realtime: confirmed live 2026-08-12, every
+        # goto reported "Setpoint cmd timed out" / "Goto Position failed" while
+        # the vehicle was in fact tracking the target correctly.
+        success = self.goto_rbx_position(setpoint_position_body_m, timeout_sec = CMD_GOTO_TIMEOUT_SEC)
         error_str = str(self.rbx_status.errors_current)
         if success:
           self.msg_if.pub_info("Goto Position completed with errors: " + error_str )

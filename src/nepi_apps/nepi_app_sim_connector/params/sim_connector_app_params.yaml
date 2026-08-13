@@ -86,6 +86,25 @@ SIM_VEHICLE_DICT:
     # global location reference of its own.
     ground_robot_2_wheel:
       display_name: 2-Wheel Rover
+      # Not offered. Requested 2026-08-12: "get rid of the 2 wheel drone
+      # completely then - just the copter [and] 4 wheel rover are fine for now."
+      #
+      # There is no two-wheeled model in sim_container/models/ to spawn, so
+      # picking this only ever handed the operator the 4-wheel generic_rover
+      # with a 2-wheel control surface bolted on -- the exact complaint that
+      # started this ("deploying the 2-wheel rover + gazebo actually deploys the
+      # 4 wheel rover instead"). Supporting it for real means authoring a
+      # 2-wheel model + world + launch target; until then, offering it is a lie.
+      #
+      # hidden_from_selector rather than deleting the entry: stage_rover and
+      # wpilib_rover in simulator_launch_targets.yaml both map THIS key onto
+      # their own profiles via robot_config_overrides
+      # (ground_robot_2_wheel -> stage_ground_robot / wpilib_ground_robot).
+      # Deleting the key would leave those two overrides pointing at nothing and
+      # strand stage_ground_robot/wpilib_ground_robot as unreachable entries.
+      # Hiding changes only what is OFFERED, exactly as it does for those two
+      # profiles, and is a one-line revert when a real 2-wheel model exists.
+      hidden_from_selector: true
       description: Two-wheel differential-drive ground robot, local position control only
       wheel_count: 2
       motor_count: 2

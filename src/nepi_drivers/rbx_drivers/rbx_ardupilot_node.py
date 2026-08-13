@@ -1287,10 +1287,40 @@ class ArdupilotNode:
         alt_error = (goal_alt - self.rbx_if.current_location_wgs84_geo[2])
         time.sleep(check_interval_s)
         check_timer += check_interval_s
-      if (check_timer < timeout_sec):
+      # Success is decided by whether the vehicle actually REACHED the altitude,
+      # not by whether it got there fast enough. The loop above exits on either
+      # condition, and this used to test `check_timer < timeout_sec` -- so a climb
+      # that converged right at the timeout boundary was recorded as a failure
+      # even though the vehicle was exactly on target.
+      #
+      # That was not cosmetic. takeoff_complete is one of the three things
+      # autonomousControlsReady() requires (with ARM and GUIDED), so a false
+      # timeout PERMANENTLY disabled every goto command for the rest of the
+      # flight on a vehicle that was hovering at its target altitude and
+      # perfectly capable of flying. Confirmed live 2026-08-12 running
+      # drone_follow_object_mission_script.py against ArduCopter SITL: the
+      # vehicle climbed 0.007 m -> 10.004 m and held it, while the RBX status
+      # reported "takeoff did not complete", autonomous_control_mode_ready
+      # stayed False, and the follow logic's goto_position commands were all
+      # silently rejected -- local x/y never left 0.001 m. A loaded VM runs SITL
+      # slower than realtime, so the ~20 s climb landed right on the script's
+      # 20 s action timeout and lost the race by a fraction.
+      #
+      # A genuine failure (timed out while still metres away) still reports
+      # failure, because that is judged on alt_error too.
+      reached_altitude = abs(alt_error) <= error_bound_m
+      if reached_altitude:
         cmd_success = True
         self.takeoff_complete = True
-        self.msg_if.pub_info("Takeoff action completed with error: " + str(alt_error) + " meters")
+        if check_timer >= timeout_sec:
+          self.msg_if.pub_warn("Takeoff reached " + str(takeoff_height_m)
+                               + " m but only as the " + str(timeout_sec)
+                               + "s timeout expired (error " + str(alt_error)
+                               + " m) -- treating as complete since the vehicle is"
+                               + " at altitude. Raise this command's timeout if the"
+                               + " simulator is running slower than realtime.")
+        else:
+          self.msg_if.pub_info("Takeoff action completed with error: " + str(alt_error) + " meters")
       else:
         self.takeoff_complete = False
         fail_msg = "Takeoff action timed out with error: " + str(alt_error) + " meters"
