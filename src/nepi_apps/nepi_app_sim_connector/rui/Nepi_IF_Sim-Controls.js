@@ -144,6 +144,7 @@ class NepiIFSimControls extends Component {
     this.renderHomeControls = this.renderHomeControls.bind(this)
     this.renderCameraControls = this.renderCameraControls.bind(this)
     this.renderRobotCapabilityControls = this.renderRobotCapabilityControls.bind(this)
+    this.renderImageSourceCuration = this.renderImageSourceCuration.bind(this)
     this.renderEnvironmentControls = this.renderEnvironmentControls.bind(this)
     this.renderControls = this.renderControls.bind(this)
   }
@@ -800,7 +801,10 @@ class NepiIFSimControls extends Component {
     const values = this.state.rbxSettingsValuesDict
     const has_autonomous_toggle = settings.includes("autonomous_movement_enabled")
     const has_teleop_toggle = settings.includes("teleop_movement_enabled")
-    if (has_autonomous_toggle === false && has_teleop_toggle === false) {
+    const has_camera_toggle = settings.includes("camera_controls_enabled")
+    const has_image_curation = settings.includes("enabled_image_sources")
+    if (has_autonomous_toggle === false && has_teleop_toggle === false
+        && has_camera_toggle === false && has_image_curation === false) {
       return null
     }
 
@@ -832,6 +836,72 @@ class NepiIFSimControls extends Component {
           </Label>
         : null}
 
+        {(has_camera_toggle === true) ?
+          <Label title={"Camera Controls"}>
+            <Toggle
+              checked={values["camera_controls_enabled"] !== "FALSE"}
+              onClick={() => setToggle("camera_controls_enabled", values["camera_controls_enabled"] === "FALSE")}
+            />
+          </Label>
+        : null}
+
+        {this.renderImageSourceCuration()}
+
+      </React.Fragment>
+    )
+  }
+
+  // "Choose what image sources are good and what aren't" -- one checkbox per
+  // candidate image topic (this.state.capabilities.available_image_topics,
+  // the SAME list renderCameraControls' own selector above already uses),
+  // membership toggling that topic in the comma-separated
+  // enabled_image_sources Setting NepiDeviceRBX.js's createImageOptions
+  // filters by. Gated on the Setting's presence, not a capability, matching
+  // every other control in this block.
+  renderImageSourceCuration() {
+    const rbx_ns = this.state.rbx_namespace
+    if (rbx_ns === null || rbx_ns === '' || rbx_ns === 'None') {
+      return null
+    }
+    if (!this.state.rbxSettingsNamesList.includes("enabled_image_sources")) {
+      return null
+    }
+    const caps = this.state.capabilities
+    const candidates = (caps != null && caps.available_image_topics !== undefined) ? caps.available_image_topics : []
+    if (candidates.length === 0) {
+      return null
+    }
+
+    const { updateSetting } = this.props.ros
+    const currentRaw = this.state.rbxSettingsValuesDict["enabled_image_sources"]
+    const current = (currentRaw !== undefined) ? String(currentRaw) : ''
+    // Empty Setting means "unrestricted" (every candidate implicitly
+    // allowed) -- shown here as every checkbox already checked, matching
+    // what the RBX panel actually does with an empty value, rather than
+    // showing everything unchecked and implying nothing is enabled.
+    const enabled = (current.trim() === '')
+      ? candidates.slice()
+      : current.split(',').map((s) => s.trim()).filter((s) => s !== '')
+
+    const toggleTopic = (topic, checked) => {
+      const next = checked
+        ? enabled.concat(topic).filter((t, i, arr) => arr.indexOf(t) === i)
+        : enabled.filter((t) => t !== topic)
+      updateSetting(rbx_ns + "/settings", "enabled_image_sources", "String", next.join(','))
+    }
+
+    return (
+      <React.Fragment>
+        <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
+        <Label title={"Image Sources"} labelStyle={{ fontWeight: 'bold' }}/>
+        {candidates.map((topic) => (
+          <Label key={topic} title={topic}>
+            <Toggle
+              checked={enabled.includes(topic)}
+              onClick={() => toggleTopic(topic, !enabled.includes(topic))}
+            />
+          </Label>
+        ))}
       </React.Fragment>
     )
   }

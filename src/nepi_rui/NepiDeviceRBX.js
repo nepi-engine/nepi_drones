@@ -390,12 +390,31 @@ class NepiDeviceRBX extends Component {
       }
     }
 
+    // Sim Connector's own "choose what image sources are good and what
+    // aren't" curation -- enabled_image_sources is a comma-separated
+    // allowlist Setting (see rbx_sim_node.py's CAPABILITY_SETTING_NAMES).
+    // Empty (a driver that doesn't define it, or hasn't set it) means
+    // unrestricted -- the namespace-scoped list above stays exactly as it
+    // was, so this can only ever narrow the list, never break a deployment
+    // that hasn't touched it. curationActive gates the unscoped fallback
+    // below: without it, a curated-down-to-zero list (e.g. every allowed
+    // topic happens to be temporarily unpublished) would silently fall
+    // through to "show everything unfiltered" -- defeating the curation the
+    // operator explicitly set up, exactly when it looks like it worked.
+    const enabledSourcesRaw = this.state.settingsValuesDict["enabled_image_sources"]
+    const curationActive = (enabledSourcesRaw !== undefined && String(enabledSourcesRaw).trim() !== '')
+    if (curationActive) {
+      const allowlist = String(enabledSourcesRaw).split(',').map((s) => s.trim()).filter((s) => s !== '')
+      img_topics = img_topics.filter((topic) => allowlist.includes(topic))
+    }
+
     // Fall back to the unscoped list rather than offering nothing but "None":
     // a robot driver that publishes no camera of its own would otherwise have
     // no selectable source at all, which is strictly worse than a longer
     // list. Robots that DO publish their own camera (the ArduPilot driver's
-    // color_2d_image, the sim rover's) never reach this.
-    if (img_topics.length === 0) {
+    // color_2d_image, the sim rover's) never reach this. Skipped entirely
+    // while curationActive -- see above.
+    if (img_topics.length === 0 && curationActive === false) {
       for (var j = 0; j < image_topics.length; j++) {
         const other = image_topics[j]
         if (other === ownImageTopic || other.includes('zed_node') === true) {
@@ -758,6 +777,25 @@ class NepiDeviceRBX extends Component {
             />
           </Label>
         ))}
+        {/* Resets to (0,0,0) -- the camera's own reference point -- not to
+            whatever value shipped as this driver's FACTORY_SETTINGS. The RUI
+            has no channel to ask a driver "what is this Setting's factory
+            default", and (0,0,0) is what "reset an offset" means in ordinary
+            usage: put it back at center, not at some hidden preset a
+            different operator chose. */}
+        <ButtonMenu>
+          <Button onClick={() => {
+            const { updateSetting } = this.props.ros
+            const namespace = this.state.currentRBXNamespace + "/settings"
+            offsets.forEach((offset) => {
+              updateSetting(namespace, offset.name, "Float", "0.0")
+              const el = document.getElementById("rbx_" + offset.name)
+              if (el) {
+                clearElementStyleModified(el)
+              }
+            })
+          }}>{"Reset " + titlePrefix + " Offset"}</Button>
+        </ButtonMenu>
       </React.Fragment>
     )
   }
@@ -775,9 +813,17 @@ class NepiDeviceRBX extends Component {
     // defines camera_view_mode for its own camera-rig chase-cam feature --
     // that assumption hid this toggle for exactly the driver it was built
     // for.
-    const has_camera_pov_toggle = this.state.settingsNamesList.includes("camera_view_mode")
-    const has_camera_offsets = this.state.settingsNamesList.includes("camera_offset_x")
-    const has_scene_offsets = this.state.settingsNamesList.includes("scene_offset_x")
+    // camera_controls_enabled is the Sim Connector's own "customize the
+    // capabilities that are open" toggle for this whole block -- absent
+    // Setting (a driver that doesn't define it) is treated as enabled, so a
+    // real driver without this feature is completely unaffected. Same
+    // settingEnabled pattern as NepiDeviceRBX-Controls.js's
+    // autonomous_movement_enabled check.
+    const camera_controls_enabled = !this.state.settingsNamesList.includes("camera_controls_enabled")
+      || this.state.settingsValuesDict["camera_controls_enabled"] !== "FALSE"
+    const has_camera_pov_toggle = this.state.settingsNamesList.includes("camera_view_mode") && camera_controls_enabled
+    const has_camera_offsets = this.state.settingsNamesList.includes("camera_offset_x") && camera_controls_enabled
+    const has_scene_offsets = this.state.settingsNamesList.includes("scene_offset_x") && camera_controls_enabled
     return (
       <React.Fragment>
         <Columns>

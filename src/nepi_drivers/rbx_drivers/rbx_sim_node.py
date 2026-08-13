@@ -123,7 +123,25 @@ class SimNode:
   #   - toggling it takes real effect at the DRIVER too (autonomousControlsReady/
   #     teleopControlsReady below), not just in the RUI, so a client that
   #     bypasses the RUI can't do what was turned off either.
-  CAPABILITY_SETTING_NAMES = ("autonomous_movement_enabled", "teleop_movement_enabled")
+  # camera_controls_enabled: same toggle mechanism, gating whether
+  # camera_view_mode/camera_offset_*/scene_offset_* show up on the RUI at all
+  # (see NepiDeviceRBX.js's has_camera_pov_toggle/has_camera_offsets/
+  # has_scene_offsets, which AND this in alongside the Setting-existence
+  # check). Unlike autonomous/teleop movement, this has no driver-side
+  # enforcement point to add -- there is no "camera controls ready" concept,
+  # positioning a Gazebo camera can't fail the way a goto or a motor command
+  # can -- so it is a pure visibility toggle, RUI-side only.
+  #
+  # enabled_image_sources: comma-separated allowlist of image topic names for
+  # NepiDeviceRBX.js's own Image_Source dropdown (createImageOptions) --
+  # "choose what image sources are good and what aren't". Empty (the factory
+  # value) means unrestricted -- every image topic createImageOptions would
+  # otherwise offer stays offered, so a robot config that never touches this
+  # Setting is completely unaffected. A String Setting, not a Discrete list,
+  # since the candidate topic set is per-deployment and can't be enumerated as
+  # fixed Discrete options the way TRUE/FALSE can.
+  CAPABILITY_SETTING_NAMES = ("autonomous_movement_enabled", "teleop_movement_enabled",
+                              "camera_controls_enabled", "enabled_image_sources")
 
   CAP_SETTINGS = dict(
     max_linear_speed_mps = {"type":"Float","name":"max_linear_speed_mps","options":["0.05","5.0"]},
@@ -137,7 +155,10 @@ class SimNode:
     scene_offset_y = {"type":"Float","name":"scene_offset_y","options":["-10.0","10.0"]},
     scene_offset_z = {"type":"Float","name":"scene_offset_z","options":["-10.0","10.0"]},
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
-    teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","options":["TRUE","FALSE"]}
+    teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","options":["TRUE","FALSE"]},
+    camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]},
+    # No fixed options -- the candidate topic set is per-deployment.
+    enabled_image_sources = {"type":"String","name":"enabled_image_sources"}
   )
 
   FACTORY_SETTINGS = dict(
@@ -157,7 +178,10 @@ class SimNode:
     # settings behaves exactly as every robot config did before this feature
     # existed.
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","value":"TRUE"},
-    teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","value":"TRUE"}
+    teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","value":"TRUE"},
+    camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","value":"TRUE"},
+    # Empty = unrestricted -- see the CAPABILITY_SETTING_NAMES comment above.
+    enabled_image_sources = {"type":"String","name":"enabled_image_sources","value":""}
   )
 
   FACTORY_SETTINGS_OVERRIDES = dict()

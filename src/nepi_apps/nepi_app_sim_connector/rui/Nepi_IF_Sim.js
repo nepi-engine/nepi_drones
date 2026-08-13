@@ -127,6 +127,10 @@ class NepiIFSim extends Component {
       robot_config_yaml: '',
       viewing_config_name: 'None',
       robotConfigYamlListener: null,
+      // Collapsed by default -- one "View Robot Configs" button reveals the
+      // per-config buttons + text area, instead of that whole block always
+      // taking up space on the page.
+      show_robot_config_viewer: false,
 
     }
 
@@ -414,25 +418,38 @@ class NepiIFSim extends Component {
     return (
       <React.Fragment>
         <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
-        <Label title={"View / Download a Robot Config"}/>
         <ButtonMenu>
-          {available.map((configName, i) => (
-            <Button key={configName} onClick={() => this.onViewConfigClicked(configName)}>
-              {(names[i] !== undefined && names[i] !== '') ? names[i] : configName}
-            </Button>
-          ))}
+          <Button onClick={() => this.setState({ show_robot_config_viewer: !this.state.show_robot_config_viewer })}>
+            {(this.state.show_robot_config_viewer ? "Hide" : "View") + " Robot Configs"}
+          </Button>
         </ButtonMenu>
-        {(this.state.robot_config_yaml !== '') ?
+        {(this.state.show_robot_config_viewer === true) ?
           <React.Fragment>
-            <textarea
-              readOnly
-              value={this.state.robot_config_yaml}
-              rows={16}
-              style={{ width: "100%", fontFamily: "monospace", whiteSpace: "pre" }}
-            />
             <ButtonMenu>
-              <Button onClick={this.onDownloadConfigClicked}>{"Download " + this.state.viewing_config_name + ".yaml"}</Button>
+              {available.map((configName, i) => (
+                <Button key={configName} onClick={() => this.onViewConfigClicked(configName)}>
+                  {(names[i] !== undefined && names[i] !== '') ? names[i] : configName}
+                </Button>
+              ))}
             </ButtonMenu>
+            {(this.state.robot_config_yaml !== '') ?
+              <React.Fragment>
+                {/* Was rows=16/width=100% -- filled most of the page for a
+                    handful-of-fields config. A fixed, modest box with its own
+                    scrollbar keeps this from dominating the panel regardless
+                    of how long any one config's YAML gets. */}
+                <textarea
+                  readOnly
+                  value={this.state.robot_config_yaml}
+                  rows={8}
+                  style={{ width: "60%", maxWidth: "40em", fontFamily: "monospace",
+                          whiteSpace: "pre", overflow: "auto", display: "block" }}
+                />
+                <ButtonMenu>
+                  <Button onClick={this.onDownloadConfigClicked}>{"Download " + this.state.viewing_config_name + ".yaml"}</Button>
+                </ButtonMenu>
+              </React.Fragment>
+            : null}
           </React.Fragment>
         : null}
       </React.Fragment>
@@ -548,37 +565,35 @@ class NepiIFSim extends Component {
 
         {(show_selectors === true) ?
           <React.Fragment>
-            {/* NepiIFSimLauncher's own target selector below IS the
-                Simulator selector for this whole panel -- it already lists
-                every real option (Gazebo/Webots/Stage/PyBullet/WPILib).
-                This component used to render a SECOND "Simulator" selector
-                here, backed by available_simulators/select_simulator (live
-                discovery of OTHER NEPI devices that declare themselves
-                simulators -- see getAvailableSimulators/simDiscoveryCb in
-                sim_connector_app_node.py, a deliberately different axis
-                from the SSH launch-target list). That mechanism stays
-                intact server-side for a possible future use, but nothing
-                on this deployment ever populates it, so showing it here
-                just produced two same-titled, mostly-empty-vs-real
-                "Simulator" fields stacked on top of each other -- removed
-                rather than merged, since the two lists mean genuinely
-                different things (already-connected device vs.
-                launch-this-on-the-VM) and forcing them into one dropdown
-                would misrepresent both. */}
-            {this.renderRobotConfigSelector()}
-            {this.renderRobotConfigUpload()}
-            {this.renderRobotConfigViewer()}
-            {/* Deploy/Kill/Install for the additive simulator auto-launch
-                capability (see docs/SIMULATOR_AUTO_LAUNCH_PLAN.md) -- lives
-                directly under Robot Config rather than as its own titled
-                section, since choosing a model above and clicking Deploy
-                here is one flow, not two. make_section={false} is
-                NepiIFSimLauncher's own default now, but named explicitly
-                here since this IS the one place it's meant to render. */}
+            {/* NepiIFSimLauncher's own target selector IS the Simulator
+                selector for this whole panel -- it already lists every real
+                option (Gazebo/Webots/Stage/PyBullet/WPILib). Placed FIRST:
+                choosing which simulator to deploy is the first decision in
+                the flow (simulator -> robot config -> deploy), not something
+                that belongs under Robot Config. This component used to
+                render a SECOND "Simulator" selector here, backed by
+                available_simulators/select_simulator (live discovery of
+                OTHER NEPI devices that declare themselves simulators -- see
+                getAvailableSimulators/simDiscoveryCb in
+                sim_connector_app_node.py, a deliberately different axis from
+                this SSH launch-target list). That mechanism stays intact
+                server-side for a possible future use, but nothing on this
+                deployment ever populates it, so showing it here just
+                produced two same-titled, mostly-empty-vs-real "Simulator"
+                fields stacked on top of each other -- removed rather than
+                merged, since the two lists mean genuinely different things
+                (already-connected device vs. launch-this-on-the-VM) and
+                forcing them into one dropdown would misrepresent both.
+                make_section={false} is NepiIFSimLauncher's own default now,
+                named explicitly here since this IS the one place it's meant
+                to render. */}
             <NepiIFSimLauncher
               namespace={namespace}
               make_section={false}
             />
+            {this.renderRobotConfigSelector()}
+            {this.renderRobotConfigUpload()}
+            {this.renderRobotConfigViewer()}
           </React.Fragment>
         : null}
 
