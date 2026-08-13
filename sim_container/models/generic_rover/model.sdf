@@ -88,8 +88,28 @@
         <surface>
           <friction>
             <ode>
+              <!-- Anisotropic on purpose. fdir1 is the wheel's rolling
+                   direction (local X; the link's -90deg X rotation puts the
+                   cylinder axis along Y, so local X stays forward), so mu is
+                   longitudinal traction and mu2 is LATERAL.
+
+                   mu2 was 1.5, the same as mu. A 4-wheel skid-steer can only
+                   yaw by slipping all four contact patches sideways, and
+                   isotropic 1.5 friction made that physically impossible.
+                   Confirmed live 2026-08-12: commanding angular.z = 1.0 rad/s
+                   for 10 s (a correct Twist, verified on /rover/cmd_vel)
+                   rotated the rover 2.3 degrees instead of the expected 573.
+                   Forward drive was unaffected and always looked fine, which
+                   is why this stayed hidden. It breaks turning only, and so
+                   also breaks every goto/autonomous command that needs to
+                   change heading.
+
+                   0.2 lateral keeps enough grip that the rover doesn't slide
+                   under its own weight while still allowing the skid a
+                   skid-steer turn requires. -->
               <mu>1.5</mu>
-              <mu2>1.5</mu2>
+              <mu2>0.2</mu2>
+              <fdir1>1 0 0</fdir1>
             </ode>
           </friction>
         </surface>
@@ -131,8 +151,28 @@
         <surface>
           <friction>
             <ode>
+              <!-- Anisotropic on purpose. fdir1 is the wheel's rolling
+                   direction (local X; the link's -90deg X rotation puts the
+                   cylinder axis along Y, so local X stays forward), so mu is
+                   longitudinal traction and mu2 is LATERAL.
+
+                   mu2 was 1.5, the same as mu. A 4-wheel skid-steer can only
+                   yaw by slipping all four contact patches sideways, and
+                   isotropic 1.5 friction made that physically impossible.
+                   Confirmed live 2026-08-12: commanding angular.z = 1.0 rad/s
+                   for 10 s (a correct Twist, verified on /rover/cmd_vel)
+                   rotated the rover 2.3 degrees instead of the expected 573.
+                   Forward drive was unaffected and always looked fine, which
+                   is why this stayed hidden. It breaks turning only, and so
+                   also breaks every goto/autonomous command that needs to
+                   change heading.
+
+                   0.2 lateral keeps enough grip that the rover doesn't slide
+                   under its own weight while still allowing the skid a
+                   skid-steer turn requires. -->
               <mu>1.5</mu>
-              <mu2>1.5</mu2>
+              <mu2>0.2</mu2>
+              <fdir1>1 0 0</fdir1>
             </ode>
           </friction>
         </surface>
@@ -174,8 +214,28 @@
         <surface>
           <friction>
             <ode>
+              <!-- Anisotropic on purpose. fdir1 is the wheel's rolling
+                   direction (local X; the link's -90deg X rotation puts the
+                   cylinder axis along Y, so local X stays forward), so mu is
+                   longitudinal traction and mu2 is LATERAL.
+
+                   mu2 was 1.5, the same as mu. A 4-wheel skid-steer can only
+                   yaw by slipping all four contact patches sideways, and
+                   isotropic 1.5 friction made that physically impossible.
+                   Confirmed live 2026-08-12: commanding angular.z = 1.0 rad/s
+                   for 10 s (a correct Twist, verified on /rover/cmd_vel)
+                   rotated the rover 2.3 degrees instead of the expected 573.
+                   Forward drive was unaffected and always looked fine, which
+                   is why this stayed hidden. It breaks turning only, and so
+                   also breaks every goto/autonomous command that needs to
+                   change heading.
+
+                   0.2 lateral keeps enough grip that the rover doesn't slide
+                   under its own weight while still allowing the skid a
+                   skid-steer turn requires. -->
               <mu>1.5</mu>
-              <mu2>1.5</mu2>
+              <mu2>0.2</mu2>
+              <fdir1>1 0 0</fdir1>
             </ode>
           </friction>
         </surface>
@@ -217,8 +277,28 @@
         <surface>
           <friction>
             <ode>
+              <!-- Anisotropic on purpose. fdir1 is the wheel's rolling
+                   direction (local X; the link's -90deg X rotation puts the
+                   cylinder axis along Y, so local X stays forward), so mu is
+                   longitudinal traction and mu2 is LATERAL.
+
+                   mu2 was 1.5, the same as mu. A 4-wheel skid-steer can only
+                   yaw by slipping all four contact patches sideways, and
+                   isotropic 1.5 friction made that physically impossible.
+                   Confirmed live 2026-08-12: commanding angular.z = 1.0 rad/s
+                   for 10 s (a correct Twist, verified on /rover/cmd_vel)
+                   rotated the rover 2.3 degrees instead of the expected 573.
+                   Forward drive was unaffected and always looked fine, which
+                   is why this stayed hidden. It breaks turning only, and so
+                   also breaks every goto/autonomous command that needs to
+                   change heading.
+
+                   0.2 lateral keeps enough grip that the rover doesn't slide
+                   under its own weight while still allowing the skid a
+                   skid-steer turn requires. -->
               <mu>1.5</mu>
-              <mu2>1.5</mu2>
+              <mu2>0.2</mu2>
+              <fdir1>1 0 0</fdir1>
             </ode>
           </friction>
         </surface>
