@@ -375,6 +375,19 @@ class SimNode:
     self.msg_if.pub_info(str(self.device_info_dict))
 
     self.rbx_if = RBXRobotIF(device_info = self.device_info_dict,
+                                  # RBXRobotIF's factory default is
+                                  # 'control_system' -- sim_connector_app_node.py's
+                                  # own device discovery (simDiscoveryCb) only
+                                  # matches DeviceRBXStatus publishers reporting
+                                  # 'simulator' (SIM_SOURCE_DESCRIPTION) here.
+                                  # Without this override, this rover never
+                                  # appears in that app's available_simulators
+                                  # list, so its own selected_simulator can never
+                                  # resolve to this device's namespace -- silently
+                                  # defeating any Sim Connector control surface
+                                  # that depends on that discovery, including the
+                                  # camera-rig controls added 2026-08-13.
+                                  data_source_description = 'simulator',
                                   capSettings = self.cap_settings,
                                   factorySettings = self.factory_settings,
                                   settingUpdateFunction = self.settingUpdateFunction,

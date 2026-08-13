@@ -643,9 +643,25 @@ class NepiDeviceControls extends Component {
               </Column>
               <Column>
 
-                <ButtonMenu>
-                  <Button onClick={() => sendTriggerMsg(namespace + "/go_stop")}>{"stop"}</Button>
-                </ButtonMenu>
+                {/* Was unconditional -- rendered whenever Autonomous mode was
+                    selected, with no check on has_go_stop, unlike every
+                    sibling button here (Go Home checks has_go_home). A robot
+                    reporting has_go_stop: false still got a Stop button that
+                    published go_stop into the void.
+                    Visibility only, deliberately no click-time readiness gate
+                    (unlike Go Home): device_if_rbx.py's own goStopCb is
+                    explicitly documented as ungated -- "unlike
+                    gotoPoseCb/gotoPositionCb/gotoLocationCb, this callback has
+                    no 'another command is active' ready-check" -- because Stop
+                    must interrupt an in-progress command, which is exactly
+                    when status.ready is False. Gating the click here would
+                    make Stop unresponsive at the one moment it exists to be
+                    used. */}
+                <div hidden={(!this.state.has_go_stop)}>
+                  <ButtonMenu>
+                    <Button onClick={() => sendTriggerMsg(namespace + "/go_stop")}>{"stop"}</Button>
+                  </ButtonMenu>
+                </div>
 
               </Column>
               <Column>

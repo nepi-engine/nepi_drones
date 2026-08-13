@@ -58,6 +58,11 @@ class NepiIFSimControls extends Component {
       status_msg: null,
       statusListener: null,
 
+      // The RBX namespace last resolved from status_msg.selected_simulator --
+      // see the rig-offset block below for why this is tracked separately from
+      // status_msg itself.
+      rbx_namespace: '',
+
       // SimInfo is latched and is the authoritative source for the two
       // selections that are not per-tick telemetry: which image topic is
       // streaming and which camera view mode is set. Reading them here rather
@@ -95,6 +100,38 @@ class NepiIFSimControls extends Component {
       // Selections held locally so a dropdown reflects the click immediately.
       selected_environment_option: 'None',
 
+      // Camera rig positioning (robot-view/scene-view offset, and the
+      // FIRST_PERSON/THIRD_PERSON toggle) is NOT part of the SimCapabilitiesQuery/
+      // device_if_sim.py contract above -- it is published straight to whichever
+      // RBX driver SimStatus.selected_simulator currently names, over that
+      // driver's own generic Settings mechanism (camera_offset_x/y/z,
+      // scene_offset_x/y/z, camera_view_mode -- see rbx_sim_node.py's
+      // CAMERA_SETTING_NAMES). Two reasons this bypasses the capabilities-driven
+      // controls above instead of going through a new device_if_sim.py-owned
+      // capability:
+      //   1. This is the ONLY delivery path to the actually-deployed simulator
+      //      tonight. device_if_sim.py's OWN existing "Camera View Mode" selector
+      //      (see has_view_control below) talks to sim_connector_bridge_gazebo.py
+      //      over this app's port-9030 listener -- a separate, newer bridge
+      //      script that generic_rover's currently-deployed launch_command does
+      //      not start. Going through it here would render controls that publish
+      //      into the void.
+      //   2. Rig offset was previously rendered generically on NepiDeviceRBX.js
+      //      (any RBX driver's Settings show up there) and has been moved here on
+      //      request -- "the rbx viewer shouldn't know it's a simulation ... all
+      //      sim specific commands should be set [in the sim connector]". Moving
+      //      the UI does not change which mechanism it drives; it is still a
+      //      Setting update on the RBX driver, same as it always was.
+      rbxSettingsListener: null,
+      rbxSettingsNamesList: [],
+      rbxSettingsValuesDict: {},
+      camera_offset_x: '',
+      camera_offset_y: '',
+      camera_offset_z: '',
+      scene_offset_x: '',
+      scene_offset_y: '',
+      scene_offset_z: '',
+
     }
 
     this.updateStatusListener = this.updateStatusListener.bind(this)
@@ -102,6 +139,9 @@ class NepiIFSimControls extends Component {
     this.updateInfoListener = this.updateInfoListener.bind(this)
     this.infoListener = this.infoListener.bind(this)
     this.queryCapabilities = this.queryCapabilities.bind(this)
+    this.updateRbxSettingsListener = this.updateRbxSettingsListener.bind(this)
+    this.rbxSettingsListener = this.rbxSettingsListener.bind(this)
+    this.onEnterSetCameraOffset = this.onEnterSetCameraOffset.bind(this)
 
     this.onUpdateInput = this.onUpdateInput.bind(this)
     this.publishMotorRatio = this.publishMotorRatio.bind(this)
@@ -111,6 +151,8 @@ class NepiIFSimControls extends Component {
     this.renderGotoControls = this.renderGotoControls.bind(this)
     this.renderHomeControls = this.renderHomeControls.bind(this)
     this.renderCameraControls = this.renderCameraControls.bind(this)
+    this.renderCameraOffsetControls = this.renderCameraOffsetControls.bind(this)
+    this.renderCameraRigControls = this.renderCameraRigControls.bind(this)
     this.renderEnvironmentControls = this.renderEnvironmentControls.bind(this)
     this.renderControls = this.renderControls.bind(this)
   }
@@ -216,6 +258,16 @@ class NepiIFSimControls extends Component {
       this.queryCapabilities(config)
     }
 
+    // Re-point the RBX Settings listener whenever which simulator is selected
+    // changes -- selected_simulator IS the RBX namespace (see
+    // getAvailableSimulators in sim_connector_app_node.py: "the device namespace
+    // is the status topic minus its trailing '/status'").
+    const selected_simulator = (status_msg.selected_simulator !== undefined) ? status_msg.selected_simulator : ''
+    if (selected_simulator !== prevState.rbx_namespace) {
+      this.setState({ rbx_namespace: selected_simulator })
+      this.updateRbxSettingsListener(selected_simulator)
+    }
+
     // Seed the motor sliders once the motor count becomes known, and resize them
     // when a robot config change changes it.
     const motors = (status_msg.current_motor_control_settings !== undefined)
@@ -236,6 +288,78 @@ class NepiIFSimControls extends Component {
     }
     if (this.state.infoListener) {
       this.state.infoListener.unsubscribe()
+    }
+    if (this.state.rbxSettingsListener) {
+      this.state.rbxSettingsListener.unsubscribe()
+    }
+  }
+
+  // Callback for handling nepi_interfaces/SettingsStatus messages from the RBX
+  // driver named by selected_simulator. Tracks the setting NAMES it actually
+  // registers, so the rig-offset/view-mode controls gate on whether the
+  // underlying Setting exists, the same way NepiDeviceRBX.js used to before this
+  // control moved here.
+  rbxSettingsListener(message) {
+    const settings = (message.settings_list !== undefined) ? message.settings_list : []
+    var namesList = []
+    var valuesDict = {}
+    for (let ind = 0; ind < settings.length; ind++) {
+      namesList.push(settings[ind].name_str)
+      valuesDict[settings[ind].name_str] = settings[ind].value_str
+    }
+    this.setState({ rbxSettingsNamesList: namesList, rbxSettingsValuesDict: valuesDict })
+
+    // Seed/resync each offset edit buffer only when the DEVICE's own value
+    // changed (or on first sight), never on every status tick -- otherwise a
+    // 1Hz status message overwrites whatever is being typed.
+    const offsetNames = ["camera_offset_x", "camera_offset_y", "camera_offset_z",
+                        "scene_offset_x", "scene_offset_y", "scene_offset_z"]
+    var updates = {}
+    for (let i = 0; i < offsetNames.length; i++) {
+      const name = offsetNames[i]
+      const deviceVal = valuesDict[name]
+      if (deviceVal !== undefined && deviceVal !== this.state.rbxSettingsValuesDict[name]) {
+        updates[name] = deviceVal
+      }
+    }
+    if (Object.keys(updates).length > 0) {
+      this.setState(updates)
+    }
+  }
+
+  // Function for configuring and subscribing to the selected RBX device's
+  // settings/status. rbxNamespace is passed explicitly (rather than read back
+  // off state) so the caller's own just-computed value is what gets subscribed,
+  // avoiding a stale read the same render cycle it changed.
+  updateRbxSettingsListener(rbxNamespace) {
+    if (this.state.rbxSettingsListener) {
+      this.state.rbxSettingsListener.unsubscribe()
+      this.setState({ rbxSettingsListener: null, rbxSettingsNamesList: [] })
+    }
+    if (rbxNamespace !== null && rbxNamespace !== '' && rbxNamespace !== 'None') {
+      var listener = this.props.ros.setupSettingsStatusListener(
+        rbxNamespace + "/settings/status",
+        this.rbxSettingsListener
+      )
+      this.setState({ rbxSettingsListener: listener })
+    }
+  }
+
+  // Enter-to-apply for a camera offset input. Publishes the single Setting
+  // being edited (Float) directly to the RBX driver named by selected_simulator
+  // -- see the constructor comment on rbxSettingsListener for why this bypasses
+  // the capabilities-driven controls elsewhere in this file.
+  onEnterSetCameraOffset(event, settingName) {
+    if (event.key === 'Enter') {
+      const value = parseFloat(event.target.value)
+      if (!isNaN(value)) {
+        const { updateSetting } = this.props.ros
+        updateSetting(this.state.rbx_namespace + "/settings", settingName, "Float", String(value))
+      }
+      const el = document.getElementById(event.target.id)
+      if (el) {
+        clearElementStyleModified(el)
+      }
     }
   }
 
@@ -696,6 +820,81 @@ class NepiIFSimControls extends Component {
     )
   }
 
+  // Robot-view/scene-view rig positioning. Unlike everything else in this
+  // file, gated on the RBX driver's own reported Setting names
+  // (rbxSettingsNamesList, from selected_simulator's settings/status), not on
+  // the SimCapabilitiesQuery response above -- see the constructor comment on
+  // rbxSettingsListener for why. namePrefix/titlePrefix let this same block
+  // render either offset triple: "camera_offset_*" (robot view) or
+  // "scene_offset_*" (scene view, only on rbx_sim_node.py -- the rover has two
+  // independently-positioned rigid cameras; rbx_ardupilot_node.py's single
+  // aimable rig only ever defines camera_offset_*).
+  renderCameraOffsetControls(namePrefix, titlePrefix) {
+    const offsets = [
+      { name: namePrefix + "_x", title: titlePrefix + " Offset X (m)" },
+      { name: namePrefix + "_y", title: titlePrefix + " Offset Y (m)" },
+      { name: namePrefix + "_z", title: titlePrefix + " Offset Z (m)" },
+    ]
+    return (
+      <React.Fragment>
+        {offsets.map((offset) => (
+          <Label key={offset.name} title={offset.title}>
+            <Input
+              id={"SimCam_" + offset.name}
+              value={this.state[offset.name]}
+              onChange={(e) => {
+                const el = document.getElementById("SimCam_" + offset.name)
+                if (el) {
+                  setElementStyleModified(el)
+                }
+                this.setState({ [offset.name]: e.target.value })
+              }}
+              onKeyDown={(e) => this.onEnterSetCameraOffset(e, offset.name)}
+            />
+          </Label>
+        ))}
+      </React.Fragment>
+    )
+  }
+
+  // Robot-view/scene-view toggle plus both offset triples, all gated on the RBX
+  // driver's own reported Settings -- see renderCameraOffsetControls above.
+  renderCameraRigControls() {
+    const rbx_ns = this.state.rbx_namespace
+    if (rbx_ns === null || rbx_ns === '' || rbx_ns === 'None') {
+      return null
+    }
+    const settings = this.state.rbxSettingsNamesList
+    const has_view_toggle = settings.includes("camera_view_mode")
+    const has_camera_offsets = settings.includes("camera_offset_x")
+    const has_scene_offsets = settings.includes("scene_offset_x")
+    if (has_view_toggle === false && has_camera_offsets === false && has_scene_offsets === false) {
+      return null
+    }
+
+    const { updateSetting } = this.props.ros
+
+    return (
+      <React.Fragment>
+
+        <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
+
+        <Label title={"Camera Rig"} labelStyle={{ fontWeight: 'bold' }}/>
+
+        {(has_view_toggle === true) ?
+          <ButtonMenu>
+            <Button onClick={() => updateSetting(rbx_ns + "/settings", "camera_view_mode", "Discrete", "FIRST_PERSON")}>{"Robot View"}</Button>
+            <Button onClick={() => updateSetting(rbx_ns + "/settings", "camera_view_mode", "Discrete", "THIRD_PERSON")}>{"Scene View"}</Button>
+          </ButtonMenu>
+        : null}
+
+        {(has_camera_offsets === true) ? this.renderCameraOffsetControls("camera_offset", "Robot View Camera") : null}
+        {(has_scene_offsets === true) ? this.renderCameraOffsetControls("scene_offset", "Scene View Camera") : null}
+
+      </React.Fragment>
+    )
+  }
+
   // Environment toggles, one per reported environment option. The reported list
   // is what makes this generalize past any one hardcoded option.
   renderEnvironmentControls() {
@@ -751,6 +950,7 @@ class NepiIFSimControls extends Component {
         {this.renderGotoControls()}
         {this.renderHomeControls()}
         {this.renderCameraControls()}
+        {this.renderCameraRigControls()}
         {this.renderEnvironmentControls()}
 
       </React.Fragment>
