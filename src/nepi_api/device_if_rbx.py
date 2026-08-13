@@ -204,6 +204,8 @@ class RBXRobotIF:
                  manualControlsReadyFunction=None,
                  getMotorControlRatios=None,
                  setMotorControlRatio=None,
+                 teleopControlsReadyFunction=None,
+                 setTeleopVelocityFunction=None,
                  autonomousControlsReadyFunction=None,
                  goHomeFunction=None, goStopFunction=None, 
                  gotoPoseFunction=None, gotoPositionFunction=None, gotoLocationFunction=None,
@@ -384,6 +386,18 @@ class RBXRobotIF:
             motor_controls_info_msg = self.get_motor_controls_status_msg(self.getMotorControlRatios())
         else:
             motor_controls_info_msg = self.get_motor_controls_status_msg([])
+
+        ## Setup Teleop Controls
+        # Deliberately NOT a caps_report field (no RBXCapabilitiesQuery.srv
+        # change, no interfaces rebuild/full-stack-restart risk) and no new
+        # status field -- teleop_movement_enabled is a plain Setting
+        # (rbx_sim_node.py's CAPABILITY_SETTING_NAMES), so its mere presence in
+        # settingsNamesList already tells the RUI whether this driver supports
+        # teleop, and its value already tells it whether the current
+        # deployment wants it on. Readiness is checked at command time
+        # (setTeleopVelocityCb below), same pattern as manual controls.
+        self.teleopControlsReadyFunction = teleopControlsReadyFunction
+        self.setTeleopVelocityFunction = setTeleopVelocityFunction
 
         # Setup Autonomous Controls
         self.autonomousControlsReadyFunction = autonomousControlsReadyFunction
@@ -589,6 +603,25 @@ class RBXRobotIF:
                 # max (16) so a full burst is never dropped.
                 'qsize': 20,
                 'callback': self.setMotorControlCb,
+                'callback_args': ()
+            },
+
+            'set_teleop_velocity': {
+                'namespace': self.namespace,
+                'topic': 'set_teleop_velocity',
+                # Stock geometry_msgs/Twist, not a new nepi_interfaces message --
+                # avoids the interfaces-rebuild + full-stack-restart risk a new
+                # .msg would carry (see feedback_nepi_device_catkin_deploy_gotchas
+                # in project memory). linear.x/y/z and angular.z are the only
+                # fields any driver here reads; angular.x/y (roll/pitch RATE)
+                # are deliberately unused -- see setTeleopVelocityCb.
+                'msg': Twist,
+                # qsize=1, matching manualControlsReadyFunction's own bursty-
+                # input reasoning above: a keyboard-driven teleop client re-sends
+                # on every key event, so only the newest command matters, never
+                # a queued-up backlog of stale ones.
+                'qsize': 1,
+                'callback': self.setTeleopVelocityCb,
                 'callback_args': ()
             },
 
@@ -1180,10 +1213,29 @@ class RBXRobotIF:
             elif self.setMotorControlRatio is not None:
                 self.setMotorControlRatio(m_ind,m_sr)
         else:
-            self.update_error_msg("Ignoring Set Motor Control msg, Manual Controls not Ready")     
+            self.update_error_msg("Ignoring Set Motor Control msg, Manual Controls not Ready")
 
 
- 
+    ### Callback to set teleop (keyboard-driven) velocity
+    def setTeleopVelocityCb(self,twist_msg):
+        self.msg_if.pub_info("Received teleop velocity message", log_name_list = self.log_name_list)
+        if self.setTeleopVelocityFunction is None:
+            self.update_error_msg("Ignoring teleop velocity command, no teleop function")
+            return
+        if self.teleopControlsReadyFunction is None or self.teleopControlsReadyFunction() is not True:
+            self.update_error_msg("Ignoring teleop velocity command, Teleop Controls not Ready")
+            return
+        # linear.x/y/z, angular.z only. angular.x/y (roll-rate/pitch-rate) are
+        # deliberately not read here: a rover has no meaning for them at all,
+        # and for a drone the requested "roll, pitch" teleop controls are body-
+        # frame horizontal VELOCITY (linear.x forward/back, linear.y left/right),
+        # the same command shape MAVROS SET_POSITION_TARGET_LOCAL_NED velocity
+        # setpoints already use for GUIDED-mode flight -- not raw attitude-rate
+        # setpoints, which would fight the flight controller's own attitude
+        # control loop and is a materially riskier command to accept from a
+        # keyboard with no stick centering/failsafe.
+        self.setTeleopVelocityFunction(twist_msg.linear.x, twist_msg.linear.y,
+                                       twist_msg.linear.z, twist_msg.angular.z)
 
 
     ### Callback to set home

@@ -36,6 +36,33 @@ import { onEnterSetStateFloatValue, createMenuListFromStrList, onUpdateSetStateV
 // Motors above this ratio are considered high speed for the props-off warning
 const MOTOR_WARNING_RATIO = 0.5
 
+// Teleop key bindings -- each entry is a [linear_x, linear_y, linear_z,
+// angular_z] RATIO contribution (summed across every currently-held mapped
+// key, then clamped to [-1,1] per axis, so e.g. W+A held together drives
+// forward while turning). W/S (forward/back) and A/D (yaw) work identically
+// for a rover or a drone; Q/E (lateral/roll-equivalent) and the up/down arrow
+// keys (altitude) are axes only a drone has any meaning for -- rbx_sim_node.py's
+// own setTeleopVelocity ignores linear_y/linear_z entirely for the rover.
+//
+// A/D are mapped EXACTLY as requested -- "w would move a rover forward, s
+// backwards, a right, d left" -- which is the reverse of the conventional
+// WASD scheme (a=left, d=right) used almost everywhere else. If that was a
+// slip rather than intentional, swap the two angular_z signs below.
+const TELEOP_KEY_MAP = {
+  'w': [1, 0, 0, 0],
+  's': [-1, 0, 0, 0],
+  'a': [0, 0, 0, -1],
+  'd': [0, 0, 0, 1],
+  'q': [0, -1, 0, 0],
+  'e': [0, 1, 0, 0],
+  'arrowup': [0, 0, 1, 0],
+  'arrowdown': [0, 0, -1, 0],
+}
+// How often a still-held key re-sends its command (ms). Comfortably inside
+// rbx_sim_node.py's TELEOP_CMD_TIMEOUT_SEC (750ms) so a single dropped
+// WebSocket frame is invisible in normal operation.
+const TELEOP_SEND_INTERVAL_MS = 200
+
 // True if two arrays have the same length and elements, used to detect when
 // locally-tracked slider values actually changed (vs. an unrelated re-render)
 // so the editable percent text boxes only get resynced when they should be.
@@ -123,6 +150,24 @@ class NepiDeviceControls extends Component {
       controlsStatusListener: null,
       navposeListener: null,
 
+      // Teleop (keyboard-driven) movement. teleop_active_keys is a plain
+      // {key: true} map (not a Set -- setState/React works with plain
+      // objects, and a Set here would need extra plumbing for no benefit)
+      // of every currently-held mapped key, recomputed into a single
+      // (linear_x, linear_y, linear_z, angular_z) vector and re-sent on an
+      // interval WHILE any mapped key is held (teleop_send_timer) -- this is
+      // the client side of the same "keep re-asserting, never trust a single
+      // packet" reasoning rbx_sim_node.py's own comments give for its
+      // TELEOP_CMD_TIMEOUT_SEC self-healing window; a single dropped
+      // WebSocket frame must not leave the robot moving forever.
+      teleop_active_keys: {},
+      teleop_send_timer: null,
+      // Whether this component currently owns the window keydown/keyup
+      // listeners -- only true while "Teleop" is the selected control type,
+      // so keyboard input elsewhere on the page (typing in an unrelated text
+      // box) is never hijacked as a drive command.
+      teleop_capture_active: false,
+
       roll_deg: 0,
       pitch_deg: 0,
       yaw_deg_pose: 0,
@@ -191,10 +236,123 @@ class NepiDeviceControls extends Component {
     this.settingsStatusListener = this.settingsStatusListener.bind(this)
     this.onMotorTestTimeoutInputChange = this.onMotorTestTimeoutInputChange.bind(this)
     this.onMotorTestTimeoutInputSubmit = this.onMotorTestTimeoutInputSubmit.bind(this)
+
+    this.handleTeleopKeyDown = this.handleTeleopKeyDown.bind(this)
+    this.handleTeleopKeyUp = this.handleTeleopKeyUp.bind(this)
+    this.sendTeleopVector = this.sendTeleopVector.bind(this)
+    this.startTeleopKeyCapture = this.startTeleopKeyCapture.bind(this)
+    this.stopTeleopKeyCapture = this.stopTeleopKeyCapture.bind(this)
+    this.renderTeleopControls = this.renderTeleopControls.bind(this)
   }
 
   // No-op helper used by guarded command buttons when the robot is not ready.
   doNothing() { }
+
+  // Sums every currently-held mapped key's contribution into one
+  // [linear_x, linear_y, linear_z, angular_z] vector (clamped per axis to
+  // [-1,1], so opposite keys held together cancel rather than exceeding the
+  // ratio range) and sends it. Called on every keydown/keyup (so a release or
+  // a new key press takes effect immediately) AND on the resend timer while
+  // any mapped key stays held.
+  sendTeleopVector(activeKeys) {
+    const { sendTeleopVelocityMsg } = this.props.ros
+    const namespace = this.props.rbxNamespace
+    if (namespace == null || namespace === 'None') {
+      return
+    }
+    var vec = [0, 0, 0, 0]
+    Object.keys(activeKeys).forEach((key) => {
+      const contribution = TELEOP_KEY_MAP[key]
+      if (contribution) {
+        for (var i = 0; i < 4; i++) {
+          vec[i] += contribution[i]
+        }
+      }
+    })
+    vec = vec.map((v) => Math.max(-1, Math.min(1, v)))
+    sendTeleopVelocityMsg(namespace, vec[0], vec[1], vec[2], vec[3])
+  }
+
+  handleTeleopKeyDown(event) {
+    const key = event.key.toLowerCase()
+    if (!(key in TELEOP_KEY_MAP)) {
+      return
+    }
+    // Stop the browser's own scrolling on the arrow keys/space -- this panel
+    // owns them while Teleop is selected.
+    event.preventDefault()
+    if (this.state.teleop_active_keys[key]) {
+      return // Already held (key-repeat) -- nothing new to send or start.
+    }
+    const keys = Object.assign({}, this.state.teleop_active_keys, { [key]: true })
+    this.setState({ teleop_active_keys: keys })
+    this.sendTeleopVector(keys)
+    if (!this.state.teleop_send_timer) {
+      const timer = setInterval(() => this.sendTeleopVector(this.state.teleop_active_keys), TELEOP_SEND_INTERVAL_MS)
+      this.setState({ teleop_send_timer: timer })
+    }
+  }
+
+  handleTeleopKeyUp(event) {
+    const key = event.key.toLowerCase()
+    if (!(key in TELEOP_KEY_MAP)) {
+      return
+    }
+    const keys = Object.assign({}, this.state.teleop_active_keys)
+    delete keys[key]
+    this.setState({ teleop_active_keys: keys })
+    this.sendTeleopVector(keys)
+    if (Object.keys(keys).length === 0 && this.state.teleop_send_timer) {
+      clearInterval(this.state.teleop_send_timer)
+      this.setState({ teleop_send_timer: null })
+    }
+  }
+
+  startTeleopKeyCapture() {
+    if (this.state.teleop_capture_active) {
+      return
+    }
+    window.addEventListener('keydown', this.handleTeleopKeyDown)
+    window.addEventListener('keyup', this.handleTeleopKeyUp)
+    this.setState({ teleop_capture_active: true })
+  }
+
+  stopTeleopKeyCapture() {
+    if (!this.state.teleop_capture_active) {
+      return
+    }
+    window.removeEventListener('keydown', this.handleTeleopKeyDown)
+    window.removeEventListener('keyup', this.handleTeleopKeyUp)
+    if (this.state.teleop_send_timer) {
+      clearInterval(this.state.teleop_send_timer)
+    }
+    // Explicit stop -- whatever was held when the panel closed must not keep
+    // driving after keyboard capture ends.
+    this.sendTeleopVector({})
+    this.setState({ teleop_capture_active: false, teleop_active_keys: {}, teleop_send_timer: null })
+  }
+
+  // Live indicator of which mapped keys are currently held, plus the key
+  // legend -- shown only while "Teleop" is the selected control type (the
+  // same block that gates the window listeners themselves in
+  // componentDidUpdate).
+  renderTeleopControls() {
+    if (this.state.selected_control_type !== "Teleop") {
+      return null
+    }
+    const held = this.state.teleop_active_keys
+    const heldLabel = (key) => (held[key] ? key.toUpperCase() + " (held)" : key.toUpperCase())
+    return (
+      <React.Fragment>
+        <Label title={"Teleop: click this page, then use the keys below"}/>
+        <Label title={heldLabel('w') + " forward, " + heldLabel('s') + " back, "
+                     + heldLabel('a') + " turn right, " + heldLabel('d') + " turn left"}/>
+        <Label title={"Drone only -- " + heldLabel('q') + "/" + heldLabel('e')
+                     + " strafe left/right, " + heldLabel('arrowup') + "/" + heldLabel('arrowdown')
+                     + " altitude up/down"}/>
+      </React.Fragment>
+    )
+  }
 
 
   // Callback for handling ROS DeviceRBXStatus messages
@@ -220,7 +378,14 @@ class NepiDeviceControls extends Component {
       last_error_message: message.last_error_message,
       motor_control_settings: message.current_motor_control_settings ? message.current_motor_control_settings : []
     })
-    if (this.state.rbx_capabilities === null) {
+    // Was gated on `this.state.rbx_capabilities === null` -- fetched once and
+    // never resynced, so a capability toggled later from the Sim Connector app
+    // (has_autonomous_controls for "automated movement", etc.) never reached
+    // this panel. NepiDeviceRBX.js's capabilitiesPollTimer keeps
+    // rbxDevices[namespace] itself fresh; this component now just needs to
+    // stop ignoring updates after the first. Everything below is a pure
+    // re-derivation from `capabilities`, safe to re-run on every status tick.
+    {
       const capabilities = rbxDevices[this.props.rbxNamespace]
       if (capabilities) {
         const actions = (capabilities.go_action_options !== undefined && capabilities.go_action_options !== null) ? capabilities.go_action_options : []
@@ -244,12 +409,40 @@ class NepiDeviceControls extends Component {
           data_products: capabilities.data_products,
         })
 
+        // A robot TYPE supporting autonomous movement (has_autonomous_controls)
+        // is a different question from whether THIS deployment wants it
+        // exposed right now -- e.g. a Sim Connector robot config with
+        // "automated movement" unchecked. That's a Setting
+        // (autonomous_movement_enabled), same mechanism as camera_offset_x,
+        // not a capability -- a real robot that never defines this Setting at
+        // all keeps behaving exactly as before (settingEnabled treats an
+        // absent Setting as enabled, never as a reason to hide something a
+        // capability already says exists).
+        const settingsNamesList = (this.props.settingsNamesList !== undefined) ? this.props.settingsNamesList : []
+        const settingsValuesDict = (this.props.settingsValuesDict !== undefined) ? this.props.settingsValuesDict : {}
+        const settingEnabled = (name) => {
+          if (!settingsNamesList.includes(name)) {
+            return true
+          }
+          return settingsValuesDict[name] !== "FALSE"
+        }
+        const autonomous_movement_enabled = settingEnabled("autonomous_movement_enabled")
+        // Teleop has no capabilities-query flag at all (deliberately -- see
+        // device_if_rbx.py's setTeleopVelocityFunction comment): its Setting's
+        // mere presence is both "does this driver support it" and, via
+        // settingEnabled, "is it turned on for this deployment".
+        const has_teleop_controls = settingsNamesList.includes("teleop_movement_enabled")
+                                    && settingEnabled("teleop_movement_enabled")
+
         var controls_type_list = ["None"]
         if (capabilities.has_manual_controls) {
           controls_type_list.push("Manual")
         }
-        if (capabilities.has_autonomous_controls) {
+        if (capabilities.has_autonomous_controls && autonomous_movement_enabled) {
           controls_type_list.push("Autonomous")
+        }
+        if (has_teleop_controls) {
+          controls_type_list.push("Teleop")
         }
         const controls_type_menu = createMenuListFromStrList(controls_type_list, false, [], [], [])
 
@@ -257,13 +450,13 @@ class NepiDeviceControls extends Component {
         if (actions.length > 0) {
           controls_auto_list.push("Action")
         }
-        if (capabilities.has_goto_pose) {
+        if (capabilities.has_goto_pose && autonomous_movement_enabled) {
           controls_auto_list.push("Pose")
         }
-        if (capabilities.has_goto_position) {
+        if (capabilities.has_goto_position && autonomous_movement_enabled) {
           controls_auto_list.push("Position")
         }
-        if (capabilities.has_goto_location) {
+        if (capabilities.has_goto_location && autonomous_movement_enabled) {
           controls_auto_list.push("Location")
         }
         const controls_auto_menu = createMenuListFromStrList(controls_auto_list, false, [], [], [])
@@ -274,6 +467,20 @@ class NepiDeviceControls extends Component {
           controls_auto_list: controls_auto_list,
           controls_auto_menu: controls_auto_menu
         })
+
+        // A capability can now disappear out from under an already-selected
+        // dropdown value (e.g. "automated movement" toggled off from the Sim
+        // Connector while "Autonomous" is the current control type) -- reset
+        // to a valid selection rather than leaving a stale one whose controls
+        // no longer make sense to show.
+        if (this.state.selected_control_type !== null
+            && !controls_type_list.includes(this.state.selected_control_type)) {
+          this.setState({ selected_control_type: "None" })
+        }
+        if (this.state.selected_auto_control !== null
+            && !controls_auto_list.includes(this.state.selected_auto_control)) {
+          this.setState({ selected_auto_control: "None" })
+        }
       }
     }
   }
@@ -399,11 +606,27 @@ class NepiDeviceControls extends Component {
     if (!sameNumberArray(prevState.motor_slider_values, this.state.motor_slider_values)) {
       this.setState({ motor_slider_text: this.state.motor_slider_values.map((v) => String(v)) })
     }
+    // Keyboard capture follows the selected control type, not the other way
+    // around: leaving "Teleop" (switching to Manual/Autonomous/None, OR the
+    // capability disappearing out from under the current selection -- see the
+    // has_teleop_controls-driven reset above) must always release the window
+    // keydown/keyup listeners, the same way navigating away from any other
+    // page-level keyboard shortcut would.
+    if (prevState.selected_control_type !== this.state.selected_control_type) {
+      if (this.state.selected_control_type === "Teleop") {
+        this.startTeleopKeyCapture()
+      } else {
+        this.stopTeleopKeyCapture()
+      }
+    }
   }
 
   // Lifecycle method called just before the component unmounts.
   // Used to unsubscribe from Status messages
   componentWillUnmount() {
+    // Release the window keyboard listeners and stop the robot -- navigating
+    // away from this page must not leave a teleop command latched.
+    this.stopTeleopKeyCapture()
     if (this.state.controlsStatusListener) {
       this.state.controlsStatusListener.unsubscribe()
     }
@@ -675,6 +898,14 @@ class NepiDeviceControls extends Component {
                   </ButtonMenu>
                 </div>
 
+              </Column>
+            </Columns>
+          </div>
+
+          <div hidden={(this.state.selected_control_type !== "Teleop")}>
+            <Columns>
+              <Column>
+                {this.renderTeleopControls()}
               </Column>
             </Columns>
           </div>

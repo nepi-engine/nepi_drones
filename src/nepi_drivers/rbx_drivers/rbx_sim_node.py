@@ -109,6 +109,22 @@ class SimNode:
   # camera_view_mode is: one clean value, one place it lives.
   ENVIRONMENT_SETTING_NAMES = ("environment",)
 
+  # Which control SURFACES this deployment wants exposed, as opposed to which
+  # ones this robot TYPE structurally supports (that's still
+  # has_autonomous_controls/has_manual_controls etc on the capabilities query,
+  # untouched). These are the Sim Connector's own robot-config "customize the
+  # capabilities that are open" controls -- e.g. unchecking "automated
+  # movement" for a robot config that's meant to be driven purely by teleop.
+  # Modeled as Settings, same mechanism as camera_offset_x, so:
+  #   - the RUI needs no new capability-query plumbing, just the existing
+  #     settingsNamesList/settingsValuesDict gate (see NepiDeviceRBX-Controls.js)
+  #   - the value is "always editable" (the user's own requirement) rather
+  #     than a one-shot capability decided at construction and frozen
+  #   - toggling it takes real effect at the DRIVER too (autonomousControlsReady/
+  #     teleopControlsReady below), not just in the RUI, so a client that
+  #     bypasses the RUI can't do what was turned off either.
+  CAPABILITY_SETTING_NAMES = ("autonomous_movement_enabled", "teleop_movement_enabled")
+
   CAP_SETTINGS = dict(
     max_linear_speed_mps = {"type":"Float","name":"max_linear_speed_mps","options":["0.05","5.0"]},
     max_angular_rate_dps = {"type":"Float","name":"max_angular_rate_dps","options":["5.0","180.0"]},
@@ -119,7 +135,9 @@ class SimNode:
     camera_offset_z = {"type":"Float","name":"camera_offset_z","options":["-10.0","10.0"]},
     scene_offset_x = {"type":"Float","name":"scene_offset_x","options":["-10.0","10.0"]},
     scene_offset_y = {"type":"Float","name":"scene_offset_y","options":["-10.0","10.0"]},
-    scene_offset_z = {"type":"Float","name":"scene_offset_z","options":["-10.0","10.0"]}
+    scene_offset_z = {"type":"Float","name":"scene_offset_z","options":["-10.0","10.0"]},
+    autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
+    teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","options":["TRUE","FALSE"]}
   )
 
   FACTORY_SETTINGS = dict(
@@ -134,7 +152,12 @@ class SimNode:
     # Reproduces generic_rover/model.sdf's hard-coded camera_link_chase pose.
     scene_offset_x = {"type":"Float","name":"scene_offset_x","value":"-2.5"},
     scene_offset_y = {"type":"Float","name":"scene_offset_y","value":"0.0"},
-    scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"1.65"}
+    scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"1.65"},
+    # Both default to enabled: a robot config that never touches these
+    # settings behaves exactly as every robot config did before this feature
+    # existed.
+    autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","value":"TRUE"},
+    teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","value":"TRUE"}
   )
 
   FACTORY_SETTINGS_OVERRIDES = dict()
@@ -187,6 +210,12 @@ class SimNode:
   CONTROLLER_RATE_HZ = 20
   NAVPOSE_UPDATE_RATE = 10
   TELEMETRY_FRESH_SEC = 2.0
+  # A keyboard teleop client is expected to re-send on an interval while a key
+  # is held (see the RUI's teleop panel) -- this is the self-healing timeout
+  # for a dropped stop/keyup packet, not the client's own send interval. Short
+  # enough that a genuinely dropped stop is caught within one perceptible
+  # instant, long enough to have real margin over the client's own resend rate.
+  TELEOP_CMD_TIMEOUT_SEC = 0.75
 
   # Manual motor-ratio tank-drive conversion (RBX_EXTERNAL_HARDWARE_INTERFACES.md
   # worked example, section 6): motor 0 = left, motor 1 = right. Converted to
@@ -332,6 +361,19 @@ class SimNode:
     self.motor_ratios = [0.0, 0.0]
 
     ##############################
+    # Teleop (keyboard-driven) velocity state -- already-scaled m/s and rad/s,
+    # not a raw ratio, so gotoControlCb's dispatch below can use it exactly
+    # like a goto-computed (lin, ang) pair with no further conversion. See
+    # setTeleopVelocity. teleop_last_cmd_time backs a self-healing timeout
+    # (TELEOP_CMD_TIMEOUT_SEC) matching the same reasoning gotoControlCb's own
+    # comment gives for resending every tick rather than trusting a one-shot
+    # stop packet over the sim bridge's plain, non-acked TCP link -- a dropped
+    # keyup/stop command must not leave the rover driving forever.
+    self.teleop_linear_x = 0.0
+    self.teleop_angular_z = 0.0
+    self.teleop_last_cmd_time = 0.0
+
+    ##############################
     # Home position state: local ENU x/y/z meters (this rover has no WGS84
     # reference), carried over RBXRobotIF's existing GeoPoint-based
     # set_home/get_home/set_home_current plumbing -- see getHome/setHome
@@ -408,6 +450,8 @@ class SimNode:
                                   manualControlsReadyFunction = self.manualControlsReady,
                                   getMotorControlRatios = self.getMotorControlRatios,
                                   setMotorControlRatio = self.setMotorControlRatio,
+                                  teleopControlsReadyFunction = self.teleopControlsReady,
+                                  setTeleopVelocityFunction = self.setTeleopVelocity,
                                   autonomousControlsReadyFunction = self.autonomousControlsReady,
                                   getHomeFunction = self.getHome,
                                   setHomeFunction = self.setHome,
@@ -531,9 +575,38 @@ class SimNode:
   def getMotorControlRatios(self):
     return self.motor_ratios
 
+  def teleopControlsReady(self):
+    # Same bridge-connectivity requirement as manualControlsReady, plus the
+    # Sim Connector's own teleop_movement_enabled toggle -- see
+    # autonomousControlsReady's identical autonomous_movement_enabled check
+    # above for why this lives here rather than only in the RUI (a client that
+    # bypasses the RUI's own gating must not be able to do what was turned off).
+    if self.settings_dict['teleop_movement_enabled']['value'] != 'TRUE':
+      return False
+    with self.sock_lock:
+      return self.sock is not None
+
+  def setTeleopVelocity(self, linear_x, linear_y, linear_z, angular_z):
+    # linear_y/linear_z ignored -- a ground rover has no strafe or altitude
+    # axis. Ratios in [-1,1], scaled by the SAME max_linear_speed_mps/
+    # max_angular_rate_dps Settings that already cap goto speed: one "how
+    # fast" knob governs autonomous and teleop movement both, not a second one
+    # to keep in sync with it.
+    max_lin = float(self.settings_dict['max_linear_speed_mps']['value'])
+    max_ang = math.radians(float(self.settings_dict['max_angular_rate_dps']['value']))
+    self.teleop_linear_x = max(-1.0, min(1.0, linear_x)) * max_lin
+    self.teleop_angular_z = max(-1.0, min(1.0, angular_z)) * max_ang
+    self.teleop_last_cmd_time = nepi_utils.get_time()
+
   def autonomousControlsReady(self):
     # Gates all goto commands: require a live bridge connection with fresh
-    # telemetry so goto targets are computed from a real current position
+    # telemetry so goto targets are computed from a real current position.
+    # Also require autonomous_movement_enabled -- the Sim Connector's own
+    # per-robot-config "automated movement" toggle. Checked HERE, not just in
+    # the RUI (which hides the controls entirely), so disabling it actually
+    # blocks the command for any client, not merely the RUI's own buttons.
+    if self.settings_dict['autonomous_movement_enabled']['value'] != 'TRUE':
+      return False
     with self.sock_lock:
       connected = self.sock is not None
     fresh = (nepi_utils.get_time() - self.last_telemetry_time) < self.TELEMETRY_FRESH_SEC
@@ -724,10 +797,19 @@ class SimNode:
           # Target reached: clear (lin/ang stay 0.0 -- rover stops)
           self.clearGotoTarget()
           self.msg_if.pub_info("Goto target reached")
+    elif (nepi_utils.get_time() - self.teleop_last_cmd_time) < self.TELEOP_CMD_TIMEOUT_SEC and \
+         (self.teleop_linear_x != 0.0 or self.teleop_angular_z != 0.0):
+      # No active goto -- a recent, non-zero teleop command takes over this
+      # same tick, same "exactly one authoritative sender" reasoning as manual
+      # motor control below. Checked BEFORE motor_ratios: teleop and manual
+      # motor control are two different control TYPES a user selects one of at
+      # a time in the RUI, and a stale nonzero motor_ratios left over from a
+      # previous Manual-mode session must not fight a live teleop command.
+      lin, ang = self.teleop_linear_x, self.teleop_angular_z
     elif any(self.motor_ratios):
-      # No active goto -- an active manual motor command takes over this
-      # same tick, so there is exactly one authoritative sender rather than
-      # a race between this loop and a separate one-shot command.
+      # No active goto or teleop -- an active manual motor command takes over
+      # this same tick, so there is exactly one authoritative sender rather
+      # than a race between this loop and a separate one-shot command.
       lin, ang = self.motorControlToVelocity()
     self.sendVelocityCmd(lin, ang)
 

@@ -2799,6 +2799,24 @@ class ROSConnectionStore {
   }
 
   @action.bound
+  // Keyboard-driven teleop velocity -- geometry_msgs/Twist, matching
+  // device_if_rbx.py's set_teleop_velocity topic exactly (a stock ROS message,
+  // not a new nepi_interfaces one, to avoid an interfaces rebuild). Ratios in
+  // [-1,1]; each driver scales them by its own speed-limit Settings.
+  @action.bound
+  sendTeleopVelocityMsg(namespace, linear_x, linear_y, linear_z, angular_z) {
+    this.publishMessage({
+      name: namespace + "/set_teleop_velocity",
+      messageType: "geometry_msgs/Twist",
+      data: {
+        linear: { x: linear_x, y: linear_y, z: linear_z },
+        angular: { x: 0.0, y: 0.0, z: angular_z }
+      },
+      noPrefix: true
+    })
+  }
+
+  @action.bound
   sendFloatGotoPositionMsg(namespace, float1_str,float2_str,float3_str,float4_str) {
     let float1Val = parseFloat(float1_str)
     let float2Val = parseFloat(float2_str)
