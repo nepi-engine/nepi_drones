@@ -88,6 +88,7 @@ import base64
 import json
 import math
 import os
+import re
 import socket
 import threading
 import time
@@ -143,6 +144,55 @@ OBSTACLE_COURSE_SDF_PATH = os.path.join(
     'obstacle_course', 'model.sdf')
 SPAWN_MODEL_SERVICE = '/gazebo/spawn_sdf_model'
 DELETE_MODEL_SERVICE = '/gazebo/delete_model'
+
+# camera_offset_*/scene_offset_* settings (rbx_sim_node.py's own robot-view /
+# scene-view camera offset controls, sent here in the same camera_settings
+# line as view_mode): applied by editing generic_rover/model.sdf's camera_link
+# / camera_link_chase <pose> and respawning the whole rover model.
+#
+# Why a respawn rather than moving the camera at runtime -- every runtime
+# option was tried live on this VM (Gazebo 11.15.1) and rejected:
+#   - A cross-model fixed joint (spawning the camera as its own model welded
+#     to generic_rover_demo::base_link) is SILENTLY IGNORED. Confirmed: the
+#     spawn reports success, but the welded link stayed at its spawn pose
+#     while the rover drove 13 m away.
+#   - /gazebo/set_model_configuration and /gazebo/set_link_state (to drive a
+#     3-DOF prismatic camera-mount chain built for this) both report success
+#     while moving nothing -- tried with and without physics paused, and with
+#     every joint-name scoping variant get_model_properties actually reports.
+#   - gazebo_ros_joint_pose_trajectory (the one plugin that DID move the
+#     joints) fights the physics engine's own integration of an unactuated
+#     joint and drove all six camera joint states to nan within a few ticks --
+#     usable for a kinematic-only model, not for links riding on a
+#     physically-simulated rover.
+# The two cameras stay genuinely rigid (fixed joints, zero per-tick follow
+# lag) between offset changes, which is the property worth keeping; the
+# respawn is the one moment they are not, and it is instant. This is viable
+# specifically because generic_rover/model.sdf's diff_drive plugin uses
+# <odometrySource>world</odometrySource> -- odom is read back from Gazebo's
+# own model pose, so it resumes correctly after the model is recreated with
+# no encoder state to lose.
+ROVER_MODEL_SDF_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'models',
+    'generic_rover', 'model.sdf')
+# Matches a <link name="LINKNAME"> immediately followed by its own <pose>
+# element. Group 1 is everything up to and including "<pose>"; group 2 is the
+# existing rotation triple plus "</pose>" -- substituting keeps group 1 and
+# group 2 and replaces only what sits between them (the position triple), so
+# the existing roll/pitch/yaw survives untouched. (camera_link_chase carries a
+# pitch for its downward look; camera_link does not offer rotation as a
+# setting at all, so preserving whatever is already there is correct for
+# both.)
+CAMERA_LINK_POSE_RE = {
+  'camera_link': re.compile(
+      r'(<link name="camera_link">\s*<pose>)\s*'
+      r'[-0-9.eE]+\s+[-0-9.eE]+\s+[-0-9.eE]+\s*'
+      r'([-0-9.eE]+\s+[-0-9.eE]+\s+[-0-9.eE]+\s*</pose>)'),
+  'camera_link_chase': re.compile(
+      r'(<link name="camera_link_chase">\s*<pose>)\s*'
+      r'[-0-9.eE]+\s+[-0-9.eE]+\s+[-0-9.eE]+\s*'
+      r'([-0-9.eE]+\s+[-0-9.eE]+\s+[-0-9.eE]+\s*</pose>)'),
+}
 GAZEBO_SERVICE_WAIT_SEC = 5.0
 
 
@@ -181,6 +231,24 @@ class SimBridgeNode:
                     OBSTACLE_COURSE_SDF_PATH + ": " + str(e))
       self.obstacle_course_sdf = None
     self.obstacle_course_spawned = False
+
+    # Rover model SDF, read once here for the same reason as the obstacle
+    # course file above (the file's structure never changes at runtime -- only
+    # the two camera <pose> values get substituted per offset change, see
+    # applyCameraSettings). self.applied_camera_offsets tracks the last offsets
+    # actually baked into the live model, so a camera_settings line that only
+    # changed view_mode (view_mode and the offsets share one wire message,
+    # see rbx_sim_node.py's sendCameraSettings) does not trigger a pointless
+    # respawn.
+    try:
+      with open(ROVER_MODEL_SDF_PATH, 'r') as f:
+        self.rover_sdf_template = f.read()
+    except Exception as e:
+      rospy.logwarn(PKG_NAME + ": Failed to read rover SDF at " +
+                    ROVER_MODEL_SDF_PATH + ": " + str(e) +
+                    " -- camera offset changes will be ignored")
+      self.rover_sdf_template = None
+    self.applied_camera_offsets = None
 
     # Latest odom snapshot for the telemetry push loop, and the single
     # active bridge client (one robot, one remote node -- serve one
@@ -372,6 +440,81 @@ class SimBridgeNode:
     # process state. Stored as a plain ROS param for camera_rig_controller.py
     # to read each image-publish tick.
     rospy.set_param(PARAM_VIEW_MODE, str(cmd.get('view_mode', 'FIRST_PERSON')))
+
+    # offset_x/y/z (robot view) and scene_offset_x/y/z (scene/chase view) are
+    # optional in this wire message: absent on any deployment still running
+    # an older rbx_sim_node.py that only ever sent view_mode. get() with None
+    # sentinels, then bail without touching anything already applied, rather
+    # than defaulting to 0.0 and silently snapping both cameras to the origin
+    # the first time an old sender's message arrives.
+    keys = ('offset_x', 'offset_y', 'offset_z',
+            'scene_offset_x', 'scene_offset_y', 'scene_offset_z')
+    if any(cmd.get(k) is None for k in keys):
+      return
+    try:
+      offsets = tuple(float(cmd[k]) for k in keys)
+    except (TypeError, ValueError) as e:
+      rospy.logwarn(PKG_NAME + ": Ignoring malformed camera offsets: " + str(e))
+      return
+    if offsets == self.applied_camera_offsets:
+      return  # Already live -- e.g. this message only changed view_mode.
+    self.respawnRoverWithCameraOffsets(offsets)
+
+  def respawnRoverWithCameraOffsets(self, offsets):
+    if self.rover_sdf_template is None:
+      rospy.logwarn(PKG_NAME + ": No rover SDF loaded, cannot apply camera offsets")
+      return
+    (off_x, off_y, off_z, scene_x, scene_y, scene_z) = offsets
+
+    sdf = self.rover_sdf_template
+    sdf, n1 = CAMERA_LINK_POSE_RE['camera_link'].subn(
+        lambda m: m.group(1) + ("%.6f %.6f %.6f " % (off_x, off_y, off_z)) + m.group(2), sdf)
+    sdf, n2 = CAMERA_LINK_POSE_RE['camera_link_chase'].subn(
+        lambda m: m.group(1) + ("%.6f %.6f %.6f " % (scene_x, scene_y, scene_z)) + m.group(2), sdf)
+    if n1 != 1 or n2 != 1:
+      # A structural change to generic_rover/model.sdf (renamed link, reordered
+      # pose) could make this regex stop matching -- fail loudly rather than
+      # silently spawning the rover with its OLD/default camera poses, which
+      # would look exactly like "the offset setting doesn't do anything".
+      rospy.logerr(PKG_NAME + ": Camera pose substitution matched " + str(n1) +
+                   "/1 camera_link and " + str(n2) + "/1 camera_link_chase -- "
+                   "refusing to respawn with an unverified model")
+      return
+
+    # Capture the rover's current pose so the respawn doesn't teleport it back
+    # to the world origin -- odometrySource=world means Gazebo's own model pose
+    # IS the odom source, so this is the one piece of state that must survive.
+    pose = self.captureCurrentPose()
+    initial_pose = Pose()
+    if pose is not None:
+      initial_pose.position.x = pose['x']
+      initial_pose.position.y = pose['y']
+      initial_pose.orientation.z = math.sin(pose['yaw'] / 2.0)
+      initial_pose.orientation.w = math.cos(pose['yaw'] / 2.0)
+    else:
+      initial_pose.orientation.w = 1.0
+
+    # Stop first, same reasoning as resetRover: an in-flight cmd_vel would
+    # otherwise be applied to the new model the instant it exists.
+    self.gazebo_cmd_pub.publish(Twist())
+    try:
+      rospy.wait_for_service(DELETE_MODEL_SERVICE, timeout=GAZEBO_SERVICE_WAIT_SEC)
+      rospy.ServiceProxy(DELETE_MODEL_SERVICE, DeleteModel)(ROVER_MODEL_NAME)
+      rospy.wait_for_service(SPAWN_MODEL_SERVICE, timeout=GAZEBO_SERVICE_WAIT_SEC)
+      spawn = rospy.ServiceProxy(SPAWN_MODEL_SERVICE, SpawnModel)
+      resp = spawn(ROVER_MODEL_NAME, sdf, '', initial_pose, 'world')
+      if not resp.success:
+        rospy.logerr(PKG_NAME + ": Respawn with new camera offsets failed: " +
+                     resp.status_message)
+        return
+    except Exception as e:
+      rospy.logerr(PKG_NAME + ": Respawn with new camera offsets failed: " + str(e))
+      return
+
+    self.applied_camera_offsets = offsets
+    self.held_pose = None  # Stale anchor from before the respawn -- see resetRover.
+    rospy.loginfo(PKG_NAME + ": Applied camera offsets, robot=(%.2f,%.2f,%.2f) scene=(%.2f,%.2f,%.2f)"
+                  % offsets)
 
   def setObstacleCourse(self, enabled):
     if self.obstacle_course_sdf is None:

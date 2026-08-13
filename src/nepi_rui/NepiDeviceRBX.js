@@ -106,7 +106,12 @@ class NepiDeviceRBX extends Component {
       // whenever the device's own reported value changes.
       camera_offset_x: "",
       camera_offset_y: "",
-      camera_offset_z: ""
+      camera_offset_z: "",
+      // Same edit-buffer treatment for the scene/chase-view offset triple
+      // (currently only defined by rbx_sim_node.py).
+      scene_offset_x: "",
+      scene_offset_y: "",
+      scene_offset_z: ""
     }
 
     this.updateInfoListener = this.updateInfoListener.bind(this)
@@ -241,7 +246,8 @@ class NepiDeviceRBX extends Component {
     // Seed/resync each offset edit buffer only when the DEVICE's own value
     // changed (or on first sight), never on every status tick -- otherwise
     // a 1Hz status message overwrites whatever is being typed.
-    const offsetNames = ["camera_offset_x", "camera_offset_y", "camera_offset_z"]
+    const offsetNames = ["camera_offset_x", "camera_offset_y", "camera_offset_z",
+                        "scene_offset_x", "scene_offset_y", "scene_offset_z"]
     var updates = {}
     for (let i = 0; i < offsetNames.length; i++) {
       const name = offsetNames[i]
@@ -679,17 +685,28 @@ class NepiDeviceRBX extends Component {
   }
 
   // Camera offset X/Y/Z, shown only for drivers that actually define these
-  // Settings (ArduPilot's camera-rig chase cam). Same offset triple applies
-  // to both view modes -- switching FIRST_PERSON/THIRD_PERSON only changes
-  // how camera_rig_controller_ardupilot.py aims the camera, not which
-  // offset it reads (see that driver's own CAMERA_SETTING_NAMES comment),
-  // so this renders as one shared block under the POV buttons rather than a
-  // per-mode set.
-  renderCameraOffsetControls() {
+  // Settings. Two independent uses of this same block:
+  //   - rbx_ardupilot_node.py: a single camera_offset_* triple shared by both
+  //     view modes -- switching FIRST_PERSON/THIRD_PERSON only changes how
+  //     camera_rig_controller_ardupilot.py aims the camera, not which offset
+  //     it reads (see that driver's own CAMERA_SETTING_NAMES comment).
+  //   - rbx_sim_node.py: two SEPARATE triples, camera_offset_* (robot view)
+  //     and scene_offset_* (scene view) -- each view is its own rigidly-welded
+  //     camera in Gazebo (see that driver's CAMERA_SETTING_NAMES comment), so
+  //     unlike ArduPilot's single aimable rig, positioning one does not move
+  //     the other. Rendered as two independently-gated blocks below.
+  // namePrefix/titlePrefix let this same block render either offset triple --
+  // "camera_offset_*" (Robot View) or, on drivers that define it (currently
+  // only rbx_sim_node.py), "scene_offset_*" (Scene View). Both triples are
+  // Settings on the device exactly like camera_offset_* already was, so
+  // nothing else about this control (the edit-buffer seeding in
+  // rbxSettingsListener, the Enter-to-apply publish in
+  // onEnterSetCameraOffset) needed to change to support a second triple.
+  renderCameraOffsetControls(namePrefix, titlePrefix) {
     const offsets = [
-      { name: "camera_offset_x", title: "Camera Offset X (m)" },
-      { name: "camera_offset_y", title: "Camera Offset Y (m)" },
-      { name: "camera_offset_z", title: "Camera Offset Z (m)" },
+      { name: namePrefix + "_x", title: titlePrefix + " Offset X (m)" },
+      { name: namePrefix + "_y", title: titlePrefix + " Offset Y (m)" },
+      { name: namePrefix + "_z", title: titlePrefix + " Offset Z (m)" },
     ]
     return (
       <React.Fragment>
@@ -730,6 +747,7 @@ class NepiDeviceRBX extends Component {
     // for.
     const has_camera_pov_toggle = this.state.settingsNamesList.includes("camera_view_mode")
     const has_camera_offsets = this.state.settingsNamesList.includes("camera_offset_x")
+    const has_scene_offsets = this.state.settingsNamesList.includes("scene_offset_x")
     return (
       <React.Fragment>
         <Columns>
@@ -771,7 +789,10 @@ class NepiDeviceRBX extends Component {
               </ButtonMenu>
             </div>
             <div hidden={!has_camera_offsets}>
-              {this.renderCameraOffsetControls()}
+              {this.renderCameraOffsetControls("camera_offset", "Robot View Camera")}
+            </div>
+            <div hidden={!has_scene_offsets}>
+              {this.renderCameraOffsetControls("scene_offset", "Scene View Camera")}
             </div>
           </Column>
         </Columns>

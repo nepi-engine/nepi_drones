@@ -81,7 +81,24 @@ class SimNode:
   # there is no runtime offset left to expose -- switching this Setting
   # just selects which of the two onboard camera topics
   # camera_rig_controller.py relays.
-  CAMERA_SETTING_NAMES = ("camera_view_mode",)
+  # Camera offsets ARE runtime-adjustable again, contrary to the note above
+  # (kept for the history it records). The two cameras stay rigidly welded to
+  # the rover -- that is what makes them lag-free and is not being given up --
+  # and an offset change is applied by respawning the rover model with the new
+  # camera link poses, at its current world pose. That is viable specifically
+  # because the diff_drive plugin uses <odometrySource>world</odometrySource>,
+  # so odom is read back from the model's Gazebo pose and survives the respawn
+  # unbroken. See applyCameraOffsets in camera_rig_controller.py, which also
+  # records every Gazebo mechanism that does NOT work here.
+  #
+  # camera_offset_* is the ROBOT view (same names the ArduPilot driver uses, so
+  # the RUI's existing offset block renders it unchanged); scene_offset_* is the
+  # scene/chase view. Factory values reproduce generic_rover/model.sdf's
+  # hard-coded camera_link (0.2, 0, 0.65) and camera_link_chase
+  # (-2.5, 0, 1.65) poses exactly, so the default view is unchanged.
+  CAMERA_SETTING_NAMES = ("camera_view_mode",
+                          "camera_offset_x", "camera_offset_y", "camera_offset_z",
+                          "scene_offset_x", "scene_offset_y", "scene_offset_z")
 
   # Environment: was originally two RBX_SETUP_ACTIONS entries
   # (OBSTACLE_COURSE_ON/OFF), then a dedicated "Environment" dropdown was
@@ -96,14 +113,28 @@ class SimNode:
     max_linear_speed_mps = {"type":"Float","name":"max_linear_speed_mps","options":["0.05","5.0"]},
     max_angular_rate_dps = {"type":"Float","name":"max_angular_rate_dps","options":["5.0","180.0"]},
     camera_view_mode = {"type":"Discrete","name":"camera_view_mode","options":["FIRST_PERSON","THIRD_PERSON"]},
-    environment = {"type":"Discrete","name":"environment","options":["FLAT_GROUND","OBSTACLE_COURSE"]}
+    environment = {"type":"Discrete","name":"environment","options":["FLAT_GROUND","OBSTACLE_COURSE"]},
+    camera_offset_x = {"type":"Float","name":"camera_offset_x","options":["-10.0","10.0"]},
+    camera_offset_y = {"type":"Float","name":"camera_offset_y","options":["-10.0","10.0"]},
+    camera_offset_z = {"type":"Float","name":"camera_offset_z","options":["-10.0","10.0"]},
+    scene_offset_x = {"type":"Float","name":"scene_offset_x","options":["-10.0","10.0"]},
+    scene_offset_y = {"type":"Float","name":"scene_offset_y","options":["-10.0","10.0"]},
+    scene_offset_z = {"type":"Float","name":"scene_offset_z","options":["-10.0","10.0"]}
   )
 
   FACTORY_SETTINGS = dict(
     max_linear_speed_mps = {"type":"Float","name":"max_linear_speed_mps","value":"0.5"},
     max_angular_rate_dps = {"type":"Float","name":"max_angular_rate_dps","value":"45.0"},
     camera_view_mode = {"type":"Discrete","name":"camera_view_mode","value":"FIRST_PERSON"},
-    environment = {"type":"Discrete","name":"environment","value":"FLAT_GROUND"}
+    environment = {"type":"Discrete","name":"environment","value":"FLAT_GROUND"},
+    # Reproduces generic_rover/model.sdf's hard-coded camera_link pose exactly.
+    camera_offset_x = {"type":"Float","name":"camera_offset_x","value":"0.2"},
+    camera_offset_y = {"type":"Float","name":"camera_offset_y","value":"0.0"},
+    camera_offset_z = {"type":"Float","name":"camera_offset_z","value":"0.65"},
+    # Reproduces generic_rover/model.sdf's hard-coded camera_link_chase pose.
+    scene_offset_x = {"type":"Float","name":"scene_offset_x","value":"-2.5"},
+    scene_offset_y = {"type":"Float","name":"scene_offset_y","value":"0.0"},
+    scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"1.65"}
   )
 
   FACTORY_SETTINGS_OVERRIDES = dict()
@@ -840,6 +871,12 @@ class SimNode:
     cmd = {
       'type': 'camera_settings',
       'view_mode': self.settings_dict['camera_view_mode']['value'],
+      'offset_x': float(self.settings_dict['camera_offset_x']['value']),
+      'offset_y': float(self.settings_dict['camera_offset_y']['value']),
+      'offset_z': float(self.settings_dict['camera_offset_z']['value']),
+      'scene_offset_x': float(self.settings_dict['scene_offset_x']['value']),
+      'scene_offset_y': float(self.settings_dict['scene_offset_y']['value']),
+      'scene_offset_z': float(self.settings_dict['scene_offset_z']['value']),
     }
     self.sendLineToBridge(cmd, "Camera settings")
 
