@@ -116,6 +116,18 @@ class NepiIFSim extends Component {
       status_msg: null,
       statusListener: null,
 
+      // Robot config viewer/download -- see renderRobotConfigViewer.
+      // robot_config_yaml is the LAST config text the device reported on
+      // sim/robot_config_yaml (latched, so it also survives a page reload
+      // once at least one view has ever been requested); viewing_config_name
+      // is which config that text is FOR, tracked separately so a click on
+      // one "View" button while a different config's text is still displayed
+      // doesn't read as already showing the new one before the round trip
+      // completes.
+      robot_config_yaml: '',
+      viewing_config_name: 'None',
+      robotConfigYamlListener: null,
+
     }
 
     // Hidden <input type="file"> target for the Upload Robot Config button
@@ -132,9 +144,14 @@ class NepiIFSim extends Component {
     this.onUploadConfigClicked = this.onUploadConfigClicked.bind(this)
     this.onUploadConfigFileChange = this.onUploadConfigFileChange.bind(this)
     this.onDownloadSampleConfigClicked = this.onDownloadSampleConfigClicked.bind(this)
+    this.updateRobotConfigYamlListener = this.updateRobotConfigYamlListener.bind(this)
+    this.robotConfigYamlListener = this.robotConfigYamlListener.bind(this)
+    this.onViewConfigClicked = this.onViewConfigClicked.bind(this)
+    this.onDownloadConfigClicked = this.onDownloadConfigClicked.bind(this)
 
     this.renderRobotConfigSelector = this.renderRobotConfigSelector.bind(this)
     this.renderRobotConfigUpload = this.renderRobotConfigUpload.bind(this)
+    this.renderRobotConfigViewer = this.renderRobotConfigViewer.bind(this)
     this.renderFieldPair = this.renderFieldPair.bind(this)
     this.renderData = this.renderData.bind(this)
   }
@@ -146,6 +163,7 @@ class NepiIFSim extends Component {
 
   componentDidMount() {
     this.updateStatusListener()
+    this.updateRobotConfigYamlListener()
   }
 
   // Lifecycle method called when the component updates.
@@ -154,6 +172,7 @@ class NepiIFSim extends Component {
     const namespace = this.getSimNamespace()
     if (namespace !== this.state.namespace) {
       this.updateStatusListener()
+      this.updateRobotConfigYamlListener()
     }
   }
 
@@ -162,7 +181,67 @@ class NepiIFSim extends Component {
     if (this.state.statusListener) {
       this.state.statusListener.unsubscribe()
     }
-    this.setState({ statusListener: null })
+    if (this.state.robotConfigYamlListener) {
+      this.state.robotConfigYamlListener.unsubscribe()
+    }
+    this.setState({ statusListener: null, robotConfigYamlListener: null })
+  }
+
+  // Function for configuring and subscribing to sim/robot_config_yaml --
+  // the device's answer to whichever config name was last sent to
+  // sim/get_robot_config (see onViewConfigClicked).
+  updateRobotConfigYamlListener() {
+    const namespace = this.getSimNamespace()
+    if (this.state.robotConfigYamlListener != null) {
+      this.state.robotConfigYamlListener.unsubscribe()
+      this.setState({ robotConfigYamlListener: null, robot_config_yaml: '', viewing_config_name: 'None' })
+    }
+    if (namespace != null && namespace !== 'None') {
+      var listener = this.props.ros.setupStatusListener(
+        namespace + '/robot_config_yaml',
+        "std_msgs/String",
+        this.robotConfigYamlListener
+      )
+      this.setState({ robotConfigYamlListener: listener })
+    }
+  }
+
+  // Callback for sim/robot_config_yaml messages.
+  robotConfigYamlListener(message) {
+    this.setState({ robot_config_yaml: message.data })
+  }
+
+  // Requests a named config's YAML text -- either a checked-in preset
+  // (available_robot_configs) or the special sample/uploaded ones aren't
+  // reachable this way, since only the device's own self.robot_configs dict
+  // (real, currently-loaded configs) answers get_robot_config.
+  onViewConfigClicked(configName) {
+    const namespace = this.getSimNamespace()
+    if (namespace == null || namespace === 'None') {
+      return
+    }
+    this.setState({ viewing_config_name: configName })
+    this.props.ros.sendStringMsg(namespace + '/get_robot_config', configName)
+  }
+
+  // Downloads whatever YAML text is currently displayed -- same Blob pattern
+  // as onDownloadSampleConfigClicked, just device-reported content instead of
+  // a static client-side string.
+  onDownloadConfigClicked() {
+    const text = this.state.robot_config_yaml
+    const name = this.state.viewing_config_name
+    if (text === '' || name === 'None') {
+      return
+    }
+    const blob = new Blob([text], { type: 'text/yaml' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = name + '.yaml'
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    URL.revokeObjectURL(url)
   }
 
   // Function for configuring and subscribing to the sim namespace status topic
@@ -312,6 +391,54 @@ class NepiIFSim extends Component {
     )
   }
 
+  // Per-config "View" button (one per available_robot_configs entry --
+  // "each one that I have preset right now... downloadable too, and some
+  // viewer where they can see each config") plus the shared display/download
+  // area below. Deliberately keyed on available_robot_configs, not a
+  // hardcoded drone/rover pair: whatever this deployment's
+  // sim_connector_app_params.yaml actually offers is what gets a View button,
+  // so a future third preset needs no RUI change to be viewable.
+  renderRobotConfigViewer() {
+    const status_msg = this.state.status_msg
+    if (status_msg == null) {
+      return null
+    }
+    const available = (status_msg.available_robot_configs !== undefined)
+      ? status_msg.available_robot_configs : []
+    const names = (status_msg.available_robot_config_names !== undefined)
+      ? status_msg.available_robot_config_names : []
+    if (available.length === 0) {
+      return null
+    }
+
+    return (
+      <React.Fragment>
+        <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
+        <Label title={"View / Download a Robot Config"}/>
+        <ButtonMenu>
+          {available.map((configName, i) => (
+            <Button key={configName} onClick={() => this.onViewConfigClicked(configName)}>
+              {(names[i] !== undefined && names[i] !== '') ? names[i] : configName}
+            </Button>
+          ))}
+        </ButtonMenu>
+        {(this.state.robot_config_yaml !== '') ?
+          <React.Fragment>
+            <textarea
+              readOnly
+              value={this.state.robot_config_yaml}
+              rows={16}
+              style={{ width: "100%", fontFamily: "monospace", whiteSpace: "pre" }}
+            />
+            <ButtonMenu>
+              <Button onClick={this.onDownloadConfigClicked}>{"Download " + this.state.viewing_config_name + ".yaml"}</Button>
+            </ButtonMenu>
+          </React.Fragment>
+        : null}
+      </React.Fragment>
+    )
+  }
+
   // Puts two Label fields side by side instead of each taking a full-width
   // row on its own -- most of these values are a word, a number, or a single
   // indicator square, so stacking them one per row (the default Label
@@ -440,6 +567,7 @@ class NepiIFSim extends Component {
                 would misrepresent both. */}
             {this.renderRobotConfigSelector()}
             {this.renderRobotConfigUpload()}
+            {this.renderRobotConfigViewer()}
             {/* Deploy/Kill/Install for the additive simulator auto-launch
                 capability (see docs/SIMULATOR_AUTO_LAUNCH_PLAN.md) -- lives
                 directly under Robot Config rather than as its own titled

@@ -469,6 +469,21 @@ class NepiSimConnectorApp:
     nepi_sdk.create_subscriber(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/upload_robot_config'),
         String, self.uploadRobotConfigCb, queue_size = 1)
+    # Inverse of upload_robot_config, same std_msgs/String shape both ways --
+    # "some viewer where they can see each config" plus "downloadable too" for
+    # the checked-in presets, not just the sample template
+    # (onDownloadSampleConfigClicked) the RUI already had. A request/response
+    # pair over plain String, not a new .srv/.msg field: this app's whole wire
+    # protocol convention already speaks YAML-as-a-string in this exact
+    # direction (upload), so the reverse direction reuses it rather than
+    # introducing an interfaces rebuild for what is fundamentally the same
+    # kind of data.
+    self.robot_config_yaml_pub = nepi_sdk.create_publisher(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/robot_config_yaml'),
+        String, queue_size = 1, latch = True)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/get_robot_config'),
+        String, self.getRobotConfigCb, queue_size = 1)
     # Latched, so a client that subscribes after startup still gets a real
     # report (available targets, "idle") instead of waiting for the first
     # launch/stop -- the same reasoning SimStatus's own latch already uses.
@@ -714,6 +729,27 @@ class NepiSimConnectorApp:
     self.robot_configs[UPLOADED_ROBOT_CONFIG_NAME] = entry
     self.msg_if.pub_info("Uploaded robot config '" + display_name + "', applying it now")
     self.setSelectedRobotConfig(UPLOADED_ROBOT_CONFIG_NAME)
+
+  def getRobotConfigCb(self, msg):
+    # config name in -> that entry's full YAML text out, on the latched
+    # sim/robot_config_yaml topic. Looks up self.robot_configs (the SAME live
+    # dict setSelectedRobotConfig reads -- checked-in presets from
+    # sim_connector_app_params.yaml plus any current upload_robot_config
+    # result), not the raw params file, so this always reflects what the app
+    # actually has right now.
+    name = str(msg.data)
+    entry = self.robot_configs.get(name)
+    if entry is None:
+      self.msg_if.pub_warn("Robot config '" + name + "' not found, cannot report its YAML")
+      return
+    # hidden_from_selector is this app's OWN routing detail (whether the RUI's
+    # selector offers it directly, vs. only reachable through a launch
+    # target's robot_config_overrides) -- not part of the robot's own
+    # description, so a downloaded/viewed config omits it rather than
+    # exporting an internal implementation flag as if it were a real field.
+    exportable = {k: v for k, v in entry.items() if k != 'hidden_from_selector'}
+    yaml_text = yaml.safe_dump(exportable, default_flow_style = False, sort_keys = False)
+    self.robot_config_yaml_pub.publish(String(data = yaml_text))
 
   #**********************
   # Simulator selector. Discovery is a timer scan of the live ROS graph, matched
