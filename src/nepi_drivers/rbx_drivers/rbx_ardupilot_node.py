@@ -73,6 +73,15 @@ class ArdupilotNode:
   CAMERA_SETTING_NAMES = ("camera_view_mode", "camera_offset_x",
                           "camera_offset_y", "camera_offset_z")
 
+  # Sim Connector "customize the capabilities that are open" toggles -- same
+  # mechanism and same three names as rbx_sim_node.py's own
+  # CAPABILITY_SETTING_NAMES (see that file's comment for the full reasoning).
+  # Added here for parity: the quadcopter's robot config (flight_robot_4_motor)
+  # is exactly as much a Sim Connector-managed simulated robot as the rover's,
+  # so it gets the same three configuration toggles, not a lesser set.
+  CAPABILITY_SETTING_NAMES = ("autonomous_movement_enabled", "teleop_movement_enabled",
+                              "camera_controls_enabled")
+
   CAP_SETTINGS = dict(
     takeoff_height_m = {"type":"Float","name":"takeoff_height_m","options":["0.0","100.0"]},
     takeoff_min_pitch_deg =  {"type":"Float","name":"takeoff_min_pitch_deg","options":["-90.0","90.0"]},
@@ -82,7 +91,10 @@ class ArdupilotNode:
     camera_view_mode = {"type":"Discrete","name":"camera_view_mode","options":["FIRST_PERSON","THIRD_PERSON"]},
     camera_offset_x = {"type":"Float","name":"camera_offset_x","options":["-10.0","10.0"]},
     camera_offset_y = {"type":"Float","name":"camera_offset_y","options":["-10.0","10.0"]},
-    camera_offset_z = {"type":"Float","name":"camera_offset_z","options":["-10.0","10.0"]}
+    camera_offset_z = {"type":"Float","name":"camera_offset_z","options":["-10.0","10.0"]},
+    autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
+    teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","options":["TRUE","FALSE"]},
+    camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]}
   )
 
   FACTORY_SETTINGS = dict(
@@ -98,7 +110,12 @@ class ArdupilotNode:
     camera_view_mode = {"type":"Discrete","name":"camera_view_mode","value":"FIRST_PERSON"},
     camera_offset_x = {"type":"Float","name":"camera_offset_x","value":"0.15"},
     camera_offset_y = {"type":"Float","name":"camera_offset_y","value":"0.0"},
-    camera_offset_z = {"type":"Float","name":"camera_offset_z","value":"-0.1"}
+    camera_offset_z = {"type":"Float","name":"camera_offset_z","value":"-0.1"},
+    # All default to enabled: a robot config that never touches these
+    # settings behaves exactly as it did before this feature existed.
+    autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","value":"TRUE"},
+    teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","value":"TRUE"},
+    camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","value":"TRUE"}
   )
 
   FACTORY_SETTINGS_OVERRIDES = dict()
@@ -150,6 +167,33 @@ class ArdupilotNode:
 
   SETPOINT_PUBLISH_RATE_HZ = 50
   POSITION_UPDATE_RATE = 10
+
+  # Teleop velocity setpoint loop -- deliberately its own rate/topic, not
+  # reusing sendGotoCommandLoop/SETPOINT_PUBLISH_RATE_HZ (see
+  # sendTeleopVelocityLoop's own comment for why). 20Hz keeps MAVROS's own
+  # velocity-setpoint watchdog fed comfortably -- ArduPilot's SET_POSITION_
+  # TARGET_LOCAL_NED handling treats a stream slower than roughly 2Hz as
+  # stale and reverts to loiter, so 20Hz has wide margin. Conservative,
+  # fixed caps rather than a Setting (unlike rbx_sim_node.py's
+  # max_linear_speed_mps): this is new, unverified-in-flight code, and a
+  # hard ceiling here is a real safety margin, not just a default.
+  TELEOP_PUBLISH_RATE_HZ = 20
+  TELEOP_CMD_TIMEOUT_SEC = 0.75
+  # Confirmed live 2026-08-13: stopping the setpoint stream outright (no
+  # further publishes at all) the instant TELEOP_CMD_TIMEOUT_SEC elapses is
+  # NOT the same as stopping the vehicle -- ArduCopter's own GUIDED-mode
+  # velocity controller keeps flying at the LAST commanded velocity until ITS
+  # OWN internal setpoint-timeout expires (empirically a few seconds, not
+  # governed by anything this driver controls), so the vehicle visibly kept
+  # drifting for several seconds after this driver had already gone silent.
+  # This grace window closes that gap: once idle, publish an EXPLICIT
+  # (0,0,0,0) for TELEOP_STOP_GRACE_SEC more before actually going silent, so
+  # a real stop reaches ArduCopter directly rather than relying on it timing
+  # out on its own. Still bounded (not indefinite), so it does not go on
+  # contesting a goto command that starts shortly after teleop ends.
+  TELEOP_STOP_GRACE_SEC = 2.0
+  TELEOP_MAX_LINEAR_MPS = 2.0
+  TELEOP_MAX_ANGULAR_DPS = 30.0
 
   # MAV_CMD_DO_MOTOR_TEST (verified against pymavlink common.xml -- NOT 176,
   # which is MAV_CMD_DO_SET_MODE). ArduPilot auto-stops the motor after the
@@ -370,6 +414,13 @@ class ArdupilotNode:
     self.setpoint_location_global_pub = nepi_sdk.create_publisher(MAVLINK_SETPOINT_LOCATION_GLOBAL_TOPIC, GeoPoseStamped, queue_size=1)
     self.setpoint_attitude_pub = nepi_sdk.create_publisher(MAVLINK_SETPOINT_ATTITUDE_TOPIC, AttitudeTarget, queue_size=1)
     self.setpoint_position_local_pub = nepi_sdk.create_publisher(MAVLINK_SETPOINT_POSITION_LOCAL_TOPIC, PoseStamped, queue_size=1)
+    # Teleop's own velocity setpoint, deliberately separate from the three
+    # position/attitude/location targets above -- see sendTeleopVelocityLoop.
+    # cmd_vel_unstamped (plain Twist, not TwistStamped) is MAVROS's
+    # setpoint_velocity plugin's simpler of its two topics; this driver has no
+    # use for the stamped variant's extra header.
+    MAVLINK_SETPOINT_VELOCITY_TOPIC = MAVLINK_NAMESPACE + "setpoint_velocity/cmd_vel_unstamped"
+    self.setpoint_velocity_pub = nepi_sdk.create_publisher(MAVLINK_SETPOINT_VELOCITY_TOPIC, Twist, queue_size=1)
 
     self.msg_if.pub_info("... Connected to Mavlink!")
 
@@ -429,6 +480,17 @@ class ArdupilotNode:
     # Per-motor commanded speed ratios (0-1), tracked locally since ArduPilot's
     # DO_MOTOR_TEST is fire-and-forget and reports no ongoing per-motor state.
     self.motor_ratios = [0.0] * int(self.settings_dict['motor_count']['value'])
+
+    # Teleop (keyboard-driven) velocity state -- already rotated into ENU and
+    # scaled to m/s and rad/s, so sendTeleopVelocityLoop can publish it
+    # directly with no further conversion. See setTeleopVelocity/
+    # sendTeleopVelocityLoop. Locked because setTeleopVelocity (a subscriber
+    # callback) and sendTeleopVelocityLoop (a timer callback) run on different
+    # threads.
+    self.teleop_lock = threading.Lock()
+    self.teleop_linear_enu = [0.0, 0.0, 0.0]
+    self.teleop_angular_z = 0.0
+    self.teleop_last_cmd_time = 0.0
 
 
     # Define fake gps namespace and create fake_gps publishers.
@@ -491,6 +553,8 @@ class ArdupilotNode:
                                   manualControlsReadyFunction = self.manualControlsReady,
                                   getMotorControlRatios = self.getMotorControlRatios,
                                   setMotorControlRatio = self.setMotorControlRatio,
+                                  teleopControlsReadyFunction = self.teleopControlsReady,
+                                  setTeleopVelocityFunction = self.setTeleopVelocity,
                                   autonomousControlsReadyFunction = self.autonomousControlsReady,
                                   getHomeFunction = self.getHomeLocation,
                                   setHomeFunction = self.setHomeLocation,
@@ -518,6 +582,10 @@ class ArdupilotNode:
     ## Start goto setpoint check/send loop
     setpoint_pub_interval = float(1) / self.SETPOINT_PUBLISH_RATE_HZ
     nepi_sdk.start_timer_process(setpoint_pub_interval, self.sendGotoCommandLoop)
+    ## Start teleop velocity setpoint loop -- independent of the goto loop
+    ## above, see sendTeleopVelocityLoop's own comment for why.
+    teleop_pub_interval = float(1) / self.TELEOP_PUBLISH_RATE_HZ
+    nepi_sdk.start_timer_process(teleop_pub_interval, self.sendTeleopVelocityLoop)
     ## Initiation Complete
     self.msg_if.pub_info("Initialization Complete")
     #Set up node shutdown
@@ -792,10 +860,93 @@ class ArdupilotNode:
     return True
 
   def autonomousControlsReady(self):
+    # Also requires autonomous_movement_enabled -- the Sim Connector's own
+    # per-robot-config "automated movement" toggle, same as
+    # rbx_sim_node.py's identical check. Checked HERE, not just in the RUI
+    # (which hides the controls entirely), so disabling it actually blocks
+    # the command for any client, not merely the RUI's own buttons.
+    if self.settings_dict['autonomous_movement_enabled']['value'] != 'TRUE':
+      return False
     ready = False
     if self.RBX_STATES[self.state_ind] == "ARM" and self.RBX_MODES[self.mode_ind] == "GUIDED" and self.takeoff_complete:
       ready = True
     return ready
+
+  def teleopControlsReady(self):
+    # Same ARM+GUIDED+airborne requirement as autonomousControlsReady --
+    # sending body-frame velocity setpoints only means anything once the
+    # vehicle is actually flying under GUIDED control; on the ground or in a
+    # different mode ArduPilot ignores them anyway, but reporting "ready"
+    # in that state would be misleading. Plus teleop_movement_enabled, the
+    # Sim Connector's own toggle for this feature.
+    if self.settings_dict['teleop_movement_enabled']['value'] != 'TRUE':
+      return False
+    return (self.RBX_STATES[self.state_ind] == "ARM"
+            and self.RBX_MODES[self.mode_ind] == "GUIDED"
+            and self.takeoff_complete)
+
+  def setTeleopVelocity(self, linear_x, linear_y, linear_z, angular_z):
+    # Inputs are body-frame ratios in [-1,1] (forward/right/up, yaw-rate) --
+    # see device_if_rbx.py's setTeleopVelocityCb. MAVROS's velocity setpoint
+    # topic (sendTeleopVelocityLoop below) is LOCAL ENU, a fixed world frame,
+    # not body frame -- "forward" there means a fixed compass direction, not
+    # "wherever the nose is pointing," which is not what a keyboard teleop
+    # control is for. Rotating by the vehicle's own current yaw is what makes
+    # "W" mean forward relative to the drone regardless of which way it is
+    # facing, the same way a real quadcopter's stick inputs work.
+    #
+    # Scaled by max_linear_speed_mps-equivalent -- this driver has no such
+    # Setting today (unlike rbx_sim_node.py), so a fixed, conservative cap is
+    # used instead. TELEOP_MAX_LINEAR_MPS/TELEOP_MAX_ANGULAR_DPS below.
+    max_lin = self.TELEOP_MAX_LINEAR_MPS
+    max_ang = math.radians(self.TELEOP_MAX_ANGULAR_DPS)
+    body_x = max(-1.0, min(1.0, linear_x)) * max_lin
+    body_y = max(-1.0, min(1.0, linear_y)) * max_lin
+    yaw_rad = math.radians(self.navpose_dict['yaw_deg'])
+    enu_x = body_x * math.cos(yaw_rad) - body_y * math.sin(yaw_rad)
+    enu_y = body_x * math.sin(yaw_rad) + body_y * math.cos(yaw_rad)
+    with self.teleop_lock:
+      self.teleop_linear_enu = [enu_x, enu_y, max(-1.0, min(1.0, linear_z)) * max_lin]
+      self.teleop_angular_z = max(-1.0, min(1.0, angular_z)) * max_ang
+      self.teleop_last_cmd_time = nepi_utils.get_time()
+
+  def sendTeleopVelocityLoop(self, timer):
+    # Independent of sendGotoCommandLoop -- that loop drives ONE-SHOT position/
+    # attitude/location targets to convergence and stops (clears its targets)
+    # once status_msg.ready flips back True, which is the wrong lifecycle for
+    # a continuous joystick-style input that has no "reached" condition.
+    #
+    # Publishes ONLY while a teleop command has arrived within
+    # TELEOP_CMD_TIMEOUT_SEC -- including the explicit (0,0,0,0) the RUI sends
+    # on keyup, so a brief grace window still re-asserts that stop against a
+    # dropped packet (the same "never trust a single packet" reasoning
+    # rbx_sim_node.py's own TELEOP_CMD_TIMEOUT_SEC comment gives). Deliberately
+    # stops publishing ENTIRELY once that window elapses, rather than settling
+    # into an indefinite zero-velocity stream: unlike the rover (one Twist
+    # channel total), this vehicle's velocity setpoint
+    # (setpoint_velocity/cmd_vel_unstamped) and its position setpoint
+    # (setpoint_position/local, sendGotoCommandLoop) are two INDEPENDENT
+    # MAVROS channels -- a teleop session that ended minutes ago must not go
+    # on contesting a goto command that starts later.
+    with self.teleop_lock:
+      time_since_cmd = nepi_utils.get_time() - self.teleop_last_cmd_time
+      enu = list(self.teleop_linear_enu)
+      ang_z = self.teleop_angular_z
+    if time_since_cmd >= self.TELEOP_CMD_TIMEOUT_SEC + self.TELEOP_STOP_GRACE_SEC:
+      # Truly done -- see TELEOP_STOP_GRACE_SEC's own comment for why this
+      # isn't just "time_since_cmd >= TELEOP_CMD_TIMEOUT_SEC".
+      return
+    if time_since_cmd >= self.TELEOP_CMD_TIMEOUT_SEC:
+      # Grace window: force an explicit stop rather than trusting whatever
+      # was last commanded (which may itself have been a dropped stop).
+      enu = [0.0, 0.0, 0.0]
+      ang_z = 0.0
+    twist = Twist()
+    twist.linear.x = enu[0]
+    twist.linear.y = enu[1]
+    twist.linear.z = enu[2]
+    twist.angular.z = ang_z
+    self.setpoint_velocity_pub.publish(twist)
 
   ##############################
   # RBX NavPose Topic Publishers
