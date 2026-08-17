@@ -312,7 +312,6 @@ class NepiIFSimLauncher extends Component {
 
     const busy = (state === 'launching') || (state === 'stopping') || (state === 'installing')
     const running = (state === 'running')
-    const launching = (state === 'launching')
     const last_error = (status_msg.last_error !== undefined) ? status_msg.last_error : ''
 
     // Plain wrapping text, not an <Input> -- these messages run long (the
@@ -372,9 +371,9 @@ class NepiIFSimLauncher extends Component {
 
           <ButtonMenu>
             {selection_matches_running ?
-              <Button disabled={busy} onClick={this.onDeployClicked}>{launching ? "Deploying..." : "Use Open Sim"}</Button>
+              <Button disabled={busy} onClick={this.onDeployClicked}>{"Use Open Sim"}</Button>
             : null}
-            <Button disabled={busy} onClick={this.onNewSimClicked}>{launching ? "Deploying..." : "New Sim"}</Button>
+            <Button disabled={busy} onClick={this.onNewSimClicked}>{"New Sim"}</Button>
             <Button disabled={busy} onClick={this.onKillClicked}>{"Kill"}</Button>
           </ButtonMenu>
 
@@ -406,7 +405,7 @@ class NepiIFSimLauncher extends Component {
       <React.Fragment>
         {error_row}
         <ButtonMenu>
-          <Button disabled={deploy_disabled} onClick={this.onDeployClicked}>{launching ? "Deploying..." : "Deploy"}</Button>
+          <Button disabled={deploy_disabled} onClick={this.onDeployClicked}>{"Deploy"}</Button>
         </ButtonMenu>
       </React.Fragment>
     )
@@ -423,6 +422,12 @@ class NepiIFSimLauncher extends Component {
     const make_section = (this.props.make_section !== undefined) ? this.props.make_section : false
     const title = (this.props.title !== undefined) ? this.props.title : "Simulator"
     const status_msg = this.state.status_msg
+    // Lets a parent mount the selector and the deploy controls at two
+    // different places on the page (selector up top, deploy controls below
+    // the other sim controls) instead of always getting both together.
+    // Undefined (the default) renders both, unchanged from before this prop
+    // existed.
+    const only = this.props.only
 
     // No status yet: render nothing, matching Nepi_IF_Sim's own not-ready
     // branch -- this is "haven't heard from the device yet", not "not
@@ -439,8 +444,8 @@ class NepiIFSimLauncher extends Component {
 
     const content = (
       <React.Fragment>
-        {this.renderTargetSelector()}
-        {this.renderDeployControls()}
+        {(only !== "deploy") ? this.renderTargetSelector() : null}
+        {(only !== "selector") ? this.renderDeployControls() : null}
       </React.Fragment>
     )
 

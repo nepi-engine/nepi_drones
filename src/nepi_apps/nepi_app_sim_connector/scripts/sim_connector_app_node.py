@@ -47,6 +47,16 @@
 #          topic_name distinguishes multiple announced cameras; omitted means
 #          the currently active image topic. Only frames matching the active
 #          topic are decoded and republished -- nothing subscribes to the others.
+#   in  -- {"type":"goto_result","success":bool}
+#          Sent by a bridge once its own goto controller reports the current
+#          target reached (or definitively failed), asynchronously -- the
+#          fire-and-forget goto*Cb methods in device_if_sim.py return before
+#          any convergence is known, so this is the only path that ever sets
+#          cmd_success for a goto command. Applies to "whichever goto is most
+#          recently pending" (no per-command ID) since no bridge tracks more
+#          than one goto target at a time. Optional -- a bridge that never
+#          sends this simply leaves cmd_success untouched for goto commands,
+#          which is the same behavior as before this line existed.
 #
 #   out -- {"type":"motor_control","motor_ind":N,"speed_ratio":R}
 #   out -- {"type":"goto_position","x_meters":...,"y_meters":...,"z_meters":...,"yaw_deg":...}
@@ -196,23 +206,6 @@ TELEMETRY_AGE_IF_NEVER_CONNECTED = -1.0
 BRIDGE_RECV_BYTES = 4096
 
 STATUS_PUBLISH_RATE_HZ = 1.0
-
-# How long to wait between re-running the per-target dependency sweep while
-# any target is still 'unknown' (i.e. ssh could not reach the sim host) --
-# see refreshLauncherConfigCb. Deliberately slow: each sweep costs one ssh
-# per configured target, and the condition it recovers from (the VM or the
-# reverse tunnel not up yet when this app started) resolves on human
-# timescales, not sub-second ones. 60 s means a VM that comes up is usable
-# without touching the app, while an offline VM is probed once a minute
-# rather than once a second.
-UNREACHABLE_RECHECK_SEC = 60.0
-
-# How often to ask the sim host "is a gzserver already running?" while this
-# app has nothing of its own tracked as running -- see
-# detectExternalSimCb. One ssh per host per poll, and what it detects
-# (someone else's simulator) changes on human timescales, so this is
-# deliberately slow.
-EXTERNAL_SIM_DETECT_SEC = 20.0
 
 # Text that identifies launch_command's own "a gzserver is already running"
 # refuse-to-launch guard (both gazebo_rover and gazebo_quadcopter's
@@ -409,11 +402,6 @@ class NepiSimConnectorApp:
     # in the background regardless of which one (if any) is selected.
     self.launch_target_installed = {}
     self.launch_target_installed_check_state = {}
-    # Timestamp of the last dependency/reachability sweep, for the
-    # self-healing retry in refreshLauncherConfigCb. 0 = never swept.
-    self.last_installed_check_time = 0
-    # Timestamp of the last external-simulator probe (see detectExternalSimCb).
-    self.last_external_detect_time = 0
     launcher_config_path = find_config_path()
     if launcher_config_path:
       try:
@@ -469,21 +457,6 @@ class NepiSimConnectorApp:
     nepi_sdk.create_subscriber(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/upload_robot_config'),
         String, self.uploadRobotConfigCb, queue_size = 1)
-    # Inverse of upload_robot_config, same std_msgs/String shape both ways --
-    # "some viewer where they can see each config" plus "downloadable too" for
-    # the checked-in presets, not just the sample template
-    # (onDownloadSampleConfigClicked) the RUI already had. A request/response
-    # pair over plain String, not a new .srv/.msg field: this app's whole wire
-    # protocol convention already speaks YAML-as-a-string in this exact
-    # direction (upload), so the reverse direction reuses it rather than
-    # introducing an interfaces rebuild for what is fundamentally the same
-    # kind of data.
-    self.robot_config_yaml_pub = nepi_sdk.create_publisher(
-        nepi_sdk.create_namespace(self.node_namespace, 'sim/robot_config_yaml'),
-        String, queue_size = 1, latch = True)
-    nepi_sdk.create_subscriber(
-        nepi_sdk.create_namespace(self.node_namespace, 'sim/get_robot_config'),
-        String, self.getRobotConfigCb, queue_size = 1)
     # Latched, so a client that subscribes after startup still gets a real
     # report (available targets, "idle") instead of waiting for the first
     # launch/stop -- the same reasoning SimStatus's own latch already uses.
@@ -730,27 +703,6 @@ class NepiSimConnectorApp:
     self.msg_if.pub_info("Uploaded robot config '" + display_name + "', applying it now")
     self.setSelectedRobotConfig(UPLOADED_ROBOT_CONFIG_NAME)
 
-  def getRobotConfigCb(self, msg):
-    # config name in -> that entry's full YAML text out, on the latched
-    # sim/robot_config_yaml topic. Looks up self.robot_configs (the SAME live
-    # dict setSelectedRobotConfig reads -- checked-in presets from
-    # sim_connector_app_params.yaml plus any current upload_robot_config
-    # result), not the raw params file, so this always reflects what the app
-    # actually has right now.
-    name = str(msg.data)
-    entry = self.robot_configs.get(name)
-    if entry is None:
-      self.msg_if.pub_warn("Robot config '" + name + "' not found, cannot report its YAML")
-      return
-    # hidden_from_selector is this app's OWN routing detail (whether the RUI's
-    # selector offers it directly, vs. only reachable through a launch
-    # target's robot_config_overrides) -- not part of the robot's own
-    # description, so a downloaded/viewed config omits it rather than
-    # exporting an internal implementation flag as if it were a real field.
-    exportable = {k: v for k, v in entry.items() if k != 'hidden_from_selector'}
-    yaml_text = yaml.safe_dump(exportable, default_flow_style = False, sort_keys = False)
-    self.robot_config_yaml_pub.publish(String(data = yaml_text))
-
   #**********************
   # Simulator selector. Discovery is a timer scan of the live ROS graph, matched
   # on device type plus the device's own declared source description. Never a
@@ -791,23 +743,19 @@ class NepiSimConnectorApp:
       # Drop candidates whose status topic has gone away entirely, OR whose
       # status messages have gone stale.
       #
-      # The staleness half is not redundant with the vanished half -- without
-      # it the two form a self-sustaining loop that never releases a dead
-      # robot. A ROS topic exists in the master for as long as it has EITHER a
-      # publisher or a subscriber, so when a robot's node dies its status topic
-      # stays listed purely because THIS app is still subscribed to it. The
-      # scan above then keeps "finding" it, so `topic in found` stays true, so
-      # this loop never unregisters, so the topic never goes away: the app's
-      # own subscription is the only thing keeping it alive.
-      #
-      # That leaked out into the RUI, which builds its Devices -> Robots list
-      # from topic NAMES: a killed simulator's robot stayed listed forever,
-      # unselectable and uncontrollable, until the whole app restarted.
-      # Confirmed live 2026-08-12 -- after killing the sim, both the rbx node
-      # AND its discovery were gone, yet .../sim_rover1/rbx/status still
-      # listed with "Publishers: None" and this app as the sole subscriber
-      # (reported as "even after killing the quadcopter and gazebo,
-      # ardupilot_sitl still shows up in the devices -> robot section").
+      # The staleness half is NOT redundant with the vanished half -- without
+      # it this loop can never actually unregister anything. find_topics_by_msgs
+      # (used to build `found` above) counts a topic as present if it has
+      # EITHER a publisher or a subscriber, and the subscription THIS loop
+      # would need to drop is itself one of those subscribers -- so as long as
+      # we still hold it, `topic in found` stays true, so this loop never
+      # unregisters, so the topic never goes away: our own subscription is the
+      # only thing keeping a dead device's status topic visible in the ROS
+      # graph, which is exactly what the RUI's Devices page reads (it scans
+      # raw topic names via rosapi, not this app's own state) -- confirmed
+      # live: after killing a rover sim, both the RBX node and its discovery
+      # were gone, yet .../rbx/status still listed with "Publishers: None" and
+      # this app as the sole subscriber, and the RUI kept showing the device.
       #
       # SIM_DEVICE_STALE_SEC is the same threshold getAvailableSimulators
       # already uses to hide a stale device from the selector; this makes the
@@ -827,10 +775,6 @@ class NepiSimConnectorApp:
           sub.unregister()
         except Exception:
           pass
-        if stale:
-          self.msg_if.pub_info("Dropping stale simulator device " + topic +
-                               " (no status for " + str(SIM_DEVICE_STALE_SEC) + "s)",
-                               throttle_s = 60.0)
 
     # A selection that is no longer available falls back to no selection rather
     # than silently pointing at a device that is gone.
@@ -1254,26 +1198,14 @@ class NepiSimConnectorApp:
       self.launch_target_installed_check_state[target_key] = 'unknown'
 
   def startInstalledCheckAll(self):
-    # Runs at startup, on config reload, and from the unreachable-retry in
-    # refreshLauncherConfigCb -- NOT on the launcher_thread/launcher_lock
+    # Runs once at startup and once per config reload (see
+    # refreshLauncherConfigCb) -- NOT on the launcher_thread/launcher_lock
     # launch/stop/install share, since checking is a read-only, low-stakes
     # operation against every target and shouldn't be blocked by (or block)
     # an in-flight launch/stop/install of one specific target.
-    self.last_installed_check_time = nepi_utils.get_time()
     thread = threading.Thread(target = self.checkInstalledAllCb)
     thread.daemon = True
     thread.start()
-
-  def anyTargetUnreachable(self):
-    # True when at least one target's dependency state is 'unknown', which
-    # is_installed()/checkInstalledOne() use specifically to mean "ssh never
-    # reached the host" (as opposed to 'not_installed', a confirmed answer) --
-    # see SimulatorLauncher.is_installed's own docstring. An empty dict counts
-    # too: it means no sweep has ever produced a result.
-    if not self.launch_target_installed_check_state:
-      return True
-    return any(state == 'unknown'
-               for state in self.launch_target_installed_check_state.values())
 
   def checkInstalledAllCb(self):
     if self.launcher is None:
@@ -1402,13 +1334,9 @@ class NepiSimConnectorApp:
     self.sendLineToBridge({'type': 'camera_settings', 'view_mode': view_mode},
                           "Camera settings")
 
-  def setEnvironmentOption(self, option):
-    # The contract's environment control is a single option string today, not an
-    # (option, enabled) pair. Forwarded as an enable until that control's own
-    # on/off semantics are designed; the only real precedent (an obstacle-course
-    # toggle) is a one-way "turn this on".
+  def setEnvironmentOption(self, option, enabled = True):
     self.sendLineToBridge({'type': 'environment_option', 'option': option,
-                           'enabled': True}, "Environment option")
+                           'enabled': bool(enabled)}, "Environment option")
 
   def setActiveImageTopic(self, topic_name):
     self.active_image_topic = topic_name
@@ -1501,6 +1429,11 @@ class NepiSimConnectorApp:
       self.processEnvironmentOptionsLine(msg)
     elif msg_type == 'image':
       self.processImageLine(msg)
+    elif msg_type == 'goto_result':
+      # Async ack a bridge sends once its own goto controller reports the
+      # target reached (or failed) -- see device_if_sim.py's report_goto_result
+      # for why this is the only place cmd_success gets set for goto commands.
+      self.sim_if.report_goto_result(bool(msg.get('success', False)))
     else:
       # A line with no "type" key is telemetry -- the dispatch-by-key-presence
       # convention the existing bridge scripts already use. An unrecognized type
@@ -1621,74 +1554,6 @@ class NepiSimConnectorApp:
     if self.sim_if is not None:
       self.sim_if.publish_status()
     self.refreshLauncherConfigCb()
-    self.detectExternalSimCb()
-
-  def detectExternalSimCb(self):
-    """Notices a simulator running on the sim host that this app is not
-    tracking, and reports it as a gazebo_conflict so the RUI offers the
-    Launch New / Use Existing / Kill All Gazebo choice instead of a bare
-    Deploy button that could only fail.
-
-    The gap this closes: launch bookkeeping (launcher_state,
-    active_launch_target) lives only in this node's memory, so it resets
-    whenever the app node restarts -- an app restart, or a container restart
-    from nepicommit -- while the VM-side simulator keeps running untouched.
-    The app then reported 'idle' against a fully-running sim, and the only
-    way to find out was to click Deploy and watch it refuse. Reported live
-    2026-08-12: a Gazebo/SITL was up on the VM and the RUI showed no sign of
-    it and no way to kill it.
-
-    Reuses the existing 'gazebo_conflict' state deliberately rather than
-    adding a new one: that state already means "something is running that we
-    do not own, here are your options", and the RUI already renders exactly
-    the three buttons for it (including the Kill All Gazebo escape hatch),
-    so no SimLauncherStatus schema change or RUI rebuild is needed.
-
-    Only runs while genuinely idle -- never during launching/stopping/
-    installing (the launcher_lock holder is mid-operation and its own state
-    is authoritative), never while this app already tracks something running
-    (then the sim IS ours and Kill already works), and never once already in
-    gazebo_conflict (nothing to re-decide). That also keeps it from fighting
-    runStop/runLaunch over launcher_state."""
-    if self.launcher is None:
-      return
-    if self.launcher_state != 'idle' or self.active_launch_target:
-      return
-    if self.launcher_thread is not None and self.launcher_thread.is_alive():
-      return
-    if (nepi_utils.get_time() - self.last_external_detect_time) < EXTERNAL_SIM_DETECT_SEC:
-      return
-    self.last_external_detect_time = nepi_utils.get_time()
-    # Probed on a worker thread: this runs from the 1 Hz status tick, and an
-    # ssh to an unreachable host blocks for the connect timeout, which would
-    # stall status publication for every other consumer.
-    thread = threading.Thread(target = self.runExternalSimDetect)
-    thread.daemon = True
-    thread.start()
-
-  def runExternalSimDetect(self):
-    try:
-      detected = self.launcher.detect_running_gazebo()
-    except Exception as e:
-      self.msg_if.pub_warn("External simulator detection failed: " + str(e), throttle_s = 300.0)
-      return
-    if not detected:
-      return
-    # Re-check the guards: this ran on a worker thread, so a launch/stop may
-    # have started (and taken ownership of launcher_state) while the ssh was
-    # in flight.
-    if self.launcher_state != 'idle' or self.active_launch_target:
-      return
-    if self.launcher_thread is not None and self.launcher_thread.is_alive():
-      return
-    self.msg_if.pub_info("Detected a simulator already running on the sim host "
-                         "that this app did not launch", throttle_s = 300.0)
-    self.launcher_state = 'gazebo_conflict'
-    self.launcher_last_error = ("A Gazebo simulator is already running on the sim host, and this app "
-                                "is not tracking it (it was started outside this app, or before this "
-                                "app last restarted). Use Kill All Gazebo to clear it, Launch New to "
-                                "replace it, or Use Existing to connect to it as-is.")
-    self.publishLauncherStatus()
 
   def refreshLauncherConfigCb(self):
     # Picks up launch-target config changes (an edited file, or a file that
@@ -1722,23 +1587,6 @@ class NepiSimConnectorApp:
         # Targets may have been added/edited -- re-check all of them rather
         # than trying to diff what changed.
         self.startInstalledCheckAll()
-      elif self.anyTargetUnreachable():
-        # Self-heal the "app came up before the VM/tunnel did" case. The
-        # startup and config-reload sweeps above were the ONLY things that
-        # ever refreshed reachability, so a target that was unreachable at
-        # app start stayed 'unknown' indefinitely -- the app sat there
-        # believing the VM was unreachable even after it came back, and the
-        # operator had to restart the app (or touch the config) before a
-        # Deploy could work. Since 'unknown' specifically means "couldn't
-        # reach the host", retrying it on a slow cadence is exactly the
-        # recovery that was missing. Rate-limited because each sweep is one
-        # ssh per target: at 1 Hz (this callback's own rate, via
-        # statusPublishCb) an unthrottled retry would hammer the VM.
-        # Confirmed states settle to 'installed'/'not_installed' once the
-        # host answers, so this stops retrying on its own.
-        if (nepi_utils.get_time() - self.last_installed_check_time) >= UNREACHABLE_RECHECK_SEC:
-          self.msg_if.pub_info("Re-checking simulator host reachability", throttle_s = 300.0)
-          self.startInstalledCheckAll()
     except LauncherError as e:
       # throttle_s alone is correct here: pub_warn derives the throttle uid
       # itself from the caller's file/function/line, and takes no uid argument

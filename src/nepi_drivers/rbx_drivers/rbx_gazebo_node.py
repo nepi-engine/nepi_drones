@@ -83,7 +83,7 @@ from nepi_sdk import nepi_img
 from std_msgs.msg import UInt32, String
 from sensor_msgs.msg import Image
 
-from nepi_interfaces.msg import AxisControls, ErrorBounds
+from nepi_interfaces.msg import AxisControls
 from geographic_msgs.msg import GeoPoint
 
 from nepi_api.device_if_rbx import RBXRobotIF
@@ -215,19 +215,6 @@ class GazeboNode:
   # maneuver complexity for non-holonomic ground vehicles in general -- is
   # deferred, not solved here.
   GOTO_CMD_TIMEOUT_SEC = 60
-
-  # RBXRobotIF.FACTORY_GOTO_MAX_ERROR_M is 2.0m -- sized for a GPS-guided
-  # drone/ArduPilot, the driver type this tolerance was originally written
-  # for. Confirmed live against a real Gazebo rover: a 2m goto_position call
-  # reported cmd_success=True and "Goto target reached" after the rover had
-  # only covered ~1m, since 2m of remaining distance error is still "within
-  # 2.0m" of the target. Tightened here rather than in the shared
-  # device_if_rbx.py default, which ArduPilot also uses and where 2.0m may be
-  # perfectly reasonable for GPS-scale positioning. 0.2m is comfortably above
-  # the small steady-state drift noise documented in sim_bridge_node.py's
-  # holdStill() (residual wheel-friction creep, sub-centimeter per tick) while
-  # still being a real local-positioning tolerance for a room-scale rover.
-  GOTO_MAX_ERROR_M = 0.2
 
   #######################
   ### Node Initialization
@@ -399,16 +386,6 @@ class GazeboNode:
     ## persisted config on every startup, for deterministic per-instance behavior.
     self.rbx_if.setImageTopicCb(String(data = self.image_topic_name))
 
-    ## Tighten the goto-arrival distance tolerance for this rover -- see
-    ## GOTO_MAX_ERROR_M above. Rotation tolerance and stabilize time are left
-    ## at RBXRobotIF's own factory defaults (read back rather than
-    ## duplicated here, so this stays correct if those defaults ever change).
-    error_bounds = ErrorBounds()
-    error_bounds.max_distance_error_m = self.GOTO_MAX_ERROR_M
-    error_bounds.max_rotation_error_deg = self.rbx_if.node_if.get_param('max_error_deg')
-    error_bounds.min_stabilize_time_s = self.rbx_if.node_if.get_param('stabilized_sec')
-    self.rbx_if.setErrorBoundsCb(error_bounds)
-
     ## Start the closed-loop goto controller
     controller_interval = float(1) / self.CONTROLLER_RATE_HZ
     nepi_sdk.start_timer_process(controller_interval, self.gotoControlCb)
@@ -419,46 +396,14 @@ class GazeboNode:
     nepi_sdk.spin()
 
 
-  #**********************
-  # Two-camera reporting
-
-  def get_sensor_topics(self):
-    """Returns this driver's two named camera entries as typed topic pairs.
-
-    Both cameras surface through the same generic sensor-topic mechanism, as the
-    two named entries scene_camera and robot_camera. Which one is streaming is
-    the camera_view_mode setting, not a separate mechanism.
-
-    Returns:
-        list: [(topic_name, msg_type), ...] with exactly two entries, both
-            'sensor_msgs/Image'.
-    """
-    return list(self.sensor_topics)
-
-  def get_camera_reference_frames(self):
-    """Returns each camera's reference frame and default pose.
-
-    Declarative for this pass: reported, not commandable. No wire shape for live
-    camera pose adjustment is defined until the generic contract's camera control
-    surface is settled.
-
-    Returns:
-        dict: Per-camera dicts with 'reference_frame', 'offset_m', and
-            'tilt_deg'. robot_camera is coincident with the robot's main
-            reference frame; scene_camera carries a default offset from it.
-    """
-    return {
-      self.SCENE_CAMERA_NAME: {
-        'reference_frame': self.ROBOT_MAIN_REFERENCE_FRAME,
-        'offset_m': list(self.SCENE_CAMERA_DEFAULT_OFFSET_M),
-        'tilt_deg': self.SCENE_CAMERA_DEFAULT_TILT_DEG,
-      },
-      self.ROBOT_CAMERA_NAME: {
-        'reference_frame': self.ROBOT_MAIN_REFERENCE_FRAME,
-        'offset_m': [0.0, 0.0, 0.0],
-        'tilt_deg': 0.0,
-      },
-    }
+  # Note: this driver's two-camera reporting (get_sensor_topics()/
+  # get_camera_reference_frames()) was removed 2026-08-17 -- dead code, never
+  # called or wired into the RBXRobotIF constructor above, since RBXRobotIF has
+  # no available_sensor_topics mechanism to call it through. The real two-camera
+  # support lives in the generic sim_connector/SimDeviceIF path instead (see
+  # sim_container/bridges/gazebo/sim_connector_bridge_gazebo.py), which this
+  # driver is superseded by for Gazebo. See docs/SIM_CONNECTOR_REMAINING_WORK.md
+  # for the open decision on whether to retire this driver entirely.
 
 
   #**********************

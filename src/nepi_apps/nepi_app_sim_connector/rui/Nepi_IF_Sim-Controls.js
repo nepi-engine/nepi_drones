@@ -101,6 +101,12 @@ class NepiIFSimControls extends Component {
       // Selections held locally so a dropdown reflects the click immediately.
       selected_environment_option: 'None',
 
+      // Per-option on/off state, held locally since SimStatus doesn't report
+      // which environment options are currently active server-side. Resets to
+      // "all off" on page reload -- a known limitation, not a synced source of
+      // truth. See docs/SIM_CONNECTOR_REMAINING_WORK.md if this needs fixing.
+      environment_option_enabled: {},
+
       // Live control of the RBX driver's own Settings (camera_offset_x/y/z,
       // scene_offset_x/y/z, camera_view_mode) used to be rendered HERE, bypassing
       // the capabilities-driven controls above and publishing straight to
@@ -146,6 +152,7 @@ class NepiIFSimControls extends Component {
     this.renderRobotCapabilityControls = this.renderRobotCapabilityControls.bind(this)
     this.renderImageSourceCuration = this.renderImageSourceCuration.bind(this)
     this.renderEnvironmentControls = this.renderEnvironmentControls.bind(this)
+    this.toggleEnvironmentOption = this.toggleEnvironmentOption.bind(this)
     this.renderControls = this.renderControls.bind(this)
   }
 
@@ -906,6 +913,25 @@ class NepiIFSimControls extends Component {
     )
   }
 
+  // Sends a real (option, enabled) pair, JSON-encoded onto the existing
+  // std_msgs/String topic -- see device_if_sim.py's setEnvironmentOptionCb for
+  // the matching decode side. Flips local toggle state optimistically; there is
+  // no status field reporting real server-side on/off state to reconcile against.
+  toggleEnvironmentOption(option) {
+    const namespace = this.props.namespace
+    const { sendStringMsg } = this.props.ros
+    const current = this.state.environment_option_enabled[option] === true
+    const next = !current
+    sendStringMsg(namespace + "/set_environment_option",
+      JSON.stringify({ option: option, enabled: next }))
+    this.setState({
+      environment_option_enabled: {
+        ...this.state.environment_option_enabled,
+        [option]: next
+      }
+    })
+  }
+
   // Environment toggles, one per reported environment option. The reported list
   // is what makes this generalize past any one hardcoded option.
   renderEnvironmentControls() {
@@ -919,9 +945,6 @@ class NepiIFSimControls extends Component {
       return null
     }
 
-    const namespace = this.props.namespace
-    const { sendStringMsg } = this.props.ros
-
     return (
       <React.Fragment>
 
@@ -930,12 +953,16 @@ class NepiIFSimControls extends Component {
         <Label title={"Environment"} labelStyle={{ fontWeight: 'bold' }}/>
 
         <ButtonMenu>
-          {options.map((option) => (
-            <Button
-              key={option}
-              onClick={() => sendStringMsg(namespace + "/set_environment_option", option)}
-            >{option}</Button>
-          ))}
+          {options.map((option) => {
+            const isOn = this.state.environment_option_enabled[option] === true
+            return (
+              <Button
+                key={option}
+                style={isOn ? { fontWeight: 'bold', textDecoration: 'underline' } : {}}
+                onClick={() => this.toggleEnvironmentOption(option)}
+              >{option + (isOn ? " (on)" : " (off)")}</Button>
+            )
+          })}
         </ButtonMenu>
 
       </React.Fragment>

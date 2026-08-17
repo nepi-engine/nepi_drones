@@ -229,6 +229,8 @@ class GazeboSimConnectorBridge:
           with self.goto_lock:
             self.goto_target = None
           rospy.loginfo("sim_connector_bridge_gazebo: goto target reached")
+          if self.sock is not None:
+            self.sendLine(self.sock, {"type": "goto_result", "success": True})
     elif any(motor_ratios):
       left, right = motor_ratios[0], motor_ratios[1]
       lin = (left + right) / 2.0 * MOTOR_MAX_LINEAR_MPS
@@ -370,8 +372,8 @@ class GazeboSimConnectorBridge:
       self.view_mode = msg.get("view_mode", FACTORY_VIEW_MODE)
       rospy.loginfo("sim_connector_bridge_gazebo: view mode set to %s", self.view_mode)
     elif msg_type == "environment_option":
-      if msg.get("option") == "obstacle_course" and msg.get("enabled", True):
-        self.setObstacleCourse(True)
+      if msg.get("option") == "obstacle_course":
+        self.setObstacleCourse(bool(msg.get("enabled", True)))
     elif msg_type == "robot_config":
       rospy.loginfo("sim_connector_bridge_gazebo: robot_config selected: %s", msg.get("config"))
     else:

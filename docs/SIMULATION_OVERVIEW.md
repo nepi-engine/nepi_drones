@@ -333,21 +333,25 @@ this. Documented in `src/nepi_drivers/CLAUDE.md`'s Known Constraints.
 
 ### C. Planning docs (historical context, not current-state truth)
 
-#### 14. `sim_container/ROVER_GAZEBO_BRIDGE_IMPL_PLAN.md` (renamed 2026-08-05 from `UNIVERSAL_SIMULATOR_IMPL_PLAN.md` — despite the old name, always specific to the rover bridge, never the vehicle-agnostic contract `docs/SIMULATION_INTERFACE_SPEC.md` now owns)
-The original 5-phase plan for the rover simulator effort. Contains a notable
-self-correction: the first draft assumed NEPI and the simulator share one ROS master
-over LAN; the real environment turned out to be two fully separate machines connected
-only by a raw-TCP reverse SSH tunnel, which is why the custom bridge exists at all. The
-code samples in this doc are early drafts — the actual built code diverged
-substantially (bridge protocol, camera relay, multi-robot slots, threading details).
-Treat it as intent/history, not documentation of what's actually running.
+#### 14. Original rover Gazebo bridge implementation plan (now removed)
+An earlier, now-removed doc (at one point renamed from `UNIVERSAL_SIMULATOR_IMPL_PLAN.md`
+to `ROVER_GAZEBO_BRIDGE_IMPL_PLAN.md`, since despite the old name it was always specific
+to the rover bridge, never the vehicle-agnostic contract `docs/SIM_DEVICE_IF_CONTRACT.md`
+now owns) held the original 5-phase plan for the rover simulator effort. It contained a
+notable self-correction: the first draft assumed NEPI and the simulator share one ROS
+master over LAN; the real environment turned out to be two fully separate machines
+connected only by a raw-TCP reverse SSH tunnel, which is why the custom bridge exists at
+all. Its code samples were early drafts — the actual built code diverged substantially
+(bridge protocol, camera relay, multi-robot slots, threading details) — so it was removed
+rather than kept as a stale reference once `SIMULATION_OVERVIEW.md` (this document) and
+`docs/SIM_DEVICE_IF_CONTRACT.md` fully superseded it.
 
-#### 15. `docs/SIMULATOR_DEV_GUIDE.md`
-An earlier, ArduPilot-only task guide (predates the rover work entirely) covering the
-original mavros/RBX hookup, autonomous flight through the RUI, and motor controls. It
-explicitly scoped out cameras ("no cameras, no lights") — that scope note is now
-superseded by this week's camera-rig work. Doesn't cover the rover/`sim_container` side
-at all.
+#### 15. Earlier ArduPilot-only task guide (now removed)
+An earlier, now-removed ArduPilot-only task guide (predated the rover work entirely)
+covered the original mavros/RBX hookup, autonomous flight through the RUI, and motor
+controls. It explicitly scoped out cameras ("no cameras, no lights") — a scope note
+superseded by this week's camera-rig work. It never covered the rover/`sim_container`
+side at all.
 
 ---
 

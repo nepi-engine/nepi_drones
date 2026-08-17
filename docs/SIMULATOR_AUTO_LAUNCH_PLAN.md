@@ -6,7 +6,7 @@ request; check items off in place as each is done.
 ## 0. What this adds, and why it's additive
 
 Today `nepi_app_sim_connector` is deliberately **passive**: per
-`SIMULATION_INTERFACE_SPEC.md`'s stated convention (restated in
+`SIM_DEVICE_IF_CONTRACT.md`'s stated convention (restated in
 `MULTI_SIMULATOR_INTEGRATION_PLAN.md`'s deferred-scope section), a new
 simulator is only ever a new bridge script + a new `robot_configs` entry —
 never a change to `device_if_sim.py`'s core contract. You start the

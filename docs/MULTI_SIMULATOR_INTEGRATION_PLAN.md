@@ -2,48 +2,29 @@
 
 Phased, testable plan to plug five more simulators into NEPI's generic simulator contract
 (`nepi_app_sim_connector`), one at a time, each fully installed/tested/debugged before moving
-to the next. Same Phase/Step/"Done when" format as `SIMULATION_INTERFACE_SPEC.md` and
-`FORWARD_PLAN.md`.
+to the next. See `SIM_DEVICE_IF_CONTRACT.md` for the contract itself (data flow, capability
+fields, the two-camera convention) — this document is the phased build/status log, not the
+contract reference.
 
 All work happens in `nepi_drones` (this repo), not the main `nepi_engine_ws` submodules — see
-`FORWARD_PLAN.md`/`SIMULATION_OVERVIEW.md` for why. Environment: the dev VM (`suraj-vm`), the
+`SIMULATION_OVERVIEW.md` for why. Environment: the dev VM (`suraj-vm`), the
 same one running the existing Gazebo/SITL work — see resource inventory below.
 
 ---
 
 ## 0. Correcting a premise before planning against it
 
-The request that motivated this doc assumed "we're right now only testing with Gazebo," with
-the implication that Gazebo already flows through the generic multi-simulator abstraction. On
-inspection that's not quite the current state, and it changes what Phase 1 actually is:
-
-- **`nepi_app_sim_connector`** (`api/device_if_sim.py` + `scripts/sim_connector_app_node.py`) —
-  the genuinely simulator-agnostic contract — is real and well-designed: one well-known TCP
-  port (9030 factory default), a documented newline-delimited-JSON wire protocol, and
-  capability flags derived from a `SIM_VEHICLE_DICT` robot-config profile. **But it has never
-  been connected to a real simulator.** It has only ever been exercised by
-  `test_device_if_sim_harness.py` (mocked lambda callbacks, no bridge socket at all) and
-  `demo_bridge_client.py` (a synthetic client with circular-motion fake telemetry, explicitly
-  documented as "NOT a real simulator integration").
-- The Gazebo integration that *is* real and working today (the rover + the ArduPilot SITL
-  drone, per `SIMULATION_OVERVIEW.md`) uses a **different, older path**: the `RBX_SIM` /
-  `RBX_ARDUPILOT` drivers built directly on `RBXRobotIF` (`device_if_rbx.py`), with their own
-  bespoke TCP/JSON bridge (`sim_bridge_node.py`) — not `SimDeviceIF`/`sim_connector_app_node.py`
-  at all.
-
-So the real starting line is: **zero simulators, including Gazebo, are currently wired into the
-new generic abstraction.** Phase 1 below is therefore "get Gazebo talking to
-`sim_connector_app_node.py`'s protocol" — writing a `sim_connector`-flavored bridge script that
-reuses everything already learned from `sim_bridge_node.py`/`camera_rig_controller.py`, rather
-than skipping straight to Webots. This also means Phase 1 doubles as the shakedown for the
-*process* every later simulator repeats, and is the cheapest phase to validate against (Gazebo
-is already installed, already scripted, already has a known-good rover model).
+**Done — see `completed/GAZEBO_SIM_CONNECTOR_INTEGRATION.md`.** That doc covers the
+premise-correction (Gazebo was not actually wired into the generic `sim_connector`
+contract when this plan started, despite an initial assumption that it was) and the full
+Phase 1 writeup. Kept here only as a pointer since Phases 2-6 below build on the same
+"one phase per simulator" process that Phase 1 established.
 
 ---
 
 ## 1. Blocking issue, now resolved: the NavPose "hang"
 
-`docs/SIM_CONNECTOR_NAVPOSE_HANG_BUG.md` originally documented an open, 100%-reproducible hang
+`docs/completed/SIM_CONNECTOR_NAVPOSE_HANG_BUG.md` originally documented an open, 100%-reproducible hang
 inside `NPXDeviceIF` → `NavPoseIF` → `NodeServicesIF`. Investigated 2026-08-07 from two
 directions at once (see that doc's full write-up, including its addendum) with a reconciled
 answer:
@@ -82,7 +63,7 @@ before proceeding on its own — annoying, not fatal, but seed the params and av
    addendum.
 2. ~~Root-cause it~~ — done (missing-param `wait_for_param` block, not a `NodeServicesIF`
    defect).
-3. ~~Document the finding~~ — done, in `SIM_CONNECTOR_NAVPOSE_HANG_BUG.md`.
+3. ~~Document the finding~~ — done, in `completed/SIM_CONNECTOR_NAVPOSE_HANG_BUG.md`.
 4. **Get `sim_connector_app_node.py` to a confirmed-running state** on the VM, listening on its
    factory port, with `demo_bridge_client.py` able to connect and see `bridge_connected: true`
    in `sim/status` — this is the baseline every later phase's "point a real bridge at it" step
@@ -191,118 +172,11 @@ avoiding collision with the existing one:
 
 ## 4. Phase 1 — Gazebo → the new `sim_connector` contract
 
-**Goal:** the existing rover (already modeled, already working end-to-end via the *old*
-RBX_SIM path) speaks to `sim_connector_app_node.py` instead, proving the new generic contract
-against a known-good simulator before trying an unfamiliar one.
-
-1. **Install/standalone check:** already done — `gazebo`/`gzserver` present, `generic_rover.world`
-   already proven. Just relaunch `sim_rover_gazebo` and confirm the rover still drives via the
-   existing `rostopic pub .../rover/cmd_vel` path. *Done when:* rover visibly moves in the
-   Gazebo GUI.
-2. **New bridge script**, `sim_container/bridges/gazebo/sim_connector_bridge_gazebo.py`: a ROS
-   node (Gazebo's interface is ROS-native here, unlike the "prefer zero-ROS" default) that:
-   - Subscribes to `/rover/odom` (already published by `libgazebo_ros_diff_drive.so`) and
-     reformats it into the bare-telemetry JSON line (`x_m`, `y_m`, `yaw_deg`, velocities) the
-     new protocol expects — this is a reformatting layer over what `sim_bridge_node.py` already
-     computes, not new physics/math.
-   - Announces `sensor_topics` for the rover's existing camera (`rover/camera/image_raw`).
-   - Receives `motor_control`/`goto_position`/`go_home`/`go_stop`/`setup_action` lines and
-     translates them into the same `cmd_vel` + goto-controller logic
-     `rbx_sim_node.py` already implements (reuse that controller's math directly — don't
-     re-derive the proportional-gain turn/drive/turn controller from scratch).
-   - Relays camera frames the same way `camera_rig_controller.py` already does (base64 JPEG).
-   - Dials `127.0.0.1:9030` as a TCP client (matches the "app owns the listen socket" design).
-3. **Robot config:** add `gazebo_rover_2_wheel` to `SIM_VEHICLE_DICT` mirroring the existing
-   RBX_SIM capability set (wheel_count=2, `has_goto_position=True`, no `goto_location`, no
-   `goto_pose` — matches `rbx_sim_node.py`'s actual capabilities today).
-4. **Full functional test:** goto commands through `sim_connector_app_node.py` drive the same
-   rover the old path already proved; camera feed viewable; `RESET_SIM`-equivalent setup action
-   works.
-5. **A/B sanity check specific to this phase:** since the *old* RBX_SIM path and the *new*
-   sim-connector path can both technically point at the same running Gazebo instance, make sure
-   we're not accidentally running both against the same `cmd_vel` topic at once (they'd fight
-   each other). Run only one at a time during testing, and note this collision risk in the
-   phase's write-up.
-6. **Document + clean up** per the playbook.
-
-*Done when:* the RUI's sim-connector app page shows a live, driveable, camera-equipped rover,
-sourced entirely through `SimDeviceIF`/`sim_connector_app_node.py`, with the NavPose hang bug
-(§1) confirmed resolved or confirmed non-reproducing in this path.
-
-### Phase 1 — Completed 2026-08-07 (VM-side; RUI/on-device confirmation still open)
-
-Built `sim_container/bridges/gazebo/sim_connector_bridge_gazebo.py` — a plain ROS node, zero
-`nepi_sdk` dependency, that dials `sim_connector_app_node.py`'s TCP port and speaks its exact
-wire protocol. Reused `rbx_sim_node.py`'s proven closed-loop goto controller math (proportional
-gains, turn-in-place gate) and `sim_bridge_node.py`'s obstacle-course spawn/delete pattern
-rather than re-deriving either. No changes needed to `SIM_VEHICLE_DICT` —
-`ground_robot_2_wheel`, already present in `sim_connector_app_params.yaml`, matched this
-rover's real capabilities exactly (2 wheels/2 motors, `goto_position` only, two cameras,
-environment control).
-
-Verified end to end against the real `sim_connector_app_node.py` (not the mock harness) on an
-isolated test roscore, with the rover Gazebo world running standalone first as a smoke test:
-
-- `bridge_connected: True`, `telemetry_age_sec` sub-100ms, live the whole session.
-- `available_sensor_topics` announced both cameras (`gazebo_rover/robot_camera`,
-  `gazebo_rover/scene_camera`); `capabilities_query` after selecting `ground_robot_2_wheel`
-  matched the config exactly (`has_camera: True`, `wheel_count: 2`, `has_goto_position: True`,
-  `has_goto_pose/location: False`, etc.) — confirmed the flags aren't just a static echo of the
-  YAML but the real derived report.
-- A `goto_position(x=2.0)` command sent through `sim_connector_app_node.py`'s ROS topic drove
-  the rover from `x≈0.05` to `x≈1.76` in Gazebo, and the bridge logged "goto target reached" —
-  proof the full path (RUI-equivalent command → app node → bridge → controller → real physics)
-  works, not just the wire protocol in isolation.
-- `set_camera_view_mode(SCENE_CAMERA)` correctly switched which camera's frames the bridge
-  relays; images visibly flowed on the app's republished `color_2d_image` topic (confirmed via
-  `rostopic hz`, ~15Hz — see note below).
-- `RESET`/`RETURN_HOME` setup actions and the `obstacle_course` environment option are wired
-  (reusing the existing Gazebo services/model) but not individually re-verified this pass —
-  worth a quick check before calling Phase 1 fully closed.
-
-**Known minor issue, not blocking:** the image relay ran at ~15Hz against an intended 5Hz cap
-(`IMAGE_RATE_HZ` in the bridge script) — functionally fine for this proof, but the rate-limit
-logic should be re-checked before treating bandwidth as tuned.
-
-**Setup notes for repeating this on a bare test roscore** (needed again for every later phase):
-1. `sim_connector_app_node.py` imports `nepi_api.device_if_sim`, which only exists there via
-   the app's own `CMakeLists.txt` install rule on a real build — a bare devel-space catkin
-   workspace doesn't have it. Symlinking `nepi_app_sim_connector/api/{device_if_sim,
-   messages_if}.py` directly into the workspace's `nepi_api` source package reproduces that
-   install-time override locally (this is what was done in `~/sim_connector_test_ws`).
-2. `apps_mgr` normally loads every top-level key of `sim_connector_app_params.yaml` onto the
-   app's own param namespace before launch — bypassing that (running the script directly)
-   leaves `robot_configs` at just the capability-empty `default` entry. Load it explicitly first:
-   `rosparam load sim_connector_app_params.yaml /nepi/device1/app_sim_connector`.
-3. Seed `debug_mode`/`user_folders` per §1 before launching.
-4. Launch with `python3 -u` (or `PYTHONUNBUFFERED=1`) and verify state via `rosservice call .../capabilities_query` / `rostopic echo .../sim/status`, not by grepping a redirected log — see
-   `SIM_CONNECTOR_NAVPOSE_HANG_BUG.md`'s "How to test NEPI nodes correctly" section.
-
-**Real-device confirmation — completed 2026-08-07.** The device came back up mid-session (the
-other concurrent session's own reboot); `app_sim_connector` was already running there (launched
-directly via `rosrun`, same as this plan's own VM testing convention, so it had only the
-capability-empty `default` config — not a defect, the same setup note documented above applies
-equally on-device). Confirmed **direct network connectivity works with no SSH tunnel needed**
-(`cat < /dev/null > /dev/tcp/nepi/9030` succeeds) — the VM and device share a LAN, so a bridge
-script can dial `--host nepi --port 9030` directly. Loaded `SIM_VEHICLE_DICT` onto the device's
-param server and restarted `app_sim_connector` there (coordinated with the user first, since
-another session had a live connection to it) — restarted cleanly in seconds, `NavPoseIF`
-included, consistent with §1's finding that nothing is actually broken once params exist.
-Reconnected `sim_connector_bridge_gazebo.py` from the VM straight to the real device and
-repeated the full Phase 1 verification against it: `bridge_connected: True`, `capabilities_query`
-after selecting `ground_robot_2_wheel` matched exactly, and `goto_position(x=2.0)` moved the
-real device's tracked position from `x≈0.12` to `x≈1.82`, with the camera feed flowing on the
-device's actual `color_2d_image` topic at ~3.5-3.9Hz (slightly under the VM-only tests' 5Hz,
-consistent with real network latency over an actual LAN hop rather than localhost). Restored the
-device's robot-config selection to `default` afterward. **The only remaining piece is someone
-with a browser on the same network actually loading the RUI page**
-(`http://192.168.179.103:5003` from this VM's vantage point — the device has several other
-interface IPs too, see `hostname -I`) and eyeballing that the capability-driven controls render
-— everything the RUI reads to do that is now confirmed live and correct; this agent has no
-browser/screenshot capability to complete that last visual step itself.
-
-The two setup-action/obstacle-course re-checks noted in Phase 1's original write-up above are
-still open.
+**Completed — see `completed/GAZEBO_SIM_CONNECTOR_INTEGRATION.md`** for the full goal,
+what was built (`sim_container/bridges/gazebo/sim_connector_bridge_gazebo.py`),
+verification detail (including real-device confirmation), and what's still open from
+this phase (a human visually confirming the RUI page, two individual re-checks, one
+minor rate-limit bug) — the last two are tracked in `SIM_CONNECTOR_REMAINING_WORK.md`.
 
 ---
 
@@ -722,8 +596,8 @@ so a future session doesn't have to re-derive it from git history.
 
 | Phase | Simulator | Status | Notes |
 |---|---|---|---|
-| 0 | NavPose hang bug | **Resolved 2026-08-07** | Not a real bug — missing-param `wait_for_param` block in bare test roscores only; see `SIM_CONNECTOR_NAVPOSE_HANG_BUG.md` addendum. Seed `debug_mode`/`user_folders` params before bridge testing |
-| 1 | Gazebo (new contract) | **Fully done 2026-08-07, incl. real device** | `sim_container/bridges/gazebo/sim_connector_bridge_gazebo.py`; reused `ground_robot_2_wheel` config as-is. Confirmed live against the real device over direct LAN (no tunnel needed); only a human visually loading the RUI page remains |
+| 0 | NavPose hang bug | **Resolved 2026-08-07** | Not a real bug — missing-param `wait_for_param` block in bare test roscores only; see `completed/SIM_CONNECTOR_NAVPOSE_HANG_BUG.md` addendum. Seed `debug_mode`/`user_folders` params before bridge testing |
+| 1 | Gazebo (new contract) | **Fully done 2026-08-07, incl. real device** | See `completed/GAZEBO_SIM_CONNECTOR_INTEGRATION.md` for full detail; only a human visually loading the RUI page remains, tracked in `SIM_CONNECTOR_REMAINING_WORK.md` |
 | 2 | Webots | **VM-side done 2026-08-07** | R2023a (R2025a needs glibc ≥2.34, incompatible with this VM). Native Controller API, zero ROS. RUI/on-device confirmation still open |
 | 3 | ROS Stage | **VM-side done 2026-08-07** | ROS-native bridge (correctly, not a fallback). Found: Stage needs continuous cmd_vel, unlike Gazebo's latching plugin. RUI/on-device confirmation still open |
 | 4 | PyBullet | **VM-side done 2026-08-07** | Fully ROS-free on the sim side; RESET actually works (no Supervisor restriction, unlike Webots). RUI/on-device confirmation still open |
@@ -737,9 +611,9 @@ so a future session doesn't have to re-derive it from git history.
 - Multi-robot variants for any of the new simulators (Gazebo already has one; the others get a
   single-vehicle proof first).
 - Any change to `device_if_sim.py`, `sim_connector_app_node.py`, or the RUI components — per
-  `SIMULATION_INTERFACE_SPEC.md`'s stated convention, a new simulator is only ever a new bridge
+  `SIM_DEVICE_IF_CONTRACT.md`'s stated convention, a new simulator is only ever a new bridge
   script + a new `robot_configs` entry, never a core-contract change. If a phase in this plan
   discovers the contract genuinely can't express something a simulator needs, stop and write up
   the gap rather than patching the shared interface unilaterally.
 - Real hardware / non-simulator targets for any of these toolchains (e.g. a physical FRC
-  RoboRIO) — explicitly out of scope, matching `SIMULATION_INTERFACE_SPEC.md`'s own scope note.
+  RoboRIO) — explicitly out of scope, matching `SIM_DEVICE_IF_CONTRACT.md`'s own scope note.

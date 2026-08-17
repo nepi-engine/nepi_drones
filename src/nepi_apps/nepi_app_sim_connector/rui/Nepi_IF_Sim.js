@@ -567,14 +567,19 @@ class NepiIFSim extends Component {
           <React.Fragment>
             {/* NepiIFSimLauncher's own target selector IS the Simulator
                 selector for this whole panel -- it already lists every real
-                option (Gazebo/Webots/Stage/PyBullet/WPILib). Placed FIRST:
-                choosing which simulator to deploy is the first decision in
-                the flow (simulator -> robot config -> deploy), not something
-                that belongs under Robot Config. This component used to
-                render a SECOND "Simulator" selector here, backed by
-                available_simulators/select_simulator (live discovery of
-                OTHER NEPI devices that declare themselves simulators -- see
-                getAvailableSimulators/simDiscoveryCb in
+                option (Gazebo/Webots/Stage/PyBullet/WPILib). Placed FIRST,
+                alone: choosing which simulator to deploy is the first
+                decision in the flow (simulator -> robot config -> deploy),
+                so only the selector half of NepiIFSimLauncher renders here
+                (only="selector") -- its Deploy/Kill/Install controls are
+                intentionally moved below Robot Config + the capability
+                controls (see NepiIFSimLauncher only="deploy" near the
+                bottom), so Deploy isn't the first/most prominent thing on
+                the page ahead of picking a real robot config. This
+                component used to render a SECOND "Simulator" selector here,
+                backed by available_simulators/select_simulator (live
+                discovery of OTHER NEPI devices that declare themselves
+                simulators -- see getAvailableSimulators/simDiscoveryCb in
                 sim_connector_app_node.py, a deliberately different axis from
                 this SSH launch-target list). That mechanism stays intact
                 server-side for a possible future use, but nothing on this
@@ -583,13 +588,11 @@ class NepiIFSim extends Component {
                 fields stacked on top of each other -- removed rather than
                 merged, since the two lists mean genuinely different things
                 (already-connected device vs. launch-this-on-the-VM) and
-                forcing them into one dropdown would misrepresent both.
-                make_section={false} is NepiIFSimLauncher's own default now,
-                named explicitly here since this IS the one place it's meant
-                to render. */}
+                forcing them into one dropdown would misrepresent both. */}
             <NepiIFSimLauncher
               namespace={namespace}
               make_section={false}
+              only={"selector"}
             />
             {this.renderRobotConfigSelector()}
             {this.renderRobotConfigUpload()}
@@ -605,6 +608,18 @@ class NepiIFSim extends Component {
           <NepiIFSimControls
             namespace={namespace}
             make_section={false}
+          />
+        : null}
+
+        {/* Deploy/Kill/Install controls -- deliberately last on the page.
+            Picking WHAT to run (the selector above) and configuring it
+            (robot config + capability controls above) both come before
+            actually launching it. */}
+        {(show_selectors === true) ?
+          <NepiIFSimLauncher
+            namespace={namespace}
+            make_section={false}
+            only={"deploy"}
           />
         : null}
 

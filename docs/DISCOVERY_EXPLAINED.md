@@ -1,10 +1,10 @@
 # How NEPI Driver Discovery Works (ArduPilot RBX)
 
-Companion to `SITL_IMPLEMENTATION_PLAN.md`. This explains the mechanism that
-finds a flight controller, launches `mavros`, and launches the RBX node — both
-the generic NEPI drivers framework and the ArduPilot-specific discovery class.
-Read this to understand *why* the SITL change (a new `connection` branch) is all
-that's needed, and to debug discovery when a device does not appear.
+This explains the mechanism that finds a flight controller, launches `mavros`,
+and launches the RBX node — both the generic NEPI drivers framework and the
+ArduPilot-specific discovery class. Read this to understand *why* ArduPilot
+SITL support needed only a new `connection` branch (see the appendix), and to
+debug discovery when a device does not appear.
 
 All paths are under `/home/production/nepi_engine_ws/src/`.
 
@@ -117,7 +117,7 @@ are what steer discovery. They are changed at runtime, not just from the YAML:
 - `updateSetting` builds a caps dict from the option's declared **`type`** and
   **`options`** list and calls `nepi_settings.check_valid_setting(...)`. **A new
   value is rejected unless it is one of the declared `options`.** This is exactly
-  why the SITL plan must add `SITL` to `connection.options` in the YAML — without
+  why `connection.options` in the YAML must list `SITL` explicitly — without
   it, selecting SITL fails validation and silently reverts to the default.
 - On a valid change it writes
   `drvs_dict[driver_name]['DISCOVERY_DICT']['OPTIONS'][name]['value']` and calls
@@ -133,7 +133,7 @@ method at line 77). One pass does four things in order:
 
 ### 3.1 Read options (lines 84-96)
 ```python
-connection_type = drv_dict['DISCOVERY_DICT']['OPTIONS']['connection']['value']   # SERIAL / TCP / UDP / (SITL)
+connection_type = drv_dict['DISCOVERY_DICT']['OPTIONS']['connection']['value']   # SERIAL / TCP / UDP / SITL
 fake_gps_val    = drv_dict['DISCOVERY_DICT']['OPTIONS']['fake_gps']['value']
 self.enable_fake_gps = (str(fake_gps_val).lower() == 'true')
 self.retry = retry_enabled
@@ -165,7 +165,8 @@ if connection_type == 'SERIAL':        # scan serial ports, probe for heartbeat
     ...
 elif connection_type == 'TCP' or connection_type == 'UDP':
     ...                                 # iterate ip/port lists, probe, launch
-# (SITL branch would be added here per the SITL plan)
+elif connection_type == 'SITL':        # see appendix: standing up ArduPilot SITL
+    ...
 ```
 
 **SERIAL path in detail** (lines 113-130), the production path today:
@@ -213,8 +214,8 @@ confirm a live autopilot without a heavyweight dependency. **For TCP/UDP/SITL
 there is no heartbeat sniff** — `checkForTcpDevice` (line 370) does a real socket
 `connect_ex` (so it only "finds" the device if the port is open), while
 `checkForUdpDevice` (line 400) always returns True (connectionless). This
-difference is the reason the SITL plan prefers the TCP-based probe: it gives
-correct start-ordering for free.
+difference is why the SITL connection uses the TCP-based probe (see appendix):
+it gives correct start-ordering for free.
 
 ### 4.2 `launchSerialDeviceNode` -> `launchDeviceNode` (lines 358-365, 212-293)
 `launchSerialDeviceNode` just builds the connection string and delegates:
@@ -297,9 +298,9 @@ class/instance attributes persist across passes and carry the loop's memory:
 
 ---
 
-## 6. Where each connection type diverges (map for the SITL work)
+## 6. Where each connection type diverges
 
-| Concern | SERIAL | TCP | UDP | SITL (proposed) |
+| Concern | SERIAL | TCP | UDP | SITL |
 |---|---|---|---|---|
 | Candidate enumeration | `get_serial_ports_list()` | `ip_addr_list` x `ip_tcp_port_list` | `ip_addr_list` x `ip_udp_port_list` | `sitl_addr_list` x `sitl_tcp_port_list` |
 | Reachability probe | MAVLink heartbeat sniff (`checkForSerialDevice`) | real `connect_ex` (`checkForTcpDevice`) | none, always True (`checkForUdpDevice`) | reuse `checkForTcpDevice` |
@@ -307,9 +308,9 @@ class/instance attributes persist across passes and carry the loop's memory:
 | Node id (`device_id_str`) | port basename (`ttyUSB0`) | IP+port flattened (`127001_5760`) | IP+port flattened | `sitl` -> `mavlink_sitl` |
 | Everything after | `launchDeviceNode` (shared) | same | same | same |
 
-The table makes the SITL plan's claim concrete: only the left three rows differ
-per connection type, and the entire bottom row (`launchDeviceNode` + the RBX
-node) is shared and unchanged.
+The table makes this concrete: only the left three rows differ per connection
+type, and the entire bottom row (`launchDeviceNode` + the RBX node) is shared
+and unchanged.
 
 ---
 
@@ -360,3 +361,111 @@ RX() { docker exec -i "$C" bash -c "export ROS_MASTER_URI=http://localhost:11311
 - RBX node consumes `DEVICE_DICT`: `rbx_drivers/rbx_ardupilot_node.py` lines 185-201
 - Serial enumeration: `nepi_sdk/src/nepi_sdk/nepi_serial.py` `get_serial_ports_list` line 56
 - Params/OPTIONS: `rbx_drivers/rbx_ardupilot_params.yaml`
+
+---
+
+## Appendix: Standing up ArduPilot SITL
+
+ArduPilot SITL is a normal MAVLink endpoint — the RBX driver's `SITL`
+connection branch (§6) points `mavros` at a locally-running ArduCopter SITL
+binary instead of a serial Pixhawk, reusing the same `launchDeviceNode` path
+as every other connection type. This appendix collects the operational
+knowledge for standing up and reasoning about that SITL instance: how to
+build/run it, why the connection is TCP rather than UDP, and the gotchas that
+bite if you deviate.
+
+### Building and running ArduCopter SITL
+
+SITL is plain ArduPilot, independent of NEPI. Because the NEPI container runs
+with `--net=host` (`nepi_setup/resources/docker/nepi_docker_start.sh` lines
+116-132), a `127.0.0.1`-bound SITL instance is reachable by `mavros` whether
+SITL runs on the host, in its own `--net=host` container, or inside the NEPI
+container itself. Running it on the host keeps the NEPI image clean.
+
+Build from source (one time):
+```bash
+git clone --recurse-submodules https://github.com/ArduPilot/ardupilot
+cd ardupilot
+Tools/environment_install/install-prereqs-ubuntu.sh -y
+. ~/.profile
+./waf configure --board sitl
+./waf copter          # builds ArduCopter SITL
+```
+
+Run it so mavros's TCP port stays free of contention:
+```bash
+# --no-mavproxy: do NOT start the MAVProxy GCS, so it doesn't consume TCP 5760.
+# mavros will be the sole MAVLink client on 5760.
+Tools/autotest/sim_vehicle.py -v ArduCopter --no-mavproxy
+```
+or run the binary directly (also leaves 5760 free, no MAVProxy at all):
+```bash
+build/sitl/bin/arducopter -S -I0 --model + --speedup 1 \
+    --defaults Tools/autotest/default_params/copter.parm
+```
+
+A prebuilt Docker image works the same way — run it with `--net=host` so it
+binds `127.0.0.1` on the shared network stack, and confirm the image exposes
+the TCP MAVLink server rather than hiding it behind MAVProxy.
+
+Quick reachability check (from the host or inside the NEPI container):
+```bash
+nc -z 127.0.0.1 5760 && echo open
+```
+and, from inside the running NEPI container specifically (name changes each
+restart):
+```bash
+C=$(docker ps --format '{{.Names}}' | head -1)
+docker exec -i "$C" bash -c 'timeout 2 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/5760" && echo REACHABLE || echo NOT-REACHABLE'
+```
+If this prints `REACHABLE`, `mavros` will connect on the next discovery pass;
+if not, SITL isn't running, isn't bound to `127.0.0.1`, or MAVProxy is holding
+the port.
+
+> The dev-VM two-machine simulator environment wraps this same SITL binary in
+> scripted helpers rather than the raw commands above — see
+> `SIMULATION_OVERVIEW.md` for the concrete, currently-running dev setup and
+> its port choices.
+
+### Why TCP, not UDP
+
+ArduPilot SITL exposes MAVLink on several endpoints; `mavros` can reach it
+either way, but the two options behave very differently under NEPI's
+polling-based discovery (§2, §4.1):
+
+| Option | `fcu_url` | Pros | Cons |
+|---|---|---|---|
+| **TCP to 5760** | `tcp://127.0.0.1:5760` | SITL's TCP server; `checkForTcpDevice()` does a real `connect_ex` probe, so `mavros` only launches once SITL is actually up. Clean retry if SITL starts after NEPI. | SITL must expose 5760 to `mavros` (don't let MAVProxy grab it — see Gotchas). |
+| UDP to 14550 | `udp://127.0.0.1:14550@` | Matches `sim_vehicle.py`'s default MAVProxy output. | `checkForUdpDevice()` always returns `True` with no probe, so `mavros` launches against a dead endpoint if SITL isn't running yet, then sits disconnected. Ordering-fragile. |
+
+TCP wins because the reachability probe gives correct start-ordering for free:
+NEPI can boot before or after SITL and self-heal on the 1 Hz discovery timer
+instead of racing it. This is also why the driver uses a dedicated `SITL`
+connection type rather than the generic `TCP` branch — it keeps the RUI
+dropdown self-documenting, avoids colliding with a future real networked
+flight controller, produces a clean node name (`mavlink_sitl`) instead of an
+IP-mangled one (`mavlink_127001_5760`), and lets the SITL branch force
+fake-GPS off unconditionally (see Gotchas).
+
+Note the direction: `mavros` is the TCP *client* and SITL is the TCP *server*
+— `tcp://host:port` (no trailing `@`) makes `mavros` dial out.
+
+### Gotchas
+
+- **MAVProxy port contention.** Only one MAVLink client can own SITL's TCP
+  port. `sim_vehicle.py` starts MAVProxy by default, which will grab the same
+  port `mavros` wants. Either start SITL with `--no-mavproxy` so `mavros` is
+  the sole client, or give MAVProxy a distinct `--out` port and point `mavros`
+  at that instead. Two clients fighting over the same port shows up as
+  connection churn (repeated connect/disconnect).
+- **fake GPS vs SITL GPS.** SITL simulates its own GPS and compass. Never run
+  the `nepi_app_fake_gps` app's injected `GPS_INPUT` at the same time — the two
+  position sources fight, producing EKF glitches and unreliable arming. The
+  `SITL` connection branch forces `fake_gps` off in `DEVICE_DICT` regardless of
+  the driver option's value, but the app itself should also be disabled at the
+  source for a clean test.
+- **The UDP probe is a trap for SITL.** `checkForUdpDevice()` (§4.1) never
+  actually probes the endpoint — it always returns `True`. A UDP-based SITL
+  connection would therefore launch `mavros` even when SITL is down, and it
+  would just sit at `connected: False` instead of retrying cleanly. This is
+  the concrete reason the SITL path is TCP-based rather than reusing UDP.

@@ -113,7 +113,7 @@ real device.
   "stuck" after redirecting to a log file may have already finished starting
   — you just can't see it yet. This produced a multi-hour false debugging
   trail chasing a NavPoseIF "hang" that turned out not to exist; see
-  `SIM_CONNECTOR_NAVPOSE_HANG_BUG.md` for the full writeup.
+  `completed/SIM_CONNECTOR_NAVPOSE_HANG_BUG.md` for the full writeup.
 - **Never `kill -9` a process just because its log looks stalled.** `-9`
   bypasses normal interpreter shutdown, which is what would otherwise flush
   the stdio buffer — so the kill itself destroys the evidence that would

@@ -391,12 +391,12 @@ launch_targets:
       pkill -f "[a]i_targeting_controller_ardupilot.py" 2>/dev/null;
       echo $$ > /tmp/sim_connector_quadcopter_launch.pgid;
       rostopic list > /dev/null 2>&1 || {{ nohup roscore < /dev/null > /tmp/sim_connector_quadcopter_roscore_launch.log 2>&1 & until rostopic list > /dev/null 2>&1; do sleep 1; done; }};
+      sim_vehicle.py -v ArduCopter -f gazebo-iris --out=tcpin:0.0.0.0:5771 --out=tcpin:0.0.0.0:5772 --mavproxy-args="--daemon" < /dev/null > /tmp/sim_connector_quadcopter_sitl_launch.log 2>&1 & SITL_PID=$!;
       rosrun gazebo_ros gazebo $HOME/ardupilot_gazebo/worlds/iris_arducopter_cmac.world < /dev/null > /tmp/sim_connector_quadcopter_gazebo_launch.log 2>&1 & GZ_PID=$!;
       sleep 8;
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/camera_rig_controller_ardupilot.py < /dev/null > /tmp/sim_connector_quadcopter_camera_rig_launch.log 2>&1 & CAM_PID=$!;
-      sim_vehicle.py -v ArduCopter -f gazebo-iris --out=tcpin:0.0.0.0:5771 --out=tcpin:0.0.0.0:5772 --mavproxy-args="--daemon" < /dev/null > /tmp/sim_connector_quadcopter_sitl_launch.log 2>&1 & SITL_PID=$!;
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/gazebo/sim_connector_bridge_gazebo_quadcopter.py --host {device_bridge_host} --port {device_bridge_port} --mavlink tcp:127.0.0.1:5772 < /dev/null > /tmp/sim_connector_quadcopter_bridge_launch.log 2>&1 & BRIDGE_PID=$!;
-      wait $GZ_PID $CAM_PID $SITL_PID $BRIDGE_PID
+      wait $SITL_PID $GZ_PID $CAM_PID $BRIDGE_PID
       '
     # Same "Use Existing" override as gazebo_rover's own attach_launch_command
     # -- skips ONLY the gzserver refuse-guard and the `rosrun gazebo_ros

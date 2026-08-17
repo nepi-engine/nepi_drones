@@ -222,3 +222,83 @@ describing your robot's real capabilities (see the table above for the
 existing shapes to copy from) rather than reusing a mismatched one — a
 robot with no camera claiming `has_camera_view_control: true` will show a
 camera selector that silently does nothing.
+
+## Appendix: legacy hardware/SITL command reference
+
+The commands above all go through `nepi_app_sim_connector`'s own `sim/*`
+topics. The ArduPilot path is different: `rbx_ardupilot_node.py` talks
+straight to `mavros`, with no bridge/app layer in between. These raw
+`rostopic`/`rosservice` commands (originally from a 2023 ArduPilot tutorial)
+hit mavros directly — useful for debugging the ArduPilot RBX driver itself,
+or for confirming what mavros exposes/accepts before it's wired into NEPI.
+They're not part of the sim connector protocol and don't apply to the
+Gazebo rover path described above.
+
+Set the mavros namespace once per terminal:
+```bash
+source /opt/nepi/ros/setup.bash
+MAV=/nepi/device1/mavlink_sitl     # confirm real name with: rostopic list | grep mavlink
+```
+
+**Discover what's available**
+```bash
+rostopic list | grep mavlink
+rosservice list | grep mavlink
+rostopic list | grep setpoint
+```
+
+**Confirm mavros is connected**
+```bash
+rostopic echo $MAV/state          # expect connected: True
+```
+
+**Read nav/pose data**
+```bash
+rostopic echo $MAV/global_position/global      # lat/lon/alt (WGS84)
+rostopic echo $MAV/global_position/local       # ENU pose/odom
+rostopic echo $MAV/global_position/compass_hdg # heading
+# NEPI-side fused solution:
+rosservice call /nepi/device1/nav_pose_query "query_time: {secs: 0, nsecs: 0}
+transform: false"
+```
+
+**Arm / mode / takeoff** (normally done via the RUI; shown here for direct
+CLI testing):
+```bash
+rosservice call $MAV/set_mode "base_mode: 0
+custom_mode: 'GUIDED'"
+rosservice call $MAV/cmd/arming "value: true"
+rosservice call $MAV/cmd/takeoff "{min_pitch: 0.0, yaw: 0.0, latitude: 0.0, longitude: 0.0, altitude: 10.0}"
+```
+
+**Autonomous setpoint moves**
+```bash
+rostopic pub $MAV/setpoint_position/local  geometry_msgs/PoseStamped ...
+rostopic pub $MAV/setpoint_position/global geographic_msgs/GeoPoseStamped ...
+rostopic pub $MAV/setpoint_raw/attitude    mavros_msgs/AttitudeTarget ...
+# hit space+Tab after the message type to auto-fill the body
+```
+
+**Direct motor drive** — there's no single blessed mavros CLI command for
+per-motor drive; confirm what a given ArduPilot build actually accepts:
+```bash
+rostopic list | grep -i actuator     # e.g. $MAV/actuator_control
+```
+Candidates: `mavros_msgs/ActuatorControl`, or `MAV_CMD_DO_MOTOR_TEST` via
+`$MAV/cmd/command`. Params to tame spin speed while testing (set in Mission
+Planner / SITL params): `MOT_PWM_MAX=1500`, `MOT_SPIN_ARM=0.03`,
+`MOT_SPIN_MAX=0.5`, `MOT_SPIN_MIN=0.15`.
+
+**Fake GPS — skip for SITL** (SITL supplies its own GPS). Kept only for the
+no-GPS hardware path:
+```bash
+rostopic pub -r 10 $MAV/hil/gps mavros_msgs/HilGPS '{header: auto, fix_type: 3, geo: {latitude: 47.6541, longitude: -122.31894, altitude: 0.005}, eph: 0, epv: 0, vel: 0, vn: 0, ve: 0, vd: 0, cog: 0, satellites_visible: 9}'
+```
+
+**NEPI motor command** (once the RBX driver's motor-control hooks are
+wired — `getMotorControlRatios`/`setMotorControlRatio` in
+`rbx_ardupilot_node.py`):
+```bash
+rostopic pub -1 /nepi/device1/ardupilot_sitl/rbx/set_motor_control \
+  nepi_interfaces/MotorControl "{motor_ind: 2, speed_ratio: 0.4}"
+```
