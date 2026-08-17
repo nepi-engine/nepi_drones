@@ -32,49 +32,53 @@ Gazebo).
 
 ## Checklist
 
-### 1. Discovery: `rbx_webots_discovery.py`
-- [ ] Copy `rbx_gazebo_discovery.py` as the starting point — its structure (purge → probe →
-      launch, heartbeat-with-ALIVE-reply pattern, backoff) needs no Webots-specific changes,
-      only renaming (`PKG_NAME`, `DEVICE_ID`, log names).
-- [ ] Confirm the discovery options schema (`host`, `heartbeat_port`, `bridge_port`) matches
-      what `rbx_webots_params.yaml` (below) declares.
+### 1. Discovery: `rbx_webots_discovery.py` — done
+- [x] Copied `rbx_gazebo_discovery.py`, renamed only (`WEBOTS`/`Webots` throughout,
+      `WebotsDiscovery` class). No structural changes needed — confirmed compiles clean.
 
-### 2. Params: `rbx_webots_params.yaml`
-- [ ] Copy `rbx_gazebo_params.yaml`, rename identifiers, pick heartbeat/bridge ports not
-      already used in the 902x block (`docs/MULTI_SIMULATOR_INTEGRATION_PLAN.md`'s port
-      table already reserves `9041` for Webots utility use — use that plus one more).
+### 2. Params: `rbx_webots_params.yaml` — done
+- [x] Copied `rbx_gazebo_params.yaml`, renamed identifiers. Ports: `9041` heartbeat
+      (already reserved for Webots in the port table), `9046` bridge (fresh, clear of
+      every existing reservation). Confirmed parses clean.
 
-### 3. Webots-side bridge: a new controller, not a modified `sim_connector_bridge_webots.py`
-- [ ] New controller directory `sim_container/bridges/webots/controllers/webots_rbx_bridge/webots_rbx_bridge.py`.
-- [ ] New world file `sim_container/bridges/webots/worlds/rbx_rover.wbt` — same robot/geometry
-      as `sim_connector_rover.wbt` (reuse via copy, don't re-author), `controller` field set
-      to `"webots_rbx_bridge"` instead.
-- [ ] Implement the **simple** protocol (matching `sim_bridge_node.py`'s wire shape exactly,
-      not the generic sim_connector one): serves a heartbeat port (`ALIVE` reply) and a
-      bridge port taking `{"linear_x":...,"angular_z":...}` in, replying bare telemetry
-      `{"x","y","yaw","linear_x","angular_z"}` plus `{"type":"image",...}` frames, and
-      handling `{"type":"camera_settings"}` / `{"type":"reset"}` / `{"type":"environment_option"}`.
-      Port most of this from `sim_connector_bridge_webots.py`'s existing device-reading/motor
-      code — the wire protocol is what's different, not the Webots API calls.
-- [ ] `reset`: Webots' `Robot` node isn't a `Supervisor`, so — same documented limitation as
-      the existing Webots bridge — this is a logged no-op unless the world's robot is made a
-      `Supervisor`. Match `rbx_gazebo_node.py`'s `RESET_SIM` action either way (real teleport
-      if feasible, otherwise an honest no-op — decide once this step is reached, don't guess now).
-- [ ] `environment_option`: this world has no obstacle-course model — honest no-op, matching
-      the existing Webots bridge's documented gap.
+### 3. Webots-side bridge: a new controller, not a modified `sim_connector_bridge_webots.py` — done, live-verified
+- [x] New controller `sim_container/bridges/webots/controllers/webots_rbx_bridge/webots_rbx_bridge.py`
+      — a genuine TCP **server** (matching `sim_bridge_node.py`'s role, the reverse of
+      `sim_connector_bridge_webots.py`'s dial-out-as-client model), plus a heartbeat listener
+      thread matching `sim_heartbeat_listener.py` exactly. No goto-controller logic at all —
+      the RBX driver computes its own velocity, this bridge only applies it, matching
+      `sim_bridge_node.py`'s own simplicity.
+- [x] New world `sim_container/bridges/webots/worlds/rbx_rover.wbt` — copy of
+      `sim_connector_rover.wbt`, only the `controller` field changed.
+- [x] Implemented the simple protocol exactly: `{"linear_x","angular_z"}` in; bare
+      `{"x","y","yaw","linear_x","angular_z"}` telemetry + `{"type":"image","data":...}` out;
+      `camera_settings`/`reset`/`environment_option` handled as documented no-ops (single
+      camera, non-Supervisor robot, no obstacle model — same gaps as the existing Webots
+      bridge, ported honestly rather than guessed away).
+- [x] **Live-verified on this VM**, not just compiled: launched `webots --mode=fast --batch
+      rbx_rover.wbt` for real. Heartbeat replied `ALIVE`. Bridge port streamed real telemetry
+      and valid JPEG image frames. Sent a real `{"linear_x":0.2}` command and confirmed via
+      parsed telemetry that `x` actually increased (1.8169 → 1.8297 over ~2.5s) — not just
+      "command accepted," actual physics movement.
 
-### 4. RBX driver: `rbx_webots_node.py`
-- [ ] Copy `rbx_gazebo_node.py` as the starting point. Expect minimal logic changes — the
-      whole point of matching the wire protocol in step 3 is that this file needs only
-      renaming (class name, `PKG_NAME`, log strings) plus retuning the goto controller's
-      proportional gains for Webots' physics-time stepping if it overshoots/oscillates
-      (`MULTI_SIMULATOR_INTEGRATION_PLAN.md`'s Phase 2 already flagged this as a real
-      possibility, not confirmed either way).
-- [ ] Confirm `SCENE_CAMERA`/`ROBOT_CAMERA` two-camera convention: the existing Webots world
-      has only one `Camera` device (per Phase 2's own documented gap) — either add a second
-      camera to `rbx_rover.wbt`, or honestly report only one camera the way the existing
-      bridge does (`SCENE_CAMERA`/`ROBOT_CAMERA` both resolving to the same feed) — decide
-      once this step is reached.
+### 4. RBX driver: `rbx_webots_node.py` — done
+- [x] Copied `rbx_gazebo_node.py`, renamed only. Confirmed via the existing
+      `sim_connector_bridge_webots.py`: this world's 4 wheels are already grouped as a
+      2-sided tank drive (wheel1+wheel3 left, wheel2+wheel4 right,
+      `WHEEL_TRACK_M=0.12`/`MOTOR_MAX_LINEAR_MPS=0.3`) — same abstraction as Gazebo's
+      4-wheel model, so `motor_ratios=[0.0,0.0]` carried over unchanged, just with this
+      world's actual constants instead of Gazebo's.
+- [x] Two-camera decision: this world has only one `Camera` device — went with reporting
+      `SCENE_CAMERA`/`ROBOT_CAMERA` as two names both resolving to that one feed (matching
+      `sim_connector_bridge_webots.py`'s own precedent for the same gap), not adding a
+      second camera model. Documented in the file's own top-of-file comment.
+- [x] Goto controller gains carried over unchanged (`GOTO_KP_LIN=0.5`/`GOTO_KP_ANG=1.5`,
+      same as Gazebo) — retuning for real overshoot/oscillation is a step 6 verification
+      concern, not guessed at here.
+- [x] `RESET_SIM` kept in `RBX_SETUP_ACTIONS` and wired to fire-and-forget over the bridge
+      (matches Gazebo's pattern) even though the bridge will log-and-ignore it (this
+      world's Robot node isn't a Supervisor) — the command send succeeding is what the
+      return value reports, not a physical reset actually happening.
 
 ### 5. Launch target: `webots_rover` in `simulator_launch_targets.yaml`
 - [ ] Write `launch_command`/`ready_check_command`/`stop_command`/`attach_launch_command`,

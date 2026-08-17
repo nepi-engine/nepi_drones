@@ -1,0 +1,57 @@
+# Webots simulated robot RBX driver -- params / manifest.
+# Mirrors rbx_gazebo_params.yaml exactly; see that file's own comments for the
+# reasoning behind each field. Port numbers differ (9041/9046) to stay clear of
+# the existing 902x block (see docs/MULTI_SIMULATOR_INTEGRATION_PLAN.md's port
+# table, which already reserves 9041 for Webots utility use).
+
+driver:
+  pkg_name: RBX_WEBOTS
+  display_name: Webots Simulated Robot
+  description: Driver package for Webots-simulated robots reached over a JSON-lines bridge
+  type: RBX
+  group_id: WEBOTS
+
+  NODE_DICT:
+    file_name: rbx_webots_node.py
+    class_name: WebotsNode
+
+  # No separate driver file: all robot I/O goes over the bridge connection the
+  # node holds open, same as the gazebo/ardupilot drivers have no driver file
+  # of their own.
+  DRIVER_DICT:
+    file_name: None
+    class_name: None
+
+  DISCOVERY_DICT:
+    file_name: rbx_webots_discovery.py
+    class_name: WebotsDiscovery
+    process: CALL
+    OPTIONS:
+      # Host serving the Webots bridge (the dev VM running the Webots
+      # controller). 'localhost' covers a same-host case; set a real address
+      # for a Webots instance reached over the network/tunnel.
+      host:
+        type: String
+        options:
+          - ''
+        default: 'localhost'
+        value: 'localhost'
+      # Port the Webots-side heartbeat listener answers on. Discovery requires
+      # the ALIVE reply, not merely a successful connect -- same reasoning as
+      # the Gazebo driver.
+      heartbeat_port:
+        type: Int
+        options:
+          - '1024'
+          - '65535'
+        default: '9041'
+        value: '9041'
+      # Port serving the persistent JSON-lines command/telemetry bridge that the
+      # launched node connects to.
+      bridge_port:
+        type: Int
+        options:
+          - '1024'
+          - '65535'
+        default: '9046'
+        value: '9046'
