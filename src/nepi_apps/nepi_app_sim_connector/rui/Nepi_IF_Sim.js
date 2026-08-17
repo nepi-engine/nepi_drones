@@ -132,6 +132,14 @@ class NepiIFSim extends Component {
       // taking up space on the page.
       show_robot_config_viewer: false,
 
+      // Lifted up from NepiIFSimLauncher: two separate instances are mounted
+      // below (selector up top, deploy controls at the bottom -- see their
+      // `only` props), and this dropdown selection has to be shared between
+      // them or the deploy instance can never see what was picked in the
+      // selector instance. Owned here and passed down as a controlled prop
+      // to both, rather than living in either instance's own local state.
+      selected_launch_target: 'None',
+
     }
 
     // Hidden <input type="file"> target for the Upload Robot Config button
@@ -152,6 +160,7 @@ class NepiIFSim extends Component {
     this.robotConfigYamlListener = this.robotConfigYamlListener.bind(this)
     this.onViewConfigClicked = this.onViewConfigClicked.bind(this)
     this.onDownloadConfigClicked = this.onDownloadConfigClicked.bind(this)
+    this.onLaunchTargetSelected = this.onLaunchTargetSelected.bind(this)
 
     this.renderRobotConfigSelector = this.renderRobotConfigSelector.bind(this)
     this.renderRobotConfigUpload = this.renderRobotConfigUpload.bind(this)
@@ -226,6 +235,13 @@ class NepiIFSim extends Component {
     }
     this.setState({ viewing_config_name: configName })
     this.props.ros.sendStringMsg(namespace + '/get_robot_config', configName)
+  }
+
+  // Shared setter passed down to both NepiIFSimLauncher instances -- see
+  // selected_launch_target in this.state for why this lives here instead of
+  // in NepiIFSimLauncher's own state.
+  onLaunchTargetSelected(value) {
+    this.setState({ selected_launch_target: value })
   }
 
   // Downloads whatever YAML text is currently displayed -- same Blob pattern
@@ -593,6 +609,8 @@ class NepiIFSim extends Component {
               namespace={namespace}
               make_section={false}
               only={"selector"}
+              selected_target={this.state.selected_launch_target}
+              onTargetSelected={this.onLaunchTargetSelected}
             />
             {this.renderRobotConfigSelector()}
             {this.renderRobotConfigUpload()}
@@ -620,6 +638,8 @@ class NepiIFSim extends Component {
             namespace={namespace}
             make_section={false}
             only={"deploy"}
+            selected_target={this.state.selected_launch_target}
+            onTargetSelected={this.onLaunchTargetSelected}
           />
         : null}
 

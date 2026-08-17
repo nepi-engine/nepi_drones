@@ -62,10 +62,15 @@ class NepiIFSimLauncher extends Component {
 
       // Local dropdown selection, applied on Deploy click -- not published
       // on every change, only Deploy/Kill/Install actually send anything.
+      // Only used when this instance isn't given a selected_target prop --
+      // see getSelectedTarget/setSelectedTarget.
       selected_target: 'None',
     }
 
     this.getSimNamespace = this.getSimNamespace.bind(this)
+
+    this.getSelectedTarget = this.getSelectedTarget.bind(this)
+    this.setSelectedTarget = this.setSelectedTarget.bind(this)
 
     this.updateStatusListener = this.updateStatusListener.bind(this)
     this.statusListener = this.statusListener.bind(this)
@@ -85,6 +90,25 @@ class NepiIFSimLauncher extends Component {
 
   getSimNamespace() {
     return (this.props.namespace !== undefined) ? this.props.namespace : null
+  }
+
+  // Two instances of this component are commonly mounted at once (see the
+  // `only` prop -- selector up top, deploy controls at the bottom), and the
+  // dropdown selection has to be the same value in both. When a parent
+  // passes selected_target/onTargetSelected props (Nepi_IF_Sim does), this
+  // becomes a controlled value owned by the parent; otherwise it falls back
+  // to this instance's own local state, for standalone use.
+  getSelectedTarget() {
+    return (this.props.selected_target !== undefined)
+      ? this.props.selected_target : this.state.selected_target
+  }
+
+  setSelectedTarget(value) {
+    if (this.props.onTargetSelected !== undefined) {
+      this.props.onTargetSelected(value)
+    } else {
+      this.setState({ selected_target: value })
+    }
   }
 
   componentDidMount() {
@@ -131,12 +155,12 @@ class NepiIFSimLauncher extends Component {
     // (e.g. after a launch started from elsewhere) unless the operator
     // hasn't picked anything yet.
     if (message.selected_launch_target !== undefined && message.selected_launch_target !== '') {
-      this.setState({ selected_target: message.selected_launch_target })
+      this.setSelectedTarget(message.selected_launch_target)
     }
   }
 
   onTargetSelected(event) {
-    this.setState({ selected_target: event.target.value })
+    this.setSelectedTarget(event.target.value)
   }
 
   // Publishes the selected target key to sim/launch_simulator. The app node
@@ -153,7 +177,7 @@ class NepiIFSimLauncher extends Component {
   // know which case it's in.
   onDeployClicked() {
     const namespace = this.getSimNamespace()
-    const target = this.state.selected_target
+    const target = this.getSelectedTarget()
     if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
       this.props.ros.sendStringMsg(namespace + '/launch_simulator', target)
     }
@@ -166,7 +190,7 @@ class NepiIFSimLauncher extends Component {
   // change on it.
   onNewSimClicked() {
     const namespace = this.getSimNamespace()
-    const target = this.state.selected_target
+    const target = this.getSelectedTarget()
     if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
       this.props.ros.sendStringMsg(namespace + '/redeploy_simulator', target)
     }
@@ -184,7 +208,7 @@ class NepiIFSimLauncher extends Component {
   // pattern as Deploy/Kill.
   onInstallClicked() {
     const namespace = this.getSimNamespace()
-    const target = this.state.selected_target
+    const target = this.getSelectedTarget()
     if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
       this.props.ros.sendStringMsg(namespace + '/install_simulator', target)
     }
@@ -198,7 +222,7 @@ class NepiIFSimLauncher extends Component {
   // fresh.
   onLaunchNewClicked() {
     const namespace = this.getSimNamespace()
-    const target = this.state.selected_target
+    const target = this.getSelectedTarget()
     if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
       this.props.ros.sendStringMsg(namespace + '/force_launch_simulator', target)
     }
@@ -213,7 +237,7 @@ class NepiIFSimLauncher extends Component {
   // in simulator_launch_targets.yaml).
   onUseExistingClicked() {
     const namespace = this.getSimNamespace()
-    const target = this.state.selected_target
+    const target = this.getSelectedTarget()
     if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
       this.props.ros.sendStringMsg(namespace + '/attach_simulator', target)
     }
@@ -266,7 +290,7 @@ class NepiIFSimLauncher extends Component {
       <Label title={"Simulator"}>
         <Select
           onChange={this.onTargetSelected}
-          value={this.state.selected_target}
+          value={this.getSelectedTarget()}
         >
           {items}
         </Select>
@@ -293,7 +317,7 @@ class NepiIFSimLauncher extends Component {
   //   4. Otherwise (idle/installed/unknown, nothing running) -- plain Deploy.
   renderDeployControls() {
     const status_msg = this.state.status_msg
-    const target = this.state.selected_target
+    const target = this.getSelectedTarget()
     if (status_msg == null || target === 'None' || target === '') {
       return null
     }
