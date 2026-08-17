@@ -16,6 +16,10 @@ terrain/
 __pycache__/
 *.pyc
 
+# Webots per-checkout window-layout/perspective state, auto-generated next to
+# each .wbt the first time it's opened -- not simulation content.
+*.wbproj
+
 # Menuric session-continuity notes: supplementary context, not source. Same
 # convention (and same pattern) as the nepi_engine_ws root .gitignore, which
 # ignores the notes themselves rather than all of .claude/ -- so any real
