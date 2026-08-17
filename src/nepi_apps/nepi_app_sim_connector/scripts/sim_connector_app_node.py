@@ -1126,7 +1126,7 @@ class NepiSimConnectorApp:
     # Resolves the plain, selector-offered choice (e.g. "2-Wheel Rover") to
     # whatever profile the ACTUAL target needs -- most targets need no
     # mapping (Gazebo's rover configs already match the generic keys), but
-    # Stage/WPILib-style targets redirect to their own hidden_from_selector
+    # WPILib-style targets redirect to their own hidden_from_selector
     # profile here, so there is no separate "2-Wheel Rover (WPILib)" entry
     # to pick.
     if robot_config:

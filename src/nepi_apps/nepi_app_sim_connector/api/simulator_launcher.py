@@ -56,46 +56,6 @@ SSH_CONNECT_TIMEOUT_SEC = 8
 LAUNCH_STARTUP_GRACE_SEC = 5
 READY_CHECK_ATTEMPTS = 6
 READY_CHECK_INTERVAL_SEC = 3
-
-# What "Kill All Gazebo" actually runs on each sim host. Gazebo is only half
-# of a running simulation: the ArduPilot targets also leave sim_vehicle.py,
-# the arducopter binary, MAVProxy and an xterm behind, and BOTH the rover and
-# quadcopter flows leave their bridge/controller/listener helpers. Killing
-# only gzserver+gzclient (what this used to do) left all of that running --
-# so the port-5760 refuse-guard still blocked the next launch, a stale
-# ArduPilot SITL kept the device's RBX driver believing a vehicle was there,
-# and the operator had no button that actually cleared it. Reported live
-# 2026-08-12: "clicking the kill all gazebo button should also kill all sitls
-# if thats open too".
-#
-# Every `pkill -f` pattern is bracket-escaped ("[s]im_vehicle" etc.) because
-# this whole string arrives as one `bash -c` argument, so the shell running it
-# has the literal pattern text in its own cmdline and an unescaped `pkill -f`
-# would match -- and kill -- itself partway down the list, silently skipping
-# every later line. The bracket class matches the real process while not
-# matching the pattern text itself; it works here because each pattern occurs
-# exactly once in this command (the same reasoning as the per-target
-# stop_commands in simulator_launch_targets.yaml).
-#
-# `pkill -x` (exact process NAME) is used where possible -- it can never
-# self-match a command line at all. Ends in `true` so a no-match pkill (exit
-# 1) never makes the whole command look like a failure.
-KILL_ALL_SIM_COMMAND = (
-    "pkill -x gzclient 2>/dev/null; "
-    "pkill -x gzserver 2>/dev/null; "
-    "pkill -f \"[s]im_vehicle.py\" 2>/dev/null; "
-    "pkill -f \"[a]rducopter -S\" 2>/dev/null; "
-    "pkill -f \"[m]avproxy.py\" 2>/dev/null; "
-    "pkill -f \"[c]amera_rig_controller\" 2>/dev/null; "
-    "pkill -f \"[a]i_targeting_controller_ardupilot.py\" 2>/dev/null; "
-    "pkill -f \"[s]im_connector_bridge_gazebo\" 2>/dev/null; "
-    "pkill -f \"[s]im_bridge_node.py\" 2>/dev/null; "
-    "pkill -f \"[s]im_bridge_multi_node.py\" 2>/dev/null; "
-    "pkill -f \"[s]im_heartbeat_listener.py\" 2>/dev/null; "
-    "pkill -x xterm 2>/dev/null; "
-    "rm -f /tmp/sim_connector_launch.pgid /tmp/sim_connector_quadcopter_launch.pgid "
-    "/tmp/sim_connector_quadcopter_mavproxy_stdin.fifo 2>/dev/null; "
-    "true")
 # An install can mean anything from a pip install to a multi-package apt
 # transaction with a slow mirror -- generous on purpose; this blocks the
 # caller's dedicated install thread, never the main status/launch path.
@@ -219,8 +179,8 @@ class SimulatorLauncher(object):
     what the RUI's selector shows as "2-Wheel Rover") to whatever profile this
     specific target actually needs -- most targets need no mapping at all
     (Gazebo's own configs already match the generic keys 1:1), but a target
-    whose simulator can't fully match a generic profile (Stage has no camera
-    model, WPILib's HAL sim has no camera or environment concept) points its
+    whose simulator can't fully match a generic profile (WPILib's HAL sim has
+    no camera or environment concept) points its
     own robot_config_overrides at the specialized, hidden_from_selector
     profile instead. This is what makes "pick 2-Wheel Rover, deploy to
     WPILib" apply the right profile automatically -- there is no separate
@@ -437,11 +397,8 @@ class SimulatorLauncher(object):
         proc.wait()
 
   def kill_all_gazebo(self):
-    """Explicit, deliberately blunt escape hatch: kills EVERY simulator
-    process -- gzserver/gzclient AND the ArduPilot SITL stack (sim_vehicle,
-    arducopter, MAVProxy, xterm) AND the bridge/controller/listener helpers
-    of both flows (see KILL_ALL_SIM_COMMAND) -- on each configured target's
-    host, regardless of who started
+    """Explicit, deliberately blunt escape hatch: kills EVERY gzclient and
+    gzserver on each configured target's host, regardless of who started
     it or which target's own pgid it belongs to -- offered as its own
     button precisely for the case stop()'s pgid-scoping (by design) can
     never reach: a gzserver this app never launched (left over from manual
@@ -472,54 +429,12 @@ class SimulatorLauncher(object):
         continue
       seen_hosts.add(host_key)
       try:
-        self._run_remote(target, KILL_ALL_SIM_COMMAND,
-                         timeout_sec=SSH_CONNECT_TIMEOUT_SEC + 10)
+        self._run_remote(target, "pkill -x gzclient 2>/dev/null; pkill -x gzserver 2>/dev/null; true",
+                         timeout_sec=SSH_CONNECT_TIMEOUT_SEC + 5)
       except LauncherError as e:
         errors.append(str(e))
     if errors:
       raise LauncherError("; ".join(errors))
-
-  def detect_running_gazebo(self):
-    """Returns True when a gzserver is alive on any configured sim host.
-
-    Exists so the app can NOTICE a simulator this app did not launch --
-    started manually on the VM, left over from a crashed session, or from a
-    launch this app has since forgotten (its own launch bookkeeping resets
-    whenever the app node restarts, e.g. across a container restart, while
-    the VM-side sim keeps running). Without this the app reported 'idle' with
-    a fully-running sim on the other end, so the RUI offered a plain Deploy
-    that could only ever fail on the refuse-to-launch guard, and never
-    surfaced the Kill All Gazebo escape hatch that actually resolves it.
-
-    Deliberately a cheap, generic `pgrep -x gzserver` rather than per-target
-    ready_check_commands: this is called on a slow poll for every host, so it
-    must cost ONE ssh, and the question being asked is only "is something in
-    the way", not "which target is it". `pgrep -x` matches the process NAME
-    exactly, so unlike a `pgrep -f` pattern it cannot self-match the ssh
-    command carrying it (a trap this repo has hit repeatedly -- see
-    gazebo_quadcopter's own launch_command comments).
-
-    Same unique-host iteration as kill_all_gazebo, so the two agree about
-    which hosts are in scope. Returns False (never raises) on an unreachable
-    host: "can't tell" must not be reported to the operator as "something is
-    running", which would strand them in a conflict state they cannot clear.
-    """
-    seen_hosts = set()
-    for target_key, target in self.config["launch_targets"].items():
-      if not target or "host" not in target or "ssh_user" not in target:
-        continue
-      host_key = (target["host"], target["ssh_user"], target.get("ssh_port", 22))
-      if host_key in seen_hosts:
-        continue
-      seen_hosts.add(host_key)
-      try:
-        result = self._run_remote(target, "pgrep -x gzserver > /dev/null && echo RUNNING || echo NONE",
-                                  timeout_sec=SSH_CONNECT_TIMEOUT_SEC + 2)
-      except LauncherError:
-        continue
-      if result.returncode == 0 and "RUNNING" in (result.stdout or ""):
-        return True
-    return False
 
   #**********************
   # Per-target dependency check/install. Independent of launch/stop above --

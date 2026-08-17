@@ -72,7 +72,6 @@ launch_targets:
     # bridge expects -- auto-selected on successful launch.
     default_robot_config: ground_robot_2_wheel
   webots_rover: {}   # filled in once Phase 2 below is reached
-  stage_rover: {}
   pybullet_rover: {}
 ```
 
@@ -156,7 +155,7 @@ launch_targets:
    via a real `npm run build` on the device (production build, not dev
    server) — succeeded with no errors attributable to the new file.
    **Not yet visually verified in a browser** — that part is on the user.
-7. [ ] Repeat steps 2-5 for `webots_rover`, `stage_rover`, `pybullet_rover`
+7. [ ] Repeat steps 2-5 for `webots_rover`, `pybullet_rover`
    — each is a config entry, not new code, once the mechanism itself works
    for Gazebo. This mirrors `MULTI_SIMULATOR_INTEGRATION_PLAN.md`'s own
    phase structure on purpose.

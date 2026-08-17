@@ -54,19 +54,6 @@ SIM_VEHICLE_DICT:
     default:
       display_name: Default
       description: No capabilities. Safe default until a robot config is selected.
-      # Not offered in the Robot Config selector -- "Default" is a meaningless
-      # thing for an operator to pick (it renders no controls at all), and it
-      # was cluttering the list of real robots. Requested 2026-08-12: "there is
-      # no 'default' robot config - remove that option".
-      #
-      # hidden_from_selector rather than deleting the entry: the app injects
-      # this profile as its startup selection and its always-valid fallback
-      # (see FACTORY_ROBOT_CONFIG_NAME in sim_connector_app_node.py, which
-      # re-adds it whatever the yaml says), so there is never a state with no
-      # legal selection. Hiding changes only what is OFFERED -- the profile
-      # stays fully valid for setSelectedRobotConfig to accept, exactly like
-      # stage_ground_robot/wpilib_ground_robot below.
-      hidden_from_selector: true
       wheel_count: 0
       motor_count: 0
       has_goto_position: false
@@ -86,25 +73,6 @@ SIM_VEHICLE_DICT:
     # global location reference of its own.
     ground_robot_2_wheel:
       display_name: 2-Wheel Rover
-      # Not offered. Requested 2026-08-12: "get rid of the 2 wheel drone
-      # completely then - just the copter [and] 4 wheel rover are fine for now."
-      #
-      # There is no two-wheeled model in sim_container/models/ to spawn, so
-      # picking this only ever handed the operator the 4-wheel generic_rover
-      # with a 2-wheel control surface bolted on -- the exact complaint that
-      # started this ("deploying the 2-wheel rover + gazebo actually deploys the
-      # 4 wheel rover instead"). Supporting it for real means authoring a
-      # 2-wheel model + world + launch target; until then, offering it is a lie.
-      #
-      # hidden_from_selector rather than deleting the entry: stage_rover and
-      # wpilib_rover in simulator_launch_targets.yaml both map THIS key onto
-      # their own profiles via robot_config_overrides
-      # (ground_robot_2_wheel -> stage_ground_robot / wpilib_ground_robot).
-      # Deleting the key would leave those two overrides pointing at nothing and
-      # strand stage_ground_robot/wpilib_ground_robot as unreachable entries.
-      # Hiding changes only what is OFFERED, exactly as it does for those two
-      # profiles, and is a one-line revert when a real 2-wheel model exists.
-      hidden_from_selector: true
       description: Two-wheel differential-drive ground robot, local position control only
       wheel_count: 2
       motor_count: 2
@@ -148,51 +116,15 @@ SIM_VEHICLE_DICT:
       - ROBOT_CAMERA
       has_environment_controls: true
 
-    # Two-wheel ground robot with NO camera and NO environment control --
-    # added for MULTI_SIMULATOR_INTEGRATION_PLAN.md Phase 3 (ROS Stage), whose
-    # stock willow-erratic.world has only a LaserScan and no camera at all.
-    # Deliberately distinct from ground_robot_2_wheel: this is the contract's
-    # "sensor topic exists but has_camera stays False, has_environment_controls
-    # stays False" case, not a duplicate of an existing config.
-    #
-    # hidden_from_selector: this is a SIMULATOR constraint (Stage's world has
-    # no camera model at all), not something an operator picks as a distinct
-    # "kind of robot" -- so it's not offered in the Robot Config selector.
-    # stage_rover's own robot_config_overrides in
-    # simulator_launch_targets.yaml maps the plain "2-Wheel Rover" pick to
-    # this profile automatically when deploying to Stage specifically; every
-    # other target keeps using ground_robot_2_wheel unchanged. Kept as a real
-    # entry here (not deleted) because it's still the profile that gets
-    # applied -- just never a direct selector choice.
-    stage_ground_robot:
-      display_name: 2-Wheel Rover (No Camera)
-      hidden_from_selector: true
-      description: Two-wheel ground robot, local position control only, no camera or environment control
-      wheel_count: 2
-      motor_count: 2
-      has_goto_position: true
-      has_goto_pose: false
-      has_goto_location: false
-      has_go_home: true
-      has_set_home: true
-      has_go_stop: true
-      setup_actions: []
-      go_actions: []
-      has_camera_view_control: false
-      available_camera_view_modes: []
-      has_environment_controls: false
-
     # Two-wheel ground robot with a real, working RESET but no camera/
     # environment control -- added for MULTI_SIMULATOR_INTEGRATION_PLAN.md
-    # Phase 6 (WPILib HAL Sim). Distinct from stage_ground_robot: that config's
-    # empty setup_actions reflects Stage genuinely having no reset mechanism;
-    # this bridge's RESET is a real, working teleport
+    # Phase 6 (WPILib HAL Sim). This bridge's RESET is a real, working teleport
     # (physics.py/shared_state.py's reset_requested flag), so it gets its own
-    # config rather than inheriting Stage's honest limitation.
-    # hidden_from_selector: same reasoning as stage_ground_robot above --
-    # this is what WPILib's own simulation stack supports, not a distinct
-    # robot an operator chooses. wpilib_rover's robot_config_overrides maps
-    # "2-Wheel Rover" to this profile automatically when deploying to WPILib.
+    # config rather than the camera/environment-capable ground_robot_2_wheel.
+    # hidden_from_selector: this is what WPILib's own simulation stack
+    # supports, not a distinct robot an operator chooses. wpilib_rover's
+    # robot_config_overrides maps "2-Wheel Rover" to this profile
+    # automatically when deploying to WPILib.
     wpilib_ground_robot:
       display_name: 2-Wheel Rover (WPILib)
       hidden_from_selector: true

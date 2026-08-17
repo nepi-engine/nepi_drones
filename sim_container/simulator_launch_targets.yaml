@@ -448,7 +448,7 @@ launch_targets:
     ready_check_command: "bash -lc \"source /opt/ros/noetic/setup.bash; pgrep -f 'gzserver.*iris_arducopter_cmac.world' > /dev/null && pgrep -f 'sim_vehicle.py -v ArduCopter' > /dev/null && pgrep -f sim_connector_bridge_gazebo_quadcopter.py > /dev/null && rostopic info /camera_rig/camera/image_raw 2>/dev/null | grep -A1 '^Publishers:' | grep -q ' \\* /'\""
     default_robot_config: flight_robot_4_motor
 
-  # webots_rover, stage_rover, and pybullet_rover below are checkable and
+  # webots_rover and pybullet_rover below are checkable and
   # installable, but NOT yet launchable -- launch_command/ready_check_command/
   # stop_command are intentionally absent (launch() raises a clear
   # LauncherError naming this if attempted, rather than silently doing
@@ -483,22 +483,6 @@ launch_targets:
       rm -f /tmp/webots_latest_amd64.deb
       '
 
-  stage_rover:
-    display_name: "Stage"
-    host: "127.0.0.1"
-    ssh_user: "suraj"
-    ssh_port: 12222
-    check_installed_command: "bash -lc \"source /opt/ros/noetic/setup.bash; rospack find stage_ros > /dev/null 2>&1\""
-    install_command: "bash -lc \"sudo apt-get update && sudo apt-get install -y ros-noetic-stage-ros\""
-    # Stage's stock willow-erratic.world has no camera model at all -- a
-    # simulator constraint, not something an operator picks. Redirects the
-    # plain "2-Wheel Rover" choice to the hidden_from_selector profile that
-    # actually matches what Stage can provide; every other robot config
-    # (Quadcopter, 4-Wheel Rover -- neither of which Stage supports either,
-    # but that is unchanged/pre-existing scope) passes through unmapped.
-    robot_config_overrides:
-      ground_robot_2_wheel: stage_ground_robot
-
   pybullet_rover:
     display_name: "PyBullet"
     host: "127.0.0.1"
@@ -511,7 +495,7 @@ launch_targets:
   # docs/MULTI_SIMULATOR_INTEGRATION_PLAN.md Phase 6. Its own bridge
   # (sim_container/bridges/wpilib/{robot.py,physics.py,shared_state.py})
   # already exists, confirmed working VM-side; launch_command is intentionally
-  # absent for the same reason as webots_rover/stage_rover/pybullet_rover
+  # absent for the same reason as webots_rover/pybullet_rover
   # above -- not yet wired through this launcher.
   wpilib_rover:
     display_name: "WPILib HAL Sim"
@@ -523,7 +507,6 @@ launch_targets:
     # C++20, unavailable on this Ubuntu 20.04 target; 2022.4.8 is what was
     # actually confirmed working.
     install_command: "bash -lc \"pip3 install --user robotpy==2022.4.8\""
-    # WPILib's HAL sim has no camera or environment-control concept at all --
-    # same reasoning as stage_rover's override above.
+    # WPILib's HAL sim has no camera or environment-control concept at all.
     robot_config_overrides:
       ground_robot_2_wheel: wpilib_ground_robot

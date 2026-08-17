@@ -567,7 +567,7 @@ class NepiIFSim extends Component {
           <React.Fragment>
             {/* NepiIFSimLauncher's own target selector IS the Simulator
                 selector for this whole panel -- it already lists every real
-                option (Gazebo/Webots/Stage/PyBullet/WPILib). Placed FIRST,
+                option (Gazebo/Webots/PyBullet/WPILib). Placed FIRST,
                 alone: choosing which simulator to deploy is the first
                 decision in the flow (simulator -> robot config -> deploy),
                 so only the selector half of NepiIFSimLauncher renders here

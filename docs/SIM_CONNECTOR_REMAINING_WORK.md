@@ -21,8 +21,11 @@ itself.
   including against the real device: goto commands move the real tracked position, both
   `scene_camera` and `robot_camera` are announced and streamable, environment options and
   reset actions are wired.
-- **Webots, ROS Stage, and PyBullet bridges are built and verified on the dev VM** (not yet
+- **Webots and PyBullet bridges are built and verified on the dev VM** (not yet
   confirmed on the real device or in a browser — see below).
+- **ROS Stage support was retired 2026-08-17** — not a priority; removed entirely (bridge
+  script, robot config, launch target). See `MULTI_SIMULATOR_INTEGRATION_PLAN.md`'s §6 if
+  the history is ever needed again.
 - **WPILib HAL Sim (the FRC-adjacent simulator) bridge is built and verified on the dev VM**
   too — goto works, RESET works, same "VM done, device/RUI unconfirmed" status as the three
   above.
@@ -105,8 +108,9 @@ option *off* — only on.
       dropped before ever reaching the toggle function, which itself already supported
       both directions correctly. Fixed to call `setObstacleCourse(bool(msg.get("enabled", True)))`
       unconditionally.
-  - [ ] Webots/Stage/PyBullet/WPILib bridges not checked for the same bug — do this
-        before relying on environment toggles for those simulators.
+  - [ ] Webots/PyBullet/WPILib bridges not checked for the same bug — do this before
+        relying on environment toggles for those simulators (PyBullet and WPILib both
+        report zero environment options today, so this may be moot for them).
 - [x] RUI (`Nepi_IF_Sim-Controls.js`) environment buttons now toggle real on/off state
       and send the JSON-encoded `{option, enabled}` string, with the button label
       reflecting current state (`"obstacle_course (on)"` / `"(off)"`).
@@ -142,12 +146,13 @@ option *off* — only on.
       `{"type":"goto_result","success":true}` at the exact point it already logged
       "goto target reached" internally — that log line existed before, the wire send
       didn't.
-- [x] **Webots/Stage/PyBullet/WPILib bridges now send it too.** All four had the exact
-      same gap (a "goto target reached" log/print with no corresponding wire message) —
-      fixed identically in `sim_connector_bridge_stage.py`, `sim_connector_bridge_pybullet.py`,
-      `sim_connector_bridge_webots.py`, and WPILib's `robot.py` (this one uses
-      `shared_state`/`self.sock_lock` instead of the other four's shared class shape, but
-      the fix is the same: send `goto_result` right where it already logs convergence).
+- [x] **Webots/PyBullet/WPILib bridges now send it too.** All had the exact same gap
+      (a "goto target reached" log/print with no corresponding wire message) — fixed
+      identically in `sim_connector_bridge_pybullet.py`, `sim_connector_bridge_webots.py`,
+      and WPILib's `robot.py` (this one uses `shared_state`/`self.sock_lock` instead of
+      the other two's shared class shape, but the fix is the same: send `goto_result`
+      right where it already logs convergence). ROS Stage's bridge got this same fix
+      too, before it was retired shortly after — see the note above.
 - [x] **Found and fixed a real thread-safety gap this introduced.** All five bridges'
       `sendLine()` only locked `self.sock`'s *assignment* (connect/disconnect), not the
       actual `sendall()` call — fine when only one thread (the main sender loop) ever
@@ -188,7 +193,6 @@ Previously reported running at ~15Hz against an intended 5Hz cap (`IMAGE_RATE_HZ
       Gazebo (wired, but not individually re-checked in the last verification pass).
 - [ ] Repeat Gazebo's real-device confirmation steps for Webots: load the RUI, confirm
       controls render, confirm on-device behavior matches the VM-side verification.
-- [ ] Same for ROS Stage.
 - [ ] Same for PyBullet.
 - [ ] Same for WPILib HAL Sim.
 
@@ -220,7 +224,7 @@ is not used by anything the new Gazebo bridge relies on.
 
 ## Explicitly not next steps (deferred on purpose)
 
-- Multi-robot variants for Webots/Stage/PyBullet/WPILib — Gazebo already has one; the
+- Multi-robot variants for Webots/PyBullet/WPILib — Gazebo already has one; the
   others get a single-vehicle proof first, by design.
 - Live camera pose/offset adjustment — deliberately left without a wire shape until real
   usage clarifies what's actually needed; don't design this speculatively.
@@ -245,7 +249,7 @@ is not used by anything the new Gazebo bridge relies on.
    more time into bridges whose controls haven't been eyeballed yet.
 4. **Decide on `rbx_gazebo_node.py`** — a quick call, removes ongoing confusion between two
    parallel Gazebo integration paths.
-5. **Work through the remaining on-device + RUI confirmations** for Webots, Stage,
-   PyBullet, and WPILib, one at a time.
+5. **Work through the remaining on-device + RUI confirmations** for Webots, PyBullet,
+   and WPILib, one at a time — Webots first, per current priority.
 6. **Unity, whenever you're ready to personally do the account sign-in** — not blocking
    anything else.

@@ -108,7 +108,6 @@ add your own there if none of these match your robot):
 | `default` | 0/0 | none | none | none | no |
 | `ground_robot_2_wheel` | 2/2 | position | RESET, RETURN_HOME | SCENE_CAMERA, ROBOT_CAMERA | yes |
 | `ground_robot_4_wheel` | 4/4 | position | RESET, RETURN_HOME | SCENE_CAMERA, ROBOT_CAMERA | yes |
-| `stage_ground_robot` | 2/2 | position | *(none — Stage has no reset)* | none | no |
 | `wpilib_ground_robot` | 2/2 | position | RESET, RETURN_HOME | none | no |
 | `flight_robot_4_motor` | 0/4 | position, pose, location | TAKEOFF, LAUNCH | SCENE_CAMERA, ROBOT_CAMERA | no |
 

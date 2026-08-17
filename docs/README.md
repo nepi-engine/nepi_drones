@@ -13,8 +13,9 @@ new to this repo; everything else here goes deeper on one piece of what it descr
 - **`SIM_CONNECTOR_REMAINING_WORK.md`** — current, living answer to "what's left to build
   and where to start." Read this before starting new sim-connector work.
 - **`MULTI_SIMULATOR_INTEGRATION_PLAN.md`** — the phased build/status log for wiring
-  Gazebo, Webots, ROS Stage, PyBullet, Unity, and WPILib HAL Sim into the generic
-  contract. The authoritative per-simulator status table lives here.
+  Gazebo, Webots, PyBullet, Unity, and WPILib HAL Sim into the generic contract (ROS
+  Stage support was tried and then dropped — not a priority). The authoritative
+  per-simulator status table lives here.
 - **`SIMULATOR_AUTO_LAUNCH_PLAN.md`** — the SSH-based remote auto-launch feature (deploy/
   start/stop a simulator on a dev VM from the app itself) — design and build log.
 - **`RBX_CAPABILITIES.md`** — the canonical RBX (robot) interface reference: namespaces,
@@ -41,7 +42,7 @@ ongoing rather than accumulating finished-work narrative. Currently:
 
 - **`completed/GAZEBO_SIM_CONNECTOR_INTEGRATION.md`** — the Gazebo simulator's full
   integration into the generic `sim_connector` contract. The only simulator integration
-  fully closed so far (Webots/Stage/PyBullet/WPILib are VM-verified but still open per
+  fully closed so far (Webots/PyBullet/WPILib are VM-verified but still open per
   `SIM_CONNECTOR_REMAINING_WORK.md` — not moved here yet).
 - **`completed/SIM_CONNECTOR_NAVPOSE_HANG_BUG.md`** — closed bug postmortem (an apparent
   startup hang that turned out to be stdout buffering, plus a real bare-roscore

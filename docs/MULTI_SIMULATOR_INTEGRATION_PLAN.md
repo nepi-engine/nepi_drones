@@ -1,4 +1,4 @@
-# Multi-Simulator Integration Plan — Webots, ROS Stage, PyBullet, Unity, WPILib HAL Sim
+# Multi-Simulator Integration Plan — Webots, PyBullet, Unity, WPILib HAL Sim
 
 Phased, testable plan to plug five more simulators into NEPI's generic simulator contract
 (`nepi_app_sim_connector`), one at a time, each fully installed/tested/debugged before moving
@@ -112,7 +112,6 @@ without error."
    dependency** where the simulator's own native scripting API can supply everything needed
    (pose, sensor list, motor/goto commands) — this matches the design point `demo_bridge_client.py`
    already establishes and keeps the bridge portable to wherever that simulator actually runs.
-   ROS Stage is the one exception (see Phase 3) since its entire interface *is* ROS topics.
 4. **Connect the bridge to `sim_connector_app_node.py`.** Point it at the app's listen port
    (assign a new port per the block convention below — don't reuse 902x, that's the
    Gazebo/ArduPilot block). Confirm in this order, each is a real go/no-go gate:
@@ -163,7 +162,6 @@ avoiding collision with the existing one:
 |---|---|---|
 | Gazebo (new sim-connector bridge) | reuse `9023` conceptually, but as a distinct process from the RBX_SIM path — see Phase 1 | Don't literally share the port with `sim_bridge_node.py` if both might run; pick `9040` if a second listener is needed |
 | Webots | `9041` (reset/heartbeat, if needed) | Webots controller likely doesn't need one — it dials out only |
-| ROS Stage | `9042` | |
 | PyBullet | `9043` | |
 | Unity | `9044` | |
 | WPILib HAL Sim | `9045` | |
@@ -182,8 +180,8 @@ minor rate-limit bug) — the last two are tracked in `SIM_CONNECTOR_REMAINING_W
 
 ## 5. Phase 2 — Webots
 
-**Why second:** open-source, free, no licensing friction, and (unlike Stage) supports full 3D
-+ camera, making it the closest analog to Gazebo — the natural next step in difficulty.
+**Why second:** open-source, free, no licensing friction, and supports full 3D + camera,
+making it the closest analog to Gazebo — the natural next step in difficulty.
 
 1. **Install.** `apt` package `webots` if available in a configured repo, otherwise the
    `.deb` from Cyberbotics' release page downloaded once and installed locally — record the
@@ -277,79 +275,17 @@ deferral as Phase 1, same reason).
 
 ---
 
-## 6. Phase 3 — ROS Stage (`stage_ros`)
+## 6. Phase 3 — ROS Stage — retired 2026-08-17, removed from the system
 
-**Why third:** genuinely simplest remaining case (2D-only, no camera, native ROS topics) — a
-good "prove the contract handles a minimal-capability vehicle honestly" case before the two
-higher-risk stretch items.
-
-1. **Install.** `sudo apt install ros-noetic-stage-ros`. Record version.
-2. **Standalone smoke test.** Launch one of `stage_ros`'s stock worlds (`willow-erratic.world`
-   or similar) via `rosrun stage_ros stageros <world>`, drive the robot manually with
-   `rostopic pub .../cmd_vel`, confirm motion in Stage's own 2D viewer.
-3. **Bridge script**, `sim_container/bridges/stage/sim_connector_bridge_stage.py` — **this one
-   is a ROS node**, not a zero-dependency script, since Stage's entire interface already is ROS
-   topics (`/cmd_vel` in, `/odom` + `/base_scan` out) — writing a non-ROS bridge here would mean
-   re-implementing a socket layer Stage doesn't need. Subscribes `/odom`, republishes telemetry;
-   subscribes nothing extra for sensors — announce `/base_scan` as a `sensor_msgs/LaserScan`
-   entry in `sensor_topics` (this is the first non-camera entry in `SCAN_MSG_TYPES` we'll
-   actually exercise, worth confirming `has_camera` correctly stays `False` while some other
-   sensor-topic-driven UI element still reflects the LaserScan being present).
-4. **Robot config:** `stage_ground_robot` — `has_goto_position=True`, no camera capability, no
-   `goto_pose`/`goto_location` (Stage is 2D — no meaningful pitch/roll/altitude).
-5. **Full functional test:** goto drives the Stage robot; confirm the RUI correctly renders "no
-   camera view" state cleanly (this is the interesting case for this phase — most other sims in
-   this plan do have a camera, so this is where a camera-optional code path actually gets
-   exercised).
-6. **Document + clean up.**
-
-*Done when:* a Stage robot is driveable through the RUI with an honestly-reported
-no-camera/no-3D capability set — the point of this phase is confirming the contract degrades
-correctly, not just that it supports everything.
-
-### Phase 3 — Completed 2026-08-07 (VM-side; RUI/on-device confirmation still open)
-
-**Install:** `sudo apt install ros-noetic-stage-ros` — clean, no version conflicts, no manual
-build needed (unlike Webots' glibc issue in Phase 2).
-
-**Standalone smoke test found a real, Stage-specific gotcha, not a config error:** driving the
-stock `willow-erratic.world` robot with a single `rostopic pub -1 /cmd_vel ...` barely moved it
-(6cm over 3 commanded seconds at 0.3 m/s). Confirmed via `/base_pose_ground_truth` (matched
-`/odom` exactly, ruling out odometry noise) that this was real, not measurement error. Root
-cause: **Stage decays commanded velocity toward zero if `/cmd_vel` isn't refreshed
-continuously** — the opposite of Gazebo's `libgazebo_ros_diff_drive.so`, which latches the last
-command indefinitely. Continuous 10Hz publishing moved the robot as expected (less than the
-full 0.3 m/s due to Stage's modeled acceleration limit, which is expected/correct, not a bug).
-**No design change was needed** — the Gazebo and Webots bridges already re-publish a velocity
-command every control tick regardless of idle/active state (for their own, different reasons);
-this just confirms that habit is the right general default, not a Gazebo-only caution.
-
-**Bridge:** `sim_container/bridges/stage/sim_connector_bridge_stage.py` — a plain ROS node,
-the one bridge in this plan where that's correct by design rather than a fallback, since
-Stage's entire interface already is ROS topics (`/cmd_vel`, `/odom`, `/base_scan`). Reused the
-same closed-loop goto controller shape as the other two bridges.
-
-**New robot config, not a reuse this time:** `stage_ground_robot`, added to
-`sim_connector_app_params.yaml` — genuinely different from `ground_robot_2_wheel`
-(`has_camera_view_control: false`, `has_environment_controls: false`), because this world has
-neither a camera nor an environment toggle. This is the phase that actually exercises the "a
-sensor topic exists but has_camera correctly stays False" path the plan called out as the point
-of doing Stage third: `available_sensor_topics` correctly reports
-`stage_robot/base_scan` (`sensor_msgs/LaserScan`) while `has_camera`/`available_image_topics`
-stay `False`/`[]` — confirmed directly via `capabilities_query`, not assumed.
-
-**Verified end to end:** `bridge_connected: True`, live telemetry, correct capability
-degradation (above), and `goto_position(x+1.0)` moved the robot from `x≈-11.82` to `x≈-11.07`
-(most of the way to the 1.0m target given the tolerance) with "goto target reached" logged.
-
-**Deliberately not implemented this pass:** actual `LaserScan` data relay over the bridge wire
-(only the topic's existence/type is announced — no lidar streaming protocol exists in the
-current wire contract, and adding one is a genuine "new capability" change, not a bridge-local
-decision) and any setup actions (no reset-to-spawn mechanism was readily available for Stage's
-default world without deeper Stage-specific work).
-
-**Still open before Phase 3 is fully closed:** RUI-level confirmation on the real device (same
-deferral as Phases 1-2).
+Was built and VM-verified (2026-08-07): a real ROS-node bridge
+(`sim_container/bridges/stage/sim_connector_bridge_stage.py`), a dedicated
+`stage_ground_robot` robot config, and a `stage_rover` entry in
+`simulator_launch_targets.yaml`. Retired at the user's request — not a priority, and Stage's
+2D-only/no-camera nature made it more of a "prove the contract degrades honestly" exercise
+than something anyone needed day to day. All of the above has been deleted; if the history is
+ever needed again, it's in git log (this section, and the code, as of commits around
+2026-08-07 through 2026-08-17). The phase numbering below is left as-is (a gap at 3) rather
+than renumbered, to avoid rewriting every cross-reference in this document for a cosmetic gain.
 
 ---
 
@@ -371,7 +307,7 @@ pass rather than assuming "just like Webots but easier."
      body's position/orientation each step for telemetry.
    - Renders a synthetic camera view via `p.getCameraImage()` (returns raw RGBA — same
      JPEG-encoding step as the Webots bridge) if we choose to model a camera-equipped robot;
-     otherwise skip camera capability honestly, same as Phase 3.
+     otherwise skip camera capability honestly (report it as absent, don't fake it).
    - Applies `motor_control`/`goto_position` commands via `p.setJointMotorControl2` (wheeled
      URDF) or direct velocity control, whichever the chosen robot model supports.
    - Dials `127.0.0.1:9030` directly (plain Python socket — this is the simplest bridge in the
@@ -399,9 +335,9 @@ linear/angular velocity every step — confirmed to move exactly as commanded (0
 
 **Bridge:** `sim_container/bridges/pybullet/sim_connector_bridge_pybullet.py` — pure Python,
 zero ROS/`nepi_sdk` dependency, and structurally the simplest bridge in the plan so far: unlike
-Gazebo/Webots/Stage, there's no separate simulator process to launch at all — PyBullet is a
+Gazebo/Webots, there's no separate simulator process to launch at all — PyBullet is a
 library, so this one script's own main loop both steps physics and serves the bridge protocol.
-Reused the same closed-loop goto controller shape as the other three bridges.
+Reused the same closed-loop goto controller shape as the other bridges.
 
 **Verified end to end**, including a capability Webots' bridge had to leave as an honest gap:
 - `bridge_connected: True`, live telemetry, `pybullet_rover/camera` sensor topic announced.
@@ -498,7 +434,7 @@ against.
 **Flagged lower-confidence.** WPILib's simulation stack (via `robotpy`, the Python
 implementation) is built to simulate an FRC robot's *control system* — motor controllers,
 encoders, gyros, NetworkTables — not a renderable 3D/2D world with a camera and a NavPose
-concept the way Gazebo/Webots/PyBullet/Stage all are. There's no built-in "world" at all;
+concept the way Gazebo/Webots/PyBullet all are. There's no built-in "world" at all;
 getting a vehicle that actually moves through space requires writing a custom
 `PhysicsEngine` (robotpy's `pyfrc.physics` hook) that integrates simple differential-drive
 kinematics ourselves — real code, not configuration.
@@ -564,9 +500,9 @@ autonomous mode at startup (no physical/virtual Driver Station or joystick invol
 motor commands actually reach the simulated PWM outputs.
 
 **New robot config:** `wpilib_ground_robot` (no camera, no environment control, but a
-**real, working** `RESET`) — deliberately not a reuse of Phase 3's `stage_ground_robot`, whose
-empty `setup_actions` list reflects Stage genuinely having no reset mechanism. WPILib HAL Sim
-has no such restriction (unlike Webots' Supervisor gate) — `physics.py` can call
+**real, working** `RESET`) — a genuinely new config, not a reuse of `ground_robot_2_wheel`,
+since this world has no camera/environment capability at all. WPILib HAL Sim has no
+restriction on a working reset (unlike Webots' Supervisor gate) — `physics.py` can call
 `self.physics_controller.field.setRobotPose(...)` directly, via a `shared_state.py`
 request-flag crossing the `robot.py`/`physics.py` boundary.
 
@@ -599,7 +535,7 @@ so a future session doesn't have to re-derive it from git history.
 | 0 | NavPose hang bug | **Resolved 2026-08-07** | Not a real bug — missing-param `wait_for_param` block in bare test roscores only; see `completed/SIM_CONNECTOR_NAVPOSE_HANG_BUG.md` addendum. Seed `debug_mode`/`user_folders` params before bridge testing |
 | 1 | Gazebo (new contract) | **Fully done 2026-08-07, incl. real device** | See `completed/GAZEBO_SIM_CONNECTOR_INTEGRATION.md` for full detail; only a human visually loading the RUI page remains, tracked in `SIM_CONNECTOR_REMAINING_WORK.md` |
 | 2 | Webots | **VM-side done 2026-08-07** | R2023a (R2025a needs glibc ≥2.34, incompatible with this VM). Native Controller API, zero ROS. RUI/on-device confirmation still open |
-| 3 | ROS Stage | **VM-side done 2026-08-07** | ROS-native bridge (correctly, not a fallback). Found: Stage needs continuous cmd_vel, unlike Gazebo's latching plugin. RUI/on-device confirmation still open |
+| 3 | ROS Stage | **Retired 2026-08-17** | Was VM-side done; removed at the user's request, not a priority. See §6 for what existed. |
 | 4 | PyBullet | **VM-side done 2026-08-07** | Fully ROS-free on the sim side; RESET actually works (no Supervisor restriction, unlike Webots). RUI/on-device confirmation still open |
 | 5 | Unity (stretch) | **Blocked 2026-08-07** | Disk OK (23GB free); licensing needs an interactive Unity ID sign-in or an existing `.ulf` file — needs the account owner, not automatable |
 | 6 | WPILib HAL Sim (stretch) | **VM-side done 2026-08-07** | Pinned to robotpy 2022.4.8 (2024.x needs GCC 10+/C++20, unavailable here). goto_position works (not motor-control-only); RESET genuinely works. RUI/on-device confirmation still open |
