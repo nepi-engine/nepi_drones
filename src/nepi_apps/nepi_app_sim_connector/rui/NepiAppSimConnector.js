@@ -87,6 +87,12 @@ class NepiAppSimConnector extends Component {
       <Columns>
         <Column>
 
+          {/* show_controls is deliberately false, not a bug -- this panel's job is
+              standing up the right sim/robot config, not direct control. Manual
+              motor/goto/camera controls would duplicate what Devices -> Robots
+              already provides once a sim is deployed and its RBX driver registers
+              there. See commit "Remove manual robot controls from sim connector RUI
+              panel" if this looks wrong again -- it isn't. */}
           <NepiIFSim
             namespace={simNamespace}
             show_selectors={true}
