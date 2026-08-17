@@ -140,8 +140,9 @@ echo "Syncing App ${APP_NAME} from ${SOURCE_PATH} to NEPI Live Folders at:"
 echo "Destination Path ${DEST_PATH}"
 echo ""
 rsync -avzhe "ssh -i ${NEPI_SSH_KEY} -o StrictHostKeyChecking=no -p 2222" ${RSYNC_EXCLUDES} ${SOURCE_PATH}/* ${nepi_user_live}@${NEPI_TARGET_IP}:${DEST_PATH}/ 2> /dev/null
+RSYNC_RC=$?
 echo ""
-if [[ $? -ne 0 ]]; then
+if [[ $RSYNC_RC -ne 0 ]]; then
   if [ "${NEPI_REMOTE_SETUP}" == "0" ]; then
     local_host_ip="localhost"
   elif [ "${NEPI_REMOTE_SETUP}" == "1" ]; then
@@ -150,5 +151,15 @@ if [[ $? -ne 0 ]]; then
   echo "Failed connect to a running NEPI container on host: ${local_host_ip}"
   echo "Live Updates Failed"
 else
+  # rsync -a preserves the SOURCE file's mode bit, and every *.py script
+  # in this repo is tracked non-executable in git (the normal build/install
+  # path sets +x via CMake's install(PROGRAMS ...), not the source mode) --
+  # so this quick live-deploy path silently strips +x from whatever it
+  # overwrites. rosrun refuses to launch a non-executable file, which is
+  # invisible while an already-running process from a prior deploy is still
+  # up, but breaks the very next fresh launch (e.g. after a container
+  # restart). Restore +x on every deployed .py explicitly rather than
+  # relying on the destination already having it.
+  ssh -i ${NEPI_SSH_KEY} -o StrictHostKeyChecking=no -p 2222 ${nepi_user_live}@${NEPI_TARGET_IP} "chmod +x ${DEST_PATH}/*.py" 2> /dev/null
   echo "Live Updates Deployed"
 fi
