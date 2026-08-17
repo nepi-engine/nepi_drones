@@ -139,6 +139,10 @@ class WpilibSimConnectorRobot(wpilib.TimedRobot):
         else:
           shared_state.set_goto_target(None)
           print("sim_connector_bridge_wpilib: goto target reached", flush = True)
+          with self.sock_lock:
+            sock = self.sock
+          if sock is not None:
+            self.sendLine(sock, {"type": "goto_result", "success": True})
     elif any(motor_ratios):
       lin = (motor_ratios[0] + motor_ratios[1]) / 2.0 * MOTOR_MAX_LINEAR_MPS
       ang = (motor_ratios[1] - motor_ratios[0]) / TRACK_WIDTH_M * MOTOR_MAX_LINEAR_MPS
@@ -230,10 +234,15 @@ class WpilibSimConnectorRobot(wpilib.TimedRobot):
       time.sleep(1.0 / TELEMETRY_RATE_HZ)
 
   def sendLine(self, sock, line_dict):
-    try:
-      sock.sendall((json.dumps(line_dict) + "\n").encode())
-    except Exception:
-      pass
+    # Locked around the actual send, not just self.sock's assignment -- the
+    # goto-convergence check (periodic() -> the drivetrain update path) can
+    # now send goto_result concurrently with the main sender loop's own
+    # sends on the same socket.
+    with self.sock_lock:
+      try:
+        sock.sendall((json.dumps(line_dict) + "\n").encode())
+      except Exception:
+        pass
 
   #**********************
   # Commands from sim_connector_app_node.py

@@ -216,6 +216,8 @@ class WebotsSimConnectorBridge:
           with self.goto_lock:
             self.goto_target = None
           print("sim_connector_bridge_webots: goto target reached", flush = True)
+          if self.sock is not None:
+            self.sendLine(self.sock, {"type": "goto_result", "success": True})
     elif any(motor_ratios):
       lin = (motor_ratios[0] + motor_ratios[1]) / 2.0 * MOTOR_MAX_LINEAR_MPS
       ang = (motor_ratios[1] - motor_ratios[0]) / WHEEL_TRACK_M * MOTOR_MAX_LINEAR_MPS
@@ -320,10 +322,14 @@ class WebotsSimConnectorBridge:
     }
 
   def sendLine(self, sock, line_dict):
-    try:
-      sock.sendall((json.dumps(line_dict) + "\n").encode())
-    except Exception:
-      pass
+    # Locked around the actual send, not just self.sock's assignment -- the
+    # goto-control thread can now send goto_result concurrently with the
+    # main sender loop's own sends on the same socket.
+    with self.sock_lock:
+      try:
+        sock.sendall((json.dumps(line_dict) + "\n").encode())
+      except Exception:
+        pass
 
   #**********************
   # Commands from sim_connector_app_node.py

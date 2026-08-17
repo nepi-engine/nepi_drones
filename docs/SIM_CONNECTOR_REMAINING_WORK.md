@@ -29,6 +29,53 @@ itself.
 - **Unity is blocked on licensing, not engineering** — needs an interactive Unity account
   sign-in, which can't be automated. Not a code task; needs you specifically.
 
+## Live testing round (2026-08-17) — real bugs found and fixed
+
+Live testing against the real device (not just VM-side code reading) surfaced several
+real bugs beyond the three below, all now fixed and deployed:
+
+- **The actually-deployed RUI had `show_controls={false}` hardcoded** in
+  `NepiAppSimConnector.js` — a second, more severe cause of "no motor/goto/camera/
+  environment controls visible" than the capability-empty-default-config explanation
+  below. This wasn't a mismatch between `nepi_apps`'s source copy and what's live — the
+  *deployed* copy had drifted to `false` while the source had `true`. Fixed by
+  redeploying the correct copy.
+- **Deploy button ordering** — fixed (see item in the checklist history), deployed.
+- **Quadcopter launched Gazebo before ArduPilot SITL** — swapped (SITL first), verified
+  safe by reading the actual ArduPilot/Gazebo FDM socket source (both sides are
+  independent, retry-based, no ordering dependency) — not yet live-verified after the
+  swap.
+- **Killed rover stayed listed in the RUI's Devices page** — root-caused to
+  `sim_connector_app_node.py`'s own dangling status-topic subscription (see the fixed
+  item below), deployed.
+- **"4-Wheel Rover" launch appeared to open an empty world** — investigated at length;
+  the committed launch-target config, world file, and model were all confirmed correct.
+  The actual cause: a leftover `roscore`/`gzserver` from an earlier, unrelated manual
+  test session on the dev VM was still running (or its stale `gzclient` window still
+  visible) when the launch was attempted, and `gazebo_rover`'s launch command correctly
+  refuses to start a second Gazebo instance when one is already running (to avoid
+  silently attaching to the wrong world) — it's very likely what looked like "empty
+  world" was actually that leftover session, not a real config/code bug. Cleaned up the
+  leftover process; **worth simply retrying this launch** before assuming anything else
+  is wrong.
+- **`apps_mgr` does not auto-relaunch a killed app** — learned the hard way while
+  restarting `app_sim_connector` to pick up code changes: killing the node did not
+  bring it back within any reasonable window, contrary to what its own docs implied.
+  Had to relaunch it manually. Worth knowing for next time, not something to "fix"
+  necessarily — just don't assume killing an app node self-heals.
+- **Manually relaunching a NEPI app node needs `LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1`
+  set** on this device, or a lazy `import open3d` deep in `ReadWriteIF`'s init crashes
+  with a static-TLS allocation error. Whatever normally launches these nodes sets this;
+  a raw manual launch doesn't. Worth understanding whether this should be baked into the
+  node's own startup rather than relying on the launcher's environment, but not changed
+  here since it's outside this pass's scope.
+
+All of the above (except the still-open live-goto/environment-toggle verification and
+the quadcopter reorder) are deployed to the real device as of this round — the RUI
+bundle was rebuilt and pushed, `sim_connector_app_node.py`/`device_if_sim.py` were
+live-synced into the running container, and the app was restarted and confirmed healthy
+via its own status topic.
+
 ---
 
 ## Real gaps — actual work left, as granular checklists
@@ -95,19 +142,26 @@ option *off* — only on.
       `{"type":"goto_result","success":true}` at the exact point it already logged
       "goto target reached" internally — that log line existed before, the wire send
       didn't.
-  - [ ] Webots/Stage/PyBullet/WPILib bridges don't send this yet — each has to be
-        checked for whether it has an equivalent convergence-detection point and wired
-        similarly. Not done here; do before relying on goto success/failure reporting
-        for those simulators. This is backward compatible either way — a bridge that
-        never sends `goto_result` just leaves `cmd_success` untouched, same as before.
-  - [ ] No failure path is actually exercised anywhere yet — every bridge only ever
-        sends `success: true`. Worth deciding what "goto failed" even means for a given
-        simulator (unreachable target? timeout? collision?) before wiring a false-case
-        send.
-- [ ] **Live verification not done** — same caveat as item 1: no running Gazebo/ROS
-      environment was available in this pass. Verified by code reading and
-      `py_compile` only. Before considering this closed: send a `goto_position`,
-      confirm `cmd_success` flips `True` in `sim/status` once the rover visibly arrives.
+- [x] **Webots/Stage/PyBullet/WPILib bridges now send it too.** All four had the exact
+      same gap (a "goto target reached" log/print with no corresponding wire message) —
+      fixed identically in `sim_connector_bridge_stage.py`, `sim_connector_bridge_pybullet.py`,
+      `sim_connector_bridge_webots.py`, and WPILib's `robot.py` (this one uses
+      `shared_state`/`self.sock_lock` instead of the other four's shared class shape, but
+      the fix is the same: send `goto_result` right where it already logs convergence).
+- [x] **Found and fixed a real thread-safety gap this introduced.** All five bridges'
+      `sendLine()` only locked `self.sock`'s *assignment* (connect/disconnect), not the
+      actual `sendall()` call — fine when only one thread (the main sender loop) ever
+      wrote to the socket, but adding a `goto_result` send from the goto-control
+      thread/timer means two threads can now write to the same socket concurrently.
+      Moved the lock to wrap the actual `sendall()` inside `sendLine()` itself (rather
+      than requiring every call site to remember to acquire it) across all five bridges.
+- [ ] No failure path is exercised anywhere yet — every bridge only ever sends
+      `success: true`. Worth deciding what "goto failed" even means per simulator
+      (unreachable target? timeout? collision?) before wiring a false-case send.
+- [ ] **Live verification still open** for the underlying goto_result plumbing itself
+      (separate from the thread-safety fix, which is a static-reasoning fix, not
+      something that needs a live race to reproduce): send a `goto_position`, confirm
+      `cmd_success` flips `True` in `sim/status` once the rover visibly arrives.
 
 ### 3. Minor: Gazebo's image relay rate cap — re-checked, looks correct now
 

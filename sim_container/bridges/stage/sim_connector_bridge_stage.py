@@ -187,6 +187,8 @@ class StageSimConnectorBridge:
           with self.goto_lock:
             self.goto_target = None
           rospy.loginfo("sim_connector_bridge_stage: goto target reached")
+          if self.sock is not None:
+            self.sendLine(self.sock, {"type": "goto_result", "success": True})
     elif any(motor_ratios):
       left, right = motor_ratios[0], motor_ratios[1]
       lin = (left + right) / 2.0 * MOTOR_MAX_LINEAR_MPS
@@ -281,10 +283,14 @@ class StageSimConnectorBridge:
     }
 
   def sendLine(self, sock, line_dict):
-    try:
-      sock.sendall((json.dumps(line_dict) + "\n").encode())
-    except Exception as e:
-      rospy.logwarn_throttle(5.0, "sim_connector_bridge_stage: send failed: %s", str(e))
+    # Locked around the actual send, not just self.sock's assignment -- the
+    # goto-control thread can now send goto_result concurrently with the
+    # main sender loop's own sends on the same socket.
+    with self.sock_lock:
+      try:
+        sock.sendall((json.dumps(line_dict) + "\n").encode())
+      except Exception as e:
+        rospy.logwarn_throttle(5.0, "sim_connector_bridge_stage: send failed: %s", str(e))
 
   #**********************
   # Commands from sim_connector_app_node.py

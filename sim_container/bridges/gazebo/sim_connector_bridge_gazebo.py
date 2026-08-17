@@ -339,10 +339,17 @@ class GazeboSimConnectorBridge:
     }
 
   def sendLine(self, sock, line_dict):
-    try:
-      sock.sendall((json.dumps(line_dict) + "\n").encode())
-    except Exception as e:
-      rospy.logwarn_throttle(5.0, "sim_connector_bridge_gazebo: send failed: %s", str(e))
+    # Locked around the actual send, not just around self.sock's assignment --
+    # controlTickCb (a ROS timer, its own thread) can now send goto_result
+    # concurrently with senderLoop's own sends on the same socket; without
+    # this, two interleaved sendall() calls could tear a JSON line in half on
+    # the wire. self.sock's connect/disconnect assignment already used this
+    # same lock; this just extends it to cover concurrent senders too.
+    with self.sock_lock:
+      try:
+        sock.sendall((json.dumps(line_dict) + "\n").encode())
+      except Exception as e:
+        rospy.logwarn_throttle(5.0, "sim_connector_bridge_gazebo: send failed: %s", str(e))
 
   #**********************
   # Commands from sim_connector_app_node.py
