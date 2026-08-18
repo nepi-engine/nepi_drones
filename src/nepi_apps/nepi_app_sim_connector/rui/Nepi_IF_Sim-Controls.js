@@ -942,23 +942,42 @@ class NepiIFSimControls extends Component {
     )
   }
 
-  // "Choose what image sources are good and what aren't" -- one checkbox per
-  // candidate image topic (this.state.capabilities.available_image_topics,
-  // the SAME list renderCameraControls' own selector above already uses),
-  // membership toggling that topic in the comma-separated
-  // enabled_image_sources Setting NepiDeviceRBX.js's createImageOptions
-  // filters by. Gated on the Setting's presence, not a capability, matching
-  // every other control in this block.
+  // Image Viewer -- "choose what image sources are good and what aren't" for
+  // THIS sim instance. One checkbox per candidate image topic, membership
+  // toggling that topic in the comma-separated enabled_image_sources Setting
+  // NepiDeviceRBX.js's createImageOptions filters the robot's own Image
+  // Source dropdown by (see that method's own comment for the other half of
+  // this feature: an allowlisted topic now shows up there even from outside
+  // this robot's own namespace, which is what makes offering a real physical
+  // camera here actually useful).
+  //
+  // Candidates come from this.props.ros.imageTopics -- the RUI-wide live
+  // sensor_msgs/Image topic list (Store.js updateImageTopics), NOT from
+  // this.state.capabilities.available_image_topics. Found live (2026-08-18)
+  // as the reason this section never appeared at all for the Gazebo rover or
+  // ArduPilot driver: that capability field is only ever populated by the
+  // newer shared "generic connector" bridge protocol (Webots/PyBullet/WPILib,
+  // see sim_connector_app_node.py's getAvailableSensorTopics), which RBX_SIM
+  // and RBX_ARDUPILOT's own separate heartbeat+bridge mechanism never feeds
+  // -- so available_image_topics was structurally always empty for them,
+  // silently hiding this whole feature rather than a capability genuinely
+  // being absent. The live system-wide list is accurate for every driver.
   renderImageSourceCuration() {
-    const rbx_ns = this.state.rbx_namespace
-    if (rbx_ns === null || rbx_ns === '' || rbx_ns === 'None') {
+    const live = this.isRbxLive()
+    if (!live) {
+      // Genuinely needs live detection -- there is no candidate topic list
+      // to curate before a real camera exists to publish one.
       return null
     }
+    const rbx_ns = this.state.rbx_namespace
     if (!this.state.rbxSettingsNamesList.includes("enabled_image_sources")) {
       return null
     }
-    const caps = this.state.capabilities
-    const candidates = (caps != null && caps.available_image_topics !== undefined) ? caps.available_image_topics : []
+    const image_topics = this.props.ros.imageTopics || []
+    const nodeNamespace = rbx_ns.split('/rbx')[0]
+    const ownImageTopic = nodeNamespace + "/image"
+    const candidates = image_topics.filter((topic) =>
+      topic !== ownImageTopic && topic.includes('zed_node') === false)
     if (candidates.length === 0) {
       return null
     }
@@ -984,7 +1003,7 @@ class NepiIFSimControls extends Component {
     return (
       <React.Fragment>
         <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
-        <Label title={"Image Sources"} labelStyle={{ fontWeight: 'bold' }}/>
+        <Label title={"Image Viewer"} labelStyle={{ fontWeight: 'bold' }}/>
         {candidates.map((topic) => (
           <Label key={topic} title={topic}>
             <Toggle
