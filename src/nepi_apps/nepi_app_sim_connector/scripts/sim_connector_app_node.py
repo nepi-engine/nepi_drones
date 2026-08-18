@@ -785,6 +785,26 @@ class NepiSimConnectorApp:
                              " is no longer available, clearing selection")
         self.selected_simulator = ""
 
+    # Auto-select when exactly one real candidate is discovered and nothing
+    # is currently selected. Found live (2026-08-18) as the actual root cause
+    # of every Sim Connector configuration control (capability toggles,
+    # camera/movement Settings -- see Nepi_IF_Sim-Controls.js's rbx_namespace,
+    # which is driven entirely by selected_simulator) staying permanently
+    # unreachable: available_simulators correctly listed the running RBX
+    # driver the whole time (confirmed via direct inspection), but nothing
+    # ever called select_simulator to actually choose it, because the manual
+    # "Simulator" selector control that would have was removed earlier under
+    # the belief that this list is always empty in practice -- it is not,
+    # only the SELECTION step was missing. This project only ever deploys one
+    # simulator at a time, so auto-selecting the sole candidate is a correct
+    # default, not a guess; more than one simultaneous candidate (not a real
+    # scenario today) still requires an explicit choice rather than picking
+    # one arbitrarily.
+    if self.selected_simulator == "":
+      available, _names = self.getAvailableSimulators()
+      if len(available) == 1:
+        self.setSelectedSimulator(available[0])
+
   def simDeviceStatusCb(self, msg, args):
     topic = args[0] if isinstance(args, tuple) else args
     with self.sim_scan_lock:
@@ -1539,6 +1559,20 @@ class NepiSimConnectorApp:
         self.msg_if.pub_warn("Failed to send " + description.lower() + " to bridge: " + str(e))
         if self.client_conn is conn:
           self.client_conn = None
+        # shutdown() before close(): bridgeServerLoop's thread is almost
+        # certainly blocked in serveClient's timeout=None recv() on this
+        # exact socket. Closing a fd out from under a thread blocked in
+        # recv() on it does not reliably unblock that recv() on Linux --
+        # without the shutdown(), that thread can stay wedged inside
+        # serveClient forever, never returning to accept() the bridge's next
+        # reconnect attempt. Same fix as sim_bridge_node.py/camera_rig_
+        # controller_ardupilot.py's sendLineToClient (found while chasing a
+        # simulator camera flicker-in-and-out bug with the identical
+        # send-thread/recv-thread split).
+        try:
+          conn.shutdown(socket.SHUT_RDWR)
+        except Exception:
+          pass
         try:
           conn.close()
         except Exception:
