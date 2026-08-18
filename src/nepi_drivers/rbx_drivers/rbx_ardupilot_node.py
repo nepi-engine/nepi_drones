@@ -1092,7 +1092,8 @@ class ArdupilotNode:
         self.rbx_if.update_error_msg(no_gps_msg)
     else:
       self.msg_if.pub_info("Updating State to: " + str(arm_value))
-      time.sleep(1) # Give time for other process to see busy
+      # See set_mavlink_mode's identical removal for why this unconditional
+      # 1s sleep is gone -- same unjustified per-command latency.
       self.msg_if.pub_info("Waiting for armed value to set to " + str(arm_value))
       timeout_sec = self.rbx_if.rbx_info.cmd_timeout
       check_interval_s = 0.25
@@ -1150,7 +1151,16 @@ class ArdupilotNode:
     new_mode.custom_mode = mode_new
     self.msg_if.pub_info("Updating mode")
     self.msg_if.pub_info(mode_new)
-    time.sleep(1) # Give time for other process to see busy
+    # Was `time.sleep(1)` here ("give time for other process to see busy") --
+    # removed. No process actually waits on this: RBXRobotIF's own busy/
+    # process_current state is set before this function is ever called, not
+    # inside it, and the poll loop below already only proceeds once the FCU
+    # actually reports the new mode. A flat 1s of dead time before every
+    # single mode change (and the identical one in set_mavlink_arm_state) is
+    # exactly the reported "sending commands is really slow" -- a LAUNCH
+    # setup action alone chains a mode change and an arm, so this was 2+
+    # full seconds of unconditional sleep before anything even started, on
+    # every command, every time.
     self.msg_if.pub_info("Waiting for mode to set to " + mode_new)
     timeout_sec = self.rbx_if.rbx_info.cmd_timeout
     check_interval_s = 0.25
