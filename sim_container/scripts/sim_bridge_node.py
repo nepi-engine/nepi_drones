@@ -445,10 +445,22 @@ class SimBridgeNode:
     state.pose.orientation.w = 1.0
     state.reference_frame = 'world'
     self.model_state_pub.publish(state)
-    # Drop any idle anchor from before the reset -- otherwise the very next
-    # idle tick's holdStill() would immediately re-teleport the rover back to
-    # its pre-reset position, fighting the reset it's supposed to respect.
-    self.held_pose = None
+    # Set the idle anchor DIRECTLY to the reset target (origin), not None --
+    # found live (2026-08-18) as the actual reason RESET_SIM appeared to do
+    # nothing. rbx_sim_node.py's gotoControlCb sends a fresh (0,0) idle
+    # cmd_vel at 20Hz regardless of activity, and cmdCb only re-captures
+    # held_pose from live telemetry when it is None (see cmdCb's own
+    # comment). Clearing it to None here left a race: an idle tick landing
+    # before Gazebo's own physics step had processed this ModelState publish
+    # would re-capture the STALE pre-reset position from /rover/odom into
+    # held_pose, and the very next holdStill() tick would republish that
+    # stale position via set_model_state -- silently undoing the reset
+    # within milliseconds, consistently enough to look like RESET_SIM simply
+    # didn't work. Setting held_pose to the actual reset target here closes
+    # that window: any holdStill() tick landing during the race now
+    # reasserts the CORRECT already-reset pose instead of re-reading
+    # (possibly stale) telemetry.
+    self.held_pose = {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
 
   def holdStill(self):
     # Confirmed live (get_joint_properties on all 4 wheel joints, with
