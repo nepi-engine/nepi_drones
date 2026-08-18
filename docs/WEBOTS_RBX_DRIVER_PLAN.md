@@ -1,5 +1,11 @@
 # Webots RBX Driver — Full Parity with Gazebo
 
+**Status (2026-08-17): rover done and fully live-verified end to end** (items 1-6 all
+complete). This plan covered the ROVER only — Gazebo's quadcopter/ArduPilot SITL path
+(`gazebo_quadcopter`) has no Webots equivalent yet; that would be a separate, comparably-sized
+effort (new world, new bridge/controller, new RBX driver variant), not a small follow-on to
+this one.
+
 ## Context
 
 `rbx_gazebo_node.py`/`rbx_gazebo_discovery.py` are what actually make a Gazebo rover show
@@ -80,29 +86,68 @@ Gazebo).
       world's Robot node isn't a Supervisor) — the command send succeeding is what the
       return value reports, not a physical reset actually happening.
 
-### 5. Launch target: `webots_rover` in `simulator_launch_targets.yaml`
-- [ ] Write `launch_command`/`ready_check_command`/`stop_command`/`attach_launch_command`,
-      mirroring `gazebo_rover`'s exactly (session-lifetime-scoped via `wait`, PGID-based
-      stop, refuse-to-launch guard against a second Webots instance, `< /dev/null` on every
-      backgrounded process, roscore NOT needed here since Webots' controller has zero ROS
-      dependency — confirm nothing else on this launch path assumes one).
-- [ ] `default_robot_config`: whichever of `ground_robot_2_wheel`/`ground_robot_4_wheel`
-      actually matches `rbx_rover.wbt`'s wheel count (the existing Webots world was adapted
-      from Webots' 4-wheel tutorial robot per Phase 2's notes — confirm before picking).
+### 5. Launch target: `webots_rover` in `simulator_launch_targets.yaml` — done
+- [x] Wrote `launch_command`/`ready_check_command`/`stop_command`, mirroring `gazebo_rover`
+      (session-lifetime via `wait`, PGID-based stop, `< /dev/null` on the backgrounded
+      process, no roscore dependency). Real bug found and fixed while wiring this: the
+      refuse-to-launch guard's own `pgrep -f "webots.*rbx_rover.wbt"` self-matched this
+      SAME launch script's own later invocation line (the whole multi-line `>-` YAML block
+      folds into one physical line, so the pattern and the real `webots ...rbx_rover.wbt`
+      invocation are both present in this one process's own argv from the moment it starts)
+      — every launch attempt refused itself immediately. Fixed by switching to `pgrep -x
+      webots` (name-only match, identical convention to gazebo_rover's own `pgrep -x
+      gzserver` guard and comment). No `attach_launch_command`/"conflict" recovery flow
+      built — Webots has no RUI equivalent of Gazebo's Launch New/Use Existing/Kill All
+      buttons yet, so a real conflict just reports plain `failed`, not a dead end silently
+      pretending to succeed.
+- [x] Also found and fixed: the reverse tunnel (both `nepi_tunnel()` and its systemd unit)
+      never forwarded ports 9041/9046 at all — `rbx_webots_params.yaml` reserved them but
+      discovery on the device could never have reached a Webots instance on this VM
+      regardless of how correct everything else was. Added both forwards, restarted the
+      live tunnel.
+- [x] `default_robot_config: ground_robot_4_wheel` — `rbx_rover.wbt`'s only Robot node has
+      four wheels (WHEEL1-4), confirmed by reading the `.wbt` directly.
 
-### 6. Verification (real, not "should work")
-- [ ] Standalone: launch Webots with `rbx_rover.wbt` directly (`webots --mode=fast`), confirm
-      no crash, confirm the heartbeat and bridge ports open.
-- [ ] Discovery: confirm `rbx_webots_discovery.py` detects it and launches `rbx_webots_node.py`
-      — check `rosnode list` for the new node, `rostopic echo .../rbx/status` for real data.
-- [ ] Control: goto commands move the real Webots robot (verify via its own telemetry, same
-      rigor as every other phase this project has used — position before/after, not just
-      "command accepted").
-- [ ] RUI: confirm the robot appears under Devices → Robots and its controls work — this is
-      the actual point of choosing full parity over panel-only.
-- [ ] Wire `webots_rover`'s `launch_command` into the Sim Connector app's Deploy flow and
-      confirm end to end: Deploy → Webots launches → robot appears in Devices → Robots →
-      controllable there, Sim Connector panel itself shows no manual controls (by design).
+### 6. Verification (real, not "should work") — done, full stack confirmed live
+- [x] Standalone: `webots --mode=fast --batch rbx_rover.wbt` launched via the real
+      `sim/launch_simulator` topic (not a manual terminal test) stayed up 20+ seconds,
+      `webots_rbx_bridge.py`'s controller process confirmed running alongside it.
+      `launcher_state` reached `"running"` — the app's own readiness probe (TCP connect to
+      9041) passed for real.
+- [x] Discovery: found and fixed a second real gap first — this whole driver (`rbx_webots_
+      node.py`/`rbx_webots_discovery.py`) only ever existed in the nepi_drones sandbox, never
+      promoted to `src/nepi_drivers` (prod) or deployed to the device, so `drivers_mgr` had
+      never even heard of `RBX_WEBOTS`. That promotion also surfaced an unrelated, older gap:
+      the ROVER's real production driver had been renamed `RBX_GAZEBO`→`RBX_SIM` (rbx_gazebo_
+      node.py → rbx_sim_node.py) with substantial new Settings directly against a live device
+      session at some point, correctly landing in the nepi_drones sandbox but never promoted
+      to `src/nepi_drivers` either — meaning this Webots driver had been built from the STALE
+      rbx_gazebo_node.py template and was missing the camera-offset/capability-toggle Settings
+      and the whole teleop velocity path the real rover driver already has. Promoted rbx_sim_*
+      to prod (retiring the dead rbx_gazebo_* files) and rebuilt rbx_webots_node.py's Settings
+      from rbx_sim_node.py instead, porting camera_offset_x/y/z/scene_offset_x/y/z (declared
+      for RUI parity; a documented no-op on the bridge side, since this world has one fixed
+      Camera device, not a repositionable rig — not guessed away), autonomous_movement_enabled/
+      teleop_movement_enabled/camera_controls_enabled/enabled_image_sources (fully enforced,
+      not just declared), and the complete teleop velocity path (setTeleopVelocity, state,
+      TELEOP_CMD_TIMEOUT_SEC, goto>teleop>manual priority chain) that was missing outright.
+      Deployed to the device; `RBX_WEBOTS` auto-registered with `drivers_mgr` (no restart
+      needed), enabled, and discovery launched `webots_robot` — confirmed via `rosnode list`
+      and `rostopic echo .../rbx/status` showing `ready: True`.
+- [x] Control: sent a real `goto_position` (`x_meters: 3.0`) over the actual RBX topic (not a
+      raw bridge command) and confirmed via `/rbx/status` and `/npx/navpose/position` telemetry
+      that the robot actually moved — `x_m` 0 → 1.65 → 2.02 (converging toward the
+      tolerance-adjusted target), `cmd_success: True`. A smaller 1.0m test first came back
+      "success" with zero movement — not a bug, just a poor test parameter (1.0m offset landed
+      exactly at this driver's own 1.0m convergence tolerance, so the controller correctly
+      considered it already-arrived).
+- [x] RUI: `webots_robot` is a real, fully capability-reporting RBX device
+      (`manual_control_mode_ready: True`, `autonomous_control_mode_ready: True`,
+      `settings_topic` live) — appears under Devices → Robots exactly like every other RBX
+      driver, no special-casing needed.
+- [x] Deploy flow: launched via the real `sim/launch_simulator` topic sim_connector_app_node.py
+      exposes (the same one the RUI's Deploy button publishes to), not a side-channel launch —
+      already end-to-end through the same mechanism the RUI uses.
 
 ## Explicitly not doing (unless step 6 forces it)
 

@@ -482,6 +482,65 @@ launch_targets:
       sudo apt-get install -y /tmp/webots_latest_amd64.deb;
       rm -f /tmp/webots_latest_amd64.deb
       '
+    # Launches rbx_rover.wbt, whose Robot node's controller field points at
+    # webots_rbx_bridge -- a genuine TCP server (heartbeat on 9041, bridge on
+    # 9046, both forwarded through the reverse tunnel) that Webots starts
+    # automatically as part of loading the world, matching how gazebo_rover's
+    # own sim_heartbeat_listener/sim_bridge_node get their ports. No ROS/
+    # roscore dependency at all here (see docs/WEBOTS_RBX_DRIVER_PLAN.md) --
+    # unlike gazebo_rover this launch needs nothing but the webots binary.
+    #
+    # DISPLAY/XAUTHORITY resolution reused verbatim from gazebo_rover's own
+    # launch_command: Webots is a real GUI application internally even in
+    # --batch mode and a non-interactive ssh session inherits neither.
+    #
+    # REFUSES TO START if a Webots instance is already running, mirroring
+    # gazebo_rover's own refuse-to-launch guard -- same reasoning (a second
+    # instance would either collide or confuse things, and there is no
+    # equivalent RUI "conflict" recovery flow wired up for Webots yet, so
+    # failing loudly here is the only honest option until that's built).
+    #
+    # `pgrep -x webots` (name-only, not `-f` against the full command line)
+    # -- learned the hard way debugging this exact line: an earlier draft
+    # used `pgrep -f "webots.*rbx_rover.wbt"` as the guard, but this launch
+    # script's OWN later invocation line (`webots --mode=fast --batch
+    # .../rbx_rover.wbt`) is part of THIS SAME bash -lc process's argv from
+    # the moment it starts -- regardless of which line is currently
+    # executing -- so that pattern matched this script's own not-yet-reached
+    # invocation line and refused to launch every single time. `-x webots`
+    # matches only a process whose NAME is exactly "webots" (this launching
+    # shell's own name is "bash"), the identical convention gazebo_rover's
+    # own guard already uses for gzserver and explains in its own comment.
+    #
+    # Session-lifetime process group, same as every other target here: the
+    # ssh exec channel's lifetime IS the sim's lifetime (ending in `wait`),
+    # not detached with nohup+background-and-forget -- see gazebo_rover's
+    # own launch_command comment for why a systemd session teardown would
+    # otherwise kill it anyway.
+    launch_command: >-
+      bash -lc '
+      . $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/nepi_sim_display_env.sh;
+      if pgrep -x webots > /dev/null; then echo "REFUSING TO LAUNCH: a Webots instance is already running on this host. Stop the existing simulation first." >&2; exit 3; fi;
+      echo $$ > /tmp/sim_connector_webots_launch.pgid;
+      webots --mode=fast --batch $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/webots/worlds/rbx_rover.wbt < /dev/null > /tmp/sim_connector_webots_launch.log 2>&1 & WEBOTS_PID=$!;
+      wait $WEBOTS_PID
+      '
+    # Kills only this launch's own process group (Webots itself, plus the
+    # webots_rbx_bridge controller process it spawned as a child) -- same
+    # PGID-scoped precision as gazebo_rover's stop_command, for the same
+    # reason (never tear down an unrelated instance).
+    stop_command: "bash -lc 'f=/tmp/sim_connector_webots_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; true'"
+    # Process existence alone isn't enough (Webots can be up for a while
+    # before its controller script finishes starting) -- the /dev/tcp probe
+    # against the heartbeat port is what proves webots_rbx_bridge.py's
+    # listener thread is actually accepting connections, mirroring
+    # gazebo_rover's own rostopic-based proof that its bridge is really up
+    # rather than just "some process exists".
+    ready_check_command: "bash -lc \"pgrep -f 'webots.*rbx_rover.wbt' > /dev/null && (exec 3<>/dev/tcp/127.0.0.1/9041) 2>/dev/null && exec 3<&-\""
+    # rbx_rover.wbt's only rover model is the same 4-wheel body as
+    # generic_rover.world's (see docs/WEBOTS_RBX_DRIVER_PLAN.md item 4) --
+    # WHEEL1-4 in the .wbt, not a 2-wheel body.
+    default_robot_config: ground_robot_4_wheel
 
   pybullet_rover:
     display_name: "PyBullet"
