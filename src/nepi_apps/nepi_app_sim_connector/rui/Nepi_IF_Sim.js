@@ -140,6 +140,21 @@ class NepiIFSim extends Component {
       // to both, rather than living in either instance's own local state.
       selected_launch_target: 'None',
 
+      // Robot config selection, tracked locally (optimistic) rather than
+      // read purely from status_msg.selected_robot_config -- found live
+      // (2026-08-18): selecting "Quadcopter" then immediately clicking
+      // Deploy on a freshly-loaded page could race the backend's own
+      // processing of the select_robot_config message, so Deploy read a
+      // stale (still-default, or still-rover) selected_robot_config and
+      // launched the rover instead of the quadcopter override -- only
+      // fixed itself after a kill + redeploy gave the round trip time to
+      // land. Deploy now explicitly re-sends this value immediately before
+      // launching (see NepiIFSimLauncher's onDeployClicked/onNewSimClicked),
+      // so the backend's own selection is always fresh by the time it reads
+      // it, regardless of any earlier message's timing. null means "no
+      // local override yet, fall back to status_msg".
+      selected_robot_config_local: null,
+
     }
 
     // Hidden <input type="file"> target for the Upload Robot Config button
@@ -186,6 +201,17 @@ class NepiIFSim extends Component {
     if (namespace !== this.state.namespace) {
       this.updateStatusListener()
       this.updateRobotConfigYamlListener()
+    }
+
+    // Once the server catches up and reports the SAME config we optimistically
+    // set locally, drop the local override and track the server again -- this
+    // is what lets a later server-side change (e.g. resolve_robot_config
+    // applying an override during a launch) become visible instead of staying
+    // masked by a stale local value forever.
+    const status_msg = this.state.status_msg
+    if (this.state.selected_robot_config_local !== null && status_msg != null
+        && status_msg.selected_robot_config === this.state.selected_robot_config_local) {
+      this.setState({ selected_robot_config_local: null })
     }
   }
 
@@ -293,10 +319,31 @@ class NepiIFSim extends Component {
   // robot, so the device re-derives and republishes its capability report --
   // which is why the controls child re-queries capabilities when the reported
   // selected config changes.
+  // The robot config currently DISPLAYED -- local override if one is
+  // pending, else whatever the server last reported. See
+  // selected_robot_config_local's own comment; used both by the selector's
+  // own display and as the value NepiIFSimLauncher's Deploy re-sends
+  // immediately before launching.
+  getSelectedRobotConfig() {
+    if (this.state.selected_robot_config_local !== null) {
+      return this.state.selected_robot_config_local
+    }
+    const status_msg = this.state.status_msg
+    return (status_msg != null && status_msg.selected_robot_config !== undefined
+            && status_msg.selected_robot_config !== '')
+      ? status_msg.selected_robot_config : 'None'
+  }
+
   onRobotConfigSelected(event) {
+    const value = event.target.value
+    // Optimistic local update FIRST -- see selected_robot_config_local's own
+    // comment for why the dropdown no longer waits on a status round trip
+    // to reflect a selection, and why Deploy needs this value immediately
+    // available rather than only in flight to the backend.
+    this.setState({ selected_robot_config_local: value })
     const namespace = this.getSimNamespace()
     if (namespace != null && namespace !== 'None') {
-      this.props.ros.sendStringMsg(namespace + '/select_robot_config', event.target.value)
+      this.props.ros.sendStringMsg(namespace + '/select_robot_config', value)
     }
   }
 
@@ -361,9 +408,7 @@ class NepiIFSim extends Component {
       ? status_msg.available_robot_configs : []
     const names = (status_msg.available_robot_config_names !== undefined)
       ? status_msg.available_robot_config_names : []
-    const selected = (status_msg.selected_robot_config !== undefined
-                      && status_msg.selected_robot_config !== '')
-      ? status_msg.selected_robot_config : 'None'
+    const selected = this.getSelectedRobotConfig()
 
     var items = []
     if (available.length === 0) {
@@ -615,6 +660,24 @@ class NepiIFSim extends Component {
             {this.renderRobotConfigSelector()}
             {this.renderRobotConfigUpload()}
             {this.renderRobotConfigViewer()}
+
+            {/* Deploy/Kill/Install controls -- right after picking WHAT to
+                run (simulator) and WHICH robot config, before the
+                capability-configuration controls below. Moved up from the
+                very bottom of the page per request: those controls only
+                shape what a robot exposes once running, not the pick-and-go
+                deploy decision -- keeping Deploy right under the two things
+                that actually decide what gets deployed. */}
+            {(show_selectors === true) ?
+              <NepiIFSimLauncher
+                namespace={namespace}
+                make_section={false}
+                only={"deploy"}
+                selected_target={this.state.selected_launch_target}
+                onTargetSelected={this.onLaunchTargetSelected}
+                selected_robot_config={this.getSelectedRobotConfig()}
+              />
+            : null}
           </React.Fragment>
         : null}
 
@@ -637,20 +700,6 @@ class NepiIFSim extends Component {
           make_section={false}
           show_live_controls={show_controls}
         />
-
-        {/* Deploy/Kill/Install controls -- deliberately last on the page.
-            Picking WHAT to run (the selector above) and configuring it
-            (robot config + capability controls above) both come before
-            actually launching it. */}
-        {(show_selectors === true) ?
-          <NepiIFSimLauncher
-            namespace={namespace}
-            make_section={false}
-            only={"deploy"}
-            selected_target={this.state.selected_launch_target}
-            onTargetSelected={this.onLaunchTargetSelected}
-          />
-        : null}
 
       </React.Fragment>
     )
