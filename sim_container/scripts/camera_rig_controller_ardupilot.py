@@ -34,23 +34,39 @@
 #   - Vehicle motion is full 3D (multirotor), not planar -- the drone's
 #     altitude varies, so cam_z now tracks drone_z + offset_z rather than a
 #     fixed offset_z as the rover used (rover never left z=0).
-#   - FIRST_PERSON is yaw-only / gimbal-stabilized (camera stays level
-#     regardless of airframe roll/pitch), not rigidly slaved to the full
-#     airframe attitude. Chosen because NEPI's target use cases (inspection,
-#     survey -- the VideoRay/OceanAero/WESMAR field deployments the platform
-#     is built around) match real commercial drones' 3-axis gimbals, not FPV
-#     racing rigs: a camera that banked/pitched with every stabilization
-#     twitch would be a poor default for an inspection data product. It is
-#     also the cheapest extension of the rover's own FIRST_PERSON semantic
-#     (cam_yaw = vehicle_yaw, pitch/roll = 0) -- same formula, now reading a
-#     real quaternion's yaw component instead of assuming pitch/roll were
-#     already zero (true for the flat rover, not for a multirotor). The
-#     rigidly-slaved alternative is a legitimate convention too (nose-mounted
-#     FPV camera) but is not built here -- see the session summary for the
-#     full reasoning and how cheaply it could be added later (a per-request
-#     stabilized/unstabilized toggle) if ever needed.
-#   - THIRD_PERSON's look-at is extended to real 3D: pitch is computed from
-#     the real altitude difference (drone_z - cam_z), not assumed zero.
+#   - Robot view (nose cam) is yaw-only / gimbal-stabilized (camera stays
+#     level regardless of airframe roll/pitch), not rigidly slaved to the
+#     full airframe attitude. Chosen because NEPI's target use cases
+#     (inspection, survey -- the VideoRay/OceanAero/WESMAR field deployments
+#     the platform is built around) match real commercial drones' 3-axis
+#     gimbals, not FPV racing rigs: a camera that banked/pitched with every
+#     stabilization twitch would be a poor default for an inspection data
+#     product. It is also the cheapest extension of the rover's own
+#     first-person semantic (cam_yaw = vehicle_yaw, pitch/roll = 0) -- same
+#     formula, now reading a real quaternion's yaw component instead of
+#     assuming pitch/roll were already zero (true for the flat rover, not
+#     for a multirotor). The rigidly-slaved alternative is a legitimate
+#     convention too (nose-mounted FPV camera) but is not built here -- see
+#     the session summary for the full reasoning and how cheaply it could be
+#     added later (a per-request stabilized/unstabilized toggle) if ever
+#     needed.
+#   - Scene view (chase cam)'s look-at is extended to real 3D: pitch is
+#     computed from the real altitude difference (drone_z - cam_z), not
+#     assumed zero.
+#   - Two rigid Gazebo models, camera_rig (robot view) and camera_rig_chase
+#     (scene view) -- see iris_arducopter_cmac.world -- both driven and
+#     published every control tick, simultaneously, not one model teleported
+#     between two poses on a view_mode toggle. Reworked (2026-08-18) after a
+#     live report that the single-model design's "third-person view" didn't
+#     really exist as an independent thing a client could rely on ("only one
+#     instance, and it still glitches") -- switching modes visibly snapped
+#     the one existing camera between two unrelated poses, and only whichever
+#     mode was currently selected could ever be observed. Matches the same
+#     fix already applied to the rover's camera_rig_controller.py (relay both
+#     always-live feeds instead of one selected feed), extended here to also
+#     need a second physical model since -- unlike the rover's two rigid
+#     welded links -- this workflow's cameras were never rigidly attached to
+#     the vehicle at all.
 #   - Bridge: no separate sim_bridge_node.py exists for this workflow (the
 #     ArduPilot driver's only other channel is raw MAVLink, which already
 #     carries telemetry/commands and has no camera channel at all) so this
@@ -80,9 +96,16 @@ NODE_NAME = 'camera_rig_controller_ardupilot'
 
 MODEL_STATES_TOPIC = '/gazebo/model_states'
 VEHICLE_MODEL_NAME = 'iris_demo'
-IMAGE_TOPIC = '/camera_rig/camera/image_raw'
 MODEL_STATE_TOPIC = '/gazebo/set_model_state'
-CAMERA_MODEL_NAME = 'camera_rig'
+
+# Two rigs, two models, two topics -- see iris_arducopter_cmac.world's own
+# comment and this module's docstring for why both are always driven and
+# published simultaneously now, rather than one model teleported between
+# poses on a view_mode toggle.
+ROBOT_VIEW_IMAGE_TOPIC = '/camera_rig/camera/image_raw'
+SCENE_VIEW_IMAGE_TOPIC = '/camera_rig_chase/camera/image_raw'
+ROBOT_VIEW_MODEL_NAME = 'camera_rig'
+SCENE_VIEW_MODEL_NAME = 'camera_rig_chase'
 
 # Pose-follow update rate: matches the rover controller's own rationale --
 # smooth relative to the ~1-10 Hz MAVLink telemetry rate elsewhere in this
@@ -101,13 +124,20 @@ BRIDGE_PORT = 9026
 
 # Matches rbx_ardupilot_node.py's FACTORY_SETTINGS for these (kept in sync by
 # eye -- both sides fall back to the same values before the first
-# camera_settings line arrives, e.g. right after a (re)connect). Forward and
-# slightly below the body: a nose/belly-mounted inspection-camera convention,
-# distinct from the rover's flat mount point since this is a multirotor.
-DEFAULT_VIEW_MODE = 'FIRST_PERSON'
+# camera_settings line arrives, e.g. right after a (re)connect).
+#
+# Robot view (nose cam): forward and slightly below the body, a
+# nose/belly-mounted inspection-camera convention, distinct from the rover's
+# flat mount point since this is a multirotor.
 DEFAULT_OFFSET_X = 0.15
 DEFAULT_OFFSET_Y = 0.0
 DEFAULT_OFFSET_Z = -0.1
+# Scene view (chase cam): behind and above the body -- same general chase-cam
+# convention as the rover's own scene_offset_* defaults, scaled down since a
+# quadcopter's own body/prop footprint is much smaller than the rover's.
+DEFAULT_SCENE_OFFSET_X = -2.0
+DEFAULT_SCENE_OFFSET_Y = 0.0
+DEFAULT_SCENE_OFFSET_Z = 1.0
 
 
 class CameraRigControllerArdupilot:
@@ -126,13 +156,16 @@ class CameraRigControllerArdupilot:
     self.have_pose = False
 
     self.settings_lock = threading.Lock()
-    self.view_mode = DEFAULT_VIEW_MODE
     self.offset_x = DEFAULT_OFFSET_X
     self.offset_y = DEFAULT_OFFSET_Y
     self.offset_z = DEFAULT_OFFSET_Z
+    self.scene_offset_x = DEFAULT_SCENE_OFFSET_X
+    self.scene_offset_y = DEFAULT_SCENE_OFFSET_Y
+    self.scene_offset_z = DEFAULT_SCENE_OFFSET_Z
 
     self.image_lock = threading.Lock()
-    self.latest_cv_img = None
+    self.latest_robot_view_img = None
+    self.latest_scene_view_img = None
 
     self.client_lock = threading.Lock()
     self.client_conn = None
@@ -140,7 +173,8 @@ class CameraRigControllerArdupilot:
     self.state_pub = rospy.Publisher(MODEL_STATE_TOPIC, ModelState, queue_size = 1)
 
     self.model_states_sub = rospy.Subscriber(MODEL_STATES_TOPIC, ModelStates, self.modelStatesCb)
-    self.image_sub = rospy.Subscriber(IMAGE_TOPIC, Image, self.imageCb)
+    self.robot_view_sub = rospy.Subscriber(ROBOT_VIEW_IMAGE_TOPIC, Image, self.robotViewImageCb)
+    self.scene_view_sub = rospy.Subscriber(SCENE_VIEW_IMAGE_TOPIC, Image, self.sceneViewImageCb)
 
     self.control_timer = rospy.Timer(rospy.Duration(1.0 / CONTROL_RATE_HZ), self.controlCb)
     self.image_timer = rospy.Timer(rospy.Duration(1.0 / IMAGE_RATE_HZ), self.imagePublishCb)
@@ -151,8 +185,8 @@ class CameraRigControllerArdupilot:
 
     rospy.loginfo(PKG_NAME + ": Camera rig controller initialized")
     rospy.loginfo(PKG_NAME + ": Following " + VEHICLE_MODEL_NAME + " (via " +
-                  MODEL_STATES_TOPIC + ") -> " + CAMERA_MODEL_NAME +
-                  " via " + MODEL_STATE_TOPIC)
+                  MODEL_STATES_TOPIC + ") -> " + ROBOT_VIEW_MODEL_NAME + " and " +
+                  SCENE_VIEW_MODEL_NAME + " via " + MODEL_STATE_TOPIC)
     rospy.loginfo(PKG_NAME + ": Camera bridge server on 127.0.0.1:" + str(BRIDGE_PORT))
 
   def run(self):
@@ -176,14 +210,23 @@ class CameraRigControllerArdupilot:
       self.drone_yaw = yaw
       self.have_pose = True
 
-  def imageCb(self, msg):
+  def robotViewImageCb(self, msg):
+    self.storeImage(msg, is_scene_view = False)
+
+  def sceneViewImageCb(self, msg):
+    self.storeImage(msg, is_scene_view = True)
+
+  def storeImage(self, msg, is_scene_view):
     try:
       cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding = 'bgr8')
     except Exception as e:
       rospy.logwarn_throttle(5.0, PKG_NAME + ": Image conversion failed: " + str(e))
       return
     with self.image_lock:
-      self.latest_cv_img = cv_img
+      if is_scene_view:
+        self.latest_scene_view_img = cv_img
+      else:
+        self.latest_robot_view_img = cv_img
 
   def controlCb(self, timer_event):
     with self.pose_lock:
@@ -195,15 +238,24 @@ class CameraRigControllerArdupilot:
       drone_yaw = self.drone_yaw
 
     with self.settings_lock:
-      view_mode = self.view_mode
       off_x = self.offset_x
       off_y = self.offset_y
       off_z = self.offset_z
+      scene_off_x = self.scene_offset_x
+      scene_off_y = self.scene_offset_y
+      scene_off_z = self.scene_offset_z
 
+    self.driveRig(ROBOT_VIEW_MODEL_NAME, drone_x, drone_y, drone_z, drone_yaw,
+                  off_x, off_y, off_z, is_scene_view = False)
+    self.driveRig(SCENE_VIEW_MODEL_NAME, drone_x, drone_y, drone_z, drone_yaw,
+                  scene_off_x, scene_off_y, scene_off_z, is_scene_view = True)
+
+  def driveRig(self, model_name, drone_x, drone_y, drone_z, drone_yaw,
+              off_x, off_y, off_z, is_scene_view):
     # Rotate the body-frame offset into the drone's current yaw only (not its
     # full 3D attitude) so the rig's position doesn't jitter with small
     # roll/pitch stabilization oscillations -- only the aim direction differs
-    # by view mode, matching a real gimbal mount's decoupled position.
+    # by which rig this is, matching a real gimbal mount's decoupled position.
     cos_y = math.cos(drone_yaw)
     sin_y = math.sin(drone_yaw)
     world_dx = off_x * cos_y - off_y * sin_y
@@ -213,7 +265,7 @@ class CameraRigControllerArdupilot:
     cam_y = drone_y + world_dy
     cam_z = drone_z + off_z
 
-    if view_mode == 'THIRD_PERSON':
+    if is_scene_view:
       # Chase-cam: real look-at (yaw AND pitch) toward the drone's current
       # position, extended to 3D via the real altitude difference.
       dx = drone_x - cam_x
@@ -223,15 +275,15 @@ class CameraRigControllerArdupilot:
       cam_yaw = math.atan2(dy, dx)
       cam_pitch = math.atan2(dz, horiz_dist) if horiz_dist > 1e-6 else 0.0
     else:
-      # FIRST_PERSON: yaw-only, gimbal-stabilized -- stays level regardless
-      # of the airframe's own roll/pitch (see module docstring for why).
+      # Robot view: yaw-only, gimbal-stabilized -- stays level regardless of
+      # the airframe's own roll/pitch (see module docstring for why).
       cam_yaw = drone_yaw
       cam_pitch = 0.0
 
     qx, qy, qz, qw = self.eulerToQuat(0.0, cam_pitch, cam_yaw)
 
     state = ModelState()
-    state.model_name = CAMERA_MODEL_NAME
+    state.model_name = model_name
     state.pose.position.x = cam_x
     state.pose.position.y = cam_y
     state.pose.position.z = cam_z
@@ -257,7 +309,12 @@ class CameraRigControllerArdupilot:
 
   def imagePublishCb(self, timer_event):
     with self.image_lock:
-      cv_img = self.latest_cv_img
+      robot_img = self.latest_robot_view_img
+      scene_img = self.latest_scene_view_img
+    self.encodeAndSend(robot_img, 'robot_view')
+    self.encodeAndSend(scene_img, 'scene_view')
+
+  def encodeAndSend(self, cv_img, camera):
     if cv_img is None:
       return
     ok, encoded = cv2.imencode('.jpg', cv_img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
@@ -266,6 +323,7 @@ class CameraRigControllerArdupilot:
       return
     line = {
       'type': 'image',
+      'camera': camera,
       'data': base64.b64encode(encoded.tobytes()).decode('ascii'),
       'stamp': rospy.Time.now().to_sec(),
     }
@@ -273,10 +331,12 @@ class CameraRigControllerArdupilot:
 
   def applyCameraSettings(self, cmd):
     with self.settings_lock:
-      self.view_mode = str(cmd.get('view_mode', DEFAULT_VIEW_MODE))
       self.offset_x = float(cmd.get('offset_x', DEFAULT_OFFSET_X))
       self.offset_y = float(cmd.get('offset_y', DEFAULT_OFFSET_Y))
       self.offset_z = float(cmd.get('offset_z', DEFAULT_OFFSET_Z))
+      self.scene_offset_x = float(cmd.get('scene_offset_x', DEFAULT_SCENE_OFFSET_X))
+      self.scene_offset_y = float(cmd.get('scene_offset_y', DEFAULT_SCENE_OFFSET_Y))
+      self.scene_offset_z = float(cmd.get('scene_offset_z', DEFAULT_SCENE_OFFSET_Z))
 
   def sendLineToClient(self, line_dict):
     with self.client_lock:

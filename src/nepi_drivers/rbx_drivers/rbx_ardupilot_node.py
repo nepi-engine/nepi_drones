@@ -65,13 +65,19 @@ class ArdupilotNode:
   DEFAULT_NODE_NAME = "ardupilot" # connection port added once discovered
 
   # Camera-rig feature (Universal Simulator Bridge, ArduPilot SITL port):
-  # view mode + body-frame offset, following the exact same live
-  # CAP_SETTINGS/FACTORY_SETTINGS pattern as rbx_sim_node.py's own camera
-  # settings -- no new mechanism. One offset triple serves both view modes;
-  # switching modes only changes how camera_rig_controller_ardupilot.py aims
-  # the camera, not which offset it reads.
-  CAMERA_SETTING_NAMES = ("camera_view_mode", "camera_offset_x",
-                          "camera_offset_y", "camera_offset_z")
+  # two body-frame offset triples, one per always-live camera (robot/scene
+  # view), following the exact same live CAP_SETTINGS/FACTORY_SETTINGS
+  # pattern as rbx_sim_node.py's own camera settings -- no new mechanism.
+  # No camera_view_mode any more (2026-08-18): both views used to be one
+  # topic switched by this Setting, teleporting the SAME single Gazebo
+  # camera model between two poses -- reworked so both are separate,
+  # always-live Gazebo models (camera_rig_controller_ardupilot.py) and
+  # separate ROS Image topics (see image_pub_robot_view/image_pub_scene_view
+  # below), after a live report that a single reassignable topic and a
+  # single teleported camera model meant the "third-person view" wasn't
+  # really an independent thing a client could rely on.
+  CAMERA_SETTING_NAMES = ("camera_offset_x", "camera_offset_y", "camera_offset_z",
+                          "scene_offset_x", "scene_offset_y", "scene_offset_z")
 
   # Sim Connector "customize the capabilities that are open" toggles -- same
   # mechanism and same three names as rbx_sim_node.py's own
@@ -88,10 +94,12 @@ class ArdupilotNode:
     motor_count = {"type":"Int","name":"motor_count","options":["1","16"]},
     motor_test_max_throttle_percent = {"type":"Float","name":"motor_test_max_throttle_percent","options":["0.0","100.0"]},
     motor_test_timeout_s = {"type":"Float","name":"motor_test_timeout_s","options":["1.0","300.0"]},
-    camera_view_mode = {"type":"Discrete","name":"camera_view_mode","options":["FIRST_PERSON","THIRD_PERSON"]},
     camera_offset_x = {"type":"Float","name":"camera_offset_x","options":["-10.0","10.0"]},
     camera_offset_y = {"type":"Float","name":"camera_offset_y","options":["-10.0","10.0"]},
     camera_offset_z = {"type":"Float","name":"camera_offset_z","options":["-10.0","10.0"]},
+    scene_offset_x = {"type":"Float","name":"scene_offset_x","options":["-10.0","10.0"]},
+    scene_offset_y = {"type":"Float","name":"scene_offset_y","options":["-10.0","10.0"]},
+    scene_offset_z = {"type":"Float","name":"scene_offset_z","options":["-10.0","10.0"]},
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
     teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","options":["TRUE","FALSE"]},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]}
@@ -103,14 +111,18 @@ class ArdupilotNode:
     motor_count = {"type":"Int","name":"motor_count","value":"4"},
     motor_test_max_throttle_percent = {"type":"Float","name":"motor_test_max_throttle_percent","value":"20"},
     motor_test_timeout_s = {"type":"Float","name":"motor_test_timeout_s","value":"30"},
-    # Matches camera_rig_controller_ardupilot.py's own defaults -- forward
-    # and slightly below the body, a nose/belly-mounted inspection-camera
-    # convention (distinct from the rover's flat camera_link mount point
-    # since this is a multirotor, not a ground vehicle).
-    camera_view_mode = {"type":"Discrete","name":"camera_view_mode","value":"FIRST_PERSON"},
+    # Matches camera_rig_controller_ardupilot.py's own defaults -- robot view
+    # is forward and slightly below the body, a nose/belly-mounted
+    # inspection-camera convention (distinct from the rover's flat
+    # camera_link mount point since this is a multirotor, not a ground
+    # vehicle); scene view is behind and above, a chase-cam convention
+    # scaled down from the rover's own scene_offset_* defaults.
     camera_offset_x = {"type":"Float","name":"camera_offset_x","value":"0.15"},
     camera_offset_y = {"type":"Float","name":"camera_offset_y","value":"0.0"},
     camera_offset_z = {"type":"Float","name":"camera_offset_z","value":"-0.1"},
+    scene_offset_x = {"type":"Float","name":"scene_offset_x","value":"-2.0"},
+    scene_offset_y = {"type":"Float","name":"scene_offset_y","value":"0.0"},
+    scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"1.0"},
     # All default to enabled: a robot config that never touches these
     # settings behaves exactly as it did before this feature existed.
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","value":"TRUE"},
@@ -439,8 +451,17 @@ class ArdupilotNode:
     # colliding with a DIFFERENT RBX driver (e.g. rbx_sim) that might be
     # running on this same device and left at RBXRobotIF's bare
     # "color_2d_image" factory default.
+    # Two always-live topics (robot_view/scene_view), not one bare topic --
+    # see CAMERA_SETTING_NAMES's own comment for why. A real onboard camera
+    # (REAL_CAMERA_TOPIC_PATTERN below) only ever feeds robot_view -- a real
+    # airframe has no chase-cam concept, so scene_view simply stays idle
+    # (topic exists, nothing ever publishes to it) on real hardware, an
+    # honest reflection of reality rather than a fabricated second feed.
     self.image_topic_name = self.device_name + "/color_2d_image"
-    self.image_pub = nepi_sdk.create_publisher(self.image_topic_name, Image, queue_size = 1)
+    self.robot_view_topic_name = self.image_topic_name + "/robot_view"
+    self.scene_view_topic_name = self.image_topic_name + "/scene_view"
+    self.image_pub_robot_view = nepi_sdk.create_publisher(self.robot_view_topic_name, Image, queue_size = 1)
+    self.image_pub_scene_view = nepi_sdk.create_publisher(self.scene_view_topic_name, Image, queue_size = 1)
 
     # Camera bridge client state and connection thread -- see
     # camera_rig_controller_ardupilot.py and CAMERA_BRIDGE_HOST/PORT above.
@@ -573,11 +594,14 @@ class ArdupilotNode:
     time.sleep(1)
 
     ## Point the interface's image-source search at this instance's own
-    ## device-name-qualified topic (see the image_pub comment above) --
-    ## overrides RBXRobotIF's plain "color_2d_image" factory default/any
-    ## stale persisted config every startup, matching rbx_sim_node.py's own
-    ## deterministic-per-startup rationale.
-    self.rbx_if.setImageTopicCb(String(data = self.image_topic_name))
+    ## device-name-qualified robot_view topic by default (see the
+    ## image_pub_robot_view comment above) -- overrides RBXRobotIF's plain
+    ## "color_2d_image" factory default/any stale persisted config every
+    ## startup, matching rbx_sim_node.py's own deterministic-per-startup
+    ## rationale. This is "the" camera on real hardware too, so the default
+    ## is correct there as well as in SITL; the operator can still switch to
+    ## scene_view (SITL only) any time via the ordinary Image Source dropdown.
+    self.rbx_if.setImageTopicCb(String(data = self.robot_view_topic_name))
 
     ## Start goto setpoint check/send loop
     setpoint_pub_interval = float(1) / self.SETPOINT_PUBLISH_RATE_HZ
@@ -1645,7 +1669,9 @@ class ArdupilotNode:
   def realCameraImageCb(self, image_msg):
     # Straight relay -- both ends are already sensor_msgs/Image, no
     # decode/re-encode needed (unlike the sim bridge's base64-JPEG frames).
-    self.image_pub.publish(image_msg)
+    # Always robot_view: a real airframe has no chase-cam concept, so there
+    # is nothing to relay to scene_view.
+    self.image_pub_robot_view.publish(image_msg)
 
   #######################
   # Camera Bridge Processes (Universal Simulator Bridge camera feature,
@@ -1722,29 +1748,39 @@ class ArdupilotNode:
   def processCameraImageLine(self, msg):
     # Bridge image frame -> decode the relayed JPEG and republish as a raw
     # sensor_msgs/Image on this instance's own namespaced image topic (see
-    # the image_pub/setImageTopicCb comments in __init__).
+    # the image_pub_robot_view/setImageTopicCb comments in __init__).
+    # "camera" (added alongside camera_rig_controller_ardupilot.py's
+    # robot_view/scene_view rig split) picks which of the two publishers
+    # this frame goes to; an older sender with no "camera" field defaults to
+    # robot_view, matching the pre-split single topic's behavior.
     try:
+      camera = msg.get('camera', 'robot_view')
+      image_pub = self.image_pub_scene_view if camera == 'scene_view' else self.image_pub_robot_view
       jpeg_bytes = base64.b64decode(msg['data'])
       arr = np.frombuffer(jpeg_bytes, dtype = np.uint8)
       cv2_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
       if cv2_img is None:
         raise ValueError("cv2.imdecode returned None")
       ros_img = nepi_img.cv2img_to_rosimg(cv2_img, encoding = "bgr8")
-      self.image_pub.publish(ros_img)
+      image_pub.publish(ros_img)
     except Exception as e:
       self.msg_if.pub_warn("Failed to process camera image frame: " + str(e))
 
   def sendCameraSettings(self):
-    # All four current values together, always -- camera_rig_controller_
+    # All current values together, always -- camera_rig_controller_
     # ardupilot.py fills any missing key with its own default, so a partial
     # push (e.g. only the field that just changed) would silently reset the
-    # rest to that default.
+    # rest to that default. No view_mode -- both views are always-live,
+    # separate ROS topics now (see CAMERA_SETTING_NAMES's own comment),
+    # nothing left to switch.
     cmd = {
       'type': 'camera_settings',
-      'view_mode': self.settings_dict['camera_view_mode']['value'],
       'offset_x': float(self.settings_dict['camera_offset_x']['value']),
       'offset_y': float(self.settings_dict['camera_offset_y']['value']),
       'offset_z': float(self.settings_dict['camera_offset_z']['value']),
+      'scene_offset_x': float(self.settings_dict['scene_offset_x']['value']),
+      'scene_offset_y': float(self.settings_dict['scene_offset_y']['value']),
+      'scene_offset_z': float(self.settings_dict['scene_offset_z']['value']),
     }
     self.sendLineToCameraBridge(cmd, "Camera settings")
 
