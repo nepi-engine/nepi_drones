@@ -29,14 +29,20 @@
 # one physics step. A fixed joint has no such lag -- both cameras move in
 # lockstep with the rover, in the same physics step, for free.
 #
-# What's left for this node to do is much smaller: just relay whichever of
-# the two onboard camera topics matches the currently-selected view mode.
-# View mode is configured on the remote NEPI device as an rbx_sim RBX
-# setting (camera_view_mode); rbx_sim_node.py pushes it over the existing
-# bridge TCP connection to sim_bridge_node.py, which sets it as a plain ROS
-# param on this VM's local master (/sim/camera/view_mode) -- the cleanest
-# path since the two machines have separate ROS masters and this node has
-# no visibility into the remote device's process memory otherwise.
+# What's left for this node to do is much smaller: relay BOTH onboard camera
+# topics simultaneously, each on its own compressed topic. This used to relay
+# only whichever one matched a currently-selected camera_view_mode RBX
+# setting (rbx_sim_node.py pushed it here via sim_bridge_node.py, which set
+# it as a plain ROS param this node polled every publish tick) -- reworked
+# (2026-08-18) per the same live report that made both the "third-person view
+# doesn't really exist" and "only one instance" complaints about the
+# quadcopter driver: a single topic that gets reassigned content depending on
+# a mode setting isn't a second view a client can rely on, it's the same
+# topic sometimes showing something else. Both feeds are now always live,
+# each its own honestly-named topic -- rbx_sim_node.py exposes them as two
+# separate ROS Image topics, and the existing Image Source dropdown's
+# find_topics_by_msg('Image') discovery picks up both with no new RUI
+# plumbing needed (see NepiDeviceRBX.js's createImageOptions).
 #
 # Image compression happens here, not in sim_bridge_node.py: this node is
 # already Gazebo/cv2-facing (it subscribes the onboard cameras' raw
@@ -57,8 +63,8 @@ from cv_bridge import CvBridge
 PKG_NAME = 'CAMERA_RIG_CONTROLLER'
 NODE_NAME = 'camera_rig_controller'
 
-FIRST_PERSON_IMAGE_TOPIC = '/rover/camera/image_raw'
-THIRD_PERSON_IMAGE_TOPIC = '/rover/camera_chase/image_raw'
+ROBOT_VIEW_IMAGE_TOPIC = '/rover/camera/image_raw'
+SCENE_VIEW_IMAGE_TOPIC = '/rover/camera_chase/image_raw'
 
 # The NEPI device receiving this feed is a Raspberry Pi (NEPI_HW_TYPE=rpi):
 # every frame that arrives here still has to be JPEG-decoded and republished
@@ -71,18 +77,10 @@ THIRD_PERSON_IMAGE_TOPIC = '/rover/camera_chase/image_raw'
 IMAGE_RATE_HZ = 10.0
 JPEG_QUALITY = 65
 
-# Param namespace sim_bridge_node.py writes into on receipt of a
-# camera_settings line from the remote device's rbx_sim_node.py. The
-# offset params (offset_x/y/z) that used to live alongside this are gone --
-# the camera offsets are now fixed joint poses baked into
-# generic_rover/model.sdf, not a runtime setting, since a rigid attachment
-# can't have a freely-adjustable offset without either driving an actuator
-# or going back to the laggy kinematic-follow approach this change removes.
-PARAM_VIEW_MODE = '/sim/camera/view_mode'
-
-# Matches rbx_sim_node.py's FACTORY_SETTINGS default -- fallback if the
-# bridge hasn't pushed anything yet, e.g. right after a (re)connect.
-DEFAULT_VIEW_MODE = 'FIRST_PERSON'
+# Camera offsets (offset_x/y/z / scene_offset_x/y/z) are applied by
+# sim_bridge_node.py respawning generic_rover/model.sdf with new camera
+# <pose> values -- not this node's concern; it only ever relays whatever
+# frames arrive on the two subscribed topics, regardless of their current pose.
 
 
 class CameraRigController:
@@ -94,49 +92,55 @@ class CameraRigController:
     self.bridge = CvBridge()
 
     self.image_lock = threading.Lock()
-    self.latest_first_person_img = None
-    self.latest_third_person_img = None
+    self.latest_robot_view_img = None
+    self.latest_scene_view_img = None
 
-    self.compressed_pub = rospy.Publisher('/camera_rig/image_compressed',
+    self.robot_view_pub = rospy.Publisher('/camera_rig/robot_view/image_compressed',
+                                          CompressedImage, queue_size = 1)
+    self.scene_view_pub = rospy.Publisher('/camera_rig/scene_view/image_compressed',
                                           CompressedImage, queue_size = 1)
 
-    self.first_person_sub = rospy.Subscriber(FIRST_PERSON_IMAGE_TOPIC, Image,
-                                             self.firstPersonImageCb)
-    self.third_person_sub = rospy.Subscriber(THIRD_PERSON_IMAGE_TOPIC, Image,
-                                             self.thirdPersonImageCb)
+    self.robot_view_sub = rospy.Subscriber(ROBOT_VIEW_IMAGE_TOPIC, Image,
+                                           self.robotViewImageCb)
+    self.scene_view_sub = rospy.Subscriber(SCENE_VIEW_IMAGE_TOPIC, Image,
+                                           self.sceneViewImageCb)
 
     self.image_timer = rospy.Timer(rospy.Duration(1.0 / IMAGE_RATE_HZ), self.imagePublishCb)
 
     rospy.loginfo(PKG_NAME + ": Camera view relay initialized")
-    rospy.loginfo(PKG_NAME + ": Relaying " + FIRST_PERSON_IMAGE_TOPIC + " / " +
-                  THIRD_PERSON_IMAGE_TOPIC + " per " + PARAM_VIEW_MODE)
+    rospy.loginfo(PKG_NAME + ": Relaying " + ROBOT_VIEW_IMAGE_TOPIC + " and " +
+                  SCENE_VIEW_IMAGE_TOPIC + " simultaneously, each its own topic")
 
   def run(self):
     """Block until ROS shutdown, servicing the image relay timer."""
     rospy.spin()
 
-  def firstPersonImageCb(self, msg):
-    self.storeImage(msg, is_third_person = False)
+  def robotViewImageCb(self, msg):
+    self.storeImage(msg, is_scene_view = False)
 
-  def thirdPersonImageCb(self, msg):
-    self.storeImage(msg, is_third_person = True)
+  def sceneViewImageCb(self, msg):
+    self.storeImage(msg, is_scene_view = True)
 
-  def storeImage(self, msg, is_third_person):
+  def storeImage(self, msg, is_scene_view):
     try:
       cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding = 'bgr8')
     except Exception as e:
       rospy.logwarn_throttle(5.0, PKG_NAME + ": Image conversion failed: " + str(e))
       return
     with self.image_lock:
-      if is_third_person:
-        self.latest_third_person_img = cv_img
+      if is_scene_view:
+        self.latest_scene_view_img = cv_img
       else:
-        self.latest_first_person_img = cv_img
+        self.latest_robot_view_img = cv_img
 
   def imagePublishCb(self, timer_event):
-    view_mode = rospy.get_param(PARAM_VIEW_MODE, DEFAULT_VIEW_MODE)
     with self.image_lock:
-      cv_img = self.latest_third_person_img if view_mode == 'THIRD_PERSON' else self.latest_first_person_img
+      robot_img = self.latest_robot_view_img
+      scene_img = self.latest_scene_view_img
+    self.encodeAndPublish(robot_img, self.robot_view_pub)
+    self.encodeAndPublish(scene_img, self.scene_view_pub)
+
+  def encodeAndPublish(self, cv_img, pub):
     if cv_img is None:
       return
     ok, encoded = cv2.imencode('.jpg', cv_img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
@@ -147,7 +151,7 @@ class CameraRigController:
     msg.header.stamp = rospy.Time.now()
     msg.format = 'jpeg'
     msg.data = encoded.tobytes()
-    self.compressed_pub.publish(msg)
+    pub.publish(msg)
 
 
 #########################################

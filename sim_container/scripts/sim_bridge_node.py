@@ -34,23 +34,27 @@
 # distinguished from the above by key presence rather than a mandatory "type"
 # tag (kept backward compatible with the already-verified velocity/telemetry
 # shapes above, which carry none):
-#   in  -- {"type":"camera_settings","view_mode":...} from rbx_sim_node.py's
-#           settings mechanism. This VM has no visibility into the remote
-#           device's process memory, so the only way camera_rig_controller.py
-#           (a separate local ROS node) learns the current view mode is via
-#           this line -> a plain ROS param on this VM's own local master
-#           (rospy get_param/set_param, not a new message type -- simplest
-#           mechanism available to two plain scripts with no nepi_sdk).
-#           Offsets are no longer part of this shape: both camera views are
-#           now rigid links welded onto generic_rover itself (fixed joint
-#           poses in generic_rover/model.sdf), not a repositionable rig, so
-#           there is nothing left to configure at runtime but which one is
-#           active.
-#   out -- {"type":"image","data":"<base64 jpeg>","stamp":...} relayed
-#           straight through from camera_rig_controller.py's own
-#           /camera_rig/image_compressed topic (it owns the Gazebo-facing
-#           compression/throttling; this node only owns the network relay,
-#           same division of labor as the existing odom -> telemetry path).
+#   in  -- {"type":"camera_settings","offset_x":...,"scene_offset_x":...}
+#           from rbx_sim_node.py's settings mechanism -- camera_offset_x/y/z
+#           (robot view) and scene_offset_x/y/z (scene view), applied by
+#           editing generic_rover/model.sdf's camera_link/camera_link_chase
+#           <pose> and respawning the rover (see applyCameraSettings/
+#           respawnRoverWithCameraOffsets below). No view_mode field any
+#           more (2026-08-18): both camera views used to be relayed on ONE
+#           topic, switched by a view_mode RBX setting pushed here as a
+#           ROS param for camera_rig_controller.py to read -- reworked so
+#           both are always-live, separately-named topics instead (see that
+#           file's own module docstring for the full reasoning), leaving
+#           nothing left for this node to forward but the offsets.
+#   out -- {"type":"image","camera":"robot_view"|"scene_view",
+#           "data":"<base64 jpeg>","stamp":...} relayed straight through
+#           from camera_rig_controller.py's own /camera_rig/robot_view/
+#           image_compressed and /camera_rig/scene_view/image_compressed
+#           topics (it owns the Gazebo-facing compression/throttling; this
+#           node only owns the network relay, same division of labor as the
+#           existing odom -> telemetry path). The "camera" field is what
+#           lets rbx_sim_node.py route each frame to the matching one of its
+#           own two published ROS Image topics.
 #
 # RESET_SIM go-action addition: a third line shape, {"type":"reset"} in, no
 # reply out. Unlike ArduPilot's RESET_SIM (which reaches gz_reset_listener.py
@@ -121,11 +125,11 @@ GAZEBO_ODOM_TOPIC = '/rover/odom'
 BRIDGE_PORT = 9023
 TELEMETRY_RATE_HZ = 10.0
 
-# Local ROS param namespace camera_rig_controller.py reads for the current
-# view mode -- see the module docstring above for why a param, not a new
-# topic/message, is the bridge point between this node and that one.
-CAMERA_COMPRESSED_TOPIC = '/camera_rig/image_compressed'
-PARAM_VIEW_MODE = '/sim/camera/view_mode'
+# camera_rig_controller.py's two always-live compressed topics -- see the
+# module docstring above for why both are relayed simultaneously now instead
+# of one topic selected via a ROS param.
+ROBOT_VIEW_COMPRESSED_TOPIC = '/camera_rig/robot_view/image_compressed'
+SCENE_VIEW_COMPRESSED_TOPIC = '/camera_rig/scene_view/image_compressed'
 
 # RESET_SIM target: generic_rover.world's containing <model> name and its
 # (unmodified, default) spawn pose -- world origin, identity orientation.
@@ -146,9 +150,9 @@ SPAWN_MODEL_SERVICE = '/gazebo/spawn_sdf_model'
 DELETE_MODEL_SERVICE = '/gazebo/delete_model'
 
 # camera_offset_*/scene_offset_* settings (rbx_sim_node.py's own robot-view /
-# scene-view camera offset controls, sent here in the same camera_settings
-# line as view_mode): applied by editing generic_rover/model.sdf's camera_link
-# / camera_link_chase <pose> and respawning the whole rover model.
+# scene-view camera offset controls, sent here in a camera_settings line):
+# applied by editing generic_rover/model.sdf's camera_link / camera_link_chase
+# <pose> and respawning the whole rover model.
 #
 # Why a respawn rather than moving the camera at runtime -- every runtime
 # option was tried live on this VM (Gazebo 11.15.1) and rejected:
@@ -212,9 +216,12 @@ class SimBridgeNode:
     self.cmd_sub = rospy.Subscriber(NEPI_CMD_VEL_TOPIC, Twist, self.cmdCb)
     self.odom_sub = rospy.Subscriber(GAZEBO_ODOM_TOPIC, Odometry, self.odomCb)
     # Camera-rover feature: camera_rig_controller.py owns compression/rate
-    # throttling on its own topic; this node only relays whatever arrives.
-    self.image_sub = rospy.Subscriber(CAMERA_COMPRESSED_TOPIC, CompressedImage,
-                                      self.imageCompressedCb)
+    # throttling on its own topics; this node only relays whatever arrives,
+    # from both simultaneously-live views.
+    self.robot_view_sub = rospy.Subscriber(ROBOT_VIEW_COMPRESSED_TOPIC, CompressedImage,
+                                           self.robotViewImageCompressedCb)
+    self.scene_view_sub = rospy.Subscriber(SCENE_VIEW_COMPRESSED_TOPIC, CompressedImage,
+                                           self.sceneViewImageCompressedCb)
     self.model_state_pub = rospy.Publisher(MODEL_STATE_TOPIC, ModelState, queue_size=1)
 
     # Obstacle-course model, read once here rather than per-toggle -- the
@@ -236,10 +243,10 @@ class SimBridgeNode:
     # course file above (the file's structure never changes at runtime -- only
     # the two camera <pose> values get substituted per offset change, see
     # applyCameraSettings). self.applied_camera_offsets tracks the last offsets
-    # actually baked into the live model, so a camera_settings line that only
-    # changed view_mode (view_mode and the offsets share one wire message,
-    # see rbx_sim_node.py's sendCameraSettings) does not trigger a pointless
-    # respawn.
+    # actually baked into the live model, so a camera_settings line carrying
+    # the same offsets as last time (e.g. a redundant resend triggered by
+    # Nepi_IF_SimLauncher's own robot-config re-send fix) does not trigger a
+    # pointless respawn.
     try:
       with open(ROVER_MODEL_SDF_PATH, 'r') as f:
         self.rover_sdf_template = f.read()
@@ -347,12 +354,22 @@ class SimBridgeNode:
       'stamp': msg.header.stamp.to_sec(),
     }
 
-  def imageCompressedCb(self, msg):
+  def robotViewImageCompressedCb(self, msg):
+    self.imageCompressedCb(msg, 'robot_view')
+
+  def sceneViewImageCompressedCb(self, msg):
+    self.imageCompressedCb(msg, 'scene_view')
+
+  def imageCompressedCb(self, msg, camera):
     # Relayed straight through to whichever client is connected right now;
     # dropped silently if none is (matches the existing "no client" behavior
-    # of sendVelocityCmd's counterpart on the remote-device side).
+    # of sendVelocityCmd's counterpart on the remote-device side). "camera"
+    # tags which of the two always-live views this frame came from, so
+    # rbx_sim_node.py can route it to the matching one of its own two
+    # published ROS Image topics.
     line = {
       'type': 'image',
+      'camera': camera,
       'data': base64.b64encode(bytes(msg.data)).decode('ascii'),
       'stamp': msg.header.stamp.to_sec(),
     }
@@ -449,18 +466,12 @@ class SimBridgeNode:
     self.model_state_pub.publish(state)
 
   def applyCameraSettings(self, cmd):
-    # From rbx_sim_node.py's RBX settings mechanism (view_mode), pushed here
-    # because this VM has no other visibility into the remote device's
-    # process state. Stored as a plain ROS param for camera_rig_controller.py
-    # to read each image-publish tick.
-    rospy.set_param(PARAM_VIEW_MODE, str(cmd.get('view_mode', 'FIRST_PERSON')))
-
     # offset_x/y/z (robot view) and scene_offset_x/y/z (scene/chase view) are
     # optional in this wire message: absent on any deployment still running
-    # an older rbx_sim_node.py that only ever sent view_mode. get() with None
-    # sentinels, then bail without touching anything already applied, rather
-    # than defaulting to 0.0 and silently snapping both cameras to the origin
-    # the first time an old sender's message arrives.
+    # an older rbx_sim_node.py. get() with None sentinels, then bail without
+    # touching anything already applied, rather than defaulting to 0.0 and
+    # silently snapping both cameras to the origin the first time an old
+    # sender's message arrives.
     keys = ('offset_x', 'offset_y', 'offset_z',
             'scene_offset_x', 'scene_offset_y', 'scene_offset_z')
     if any(cmd.get(k) is None for k in keys):
@@ -471,7 +482,7 @@ class SimBridgeNode:
       rospy.logwarn(PKG_NAME + ": Ignoring malformed camera offsets: " + str(e))
       return
     if offsets == self.applied_camera_offsets:
-      return  # Already live -- e.g. this message only changed view_mode.
+      return  # Already live -- e.g. a redundant resend of the same offsets.
     self.respawnRoverWithCameraOffsets(offsets)
 
   def respawnRoverWithCameraOffsets(self, offsets):

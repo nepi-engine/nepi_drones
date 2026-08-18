@@ -75,38 +75,48 @@ FILE_TYPE = 'NODE'
 
 class SimNode:
 
-  # Camera-rover feature: view mode only. Both cameras are now rigid links
-  # welded onto generic_rover itself (fixed joint poses in
-  # generic_rover/model.sdf) rather than a single repositionable rig, so
-  # there is no runtime offset left to expose -- switching this Setting
-  # just selects which of the two onboard camera topics
-  # camera_rig_controller.py relays.
-  # Camera offsets ARE runtime-adjustable again, contrary to the note above
-  # (kept for the history it records). The two cameras stay rigidly welded to
-  # the rover -- that is what makes them lag-free and is not being given up --
-  # and an offset change is applied by respawning the rover model with the new
-  # camera link poses, at its current world pose. That is viable specifically
-  # because the diff_drive plugin uses <odometrySource>world</odometrySource>,
-  # so odom is read back from the model's Gazebo pose and survives the respawn
-  # unbroken. See applyCameraOffsets in camera_rig_controller.py, which also
-  # records every Gazebo mechanism that does NOT work here.
+  # Camera-rover feature. Both cameras are rigid links welded onto
+  # generic_rover itself (fixed joint poses in generic_rover/model.sdf), not a
+  # single repositionable rig -- that's what makes them lag-free. Both are now
+  # relayed simultaneously as two always-live ROS Image topics (ROBOT_VIEW/
+  # SCENE_VIEW_TOPIC_SUFFIX below), not switched between via a camera_view_mode
+  # Setting: reworked (2026-08-18) after a live report that a single topic
+  # whose content gets reassigned depending on a mode setting isn't a real
+  # second view a client can rely on ("the third-person view doesn't really
+  # exist"). The existing Image Source dropdown's find_topics_by_msg('Image')
+  # discovery picks up both with no new RUI plumbing needed (see
+  # NepiDeviceRBX.js's createImageOptions).
+  #
+  # Camera offsets ARE still runtime-adjustable, a separate concept from which
+  # view a client is looking at: an offset change is applied by respawning the
+  # rover model with new camera link poses, at its current world pose. That is
+  # viable specifically because the diff_drive plugin uses
+  # <odometrySource>world</odometrySource>, so odom is read back from the
+  # model's Gazebo pose and survives the respawn unbroken. See
+  # respawnRoverWithCameraOffsets in sim_bridge_node.py, which also records
+  # every Gazebo mechanism that does NOT work here.
   #
   # camera_offset_* is the ROBOT view (same names the ArduPilot driver uses, so
   # the RUI's existing offset block renders it unchanged); scene_offset_* is the
   # scene/chase view. Factory values reproduce generic_rover/model.sdf's
   # hard-coded camera_link (0.2, 0, 0.65) and camera_link_chase
   # (-2.5, 0, 1.65) poses exactly, so the default view is unchanged.
-  CAMERA_SETTING_NAMES = ("camera_view_mode",
-                          "camera_offset_x", "camera_offset_y", "camera_offset_z",
+  CAMERA_SETTING_NAMES = ("camera_offset_x", "camera_offset_y", "camera_offset_z",
                           "scene_offset_x", "scene_offset_y", "scene_offset_z")
+
+  # Suffixes for the two always-live ROS Image topics published off
+  # self.image_topic_name -- see processImageLine's routing by the bridge
+  # line's "camera" field.
+  ROBOT_VIEW_TOPIC_SUFFIX = "robot_view"
+  SCENE_VIEW_TOPIC_SUFFIX = "scene_view"
 
   # Environment: was originally two RBX_SETUP_ACTIONS entries
   # (OBSTACLE_COURSE_ON/OFF), then a dedicated "Environment" dropdown was
   # added to the RUI that still just sent those two setup actions under the
   # hood -- redundant with itself once that dropdown existed, and the setup
   # actions kept cluttering the generic Setup Actions dropdown alongside
-  # RESET_SIM/RETURN_HOME. Modeled as a Setting instead, the same way
-  # camera_view_mode is: one clean value, one place it lives.
+  # RESET_SIM/RETURN_HOME. Modeled as a Setting instead: one clean value, one
+  # place it lives.
   ENVIRONMENT_SETTING_NAMES = ("environment",)
 
   # Which control SURFACES this deployment wants exposed, as opposed to which
@@ -124,9 +134,9 @@ class SimNode:
   #     teleopControlsReady below), not just in the RUI, so a client that
   #     bypasses the RUI can't do what was turned off either.
   # camera_controls_enabled: same toggle mechanism, gating whether
-  # camera_view_mode/camera_offset_*/scene_offset_* show up on the RUI at all
-  # (see NepiDeviceRBX.js's has_camera_pov_toggle/has_camera_offsets/
-  # has_scene_offsets, which AND this in alongside the Setting-existence
+  # camera_offset_*/scene_offset_* show up on the RUI at all (see
+  # NepiDeviceRBX.js's has_camera_offsets/has_scene_offsets, which AND this
+  # in alongside the Setting-existence
   # check). Unlike autonomous/teleop movement, this has no driver-side
   # enforcement point to add -- there is no "camera controls ready" concept,
   # positioning a Gazebo camera can't fail the way a goto or a motor command
@@ -146,7 +156,6 @@ class SimNode:
   CAP_SETTINGS = dict(
     max_linear_speed_mps = {"type":"Float","name":"max_linear_speed_mps","options":["0.05","5.0"]},
     max_angular_rate_dps = {"type":"Float","name":"max_angular_rate_dps","options":["5.0","180.0"]},
-    camera_view_mode = {"type":"Discrete","name":"camera_view_mode","options":["FIRST_PERSON","THIRD_PERSON"]},
     environment = {"type":"Discrete","name":"environment","options":["FLAT_GROUND","OBSTACLE_COURSE"]},
     camera_offset_x = {"type":"Float","name":"camera_offset_x","options":["-10.0","10.0"]},
     camera_offset_y = {"type":"Float","name":"camera_offset_y","options":["-10.0","10.0"]},
@@ -164,7 +173,6 @@ class SimNode:
   FACTORY_SETTINGS = dict(
     max_linear_speed_mps = {"type":"Float","name":"max_linear_speed_mps","value":"0.5"},
     max_angular_rate_dps = {"type":"Float","name":"max_angular_rate_dps","value":"45.0"},
-    camera_view_mode = {"type":"Discrete","name":"camera_view_mode","value":"FIRST_PERSON"},
     environment = {"type":"Discrete","name":"environment","value":"FLAT_GROUND"},
     # Reproduces generic_rover/model.sdf's hard-coded camera_link pose exactly.
     camera_offset_x = {"type":"Float","name":"camera_offset_x","value":"0.2"},
@@ -208,11 +216,12 @@ class SimNode:
   # redundant with itself.
   RBX_SETUP_ACTIONS = ["RESET_SIM", "RETURN_HOME"]
   # Go-actions dropdown (RUI's "selected_go_action" control, wired to
-  # setGoActionInd below). Camera view switching used to be duplicated here
-  # (VIEW_FIRST_PERSON/VIEW_THIRD_PERSON) alongside the camera_view_mode
-  # Settings-tab control -- removed so there's exactly one way to switch
-  # views (the Settings-based camera_view_mode toggle, which the RUI also
-  # surfaces as convenience buttons next to the image viewer).
+  # setGoActionInd below). Camera view switching used to live here
+  # (VIEW_FIRST_PERSON/VIEW_THIRD_PERSON), then moved to a camera_view_mode
+  # Settings-tab toggle -- both are gone now that robot/scene view are two
+  # always-live ROS Image topics selected via the ordinary Image Source
+  # dropdown, same as any other camera topic (see CAMERA_SETTING_NAMES's own
+  # comment).
   RBX_GO_ACTIONS = []
 
   # GO_HOME polls the same goto_target the gotoPosition/gotoPose setpoint
@@ -366,8 +375,15 @@ class SimNode:
     # against the shared device-wide namespace), but now distinguished by
     # content, so /nepi/<device>/sim_rover1/color_2d_image and
     # .../sim_rover2/color_2d_image never collide.
+    # Two always-live topics (robot_view/scene_view), not one bare topic --
+    # see CAMERA_SETTING_NAMES's own comment for why. image_topic_name stays
+    # the shared, device-name-qualified BASE both are built from, so the
+    # cross-instance collision fix above still applies identically to both.
     self.image_topic_name = self.device_name + "/color_2d_image"
-    self.image_pub = nepi_sdk.create_publisher(self.image_topic_name, Image, queue_size = 1)
+    self.robot_view_topic_name = self.image_topic_name + "/" + self.ROBOT_VIEW_TOPIC_SUFFIX
+    self.scene_view_topic_name = self.image_topic_name + "/" + self.SCENE_VIEW_TOPIC_SUFFIX
+    self.image_pub_robot_view = nepi_sdk.create_publisher(self.robot_view_topic_name, Image, queue_size = 1)
+    self.image_pub_scene_view = nepi_sdk.create_publisher(self.scene_view_topic_name, Image, queue_size = 1)
 
     ##############################
     # Goto controller state
@@ -498,12 +514,16 @@ class SimNode:
     self.rbx_if.setCmdTimeoutCb(UInt32(data = self.GOTO_CMD_TIMEOUT_SEC))
 
     ## Point the interface's image-source search at this instance's own
-    ## per-device-name-qualified topic (see the image_pub comment above) --
-    ## overrides RBXRobotIF's plain "color_2d_image" factory default/any
-    ## stale persisted config every startup, same rationale as the
+    ## per-device-name-qualified robot_view topic by default (matching the old
+    ## FIRST_PERSON factory default, back when there was one switchable topic
+    ## instead of two always-live ones -- see the image_pub_robot_view comment
+    ## above) -- overrides RBXRobotIF's plain "color_2d_image" factory
+    ## default/any stale persisted config every startup, same rationale as the
     ## cmd_timeout override just above: deterministic per-instance behavior
-    ## regardless of what a previous run left in config.
-    self.rbx_if.setImageTopicCb(String(data = self.image_topic_name))
+    ## regardless of what a previous run left in config. The operator can
+    ## still switch to scene_view any time via the ordinary Image Source
+    ## dropdown, same as picking any other camera topic.
+    self.rbx_if.setImageTopicCb(String(data = self.robot_view_topic_name))
 
     ## Start the closed-loop goto controller
     controller_interval = float(1) / self.CONTROLLER_RATE_HZ
@@ -926,17 +946,25 @@ class SimNode:
   def processImageLine(self, msg):
     # Bridge image frame -> decode the relayed JPEG and republish as a raw
     # sensor_msgs/Image on this instance's own namespaced image topic (see
-    # the image_pub / setImageTopicCb comments in __init__ for why the topic
-    # name is device_name-qualified and RBXRobotIF is pointed at it via
-    # set_image_topic).
+    # the image_pub_robot_view / setImageTopicCb comments in __init__ for why
+    # the topic name is device_name-qualified and RBXRobotIF is pointed at
+    # one of them via set_image_topic). "camera" (added alongside
+    # sim_bridge_node.py's robot_view/scene_view topic split -- see
+    # camera_rig_controller.py's own module docstring) picks which of the
+    # two publishers this frame goes to; an older sender with no "camera"
+    # field defaults to robot_view, matching the pre-split single topic's
+    # behavior.
     try:
+      camera = msg.get('camera', self.ROBOT_VIEW_TOPIC_SUFFIX)
+      image_pub = (self.image_pub_scene_view if camera == self.SCENE_VIEW_TOPIC_SUFFIX
+                   else self.image_pub_robot_view)
       jpeg_bytes = base64.b64decode(msg['data'])
       arr = np.frombuffer(jpeg_bytes, dtype = np.uint8)
       cv2_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
       if cv2_img is None:
         raise ValueError("cv2.imdecode returned None")
       ros_img = nepi_img.cv2img_to_rosimg(cv2_img, encoding = "bgr8")
-      self.image_pub.publish(ros_img)
+      image_pub.publish(ros_img)
     except Exception as e:
       self.msg_if.pub_warn("Failed to process camera image frame: " + str(e), throttle_s = 5.0)
 
@@ -987,9 +1015,10 @@ class SimNode:
     self.sendLineToBridge(cmd, "Velocity command")
 
   def sendCameraSettings(self):
+    # No view_mode -- both views are always-live, separate ROS topics now
+    # (see CAMERA_SETTING_NAMES's own comment), nothing left to switch.
     cmd = {
       'type': 'camera_settings',
-      'view_mode': self.settings_dict['camera_view_mode']['value'],
       'offset_x': float(self.settings_dict['camera_offset_x']['value']),
       'offset_y': float(self.settings_dict['camera_offset_y']['value']),
       'offset_z': float(self.settings_dict['camera_offset_z']['value']),
