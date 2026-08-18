@@ -313,6 +313,30 @@ class NepiSimConnectorApp:
     self.selected_simulator = ""
 
     ##############################
+    # Common robot_view/scene_view mirror -- a stable, simulator-agnostic
+    # viewing point for whichever robot is currently selected_simulator,
+    # regardless of which underlying driver/bridge type it is. Distinct from
+    # image_pub/color_2d_image below (the generic-connector bridge protocol's
+    # own relay, fed over the TCP bridge for a simulator with no RBX driver
+    # of its own): every simulator actually launchable today (Gazebo rover/
+    # quadcopter, Webots rover/quadcopter) instead goes through an RBX
+    # driver that already publishes real ROS Image topics on this same ROS
+    # master -- see rbx_sim_node.py/rbx_ardupilot_node.py's own
+    # color_2d_image/robot_view + .../scene_view topics -- so this mirror is
+    # a plain re-subscribe, not a protocol decode. Reported live
+    # (2026-08-18): the operator wants one topic to look at "no matter the
+    # simulator" rather than needing to know the current instance's own
+    # device-name-qualified topic. scene_view has no publisher at all for a
+    # robot that honestly has no scene camera (the Webots drivers) -- an
+    # absent feed there is accurate, not a bug.
+    self.robot_view_pub = nepi_sdk.create_publisher(self.node_name + "/robot_view", Image, queue_size = 1)
+    self.scene_view_pub = nepi_sdk.create_publisher(self.node_name + "/scene_view", Image, queue_size = 1)
+    self.robot_view_sub = None
+    self.scene_view_sub = None
+    self.robot_view_source_topic = None
+    self.scene_view_source_topic = None
+
+    ##############################
     # Home position state -- reused GeoPoint plumbing with its three floats
     # reinterpreted as local ENU x/y/z meters, the same reinterpretation an RBX
     # driver for a vehicle with no independent WGS84 reference already uses. A
@@ -804,6 +828,58 @@ class NepiSimConnectorApp:
       available, _names = self.getAvailableSimulators()
       if len(available) == 1:
         self.setSelectedSimulator(available[0])
+
+    self.updateCommonViewSubscriptions()
+
+  def updateCommonViewSubscriptions(self):
+    # Re-points robot_view_pub/scene_view_pub at whichever real Image topics
+    # the currently selected_simulator's own RBX driver publishes -- see
+    # those publishers' own comment in __init__ for the full reasoning.
+    # selected_simulator is the DeviceRBXStatus publisher's namespace, e.g.
+    # ".../sim_rover1/rbx"; its own image topics are siblings under the
+    # plain node namespace (one level up), the same relationship
+    # NepiDeviceRBX.js's createImageOptions relies on for the same reason.
+    node_namespace = self.selected_simulator.split('/rbx')[0] if self.selected_simulator else ""
+
+    if node_namespace == "":
+      robot_source = ""
+      scene_source = ""
+    else:
+      base = node_namespace + "/color_2d_image"
+      # Try the split robot_view/scene_view convention first (Gazebo-based
+      # drivers); fall back to the bare topic for a driver honestly
+      # reporting one single camera (the Webots drivers).
+      robot_source = nepi_sdk.find_topic(base + "/robot_view")
+      if robot_source == "":
+        robot_source = nepi_sdk.find_topic(base, exact = True)
+      scene_source = nepi_sdk.find_topic(base + "/scene_view")
+
+    self.repointCommonViewSub("robot_view", robot_source)
+    self.repointCommonViewSub("scene_view", scene_source)
+
+  def repointCommonViewSub(self, which, source_topic):
+    sub_attr = which + "_sub"
+    source_attr = which + "_source_topic"
+    pub = self.robot_view_pub if which == "robot_view" else self.scene_view_pub
+    if getattr(self, source_attr) == source_topic:
+      return  # Already pointed at the right thing (including both empty).
+    old_sub = getattr(self, sub_attr)
+    if old_sub is not None:
+      try:
+        old_sub.unregister()
+      except Exception:
+        pass
+      setattr(self, sub_attr, None)
+    setattr(self, source_attr, source_topic)
+    if source_topic == "":
+      return
+    new_sub = nepi_sdk.create_subscriber(source_topic, Image, self.commonViewImageCb,
+                                        queue_size = 1, callback_args = (pub,))
+    setattr(self, sub_attr, new_sub)
+
+  def commonViewImageCb(self, msg, args):
+    pub = args[0] if isinstance(args, tuple) else args
+    pub.publish(msg)
 
   def simDeviceStatusCb(self, msg, args):
     topic = args[0] if isinstance(args, tuple) else args
