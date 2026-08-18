@@ -83,11 +83,23 @@
       </link>
     </model>
 
-    <model name="generic_rover_demo">
-      <include>
-        <uri>model://generic_rover</uri>
-      </include>
-    </model>
+    <!-- Renamed via <include>'s own <name>, NOT wrapped in an outer
+         <model name="generic_rover_demo"> element (found live 2026-08-18 to
+         double-load the included model's plugins under Gazebo Classic 11 --
+         confirmed via "Tried to advertise a service that is already
+         advertised in this node [/rover/camera/set_parameters]" plus the
+         DiffDrive plugin's own startup log lines appearing twice per launch,
+         and both camera topics ending up with NO active publisher at all
+         afterward despite the model existing in get_world_properties. This
+         is almost certainly the actual mechanism behind the long-reported
+         "can't see some of the cameras in the robot viewer" -- it's not a
+         topic-discovery or RUI bug, the publisher genuinely isn't there).
+         <include><name> is the documented-correct way to rename an included
+         model and does not re-parse/re-instantiate it. -->
+    <include>
+      <uri>model://generic_rover</uri>
+      <name>generic_rover_demo</name>
+    </include>
 
     <!-- The follow-cam rig used to be spawned here as a standalone model,
          repositioned every frame via /gazebo/set_model_state by

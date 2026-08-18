@@ -196,29 +196,15 @@ Previously reported running at ~15Hz against an intended 5Hz cap (`IMAGE_RATE_HZ
 - [ ] Same for PyBullet.
 - [ ] Same for WPILib HAL Sim.
 
-### 5. A decision on old, now-superseded code — **partly done**
+### 5. A decision on old, now-superseded code — **done, removed 2026-08-18**
 
-`rbx_gazebo_node.py`/`rbx_gazebo_discovery.py` (the old `RBXRobotIF`-based Gazebo driver)
-is not used by anything the new Gazebo bridge relies on.
-
-- [x] Took the conservative middle ground rather than deciding retire-vs-keep
-      unilaterally: **removed the two dead camera methods**
-      (`get_sensor_topics()`/`get_camera_reference_frames()` — confirmed never called
-      anywhere, never wired into the `RBXRobotIF` constructor) since leaving working-
-      looking-but-unreachable code around was the actively misleading part. Left a
-      comment pointing at the real two-camera mechanism (the generic sim_connector
-      path) and at this checklist item for the still-open bigger decision. The
-      constants they used (`ROBOT_MAIN_REFERENCE_FRAME`, `SCENE_CAMERA_DEFAULT_OFFSET_M`,
-      `SCENE_CAMERA_DEFAULT_TILT_DEG`) were left in place — they're inert, not
-      misleading, and encode real tuning values worth keeping if this driver ever does
-      get migrated onto `SimDeviceIF`.
-- [ ] **Still open, genuinely your call:** retire this driver entirely now that Gazebo
-      goes through the generic contract, or keep it as a fallback/for some other
-      reason? Not decided here — a whole-file deletion (including its discovery script
-      and params YAML, and whatever `apps_mgr`/`drivers_mgr` registration references
-      it) is a bigger, more consequential change than the dead-code trim above, and
-      worth your explicit sign-off rather than an agent's unilateral guess, especially
-      since this driver may already be deployed on the real device.
+`rbx_gazebo_node.py`/`rbx_gazebo_discovery.py`/`rbx_gazebo_params.yaml` (the old
+`RBXRobotIF`-based Gazebo driver) deleted outright, per explicit sign-off. Confirmed
+before deleting: never promoted past `nepi_drones` (no copy in `src/nepi_drivers`), never
+deployed to the real device (`/opt/nepi/nepi_engine/lib/nepi_drivers/` has no matching
+files), and its default ports (9022/9023) collided with RBX_SIM's own rover-single slot
+— a real, if never-yet-triggered, footgun. `docs/ROS_TOPICS_AND_SERVICES.md` updated to
+match (driver count, port table, the two-spellings-of-reset note).
 
 ---
 
@@ -247,8 +233,7 @@ is not used by anything the new Gazebo bridge relies on.
 3. **Do the RUI visual-confirmation pass** for Gazebo — cheap, and likely to surface real
    UI gaps in exactly the "what's shown/editable" area that matters most, before sinking
    more time into bridges whose controls haven't been eyeballed yet.
-4. **Decide on `rbx_gazebo_node.py`** — a quick call, removes ongoing confusion between two
-   parallel Gazebo integration paths.
+4. ~~Decide on `rbx_gazebo_node.py`~~ — done, removed.
 5. **Work through the remaining on-device + RUI confirmations** for Webots, PyBullet,
    and WPILib, one at a time — Webots first, per current priority.
 6. **Unity, whenever you're ready to personally do the account sign-in** — not blocking
