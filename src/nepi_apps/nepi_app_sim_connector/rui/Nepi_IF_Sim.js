@@ -622,12 +622,21 @@ class NepiIFSim extends Component {
           this.renderData()
         : null}
 
-        {(show_controls === true) ?
-          <NepiIFSimControls
-            namespace={namespace}
-            make_section={false}
-          />
-        : null}
+        {/* Always mounted, even when show_controls is false: NepiIFSimControls
+            renders two logically separate groups internally -- live control
+            (motor sliders, goto SEND buttons, home/stop actions, the live
+            camera viewer) gated on show_live_controls, and configuration
+            (capability toggles, image-source curation, camera view/offset
+            settings, environment, movement limits) which always renders
+            regardless. Configuring what shows up in Devices -> Robots is
+            this app's actual purpose -- hiding it along with live control
+            was an unintended side effect of the two being bundled into one
+            gated component. See docs/SIM_CONNECTOR_CONFIG_CONTROLS_PLAN.md. */}
+        <NepiIFSimControls
+          namespace={namespace}
+          make_section={false}
+          show_live_controls={show_controls}
+        />
 
         {/* Deploy/Kill/Install controls -- deliberately last on the page.
             Picking WHAT to run (the selector above) and configuring it

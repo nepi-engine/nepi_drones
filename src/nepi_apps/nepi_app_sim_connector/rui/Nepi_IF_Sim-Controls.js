@@ -131,6 +131,21 @@ class NepiIFSimControls extends Component {
       rbxSettingsNamesList: [],
       rbxSettingsValuesDict: {},
 
+      // Edit buffers for the camera/scene offset triples and the movement
+      // limit Settings, same pattern as NepiDeviceRBX.js's own offsetNames
+      // buffers -- resynced from the device's own value in
+      // rbxSettingsListener below only when it actually changes, never on
+      // every status tick, so an in-progress edit is never clobbered.
+      camera_offset_x: '', camera_offset_y: '', camera_offset_z: '',
+      scene_offset_x: '', scene_offset_y: '', scene_offset_z: '',
+      max_linear_speed_mps: '', max_angular_rate_dps: '',
+      max_vertical_speed_mps: '', takeoff_height_m: '',
+
+      // Environment dropdown display value -- "Flat Ground"/"Obstacle
+      // Course" labels for FLAT_GROUND/OBSTACLE_COURSE, matching
+      // NepiDeviceRBX.js's own onSelectEnvironment convention exactly.
+      selected_environment_setting: 'Flat Ground',
+
     }
 
     this.updateStatusListener = this.updateStatusListener.bind(this)
@@ -153,6 +168,15 @@ class NepiIFSimControls extends Component {
     this.renderImageSourceCuration = this.renderImageSourceCuration.bind(this)
     this.renderEnvironmentControls = this.renderEnvironmentControls.bind(this)
     this.toggleEnvironmentOption = this.toggleEnvironmentOption.bind(this)
+
+    this.onEnterSetRbxFloatSetting = this.onEnterSetRbxFloatSetting.bind(this)
+    this.renderCameraViewModeControls = this.renderCameraViewModeControls.bind(this)
+    this.renderCameraOffsetControls = this.renderCameraOffsetControls.bind(this)
+    this.renderEnvironmentSetting = this.renderEnvironmentSetting.bind(this)
+    this.renderMovementLimits = this.renderMovementLimits.bind(this)
+
+    this.renderLiveControls = this.renderLiveControls.bind(this)
+    this.renderConfigControls = this.renderConfigControls.bind(this)
     this.renderControls = this.renderControls.bind(this)
   }
 
@@ -309,6 +333,31 @@ class NepiIFSimControls extends Component {
       valuesDict[settings[ind].name_str] = settings[ind].value_str
     }
     this.setState({ rbxSettingsNamesList: namesList, rbxSettingsValuesDict: valuesDict })
+
+    // Seed/resync each edit buffer only when the DEVICE's own value changed
+    // (or on first sight), never on every status tick -- otherwise a status
+    // message overwrites whatever is being typed. Same pattern as
+    // NepiDeviceRBX.js's own offsetNames sync.
+    const floatSettingNames = ["camera_offset_x", "camera_offset_y", "camera_offset_z",
+                               "scene_offset_x", "scene_offset_y", "scene_offset_z",
+                               "max_linear_speed_mps", "max_angular_rate_dps",
+                               "max_vertical_speed_mps", "takeoff_height_m"]
+    var updates = {}
+    for (let i = 0; i < floatSettingNames.length; i++) {
+      const name = floatSettingNames[i]
+      const deviceVal = valuesDict[name]
+      if (deviceVal !== undefined && deviceVal !== this.state.rbxSettingsValuesDict[name]) {
+        updates[name] = deviceVal
+      }
+    }
+    if (valuesDict["environment"] !== undefined
+        && valuesDict["environment"] !== this.state.rbxSettingsValuesDict["environment"]) {
+      updates.selected_environment_setting =
+        (valuesDict["environment"] === "OBSTACLE_COURSE") ? "Obstacle Course" : "Flat Ground"
+    }
+    if (Object.keys(updates).length > 0) {
+      this.setState(updates)
+    }
   }
 
   // Function for configuring and subscribing to the selected RBX device's
@@ -913,6 +962,177 @@ class NepiIFSimControls extends Component {
     )
   }
 
+  // Enter-to-apply for any plain editable Float RBX Setting (camera/scene
+  // offsets, movement limits) -- one generic handler rather than one per
+  // Setting, since they all share the exact same publish shape. Ported from
+  // NepiDeviceRBX.js's onEnterSetCameraOffset, generalized to any setting
+  // name/state key pair (they're the same string for every Setting this
+  // component edits, so a single argument suffices).
+  onEnterSetRbxFloatSetting(event, settingName) {
+    if (event.key === 'Enter') {
+      const value = parseFloat(event.target.value)
+      if (!isNaN(value)) {
+        const { updateSetting } = this.props.ros
+        const rbx_ns = this.state.rbx_namespace
+        updateSetting(rbx_ns + "/settings", settingName, "Float", String(value))
+      }
+      const el = document.getElementById(event.target.id)
+      if (el) {
+        clearElementStyleModified(el)
+      }
+    }
+  }
+
+  // Robot View / Scene View buttons for the camera_view_mode Setting --
+  // ported from NepiDeviceRBX.js's renderImageViewer, same
+  // FIRST_PERSON/THIRD_PERSON convention. Gated on camera_controls_enabled
+  // (absent Setting treated as enabled, matching NepiDeviceRBX.js's own
+  // settingEnabled pattern) so turning that toggle off also hides this
+  // control here, not just in Devices -> Robots.
+  renderCameraViewModeControls() {
+    const rbx_ns = this.state.rbx_namespace
+    if (rbx_ns === null || rbx_ns === '' || rbx_ns === 'None') {
+      return null
+    }
+    const settings = this.state.rbxSettingsNamesList
+    const values = this.state.rbxSettingsValuesDict
+    const camera_controls_enabled = !settings.includes("camera_controls_enabled")
+      || values["camera_controls_enabled"] !== "FALSE"
+    if (!settings.includes("camera_view_mode") || !camera_controls_enabled) {
+      return null
+    }
+    const { updateSetting } = this.props.ros
+    return (
+      <Label title={"Camera View"}>
+        <ButtonMenu>
+          <Button onClick={() => updateSetting(rbx_ns + "/settings", "camera_view_mode", "Discrete", "FIRST_PERSON")}>{"Robot View"}</Button>
+          <Button onClick={() => updateSetting(rbx_ns + "/settings", "camera_view_mode", "Discrete", "THIRD_PERSON")}>{"Scene View"}</Button>
+        </ButtonMenu>
+      </Label>
+    )
+  }
+
+  // Editable X/Y/Z Float inputs for a camera_offset_*/scene_offset_* triple
+  // -- ported near-verbatim from NepiDeviceRBX.js's method of the same name.
+  // Gated on that triple's own presence plus camera_controls_enabled, same
+  // reasoning as renderCameraViewModeControls above.
+  renderCameraOffsetControls(namePrefix, titlePrefix) {
+    const rbx_ns = this.state.rbx_namespace
+    if (rbx_ns === null || rbx_ns === '' || rbx_ns === 'None') {
+      return null
+    }
+    const settings = this.state.rbxSettingsNamesList
+    const values = this.state.rbxSettingsValuesDict
+    const camera_controls_enabled = !settings.includes("camera_controls_enabled")
+      || values["camera_controls_enabled"] !== "FALSE"
+    if (!settings.includes(namePrefix + "_x") || !camera_controls_enabled) {
+      return null
+    }
+
+    const offsets = [
+      { name: namePrefix + "_x", title: titlePrefix + " Offset X (m)" },
+      { name: namePrefix + "_y", title: titlePrefix + " Offset Y (m)" },
+      { name: namePrefix + "_z", title: titlePrefix + " Offset Z (m)" },
+    ]
+    return (
+      <React.Fragment>
+        {offsets.map((offset) => (
+          <Label key={offset.name} title={offset.title}>
+            <Input
+              id={"SimRbx_" + offset.name}
+              value={this.state[offset.name]}
+              onChange={(event) => {
+                const el = document.getElementById("SimRbx_" + offset.name)
+                if (el) {
+                  setElementStyleModified(el)
+                }
+                var obj = {}
+                obj[offset.name] = event.target.value
+                this.setState(obj)
+              }}
+              onKeyDown={(event) => this.onEnterSetRbxFloatSetting(event, offset.name)}
+            />
+          </Label>
+        ))}
+      </React.Fragment>
+    )
+  }
+
+  // "Flat Ground"/"Obstacle Course" dropdown for the RBX driver's own
+  // "environment" Setting -- distinct from renderEnvironmentControls below
+  // (a different, currently-dead-for-every-deployable-target mechanism, see
+  // docs/SIM_CONNECTOR_CONFIG_CONTROLS_PLAN.md). Ported from
+  // NepiDeviceRBX.js's onSelectEnvironment, same hardcoded label convention.
+  renderEnvironmentSetting() {
+    const rbx_ns = this.state.rbx_namespace
+    if (rbx_ns === null || rbx_ns === '' || rbx_ns === 'None') {
+      return null
+    }
+    if (!this.state.rbxSettingsNamesList.includes("environment")) {
+      return null
+    }
+    const { updateSetting } = this.props.ros
+    return (
+      <Label title={"Environment"}>
+        <Select
+          onChange={(event) => {
+            const value = event.target.value
+            this.setState({ selected_environment_setting: value })
+            updateSetting(rbx_ns + "/settings", "environment", "Discrete",
+              value === "Obstacle Course" ? "OBSTACLE_COURSE" : "FLAT_GROUND")
+          }}
+          value={this.state.selected_environment_setting}
+        >
+          <Option value="Flat Ground">{"Flat Ground"}</Option>
+          <Option value="Obstacle Course">{"Obstacle Course"}</Option>
+        </Select>
+      </Label>
+    )
+  }
+
+  // Editable Float inputs for whichever movement-limit Settings the
+  // connected driver actually reports -- naturally 3 inputs for the rover
+  // (no max_vertical_speed_mps) and all 4 for the quadcopter (adds
+  // takeoff_height_m), no per-robot-type branching here at all.
+  renderMovementLimits() {
+    const rbx_ns = this.state.rbx_namespace
+    if (rbx_ns === null || rbx_ns === '' || rbx_ns === 'None') {
+      return null
+    }
+    const settings = this.state.rbxSettingsNamesList
+    const limits = [
+      { name: "max_linear_speed_mps", title: "Max Linear Speed (m/s)" },
+      { name: "max_angular_rate_dps", title: "Max Angular Rate (deg/s)" },
+      { name: "max_vertical_speed_mps", title: "Max Vertical Speed (m/s)" },
+      { name: "takeoff_height_m", title: "Takeoff Height (m)" },
+    ].filter((limit) => settings.includes(limit.name))
+    if (limits.length === 0) {
+      return null
+    }
+    return (
+      <React.Fragment>
+        {limits.map((limit) => (
+          <Label key={limit.name} title={limit.title}>
+            <Input
+              id={"SimRbx_" + limit.name}
+              value={this.state[limit.name]}
+              onChange={(event) => {
+                const el = document.getElementById("SimRbx_" + limit.name)
+                if (el) {
+                  setElementStyleModified(el)
+                }
+                var obj = {}
+                obj[limit.name] = event.target.value
+                this.setState(obj)
+              }}
+              onKeyDown={(event) => this.onEnterSetRbxFloatSetting(event, limit.name)}
+            />
+          </Label>
+        ))}
+      </React.Fragment>
+    )
+  }
+
   // Sends a real (option, enabled) pair, JSON-encoded onto the existing
   // std_msgs/String topic -- see device_if_sim.py's setEnvironmentOptionCb for
   // the matching decode side. Flips local toggle state optimistically; there is
@@ -969,8 +1189,44 @@ class NepiIFSimControls extends Component {
     )
   }
 
+  // Live control: directly commands the robot right now (motor ratios, goto
+  // setpoints, home/stop/setup actions, the live camera preview). This is
+  // the surface `show_live_controls={false}` hides -- "the sim connector's
+  // job is standing up the right sim/robot config, not direct control...
+  // that lives in Devices -> Robots" (see NepiAppSimConnector.js).
+  renderLiveControls() {
+    return (
+      <React.Fragment>
+        {this.renderMotorControls()}
+        {this.renderGotoControls()}
+        {this.renderHomeControls()}
+        {this.renderCameraControls()}
+      </React.Fragment>
+    )
+  }
+
+  // Configuration: decides WHICH control surfaces show up at all, here and
+  // in Devices -> Robots, for the currently connected RBX driver -- this is
+  // this app's actual point, and always renders regardless of
+  // show_live_controls. See docs/SIM_CONNECTOR_CONFIG_CONTROLS_PLAN.md.
+  renderConfigControls() {
+    return (
+      <React.Fragment>
+        {this.renderRobotCapabilityControls()}
+        {this.renderCameraViewModeControls()}
+        {this.renderCameraOffsetControls("camera_offset", "Robot View Camera")}
+        {this.renderCameraOffsetControls("scene_offset", "Scene View Camera")}
+        {this.renderEnvironmentSetting()}
+        {this.renderMovementLimits()}
+        {this.renderEnvironmentControls()}
+      </React.Fragment>
+    )
+  }
+
   renderControls() {
     const namespace = this.props.namespace
+    const show_live_controls = (this.props.show_live_controls !== undefined)
+      ? this.props.show_live_controls : true
     if (namespace == null || namespace === 'None') {
       return (
         <Columns>
@@ -984,12 +1240,8 @@ class NepiIFSimControls extends Component {
     return (
       <React.Fragment>
 
-        {this.renderMotorControls()}
-        {this.renderGotoControls()}
-        {this.renderHomeControls()}
-        {this.renderCameraControls()}
-        {this.renderRobotCapabilityControls()}
-        {this.renderEnvironmentControls()}
+        {(show_live_controls === true) ? this.renderLiveControls() : null}
+        {this.renderConfigControls()}
 
       </React.Fragment>
     )
