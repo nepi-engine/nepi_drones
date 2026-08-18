@@ -376,6 +376,20 @@ class SimBridgeNode:
         rospy.logwarn_throttle(5.0, PKG_NAME + ": Failed to send line to client: " + str(e))
         if self.client_conn is conn:
           self.client_conn = None
+        # shutdown() before close(): the accept loop's recv() (a different
+        # thread) is almost certainly blocked reading this exact socket --
+        # closing a fd out from under a thread blocked in recv() on it does
+        # not reliably unblock that recv() on Linux. Without this, the
+        # accept loop can stay wedged and refuse the client's next
+        # reconnect attempt indefinitely. See camera_rig_controller_
+        # ardupilot.py's sendLineToClient for the same fix and full
+        # reasoning (found while chasing the quadcopter camera's
+        # flicker-in-and-out bug; this rover bridge has the identical
+        # send-thread/recv-thread split, so the same fix applies here).
+        try:
+          conn.shutdown(socket.SHUT_RDWR)
+        except Exception:
+          pass
         try:
           conn.close()
         except Exception:

@@ -290,6 +290,21 @@ class CameraRigControllerArdupilot:
       with self.client_lock:
         if self.client_conn is conn:
           self.client_conn = None
+      # shutdown() before close(): serveClient (a DIFFERENT thread) is
+      # almost certainly blocked in a timeout=None recv() on this exact
+      # socket -- closing a fd out from under a thread blocked in recv() on
+      # it does not reliably unblock that recv() on Linux, so without the
+      # shutdown() that thread can stay wedged, leaving bridgeServerLoop's
+      # single accept() slot (listen(1)) unable to take the client's next
+      # reconnect attempt. Confirmed as the mechanism behind "quadcopter
+      # image flickers in and out / won't stay" -- the client (rbx_ardupilot_
+      # node.py's cameraBridgeLoop) retries every 3s after any hiccup (tunnel
+      # blip, etc.), but each retry silently failed/refused until whatever
+      # eventually broke the wedged recv() on its own.
+      try:
+        conn.shutdown(socket.SHUT_RDWR)
+      except Exception:
+        pass
       try:
         conn.close()
       except Exception:
