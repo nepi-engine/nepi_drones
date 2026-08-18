@@ -33,6 +33,40 @@ const TRIGGER_MASKS = {
 
 const NEPI_TIMEOUT_MSEC = 3000
 
+// Order-independent set equality for two string arrays. updateTopicsServices
+// uses this to decide whether the topic/type/service lists actually changed
+// -- a plain .length comparison (what this replaced) misses any case where
+// one topic disappears and a different one appears in the same tick (the
+// count stays identical), which silently skips re-running every device-list
+// refresh (updateRBXDevices/updateIDXDevices/updateImageTopics/etc, all
+// gated on this same check) until some LATER, unrelated topic change happens
+// to produce a length mismatch. Confirmed as the mechanism behind real user
+// reports: a killed sim's robot lingering as a selectable device long after
+// its /rbx/status topic was actually gone, and camera topics not appearing
+// in the image selector. rosbridge's getTopics() also does not guarantee a
+// stable order between calls, so this has to be a Set comparison, not an
+// index-by-index one (which would report "changed" on every single tick
+// even when nothing real changed, reintroducing the cost this guard exists
+// to avoid).
+function sameStringSet(a, b) {
+  if (a === b) {
+    return true
+  }
+  if (a == null || b == null || a.length !== b.length) {
+    return false
+  }
+  const setA = new Set(a)
+  if (setA.size !== new Set(b).size) {
+    return false
+  }
+  for (const item of b) {
+    if (!setA.has(item)) {
+      return false
+    }
+  }
+  return true
+}
+
 
 // TODO: Would be better to query the display_name property of all nodes to generate
 // this dictionary... requires a new SDKNode service to do so
@@ -460,9 +494,14 @@ class ROSConnectionStore {
         const serviceNames = (this.serviceNamesLast != null) ? this.serviceNamesLast : []
 
         if (this.topicNames != null && this.topicTypes != null && this.serviceNames != null){
-          if (this.topicNames.length !== topicNames.length ||
-              this.topicTypes.length !== topicTypes.length ||
-              this.serviceNames.length !== serviceNames.length) {
+          // Set-based comparison (see sameStringSet's own comment) -- a
+          // plain .length check here missed any tick where one topic
+          // disappeared and a different one appeared (net-zero count
+          // change), leaving every device list below stale until an
+          // unrelated later change happened to shift the count.
+          if (!sameStringSet(this.topicNames, topicNames) ||
+              !sameStringSet(this.topicTypes, topicTypes) ||
+              !sameStringSet(this.serviceNames, serviceNames)) {
 
                 update_time = 2000
                 var newPrefix = this.updatePrefix(this.topicNames, this.topicTypes)
