@@ -30,8 +30,9 @@
 # The forwarded ports must stay in sync with nepi_tunnel() in
 # ../scripts/nepi_sitl_dev_env.sh -- that function remains the documented
 # reference for what each port is for (5760/5771 MAVLink, 9021-9028 the
-# sim-utility listeners and bridges, 9041/9046 the Webots RBX bridge's
-# heartbeat/bridge ports, 12222 this VM's own sshd).
+# sim-utility listeners and bridges, 9041/9046 the Webots rover RBX bridge's
+# heartbeat/bridge ports, 9042/9047 the Webots quadcopter RBX bridge's,
+# 12222 this VM's own sshd).
 
 [Unit]
 Description=NEPI reverse SSH tunnel to device (MAVLink, sim bridges, and VM sshd for sim connector launches)
@@ -69,7 +70,9 @@ ExecStart=/usr/bin/autossh -M 0 -p 2222 \
   -R 9027:127.0.0.1:9027 \
   -R 9028:127.0.0.1:9028 \
   -R 9041:127.0.0.1:9041 \
+  -R 9042:127.0.0.1:9042 \
   -R 9046:127.0.0.1:9046 \
+  -R 9047:127.0.0.1:9047 \
   -R 12222:127.0.0.1:22 \
   nepi@nepi
 Restart=always

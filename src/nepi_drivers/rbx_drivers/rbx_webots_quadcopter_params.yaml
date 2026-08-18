@@ -1,0 +1,56 @@
+# Webots simulated quadcopter RBX driver -- params / manifest.
+# Mirrors rbx_webots_params.yaml exactly; see that file's own comments for the
+# reasoning behind each field. Port numbers differ (9042/9047) -- next free
+# slots after the rover's 9041/9046, clear of every reservation in
+# docs/MULTI_SIMULATOR_INTEGRATION_PLAN.md's port table.
+
+driver:
+  pkg_name: RBX_WEBOTS_QUADCOPTER
+  display_name: Webots Simulated Quadcopter
+  description: Driver package for the Webots-simulated quadcopter (Supervisor-velocity flight, no ArduPilot SITL) reached over a JSON-lines bridge
+  type: RBX
+  group_id: WEBOTS
+
+  NODE_DICT:
+    file_name: rbx_webots_quadcopter_node.py
+    class_name: WebotsQuadcopterNode
+
+  # No separate driver file: all robot I/O goes over the bridge connection the
+  # node holds open, same as every other simulator RBX driver in this project.
+  DRIVER_DICT:
+    file_name: None
+    class_name: None
+
+  DISCOVERY_DICT:
+    file_name: rbx_webots_quadcopter_discovery.py
+    class_name: WebotsQuadcopterDiscovery
+    process: CALL
+    OPTIONS:
+      # Host serving the Webots bridge (the dev VM running the Webots
+      # controller). 'localhost' covers a same-host case; set a real address
+      # for a Webots instance reached over the network/tunnel.
+      host:
+        type: String
+        options:
+          - ''
+        default: 'localhost'
+        value: 'localhost'
+      # Port the Webots-side heartbeat listener answers on. Discovery requires
+      # the ALIVE reply, not merely a successful connect -- same reasoning as
+      # every other simulator driver's discovery.
+      heartbeat_port:
+        type: Int
+        options:
+          - '1024'
+          - '65535'
+        default: '9042'
+        value: '9042'
+      # Port serving the persistent JSON-lines command/telemetry bridge that the
+      # launched node connects to.
+      bridge_port:
+        type: Int
+        options:
+          - '1024'
+          - '65535'
+        default: '9047'
+        value: '9047'

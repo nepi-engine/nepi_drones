@@ -541,6 +541,57 @@ launch_targets:
     # generic_rover.world's (see docs/WEBOTS_RBX_DRIVER_PLAN.md item 4) --
     # WHEEL1-4 in the .wbt, not a 2-wheel body.
     default_robot_config: ground_robot_4_wheel
+    # This target's own rover world/bridge has no altitude axis or flight
+    # controller -- redirect a 4-motor flight profile to webots_quadcopter
+    # below instead, a different world/bridge entirely. Mirrors
+    # gazebo_rover's own flight_robot_4_motor -> gazebo_quadcopter override
+    # exactly -- "Webots" stays the one thing picked in the Simulator
+    # selector, no separate "Webots (Quadcopter)" entry to remember.
+    launch_target_overrides:
+      flight_robot_4_motor: webots_quadcopter
+
+  # Reached only through webots_rover's own launch_target_overrides above --
+  # never offered directly in the Simulator selector (hidden_from_selector,
+  # same convention gazebo_quadcopter uses). Supervisor-velocity-injected
+  # flight (no ArduPilot SITL, no rotor aerodynamics) -- see
+  # docs/WEBOTS_QUADCOPTER_DRIVER_PLAN.md for the full design and why this
+  # is NOT an attempt to reproduce gazebo_quadcopter's real ArduPilot SITL
+  # architecture.
+  webots_quadcopter:
+    display_name: "Webots (Quadcopter)"
+    hidden_from_selector: true
+    host: "127.0.0.1"
+    ssh_user: "suraj"
+    ssh_port: 12222
+    check_installed_command: "bash -lc \"command -v webots > /dev/null\""
+    install_command: >-
+      bash -lc '
+      set -e;
+      DEB_URL=$(curl -fsSL https://api.github.com/repos/cyberbotics/webots/releases/latest
+      | grep -o "https://[^\"]*_amd64\.deb" | head -1);
+      test -n "$DEB_URL";
+      wget -q "$DEB_URL" -O /tmp/webots_latest_amd64.deb;
+      sudo apt-get update;
+      sudo apt-get install -y /tmp/webots_latest_amd64.deb;
+      rm -f /tmp/webots_latest_amd64.deb
+      '
+    # Same launch mechanics as webots_rover -- see that target's own comments
+    # for the full reasoning (DISPLAY/XAUTHORITY resolution, the `pgrep -x
+    # webots` self-match fix, session-lifetime process group). Only the
+    # world file differs.
+    launch_command: >-
+      bash -lc '
+      . $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/nepi_sim_display_env.sh;
+      if pgrep -x webots > /dev/null; then echo "REFUSING TO LAUNCH: a Webots instance is already running on this host. Stop the existing simulation first." >&2; exit 3; fi;
+      echo $$ > /tmp/sim_connector_webots_quadcopter_launch.pgid;
+      webots --mode=fast --batch $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/webots/worlds/rbx_quadcopter.wbt < /dev/null > /tmp/sim_connector_webots_quadcopter_launch.log 2>&1 & WEBOTS_PID=$!;
+      wait $WEBOTS_PID
+      '
+    stop_command: "bash -lc 'f=/tmp/sim_connector_webots_quadcopter_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; true'"
+    # Heartbeat port 9042 (quadcopter), not 9041 (rover) -- see
+    # rbx_webots_quadcopter_params.yaml.
+    ready_check_command: "bash -lc \"pgrep -f 'webots.*rbx_quadcopter.wbt' > /dev/null && (exec 3<>/dev/tcp/127.0.0.1/9042) 2>/dev/null && exec 3<&-\""
+    default_robot_config: flight_robot_4_motor
 
   pybullet_rover:
     display_name: "PyBullet"
