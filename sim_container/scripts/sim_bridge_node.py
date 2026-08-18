@@ -179,6 +179,10 @@ DELETE_MODEL_SERVICE = '/gazebo/delete_model'
 ROVER_MODEL_SDF_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), '..', 'models',
     'generic_rover', 'model.sdf')
+# Matches generic_rover/model.sdf's own hard-coded camera_link/camera_link_chase
+# poses exactly, and rbx_sim_node.py's own FACTORY_SETTINGS for the same six
+# values -- see applied_camera_offsets' own comment for why this matters.
+FACTORY_CAMERA_OFFSETS = (0.2, 0.0, 0.65, -2.5, 0.0, 1.65)
 # Matches a <link name="LINKNAME"> immediately followed by its own <pose>
 # element. Group 1 is everything up to and including "<pose>"; group 2 is the
 # existing rotation triple plus "</pose>" -- substituting keeps group 1 and
@@ -247,6 +251,26 @@ class SimBridgeNode:
     # the same offsets as last time (e.g. a redundant resend triggered by
     # Nepi_IF_SimLauncher's own robot-config re-send fix) does not trigger a
     # pointless respawn.
+    #
+    # Initialized to FACTORY_CAMERA_OFFSETS, NOT None -- found live
+    # (2026-08-18) as the actual root cause of a duplicate-plugin-load Gazebo
+    # bug hitting essentially every single deploy: rbx_sim_node.py's
+    # bridgeLoop unconditionally sends its current camera settings once on
+    # every fresh connect (see that method's own comment), and with this
+    # starting as None, that FIRST sync message -- even carrying nothing but
+    # untouched factory-default offsets -- always failed the "already
+    # applied" dedup check and triggered a real respawnRoverWithCameraOffsets
+    # call. That respawn's delete+spawn raced the world file's own initial
+    # <include> spawn (still mid-plugin-init at ~2-3s into boot), producing
+    # "Tried to advertise a service that is already advertised" errors and,
+    # observed live, both camera topics ending up with zero active
+    # publishers. Starting this at the actual factory values (verified to
+    # exactly match both rbx_sim_node.py's own FACTORY_SETTINGS and
+    # generic_rover/model.sdf's hard-coded camera_link/camera_link_chase
+    # poses) means an UNCUSTOMIZED deploy -- the common case -- now legitimately
+    # skips this first respawn entirely. A deploy with genuinely customized
+    # offsets still respawns once, which is correct: that respawn is real
+    # work this mechanism exists to do.
     try:
       with open(ROVER_MODEL_SDF_PATH, 'r') as f:
         self.rover_sdf_template = f.read()
@@ -255,7 +279,7 @@ class SimBridgeNode:
                     ROVER_MODEL_SDF_PATH + ": " + str(e) +
                     " -- camera offset changes will be ignored")
       self.rover_sdf_template = None
-    self.applied_camera_offsets = None
+    self.applied_camera_offsets = FACTORY_CAMERA_OFFSETS
 
     # Latest odom snapshot for the telemetry push loop, and the single
     # active bridge client (one robot, one remote node -- serve one
@@ -525,6 +549,15 @@ class SimBridgeNode:
     try:
       rospy.wait_for_service(DELETE_MODEL_SERVICE, timeout=GAZEBO_SERVICE_WAIT_SEC)
       rospy.ServiceProxy(DELETE_MODEL_SERVICE, DeleteModel)(ROVER_MODEL_NAME)
+      # Give the deleted model's plugins (gazebo_ros_camera x2, diff_drive)
+      # time to actually unadvertise their ROS services/topics before the new
+      # model's plugins try to advertise the SAME names -- confirmed live
+      # that DeleteModel returning does not guarantee this has finished yet
+      # ("Tried to advertise a service that is already advertised in this
+      # node" on the very next SpawnModel otherwise). See
+      # FACTORY_CAMERA_OFFSETS' own comment for why this path is now rare
+      # (skipped entirely for an uncustomized deploy) rather than gone.
+      time.sleep(1.0)
       rospy.wait_for_service(SPAWN_MODEL_SERVICE, timeout=GAZEBO_SERVICE_WAIT_SEC)
       spawn = rospy.ServiceProxy(SPAWN_MODEL_SERVICE, SpawnModel)
       resp = spawn(ROVER_MODEL_NAME, sdf, '', initial_pose, 'world')
