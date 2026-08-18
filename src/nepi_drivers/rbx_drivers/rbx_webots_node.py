@@ -88,17 +88,51 @@ class WebotsNode:
   ENVIRONMENT_OPTIONS = ["FLAT_GROUND", "OBSTACLE_COURSE"]
   OBSTACLE_COURSE_OPTION = "OBSTACLE_COURSE"
 
-  CAMERA_SETTING_NAMES = ("camera_view_mode",)
+  # Ported from rbx_sim_node.py (the Gazebo rover's real, current driver --
+  # see docs/WEBOTS_RBX_DRIVER_PLAN.md's note on this file having been built
+  # from the stale rbx_gazebo_node.py template originally, before RBX_SIM's
+  # camera-offset/capability-toggle Settings existed). Unlike Gazebo's rover,
+  # this world has ONE fixed Camera device, not a repositionable rig or two
+  # independently-posed camera links -- camera_offset_x/y/z/scene_offset_x/y/z
+  # are declared here so the RUI renders the SAME control surface Gazebo's
+  # rover has (the user's own parity requirement), but sendCameraSettings
+  # below sends them to webots_rbx_bridge.py as a documented no-op, matching
+  # this driver's existing honest treatment of RESET_SIM/environment (see
+  # their own comments) rather than silently pretending a physical camera
+  # move happens.
+  CAMERA_SETTING_NAMES = ("camera_view_mode",
+                          "camera_offset_x", "camera_offset_y", "camera_offset_z",
+                          "scene_offset_x", "scene_offset_y", "scene_offset_z")
   ENVIRONMENT_SETTING_NAMES = ("environment",)
+
+  # Sim Connector's own per-robot-config "customize the capabilities that are
+  # open" toggles -- same mechanism and same names as rbx_sim_node.py's own
+  # CAPABILITY_SETTING_NAMES (see that file's comment for the full reasoning).
+  # Enforced in autonomousControlsReady/teleopControlsReady below, not just
+  # hidden in the RUI, so a client bypassing the RUI can't do what was turned
+  # off either.
+  CAPABILITY_SETTING_NAMES = ("autonomous_movement_enabled", "teleop_movement_enabled",
+                              "camera_controls_enabled", "enabled_image_sources")
 
   CAP_SETTINGS = dict(
     max_linear_speed_mps = {"type":"Float","name":"max_linear_speed_mps","options":["0.05","2.0"]},
     max_angular_rate_dps = {"type":"Float","name":"max_angular_rate_dps","options":["5.0","180.0"]},
     camera_view_mode = {"type":"Discrete","name":"camera_view_mode","options":CAMERA_VIEW_MODES},
-    environment = {"type":"Discrete","name":"environment","options":ENVIRONMENT_OPTIONS}
+    environment = {"type":"Discrete","name":"environment","options":ENVIRONMENT_OPTIONS},
+    camera_offset_x = {"type":"Float","name":"camera_offset_x","options":["-10.0","10.0"]},
+    camera_offset_y = {"type":"Float","name":"camera_offset_y","options":["-10.0","10.0"]},
+    camera_offset_z = {"type":"Float","name":"camera_offset_z","options":["-10.0","10.0"]},
+    scene_offset_x = {"type":"Float","name":"scene_offset_x","options":["-10.0","10.0"]},
+    scene_offset_y = {"type":"Float","name":"scene_offset_y","options":["-10.0","10.0"]},
+    scene_offset_z = {"type":"Float","name":"scene_offset_z","options":["-10.0","10.0"]},
+    autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
+    teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","options":["TRUE","FALSE"]},
+    camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]},
+    # No fixed options -- the candidate topic set is per-deployment.
+    enabled_image_sources = {"type":"String","name":"enabled_image_sources"}
   )
 
-  # max_linear_speed_mps factory/range lower than rbx_gazebo_node.py's: this
+  # max_linear_speed_mps factory/range lower than rbx_sim_node.py's: this
   # world's MOTOR_MAX_LINEAR_MPS (0.3, see sim_connector_bridge_webots.py) is
   # itself lower than Gazebo's (0.5) -- matching the physical model, not an
   # arbitrary choice.
@@ -106,7 +140,25 @@ class WebotsNode:
     max_linear_speed_mps = {"type":"Float","name":"max_linear_speed_mps","value":"0.3"},
     max_angular_rate_dps = {"type":"Float","name":"max_angular_rate_dps","value":"45.0"},
     camera_view_mode = {"type":"Discrete","name":"camera_view_mode","value":ROBOT_CAMERA_NAME.upper()},
-    environment = {"type":"Discrete","name":"environment","value":ENVIRONMENT_OPTIONS[0]}
+    environment = {"type":"Discrete","name":"environment","value":ENVIRONMENT_OPTIONS[0]},
+    # Placeholder factory values, not measured against this world's single
+    # fixed camera pose (there is no physical offset to reproduce here the
+    # way rbx_sim_node.py's values reproduce generic_rover/model.sdf's real
+    # camera_link poses) -- these exist so the RUI's offset inputs have
+    # something sane to show, not because moving them does anything yet.
+    camera_offset_x = {"type":"Float","name":"camera_offset_x","value":"0.0"},
+    camera_offset_y = {"type":"Float","name":"camera_offset_y","value":"0.0"},
+    camera_offset_z = {"type":"Float","name":"camera_offset_z","value":"0.0"},
+    scene_offset_x = {"type":"Float","name":"scene_offset_x","value":"-2.0"},
+    scene_offset_y = {"type":"Float","name":"scene_offset_y","value":"0.0"},
+    scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"3.0"},
+    # Both default to enabled: a robot config that never touches these
+    # settings behaves exactly as this driver did before this feature existed.
+    autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","value":"TRUE"},
+    teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","value":"TRUE"},
+    camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","value":"TRUE"},
+    # Empty = unrestricted -- see the CAPABILITY_SETTING_NAMES comment above.
+    enabled_image_sources = {"type":"String","name":"enabled_image_sources","value":""}
   )
 
   FACTORY_SETTINGS_OVERRIDES = dict()
@@ -132,6 +184,11 @@ class WebotsNode:
   CONTROLLER_RATE_HZ = 20
   NAVPOSE_UPDATE_RATE = 10
   TELEMETRY_FRESH_SEC = 2.0
+  # Ported from rbx_sim_node.py -- a keyboard teleop client is expected to
+  # re-send on an interval while a key is held (see the RUI's teleop panel);
+  # this is the self-healing timeout for a dropped stop/keyup packet, not the
+  # client's own send interval.
+  TELEOP_CMD_TIMEOUT_SEC = 0.75
 
   # Motor 0 = left side (wheel1+wheel3), motor 1 = right side (wheel2+wheel4)
   # on rbx_rover.wbt -- a 4-wheel model driven as a 2-sided tank drive, exactly
@@ -210,6 +267,15 @@ class WebotsNode:
     self.stop_triggered = False
 
     ##############################
+    # Teleop state -- ported from rbx_sim_node.py. Set only from
+    # setTeleopVelocity. teleop_last_cmd_time backs a self-healing timeout
+    # (TELEOP_CMD_TIMEOUT_SEC) for a dropped stop/keyup packet from the RUI's
+    # teleop panel, same reasoning as rbx_sim_node.py's own comment.
+    self.teleop_linear_x = 0.0
+    self.teleop_angular_z = 0.0
+    self.teleop_last_cmd_time = 0.0
+
+    ##############################
     # Manual motor-ratio state: motor 0 = left, motor 1 = right
     self.motor_ratios = [0.0, 0.0]
 
@@ -271,6 +337,8 @@ class WebotsNode:
                              manualControlsReadyFunction = self.manualControlsReady,
                              getMotorControlRatios = self.getMotorControlRatios,
                              setMotorControlRatio = self.setMotorControlRatio,
+                             teleopControlsReadyFunction = self.teleopControlsReady,
+                             setTeleopVelocityFunction = self.setTeleopVelocity,
                              autonomousControlsReadyFunction = self.autonomousControlsReady,
                              getHomeFunction = self.getHome,
                              setHomeFunction = self.setHome,
@@ -359,8 +427,33 @@ class WebotsNode:
     return triggered
 
   def manualControlsReady(self):
+    # Gates manual motor-ratio commands the same way autonomousControlsReady
+    # gates goto commands: require a live bridge connection. Fresh telemetry
+    # is not required here (unlike goto) since a direct motor command doesn't
+    # depend on knowing the current position/heading. NOT gated on
+    # teleop_movement_enabled -- that toggle is teleopControlsReady's own
+    # concern below (matches rbx_sim_node.py exactly: motor-ratio control and
+    # teleop velocity are two distinct RBXRobotIF-facing capabilities).
     with self.sock_lock:
       return self.sock is not None
+
+  def teleopControlsReady(self):
+    if self.settings_dict['teleop_movement_enabled']['value'] != 'TRUE':
+      return False
+    with self.sock_lock:
+      return self.sock is not None
+
+  def setTeleopVelocity(self, linear_x, linear_y, linear_z, angular_z):
+    # Ported from rbx_sim_node.py -- linear_y/linear_z ignored (a ground
+    # rover has no strafe or altitude axis). Ratios in [-1,1], scaled by the
+    # SAME max_linear_speed_mps/max_angular_rate_dps Settings that already
+    # cap goto speed: one "how fast" knob governs autonomous and teleop
+    # movement both, not a second one to keep in sync with it.
+    max_lin = float(self.settings_dict['max_linear_speed_mps']['value'])
+    max_ang = math.radians(float(self.settings_dict['max_angular_rate_dps']['value']))
+    self.teleop_linear_x = max(-1.0, min(1.0, linear_x)) * max_lin
+    self.teleop_angular_z = max(-1.0, min(1.0, angular_z)) * max_ang
+    self.teleop_last_cmd_time = nepi_utils.get_time()
 
   def setMotorControlRatio(self, motor_ind, speed_ratio):
     if motor_ind < 0 or motor_ind >= len(self.motor_ratios):
@@ -372,6 +465,14 @@ class WebotsNode:
     return self.motor_ratios
 
   def autonomousControlsReady(self):
+    # Gates all goto commands: require the Sim Connector's own
+    # autonomous_movement_enabled toggle (checked here, not just hidden in
+    # the RUI, so a client bypassing the RUI can't do what was turned off
+    # either -- see rbx_sim_node.py's identical check for the full
+    # reasoning), plus a live bridge connection with fresh telemetry so goto
+    # targets are computed from a real current position.
+    if self.settings_dict['autonomous_movement_enabled']['value'] != 'TRUE':
+      return False
     with self.sock_lock:
       connected = self.sock is not None
     fresh = (nepi_utils.get_time() - self.last_telemetry_time) < self.TELEMETRY_FRESH_SEC
@@ -522,6 +623,16 @@ class WebotsNode:
         else:
           self.clearGotoTarget()
           self.msg_if.pub_info("Goto target reached")
+    elif (nepi_utils.get_time() - self.teleop_last_cmd_time) < self.TELEOP_CMD_TIMEOUT_SEC and \
+         (self.teleop_linear_x != 0.0 or self.teleop_angular_z != 0.0):
+      # No active goto -- a recent, non-zero teleop command takes over this
+      # same tick, same "exactly one authoritative sender" reasoning as manual
+      # motor control below. Checked BEFORE motor_ratios: teleop and manual
+      # motor control are two different control TYPES a user selects one of at
+      # a time in the RUI, and a stale nonzero motor_ratios left over from a
+      # previous Manual-mode session must not fight a live teleop command.
+      # Ported from rbx_sim_node.py -- see that file's identical block.
+      lin, ang = self.teleop_linear_x, self.teleop_angular_z
     elif any(self.motor_ratios):
       lin, ang = self.motorControlToVelocity()
     self.sendVelocityCmd(lin, ang)
@@ -645,9 +756,17 @@ class WebotsNode:
     self.sendLineToBridge(cmd, "Velocity command")
 
   def sendCameraSettings(self):
+    # offset_x/y/z included for parity with rbx_sim_node.py's wire shape --
+    # webots_rbx_bridge.py currently logs-and-ignores them (this world's
+    # single fixed Camera device has no repositionable rig), matching this
+    # driver's existing honest treatment of RESET_SIM/environment. See
+    # CAMERA_SETTING_NAMES's own comment.
     cmd = {
       'type': 'camera_settings',
       'view_mode': self.settings_dict['camera_view_mode']['value'],
+      'offset_x': float(self.settings_dict['camera_offset_x']['value']),
+      'offset_y': float(self.settings_dict['camera_offset_y']['value']),
+      'offset_z': float(self.settings_dict['camera_offset_z']['value']),
     }
     self.sendLineToBridge(cmd, "Camera settings")
 
