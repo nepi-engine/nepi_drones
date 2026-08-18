@@ -107,6 +107,27 @@ class NepiIFSimControls extends Component {
       // truth. See docs/SIM_CONNECTOR_REMAINING_WORK.md if this needs fixing.
       environment_option_enabled: {},
 
+      // "Show Settings" button state -- lets the operator preview the full
+      // configuration surface (capability toggles, camera offsets, movement
+      // limits, environment) before any simulator is deployed. Found live
+      // (2026-08-18): every render* method below hid its controls entirely
+      // whenever rbx_namespace was empty, which is correct for anything that
+      // genuinely can't exist without a live device (the image-source
+      // candidate list, the live camera preview) but wrong for the Settings
+      // every RBX sim driver declares unconditionally (autonomous_movement_
+      // enabled/teleop_movement_enabled/camera_controls_enabled are declared
+      // identically in rbx_sim_node.py, rbx_ardupilot_node.py,
+      // rbx_webots_node.py, and rbx_webots_quadcopter_node.py -- confirmed by
+      // direct inspection, not assumed). Toggling this on renders those
+      // universal controls with factory-default-style placeholder values;
+      // toggling a control while no device is live just no-ops harmlessly
+      // (updateSetting has nothing live to reach), same as this app's own
+      // documented "no-ops every command" pattern elsewhere. Once a real
+      // simulator connects, rbxSettingsNamesList/rbxSettingsValuesDict take
+      // over and the same controls become genuinely live -- this flag never
+      // gates anything once live.
+      show_settings: false,
+
       // Live control of the RBX driver's own Settings (camera_offset_x/y/z,
       // scene_offset_x/y/z, camera_view_mode) used to be rendered HERE, bypassing
       // the capabilities-driven controls above and publishing straight to
@@ -168,6 +189,8 @@ class NepiIFSimControls extends Component {
     this.renderImageSourceCuration = this.renderImageSourceCuration.bind(this)
     this.renderEnvironmentControls = this.renderEnvironmentControls.bind(this)
     this.toggleEnvironmentOption = this.toggleEnvironmentOption.bind(this)
+    this.isRbxLive = this.isRbxLive.bind(this)
+    this.toggleShowSettings = this.toggleShowSettings.bind(this)
 
     this.onEnterSetRbxFloatSetting = this.onEnterSetRbxFloatSetting.bind(this)
     this.renderCameraViewModeControls = this.renderCameraViewModeControls.bind(this)
@@ -849,23 +872,35 @@ class NepiIFSimControls extends Component {
   // camera Settings always used, so an older driver without this feature keeps
   // working exactly as before -- simply without a control for it here.
   renderRobotCapabilityControls() {
-    const rbx_ns = this.state.rbx_namespace
-    if (rbx_ns === null || rbx_ns === '' || rbx_ns === 'None') {
+    const live = this.isRbxLive()
+    if (!live && !this.state.show_settings) {
       return null
     }
     const settings = this.state.rbxSettingsNamesList
     const values = this.state.rbxSettingsValuesDict
-    const has_autonomous_toggle = settings.includes("autonomous_movement_enabled")
-    const has_teleop_toggle = settings.includes("teleop_movement_enabled")
-    const has_camera_toggle = settings.includes("camera_controls_enabled")
-    const has_image_curation = settings.includes("enabled_image_sources")
+    // Preview mode (not live, Show Settings clicked): these three toggles are
+    // declared identically by every RBX sim driver's CAPABILITY_SETTING_NAMES
+    // (confirmed by direct inspection of rbx_sim_node.py, rbx_ardupilot_node.py,
+    // rbx_webots_node.py, rbx_webots_quadcopter_node.py), so showing them
+    // unconditionally before any simulator connects is accurate, not a guess.
+    // Image-source curation stays live-only -- there is no candidate topic
+    // list to curate before a real camera exists.
+    const has_autonomous_toggle = live ? settings.includes("autonomous_movement_enabled") : true
+    const has_teleop_toggle = live ? settings.includes("teleop_movement_enabled") : true
+    const has_camera_toggle = live ? settings.includes("camera_controls_enabled") : true
+    const has_image_curation = live && settings.includes("enabled_image_sources")
     if (has_autonomous_toggle === false && has_teleop_toggle === false
         && has_camera_toggle === false && has_image_curation === false) {
       return null
     }
 
     const { updateSetting } = this.props.ros
-    const setToggle = (name, checked) => updateSetting(rbx_ns + "/settings", name, "Discrete", checked ? "TRUE" : "FALSE")
+    const setToggle = (name, checked) => {
+      if (!live) {
+        return
+      }
+      updateSetting(this.state.rbx_namespace + "/settings", name, "Discrete", checked ? "TRUE" : "FALSE")
+    }
 
     return (
       <React.Fragment>
@@ -971,10 +1006,11 @@ class NepiIFSimControls extends Component {
   onEnterSetRbxFloatSetting(event, settingName) {
     if (event.key === 'Enter') {
       const value = parseFloat(event.target.value)
-      if (!isNaN(value)) {
+      // Preview mode (no live device yet): nothing to send it to. Still
+      // clears the modified-style below so the input doesn't look stuck.
+      if (!isNaN(value) && this.isRbxLive()) {
         const { updateSetting } = this.props.ros
-        const rbx_ns = this.state.rbx_namespace
-        updateSetting(rbx_ns + "/settings", settingName, "Float", String(value))
+        updateSetting(this.state.rbx_namespace + "/settings", settingName, "Float", String(value))
       }
       const el = document.getElementById(event.target.id)
       if (el) {
@@ -1015,17 +1051,22 @@ class NepiIFSimControls extends Component {
   // Editable X/Y/Z Float inputs for a camera_offset_*/scene_offset_* triple
   // -- ported near-verbatim from NepiDeviceRBX.js's method of the same name.
   // Gated on that triple's own presence plus camera_controls_enabled, same
-  // reasoning as renderCameraViewModeControls above.
+  // reasoning as renderCameraViewModeControls above. In preview mode (not
+  // live, Show Settings clicked) both triples are assumed present -- every
+  // current Gazebo-based driver (rbx_sim_node.py, rbx_ardupilot_node.py)
+  // declares both; the Webots drivers only declare camera_offset (one real
+  // camera, no scene view) and correctly narrow down to just that once a
+  // live connection reports the real list.
   renderCameraOffsetControls(namePrefix, titlePrefix) {
-    const rbx_ns = this.state.rbx_namespace
-    if (rbx_ns === null || rbx_ns === '' || rbx_ns === 'None') {
+    const live = this.isRbxLive()
+    if (!live && !this.state.show_settings) {
       return null
     }
     const settings = this.state.rbxSettingsNamesList
     const values = this.state.rbxSettingsValuesDict
-    const camera_controls_enabled = !settings.includes("camera_controls_enabled")
+    const camera_controls_enabled = !live || !settings.includes("camera_controls_enabled")
       || values["camera_controls_enabled"] !== "FALSE"
-    if (!settings.includes(namePrefix + "_x") || !camera_controls_enabled) {
+    if ((live && !settings.includes(namePrefix + "_x")) || !camera_controls_enabled) {
       return null
     }
 
@@ -1064,11 +1105,11 @@ class NepiIFSimControls extends Component {
   // docs/SIM_CONNECTOR_CONFIG_CONTROLS_PLAN.md). Ported from
   // NepiDeviceRBX.js's onSelectEnvironment, same hardcoded label convention.
   renderEnvironmentSetting() {
-    const rbx_ns = this.state.rbx_namespace
-    if (rbx_ns === null || rbx_ns === '' || rbx_ns === 'None') {
+    const live = this.isRbxLive()
+    if (!live && !this.state.show_settings) {
       return null
     }
-    if (!this.state.rbxSettingsNamesList.includes("environment")) {
+    if (live && !this.state.rbxSettingsNamesList.includes("environment")) {
       return null
     }
     const { updateSetting } = this.props.ros
@@ -1078,7 +1119,10 @@ class NepiIFSimControls extends Component {
           onChange={(event) => {
             const value = event.target.value
             this.setState({ selected_environment_setting: value })
-            updateSetting(rbx_ns + "/settings", "environment", "Discrete",
+            if (!live) {
+              return
+            }
+            updateSetting(this.state.rbx_namespace + "/settings", "environment", "Discrete",
               value === "Obstacle Course" ? "OBSTACLE_COURSE" : "FLAT_GROUND")
           }}
           value={this.state.selected_environment_setting}
@@ -1093,10 +1137,13 @@ class NepiIFSimControls extends Component {
   // Editable Float inputs for whichever movement-limit Settings the
   // connected driver actually reports -- naturally 3 inputs for the rover
   // (no max_vertical_speed_mps) and all 4 for the quadcopter (adds
-  // takeoff_height_m), no per-robot-type branching here at all.
+  // takeoff_height_m), no per-robot-type branching here at all. In preview
+  // mode (not live, Show Settings clicked) shows the full known union so the
+  // operator can see everything any current driver might report; a live
+  // connection narrows it down to that robot's real list exactly as before.
   renderMovementLimits() {
-    const rbx_ns = this.state.rbx_namespace
-    if (rbx_ns === null || rbx_ns === '' || rbx_ns === 'None') {
+    const live = this.isRbxLive()
+    if (!live && !this.state.show_settings) {
       return null
     }
     const settings = this.state.rbxSettingsNamesList
@@ -1105,7 +1152,7 @@ class NepiIFSimControls extends Component {
       { name: "max_angular_rate_dps", title: "Max Angular Rate (deg/s)" },
       { name: "max_vertical_speed_mps", title: "Max Vertical Speed (m/s)" },
       { name: "takeoff_height_m", title: "Takeoff Height (m)" },
-    ].filter((limit) => settings.includes(limit.name))
+    ].filter((limit) => !live || settings.includes(limit.name))
     if (limits.length === 0) {
       return null
     }
@@ -1150,6 +1197,19 @@ class NepiIFSimControls extends Component {
         [option]: next
       }
     })
+  }
+
+  // Whether a real RBX driver is currently connected and reporting its own
+  // Settings -- the one signal every render* method below actually needs.
+  // Kept as a single named helper rather than repeating the same null/''/
+  // 'None' check inline everywhere (six call sites before this change).
+  isRbxLive() {
+    const rbx_ns = this.state.rbx_namespace
+    return !(rbx_ns === null || rbx_ns === '' || rbx_ns === 'None')
+  }
+
+  toggleShowSettings() {
+    this.setState({ show_settings: !this.state.show_settings })
   }
 
   // Environment toggles, one per reported environment option. The reported list
@@ -1237,10 +1297,24 @@ class NepiIFSimControls extends Component {
       )
     }
 
+    const live = this.isRbxLive()
+
     return (
       <React.Fragment>
 
         {(show_live_controls === true) ? this.renderLiveControls() : null}
+
+        {/* Only offered pre-deploy: once a real simulator is live, the
+            settings below always render anyway (same as before this
+            control existed), so there is nothing left to reveal. */}
+        {(!live) ?
+          <Label title={"Sim Control Settings"}>
+            <Button onClick={this.toggleShowSettings}>
+              {(this.state.show_settings === true) ? "Hide Settings" : "Show Settings"}
+            </Button>
+          </Label>
+        : null}
+
         {this.renderConfigControls()}
 
       </React.Fragment>
