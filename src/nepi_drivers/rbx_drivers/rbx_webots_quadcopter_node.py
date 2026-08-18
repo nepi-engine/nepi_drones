@@ -31,8 +31,10 @@
 # real safety envelope to gate, so inventing one would just be complexity
 # with no real behavior behind it.
 #
-# Same single-camera convention as the rover driver: this world has one fixed
-# Camera device, reported as both SCENE_CAMERA/ROBOT_CAMERA names.
+# This world has exactly one fixed Camera device with no repositionable rig,
+# reported under a single honest topic name (CAMERA_NAME below) -- earlier
+# versions of this driver copied the rover's SCENE_CAMERA/ROBOT_CAMERA dual
+# naming with a "THIRD_PERSON" view mode, but that view never existed here.
 
 import copy
 import base64
@@ -70,11 +72,19 @@ FILE_TYPE = 'NODE'
 
 class WebotsQuadcopterNode:
 
-  # Same single-camera convention as rbx_webots_node.py (the rover driver) --
-  # this world also has exactly one fixed Camera device.
-  SCENE_CAMERA_NAME = "scene_camera"
-  ROBOT_CAMERA_NAME = "robot_camera"
-  CAMERA_VIEW_MODES = [SCENE_CAMERA_NAME.upper(), ROBOT_CAMERA_NAME.upper()]
+  # Exactly ONE real Camera device in this world, with no repositionable
+  # rig at all (see webots_rbx_bridge_quadcopter.py's own camera_settings
+  # handling -- a documented no-op). Earlier versions of this driver
+  # reported it under two names (SCENE_CAMERA/ROBOT_CAMERA) with a
+  # camera_view_mode Setting to "switch" between them, copied from
+  # rbx_sim_node.py's rover pattern -- but the rover's two names correspond
+  # to two REAL, independently-posed camera links, while this world has
+  # exactly one, so that Setting was a pure UI fiction offering a
+  # "THIRD_PERSON" choice that does not exist (confirmed live 2026-08-18:
+  # nothing physically changes when it's set -- see the module docstring
+  # this replaces). One real camera, one honestly-named topic, no
+  # view-mode Setting at all.
+  CAMERA_NAME = "robot_camera"
 
   ROBOT_MAIN_REFERENCE_FRAME = "base_link"
 
@@ -83,12 +93,14 @@ class WebotsQuadcopterNode:
   ENVIRONMENT_OPTIONS = ["FLAT_GROUND", "OBSTACLE_COURSE"]
   OBSTACLE_COURSE_OPTION = "OBSTACLE_COURSE"
 
-  # Camera offsets declared for RUI parity, documented no-op on the bridge
-  # side -- see rbx_webots_node.py's identical CAMERA_SETTING_NAMES comment
-  # for the full reasoning (one fixed Camera device, no repositionable rig).
-  CAMERA_SETTING_NAMES = ("camera_view_mode",
-                          "camera_offset_x", "camera_offset_y", "camera_offset_z",
-                          "scene_offset_x", "scene_offset_y", "scene_offset_z")
+  # camera_offset_x/y/z kept (unlike camera_view_mode/scene_offset_*, which
+  # are gone entirely) as an honest "not wired up yet" placeholder matching
+  # this codebase's established precedent for a real-but-currently-inert
+  # capability (RESET_SIM on a non-Supervisor world, environment on a world
+  # with no obstacle model) -- there genuinely is one real camera that could
+  # someday get a repositionable mount, unlike a second camera that simply
+  # does not exist.
+  CAMERA_SETTING_NAMES = ("camera_offset_x", "camera_offset_y", "camera_offset_z")
   ENVIRONMENT_SETTING_NAMES = ("environment",)
 
   # Sim Connector's own per-robot-config capability toggles -- same mechanism
@@ -104,14 +116,10 @@ class WebotsQuadcopterNode:
     max_vertical_speed_mps = {"type":"Float","name":"max_vertical_speed_mps","options":["0.05","1.5"]},
     max_angular_rate_dps = {"type":"Float","name":"max_angular_rate_dps","options":["5.0","180.0"]},
     takeoff_height_m = {"type":"Float","name":"takeoff_height_m","options":["0.1","10.0"]},
-    camera_view_mode = {"type":"Discrete","name":"camera_view_mode","options":CAMERA_VIEW_MODES},
     environment = {"type":"Discrete","name":"environment","options":ENVIRONMENT_OPTIONS},
     camera_offset_x = {"type":"Float","name":"camera_offset_x","options":["-10.0","10.0"]},
     camera_offset_y = {"type":"Float","name":"camera_offset_y","options":["-10.0","10.0"]},
     camera_offset_z = {"type":"Float","name":"camera_offset_z","options":["-10.0","10.0"]},
-    scene_offset_x = {"type":"Float","name":"scene_offset_x","options":["-10.0","10.0"]},
-    scene_offset_y = {"type":"Float","name":"scene_offset_y","options":["-10.0","10.0"]},
-    scene_offset_z = {"type":"Float","name":"scene_offset_z","options":["-10.0","10.0"]},
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
     teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","options":["TRUE","FALSE"]},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]},
@@ -134,14 +142,10 @@ class WebotsQuadcopterNode:
     # though the underlying goto/tolerance logic was working exactly as
     # designed. 3.0m leaves clear margin.
     takeoff_height_m = {"type":"Float","name":"takeoff_height_m","value":"3.0"},
-    camera_view_mode = {"type":"Discrete","name":"camera_view_mode","value":ROBOT_CAMERA_NAME.upper()},
     environment = {"type":"Discrete","name":"environment","value":ENVIRONMENT_OPTIONS[0]},
     camera_offset_x = {"type":"Float","name":"camera_offset_x","value":"0.0"},
     camera_offset_y = {"type":"Float","name":"camera_offset_y","value":"0.0"},
     camera_offset_z = {"type":"Float","name":"camera_offset_z","value":"0.0"},
-    scene_offset_x = {"type":"Float","name":"scene_offset_x","value":"-2.0"},
-    scene_offset_y = {"type":"Float","name":"scene_offset_y","value":"0.0"},
-    scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"3.0"},
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","value":"TRUE"},
     teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","value":"TRUE"},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","value":"TRUE"},
@@ -236,14 +240,13 @@ class WebotsQuadcopterNode:
     self.navpose_dict = copy.deepcopy(nepi_nav.BLANK_NAVPOSE_DICT)
 
     ##############################
-    # Image relay. See the class-level two-camera note: both names resolve to
-    # the one Camera device this world has.
+    # Image relay. One real camera, one topic -- see the class-level
+    # CAMERA_NAME comment for why this isn't reported under two names.
     self.image_topic_name = self.device_name + "/color_2d_image"
     self.image_pub = nepi_sdk.create_publisher(self.image_topic_name, Image, queue_size = 1)
 
     self.sensor_topics = [
-      (self.image_topic_name + "/" + self.SCENE_CAMERA_NAME, 'sensor_msgs/Image'),
-      (self.image_topic_name + "/" + self.ROBOT_CAMERA_NAME, 'sensor_msgs/Image'),
+      (self.image_topic_name + "/" + self.CAMERA_NAME, 'sensor_msgs/Image'),
     ]
 
     ##############################
@@ -780,9 +783,10 @@ class WebotsQuadcopterNode:
     self.sendLineToBridge(cmd, "Velocity command")
 
   def sendCameraSettings(self):
+    # No view_mode -- see CAMERA_NAME's own comment, there is nothing to
+    # switch between.
     cmd = {
       'type': 'camera_settings',
-      'view_mode': self.settings_dict['camera_view_mode']['value'],
       'offset_x': float(self.settings_dict['camera_offset_x']['value']),
       'offset_y': float(self.settings_dict['camera_offset_y']['value']),
       'offset_z': float(self.settings_dict['camera_offset_z']['value']),
