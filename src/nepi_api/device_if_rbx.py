@@ -388,16 +388,24 @@ class RBXRobotIF:
             motor_controls_info_msg = self.get_motor_controls_status_msg([])
 
         ## Setup Teleop Controls
-        # Deliberately NOT a caps_report field (no RBXCapabilitiesQuery.srv
-        # change, no interfaces rebuild/full-stack-restart risk) and no new
-        # status field -- teleop_movement_enabled is a plain Setting
-        # (rbx_sim_node.py's CAPABILITY_SETTING_NAMES), so its mere presence in
-        # settingsNamesList already tells the RUI whether this driver supports
-        # teleop, and its value already tells it whether the current
-        # deployment wants it on. Readiness is checked at command time
-        # (setTeleopVelocityCb below), same pattern as manual controls.
+        # Not a caps_report field -- teleop_movement_enabled is a plain
+        # Setting (rbx_sim_node.py's CAPABILITY_SETTING_NAMES), so its mere
+        # presence in settingsNamesList already tells the RUI whether this
+        # driver supports teleop, and its value already tells it whether the
+        # current deployment wants it on. Readiness itself IS now also a
+        # live status field (teleop_control_mode_ready, DeviceRBXStatus.msg)
+        # though, mirroring manual/autonomous_control_mode_ready below --
+        # was command-time-only (setTeleopVelocityCb) until a live report
+        # that holding a teleop key showed the RUI's own "held" indicator
+        # (pure local UI state) with zero visible effect and no way for a
+        # client to tell "driver not ready" apart from "broken" ahead of
+        # actually sending a command.
         self.teleopControlsReadyFunction = teleopControlsReadyFunction
         self.setTeleopVelocityFunction = setTeleopVelocityFunction
+        if self.teleopControlsReadyFunction is not None:
+          self.status_msg.teleop_control_mode_ready = self.teleopControlsReadyFunction()
+        else:
+          self.status_msg.teleop_control_mode_ready = False
 
         # Setup Autonomous Controls
         self.autonomousControlsReadyFunction = autonomousControlsReadyFunction
@@ -2093,6 +2101,11 @@ class RBXRobotIF:
           self.status_msg.manual_control_mode_ready = self.manualControlsReadyFunction()
         else:
           self.status_msg.manual_control_mode_ready = False
+
+        if self.teleopControlsReadyFunction is not None:
+          self.status_msg.teleop_control_mode_ready = self.teleopControlsReadyFunction()
+        else:
+          self.status_msg.teleop_control_mode_ready = False
 
         if self.getMotorControlRatios is not None:
             motor_controls_msg = self.get_motor_controls_status_msg(self.getMotorControlRatios())
