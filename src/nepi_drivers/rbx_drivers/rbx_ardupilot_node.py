@@ -143,6 +143,26 @@ class ArdupilotNode:
   CAMERA_RECONNECT_INTERVAL_SEC = 3.0
   CAMERA_SOCKET_TIMEOUT_SEC = 5.0
 
+  # Watchdog for a live-observed wedge: the bridge socket can stay
+  # ESTABLISHED and keep accepting bytes at the TCP layer (confirmed via
+  # `ss` byte counters climbing normally) while the recv/parse loop above it
+  # never advances -- no frame ever reaches processCameraImageLine, camera
+  # topics sit at 0 Hz indefinitely, and only a full node restart recovered
+  # it (reported live as "the drone camera takes forever to show up" /
+  # "the scene camera doesn't even exist" -- the exact case that motivated
+  # this). The precise wedge mechanism wasn't pinned down (bytes were
+  # provably arriving, so it isn't a dead/blocked recv()), so this doesn't
+  # try to fix that mechanism directly -- it just notices "no frame has
+  # gone out in far longer than the ~14 fps (2 cameras x 7 Hz) bridge should
+  # ever go quiet for" and forces the socket closed, which unblocks
+  # cameraBridgeLoop's recv() (if that's where it's actually stuck) or at
+  # minimum forces a clean reconnect either way, mirroring the same
+  # shutdown()-before-close() cross-thread unwedge already used by
+  # camera_rig_controller_ardupilot.py's sendLineToClient for the
+  # server-side half of this same bridge.
+  CAMERA_STALE_TIMEOUT_SEC = 15.0
+  CAMERA_WATCHDOG_INTERVAL_SEC = 5.0
+
   # Real-hardware camera relay: a real onboard camera (unlike the VM-side
   # simulator) is already a normal local ROS topic on this same ROS master --
   # no bridge protocol needed, just a subscriber. Runs independently of the
@@ -151,7 +171,13 @@ class ArdupilotNode:
   # convention (device_if_idx.py), distinct from the color_2d_image name this
   # driver publishes its own relayed output under -- searched for by
   # substring the same way the rest of this codebase finds live topics
-  # (nepi_sdk.find_topic).
+  # (nepi_sdk.find_topic). SITL-only guard on where this thread is started
+  # (see __init__): a SITL instance runs on a dev rig that can have an
+  # unrelated physical camera plugged in (e.g. a USB webcam used for other
+  # testing), and this substring match has no way to tell that apart from a
+  # genuine onboard camera -- confirmed live hijacking robot_view away from
+  # the sim bridge's own camera_rig feed the moment any such camera existed
+  # on the device. Real hardware has no such ambiguity.
   REAL_CAMERA_TOPIC_PATTERN = "idx/color_image"
   REAL_CAMERA_WATCH_INTERVAL_SEC = 3.0
 
@@ -470,17 +496,28 @@ class ArdupilotNode:
     # ONLY camera settings out and compressed frames in.
     self.camera_sock = None
     self.camera_sock_lock = threading.Lock()
+    # CAMERA_STALE_TIMEOUT_SEC's own comment above explains why this is
+    # tracked and watched from a separate thread rather than trusted to
+    # self-detect from inside cameraBridgeLoop.
+    self.camera_last_frame_time = 0.0
     self.camera_bridge_thread = threading.Thread(target = self.cameraBridgeLoop)
     self.camera_bridge_thread.daemon = True
     self.camera_bridge_thread.start()
+    self.camera_watchdog_thread = threading.Thread(target = self.cameraBridgeWatchdogLoop)
+    self.camera_watchdog_thread.daemon = True
+    self.camera_watchdog_thread.start()
 
     # Real-hardware camera relay -- see REAL_CAMERA_TOPIC_PATTERN above.
     # Independent of the sim bridge thread; auto-detects a real onboard
     # camera the moment one appears and needs no separate enable step.
+    # SITL guard: see REAL_CAMERA_TOPIC_PATTERN's own comment for why this
+    # must not run against a SITL instance's dev rig.
     self.real_camera_sub = None
-    self.real_camera_watch_thread = threading.Thread(target = self.realCameraWatchLoop)
-    self.real_camera_watch_thread.daemon = True
-    self.real_camera_watch_thread.start()
+    is_sitl = str(self.device_path).upper().startswith("SITL")
+    if not is_sitl:
+      self.real_camera_watch_thread = threading.Thread(target = self.realCameraWatchLoop)
+      self.real_camera_watch_thread.daemon = True
+      self.real_camera_watch_thread.start()
 
     # Initialize RBX Settings
     self.cap_settings = self.getCapSettings()
@@ -1699,6 +1736,9 @@ class ArdupilotNode:
         continue
       with self.camera_sock_lock:
         self.camera_sock = sock
+      # Baseline for the watchdog -- covers the "never got a single frame in
+      # the first place" case, not just "frames stopped after a while".
+      self.camera_last_frame_time = nepi_utils.get_time()
       self.msg_if.pub_info("Connected to camera bridge at " + self.CAMERA_BRIDGE_HOST +
                            ":" + str(self.CAMERA_BRIDGE_PORT))
       # Sync the VM side to this node's actual current camera settings on
@@ -1763,8 +1803,41 @@ class ArdupilotNode:
         raise ValueError("cv2.imdecode returned None")
       ros_img = nepi_img.cv2img_to_rosimg(cv2_img, encoding = "bgr8")
       image_pub.publish(ros_img)
+      self.camera_last_frame_time = nepi_utils.get_time()
     except Exception as e:
       self.msg_if.pub_warn("Failed to process camera image frame: " + str(e))
+
+  def cameraBridgeWatchdogLoop(self):
+    # See CAMERA_STALE_TIMEOUT_SEC's comment for the failure this catches.
+    # Runs independently of cameraBridgeLoop's own thread specifically so it
+    # can act even if that thread's recv/parse loop is the thing that's
+    # actually stuck.
+    while not nepi_sdk.is_shutdown():
+      time.sleep(self.CAMERA_WATCHDOG_INTERVAL_SEC)
+      with self.camera_sock_lock:
+        sock = self.camera_sock
+      if sock is None:
+        continue
+      if (nepi_utils.get_time() - self.camera_last_frame_time) < self.CAMERA_STALE_TIMEOUT_SEC:
+        continue
+      self.msg_if.pub_warn("Camera bridge produced no frames for " +
+                           str(self.CAMERA_STALE_TIMEOUT_SEC) +
+                           "s despite an open connection -- forcing reconnect")
+      # shutdown() before close(): cameraBridgeLoop's thread is almost
+      # certainly blocked in (or about to re-enter) a recv() on this exact
+      # socket -- closing a fd out from under a thread blocked in recv() on
+      # it does not reliably unblock that recv() on Linux, matching
+      # camera_rig_controller_ardupilot.py's own sendLineToClient fix for
+      # the same underlying cross-thread unwedge problem on the server side
+      # of this bridge.
+      try:
+        sock.shutdown(socket.SHUT_RDWR)
+      except Exception:
+        pass
+      try:
+        sock.close()
+      except Exception:
+        pass
 
   def sendCameraSettings(self):
     # All current values together, always -- camera_rig_controller_
