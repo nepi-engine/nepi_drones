@@ -135,6 +135,10 @@ SCENE_VIEW_COMPRESSED_TOPIC = '/camera_rig/scene_view/image_compressed'
 # (unmodified, default) spawn pose -- world origin, identity orientation.
 MODEL_STATE_TOPIC = '/gazebo/set_model_state'
 ROVER_MODEL_NAME = 'generic_rover_demo'
+# Name a customized-offset respawn switches to -- see
+# respawnRoverWithCameraOffsets' own comment for why reusing ROVER_MODEL_NAME
+# itself is not safe.
+ROVER_MODEL_NAME_CUSTOM = 'generic_rover_demo_custom'
 
 # OBSTACLE_COURSE_ON/OFF target: models/obstacle_course/model.sdf, read once
 # at startup and spawned/deleted whole by model name via the stock Gazebo
@@ -286,6 +290,24 @@ class SimBridgeNode:
                     " -- camera offset changes will be ignored")
       self.rover_sdf_template = None
     self.applied_camera_offsets = FACTORY_CAMERA_OFFSETS
+
+    # Which Gazebo model name is CURRENTLY live -- starts as ROVER_MODEL_NAME
+    # (the world file's own <include> spawns it under this name at boot) but
+    # permanently switches to ROVER_MODEL_NAME_CUSTOM the first time
+    # respawnRoverWithCameraOffsets actually respawns with customized
+    # offsets. Confirmed live (2026-08-18) as necessary, not cosmetic: Gazebo
+    # Classic appears to cache a world-file <include>-sourced model's
+    # geometry keyed by its instance name, so a LATER spawn_sdf_model call
+    # reusing that exact name silently reuses the ORIGINAL cached geometry
+    # regardless of the new SDF text provided -- confirmed directly (delete
+    # + respawn "generic_rover_demo" with a modified camera pose left the
+    # live link at its old pose every time; the identical delete+respawn
+    # sequence under a name that never came from an <include> applied the
+    # new pose correctly, every time, including on repeated reuse of that
+    # SAME non-<include> name). All later Gazebo calls that need "whichever
+    # rover model is live right now" (RESET_SIM, holdStill, further
+    # respawns) must read this instead of the ROVER_MODEL_NAME constant.
+    self.rover_model_name = ROVER_MODEL_NAME
 
     # Latest odom snapshot for the telemetry push loop, and the single
     # active bridge client (one robot, one remote node -- serve one
@@ -447,7 +469,7 @@ class SimBridgeNode:
     # diff-drive plugin still applying the last commanded velocity.
     self.gazebo_cmd_pub.publish(Twist())
     state = ModelState()
-    state.model_name = ROVER_MODEL_NAME
+    state.model_name = self.rover_model_name
     state.pose.orientation.w = 1.0
     state.reference_frame = 'world'
     self.model_state_pub.publish(state)
@@ -498,7 +520,7 @@ class SimBridgeNode:
     if self.held_pose is None:
       return
     state = ModelState()
-    state.model_name = ROVER_MODEL_NAME
+    state.model_name = self.rover_model_name
     state.pose.position.x = self.held_pose['x']
     state.pose.position.y = self.held_pose['y']
     yaw = self.held_pose['yaw']
@@ -564,38 +586,39 @@ class SimBridgeNode:
     # Stop first, same reasoning as resetRover: an in-flight cmd_vel would
     # otherwise be applied to the new model the instant it exists.
     self.gazebo_cmd_pub.publish(Twist())
+    old_name = self.rover_model_name
+    # Always respawn under the dedicated non-<include> name, whether this is
+    # the first customization or a later one -- see ROVER_MODEL_NAME_CUSTOM's
+    # own comment (self.rover_model_name) for the full root-cause writeup.
+    # Confirmed live that reusing THIS name across repeated respawns is
+    # safe (unlike ROVER_MODEL_NAME itself) -- the caching quirk is specific
+    # to a name that originated from the world file's own <include>.
+    new_name = ROVER_MODEL_NAME_CUSTOM
     try:
       rospy.wait_for_service(DELETE_MODEL_SERVICE, timeout=GAZEBO_SERVICE_WAIT_SEC)
-      rospy.ServiceProxy(DELETE_MODEL_SERVICE, DeleteModel)(ROVER_MODEL_NAME)
-      # Confirmed live (2026-08-18) that a FIXED delay here is not reliable:
-      # even a full 1s sleep still let SpawnModel race the deleted model's
-      # plugins (gazebo_ros_camera x2, diff_drive) still unadvertising their
-      # ROS services/topics -- "Tried to advertise a service that is already
-      # advertised in this node" kept appearing, and worse, the respawn
-      # reported success while the LIVE model silently kept its OLD pose
-      # (confirmed via get_link_state -- camera_link's world position never
-      # moved despite a logged "Applied camera offsets" success message).
-      # Poll get_world_properties until ROVER_MODEL_NAME is actually gone
-      # from the model list instead of guessing a delay -- this is the only
-      # way to know Gazebo's own (asynchronous) deletion has genuinely
-      # finished before spawning a same-named replacement.
+      rospy.ServiceProxy(DELETE_MODEL_SERVICE, DeleteModel)(old_name)
+      # Poll get_world_properties until old_name is actually gone from the
+      # model list instead of guessing a fixed delay -- DeleteModel
+      # returning does not guarantee Gazebo's own (asynchronous) deletion,
+      # and this model's plugins (gazebo_ros_camera x2, diff_drive)
+      # unadvertising their ROS services/topics, have actually finished yet.
       rospy.wait_for_service(GET_WORLD_PROPERTIES_SERVICE, timeout=GAZEBO_SERVICE_WAIT_SEC)
       get_world_props = rospy.ServiceProxy(GET_WORLD_PROPERTIES_SERVICE, GetWorldProperties)
       deadline = time.time() + DELETE_CONFIRM_TIMEOUT_SEC
       deleted = False
       while time.time() < deadline:
-        if ROVER_MODEL_NAME not in get_world_props().model_names:
+        if old_name not in get_world_props().model_names:
           deleted = True
           break
         time.sleep(DELETE_CONFIRM_POLL_INTERVAL_SEC)
       if not deleted:
         rospy.logerr(PKG_NAME + ": Respawn with new camera offsets failed: " +
-                     ROVER_MODEL_NAME + " still present " +
+                     old_name + " still present " +
                      str(DELETE_CONFIRM_TIMEOUT_SEC) + "s after DeleteModel")
         return
       rospy.wait_for_service(SPAWN_MODEL_SERVICE, timeout=GAZEBO_SERVICE_WAIT_SEC)
       spawn = rospy.ServiceProxy(SPAWN_MODEL_SERVICE, SpawnModel)
-      resp = spawn(ROVER_MODEL_NAME, sdf, '', initial_pose, 'world')
+      resp = spawn(new_name, sdf, '', initial_pose, 'world')
       if not resp.success:
         rospy.logerr(PKG_NAME + ": Respawn with new camera offsets failed: " +
                      resp.status_message)
@@ -604,10 +627,11 @@ class SimBridgeNode:
       rospy.logerr(PKG_NAME + ": Respawn with new camera offsets failed: " + str(e))
       return
 
+    self.rover_model_name = new_name
     self.applied_camera_offsets = offsets
     self.held_pose = None  # Stale anchor from before the respawn -- see resetRover.
-    rospy.loginfo(PKG_NAME + ": Applied camera offsets, robot=(%.2f,%.2f,%.2f) scene=(%.2f,%.2f,%.2f)"
-                  % offsets)
+    rospy.loginfo(PKG_NAME + ": Applied camera offsets, robot=(%.2f,%.2f,%.2f) scene=(%.2f,%.2f,%.2f), model now '%s'"
+                  % (offsets + (new_name,)))
 
   def setObstacleCourse(self, enabled):
     if self.obstacle_course_sdf is None:
