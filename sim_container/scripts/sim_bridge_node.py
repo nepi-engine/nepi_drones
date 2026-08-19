@@ -104,7 +104,7 @@ from geometry_msgs.msg import Twist, Pose
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CompressedImage
 from gazebo_msgs.msg import ModelState
-from gazebo_msgs.srv import SpawnModel, DeleteModel
+from gazebo_msgs.srv import SpawnModel, DeleteModel, GetWorldProperties
 
 PKG_NAME = 'SIM_BRIDGE'  # Use in display menus
 FILE_TYPE = 'NODE'
@@ -148,6 +148,12 @@ OBSTACLE_COURSE_SDF_PATH = os.path.join(
     'obstacle_course', 'model.sdf')
 SPAWN_MODEL_SERVICE = '/gazebo/spawn_sdf_model'
 DELETE_MODEL_SERVICE = '/gazebo/delete_model'
+GET_WORLD_PROPERTIES_SERVICE = '/gazebo/get_world_properties'
+# Poll budget for confirming a DeleteModel has actually taken effect before
+# respawning under the same name -- see respawnRoverWithCameraOffsets' own
+# comment for why a fixed sleep wasn't reliable.
+DELETE_CONFIRM_TIMEOUT_SEC = 5.0
+DELETE_CONFIRM_POLL_INTERVAL_SEC = 0.1
 
 # camera_offset_*/scene_offset_* settings (rbx_sim_node.py's own robot-view /
 # scene-view camera offset controls, sent here in a camera_settings line):
@@ -561,15 +567,32 @@ class SimBridgeNode:
     try:
       rospy.wait_for_service(DELETE_MODEL_SERVICE, timeout=GAZEBO_SERVICE_WAIT_SEC)
       rospy.ServiceProxy(DELETE_MODEL_SERVICE, DeleteModel)(ROVER_MODEL_NAME)
-      # Give the deleted model's plugins (gazebo_ros_camera x2, diff_drive)
-      # time to actually unadvertise their ROS services/topics before the new
-      # model's plugins try to advertise the SAME names -- confirmed live
-      # that DeleteModel returning does not guarantee this has finished yet
-      # ("Tried to advertise a service that is already advertised in this
-      # node" on the very next SpawnModel otherwise). See
-      # FACTORY_CAMERA_OFFSETS' own comment for why this path is now rare
-      # (skipped entirely for an uncustomized deploy) rather than gone.
-      time.sleep(1.0)
+      # Confirmed live (2026-08-18) that a FIXED delay here is not reliable:
+      # even a full 1s sleep still let SpawnModel race the deleted model's
+      # plugins (gazebo_ros_camera x2, diff_drive) still unadvertising their
+      # ROS services/topics -- "Tried to advertise a service that is already
+      # advertised in this node" kept appearing, and worse, the respawn
+      # reported success while the LIVE model silently kept its OLD pose
+      # (confirmed via get_link_state -- camera_link's world position never
+      # moved despite a logged "Applied camera offsets" success message).
+      # Poll get_world_properties until ROVER_MODEL_NAME is actually gone
+      # from the model list instead of guessing a delay -- this is the only
+      # way to know Gazebo's own (asynchronous) deletion has genuinely
+      # finished before spawning a same-named replacement.
+      rospy.wait_for_service(GET_WORLD_PROPERTIES_SERVICE, timeout=GAZEBO_SERVICE_WAIT_SEC)
+      get_world_props = rospy.ServiceProxy(GET_WORLD_PROPERTIES_SERVICE, GetWorldProperties)
+      deadline = time.time() + DELETE_CONFIRM_TIMEOUT_SEC
+      deleted = False
+      while time.time() < deadline:
+        if ROVER_MODEL_NAME not in get_world_props().model_names:
+          deleted = True
+          break
+        time.sleep(DELETE_CONFIRM_POLL_INTERVAL_SEC)
+      if not deleted:
+        rospy.logerr(PKG_NAME + ": Respawn with new camera offsets failed: " +
+                     ROVER_MODEL_NAME + " still present " +
+                     str(DELETE_CONFIRM_TIMEOUT_SEC) + "s after DeleteModel")
+        return
       rospy.wait_for_service(SPAWN_MODEL_SERVICE, timeout=GAZEBO_SERVICE_WAIT_SEC)
       spawn = rospy.ServiceProxy(SPAWN_MODEL_SERVICE, SpawnModel)
       resp = spawn(ROVER_MODEL_NAME, sdf, '', initial_pose, 'world')
