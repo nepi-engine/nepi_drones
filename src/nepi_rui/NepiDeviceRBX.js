@@ -39,8 +39,7 @@ import NepiIFSaveData from "./Nepi_IF_SaveData"
 import NepiIFConfig from "./Nepi_IF_Config"
 
 import { createShortValuesFromNamespaces, createMenuListFromStrList,
-  onDropdownSelectedSendIndex, onUpdateSetStateValue,
-  setElementStyleModified, clearElementStyleModified } from "./Utilities"
+  onDropdownSelectedSendIndex, onUpdateSetStateValue } from "./Utilities"
 
 
 @inject("ros")
@@ -83,7 +82,6 @@ class NepiDeviceRBX extends Component {
       actions_menu: null,
       selected_setup_action: null,
       selected_setup_action_index: 0,
-      selected_environment: "Flat Ground",
 
       currentRBXNamespace: null,
       currentRBXNamespaceText: "No device selected",
@@ -91,36 +89,19 @@ class NepiDeviceRBX extends Component {
       rbxInfoListener: null,
       capabilitiesPollTimer: null,
 
-      // Which Settings this device's driver actually registers -- e.g.
-      // camera_view_mode, camera_offset_x/y/z (ArduPilot's chase-cam
-      // feature) are driver-specific, not present on every RBX driver, so
-      // controls built on top of them are gated on this list rather than
-      // an unrelated capability flag that would silently no-op for drivers
-      // that don't define them.
+      // Which Settings this device's driver actually registers -- driver-
+      // specific, not present on every RBX driver, so controls built on top
+      // of them are gated on this list rather than an unrelated capability
+      // flag that would silently no-op for drivers that don't define them.
       rbxSettingsListener: null,
       settingsNamesList: [],
-      settingsValuesDict: {},
-
-      // Local edit buffers for the camera offset inputs -- kept separate
-      // from settingsValuesDict so an in-progress edit isn't clobbered by
-      // the next settings/status message mid-typing. Synced from the device
-      // whenever the device's own reported value changes.
-      camera_offset_x: "",
-      camera_offset_y: "",
-      camera_offset_z: "",
-      // Same edit-buffer treatment for the scene/chase-view offset triple
-      // (currently only defined by rbx_sim_node.py).
-      scene_offset_x: "",
-      scene_offset_y: "",
-      scene_offset_z: ""
+      settingsValuesDict: {}
     }
 
     this.updateInfoListener = this.updateInfoListener.bind(this)
     this.infoListener = this.infoListener.bind(this)
     this.updateRBXSettingsListener = this.updateRBXSettingsListener.bind(this)
     this.rbxSettingsListener = this.rbxSettingsListener.bind(this)
-    this.onEnterSetCameraOffset = this.onEnterSetCameraOffset.bind(this)
-    this.renderCameraOffsetControls = this.renderCameraOffsetControls.bind(this)
 
     this.onTopicRBXSelected = this.onTopicRBXSelected.bind(this)
     this.clearTopicRBXSelection = this.clearTopicRBXSelection.bind(this)
@@ -272,44 +253,6 @@ class NepiDeviceRBX extends Component {
       valuesDict[settings[ind].name_str] = settings[ind].value_str
     }
     this.setState({ settingsNamesList: namesList, settingsValuesDict: valuesDict })
-
-    // Seed/resync each offset edit buffer only when the DEVICE's own value
-    // changed (or on first sight), never on every status tick -- otherwise
-    // a 1Hz status message overwrites whatever is being typed.
-    const offsetNames = ["camera_offset_x", "camera_offset_y", "camera_offset_z",
-                        "scene_offset_x", "scene_offset_y", "scene_offset_z"]
-    var updates = {}
-    for (let i = 0; i < offsetNames.length; i++) {
-      const name = offsetNames[i]
-      const deviceVal = valuesDict[name]
-      if (deviceVal !== undefined && deviceVal !== this.state.settingsValuesDict[name]) {
-        updates[name] = deviceVal
-      }
-    }
-    if (Object.keys(updates).length > 0) {
-      this.setState(updates)
-    }
-  }
-
-
-  // Enter-to-apply for a camera offset input. Publishes the single Setting
-  // being edited (Float, matching rbx_ardupilot_node.py's own CAP_SETTINGS
-  // type for camera_offset_x/y/z) via the same updateSetting path the POV
-  // toggle buttons use -- camera_rig_controller_ardupilot.py picks the new
-  // offset up on its next aim cycle, for whichever view mode is active.
-  onEnterSetCameraOffset(event, settingName) {
-    if (event.key === 'Enter') {
-      const value = parseFloat(event.target.value)
-      if (!isNaN(value)) {
-        const { updateSetting } = this.props.ros
-        const namespace = this.state.currentRBXNamespace + "/settings"
-        updateSetting(namespace, settingName, "Float", String(value))
-      }
-      const el = document.getElementById(event.target.id)
-      if (el) {
-        clearElementStyleModified(el)
-      }
-    }
   }
 
 
@@ -395,17 +338,33 @@ class NepiDeviceRBX extends Component {
     // allowlist Setting (see rbx_sim_node.py's CAPABILITY_SETTING_NAMES).
     // Empty (a driver that doesn't define it, or hasn't set it) means
     // unrestricted -- the namespace-scoped list above stays exactly as it
-    // was, so this can only ever narrow the list, never break a deployment
-    // that hasn't touched it. curationActive gates the unscoped fallback
-    // below: without it, a curated-down-to-zero list (e.g. every allowed
-    // topic happens to be temporarily unpublished) would silently fall
-    // through to "show everything unfiltered" -- defeating the curation the
-    // operator explicitly set up, exactly when it looks like it worked.
+    // was, so a deployment that hasn't touched this Setting is unaffected.
+    // curationActive gates the unscoped fallback below: without it, a
+    // curated-down-to-zero list (e.g. every allowed topic happens to be
+    // temporarily unpublished) would silently fall through to "show
+    // everything unfiltered" -- defeating the curation the operator
+    // explicitly set up, exactly when it looks like it worked.
+    //
+    // When active, the allowlist can ADD topics from OUTSIDE this robot's
+    // own namespace, not just narrow the namespace-scoped list -- found live
+    // (2026-08-18): a physical camera genuinely connected to this device
+    // (e.g. nexigo_02/idx/color_image) could never be offered as an image
+    // source for a simulated robot, even after the operator explicitly
+    // allowlisted it via the Sim Connector's own image-source curation
+    // control, because this scoping ran BEFORE the allowlist and only ever
+    // narrowed within it. The allowlist is the operator's own deliberate,
+    // per-instance choice (surfaced by the Sim Connector precisely so a real
+    // camera can stand in for a simulated one) -- it should be honored
+    // wherever the topic actually lives, not silently re-scoped back to
+    // "this robot's own" after the fact.
     const enabledSourcesRaw = this.state.settingsValuesDict["enabled_image_sources"]
     const curationActive = (enabledSourcesRaw !== undefined && String(enabledSourcesRaw).trim() !== '')
     if (curationActive) {
       const allowlist = String(enabledSourcesRaw).split(',').map((s) => s.trim()).filter((s) => s !== '')
-      img_topics = img_topics.filter((topic) => allowlist.includes(topic))
+      const namespaceScoped = img_topics.filter((topic) => allowlist.includes(topic))
+      const allowlistedElsewhere = image_topics.filter((topic) =>
+        allowlist.includes(topic) && topic !== ownImageTopic && !namespaceScoped.includes(topic))
+      img_topics = namespaceScoped.concat(allowlistedElsewhere)
     }
 
     // Fall back to the unscoped list rather than offering nothing but "None":
@@ -502,23 +461,6 @@ class NepiDeviceRBX extends Component {
       selected_setup_action_index: event.target.selectedIndex
     })
   }
-
-  // Environment dropdown ("Flat Ground" / "Obstacle Course") -- its own
-  // separate control from the generic "Setup Actions" dropdown above (which
-  // only lists RESET_SIM/RETURN_HOME). Backed by rbx_sim_node.py's
-  // "environment" Setting (not a setup action -- that was redundant with
-  // this dropdown once this existed), applying immediately on selection like
-  // the Set Mode/Set State dropdowns rather than needing its own Send button.
-  // "Flat Ground" is the label for FLAT_GROUND (the default basic-room world
-  // sim_rover_gazebo always launches into).
-  onSelectEnvironment(event) {
-    const { updateSetting } = this.props.ros
-    const value = event.target.value
-    this.setState({ selected_environment: value })
-    updateSetting(this.state.currentRBXNamespace + "/settings", "environment", "Discrete",
-      value === "Obstacle Course" ? "OBSTACLE_COURSE" : "FLAT_GROUND")
-  }
-
 
   renderDeviceSelection() {
     const { rbxDevices, sendStringMsg, sendBoolMsg } = this.props.ros
@@ -656,12 +598,6 @@ class NepiDeviceRBX extends Component {
     // just not showing at all.
     const has_modes = (this.state.modes_list !== null && this.state.modes_list.length > 0)
     const has_states = (this.state.states_list !== null && this.state.states_list.length > 0)
-    // The Environment dropdown below is backed by rbx_sim_node.py's
-    // "environment" Setting, not a capability with its own dedicated flag --
-    // reuses the same has_goto_location-based rover heuristic as
-    // has_camera_pov_toggle elsewhere in this file (a robot with no WGS84
-    // goto is the fixed-obstacle-course sim rover, not a drone).
-    const has_obstacle_course = (this.state.rbx_capabilities !== null) ? (this.state.rbx_capabilities.has_goto_location !== true) : false
     return (
       <React.Fragment>
         <Section title={"Setup Controls"}>
@@ -713,117 +649,13 @@ class NepiDeviceRBX extends Component {
             </Column>
           </Columns>
 
-          <div hidden={!has_obstacle_course}>
-            <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }} />
-            <Label title={"Environment"}>
-              <Select
-                id="environment_select"
-                onChange={(event) => this.onSelectEnvironment(event)}
-                value={this.state.selected_environment}
-              >
-                <Option value="Flat Ground">{"Flat Ground"}</Option>
-                <Option value="Obstacle Course">{"Obstacle Course"}</Option>
-              </Select>
-            </Label>
-          </div>
-
         </Section>
 
       </React.Fragment>
     )
   }
 
-  // Camera offset X/Y/Z, shown only for drivers that actually define these
-  // Settings. Two independent uses of this same block:
-  //   - rbx_ardupilot_node.py: a single camera_offset_* triple shared by both
-  //     view modes -- switching FIRST_PERSON/THIRD_PERSON only changes how
-  //     camera_rig_controller_ardupilot.py aims the camera, not which offset
-  //     it reads (see that driver's own CAMERA_SETTING_NAMES comment).
-  //   - rbx_sim_node.py: two SEPARATE triples, camera_offset_* (robot view)
-  //     and scene_offset_* (scene view) -- each view is its own rigidly-welded
-  //     camera in Gazebo (see that driver's CAMERA_SETTING_NAMES comment), so
-  //     unlike ArduPilot's single aimable rig, positioning one does not move
-  //     the other. Rendered as two independently-gated blocks below.
-  // namePrefix/titlePrefix let this same block render either offset triple --
-  // "camera_offset_*" (Robot View) or, on drivers that define it (currently
-  // only rbx_sim_node.py), "scene_offset_*" (Scene View). Both triples are
-  // Settings on the device exactly like camera_offset_* already was, so
-  // nothing else about this control (the edit-buffer seeding in
-  // rbxSettingsListener, the Enter-to-apply publish in
-  // onEnterSetCameraOffset) needed to change to support a second triple.
-  renderCameraOffsetControls(namePrefix, titlePrefix) {
-    const offsets = [
-      { name: namePrefix + "_x", title: titlePrefix + " Offset X (m)" },
-      { name: namePrefix + "_y", title: titlePrefix + " Offset Y (m)" },
-      { name: namePrefix + "_z", title: titlePrefix + " Offset Z (m)" },
-    ]
-    return (
-      <React.Fragment>
-        {offsets.map((offset) => (
-          <Label key={offset.name} title={offset.title}>
-            <Input
-              id={"rbx_" + offset.name}
-              value={this.state[offset.name]}
-              onChange={(event) => {
-                const el = document.getElementById("rbx_" + offset.name)
-                if (el) {
-                  setElementStyleModified(el)
-                }
-                var obj = {}
-                obj[offset.name] = event.target.value
-                this.setState(obj)
-              }}
-              onKeyDown={(event) => this.onEnterSetCameraOffset(event, offset.name)}
-            />
-          </Label>
-        ))}
-        {/* Resets to (0,0,0) -- the camera's own reference point -- not to
-            whatever value shipped as this driver's FACTORY_SETTINGS. The RUI
-            has no channel to ask a driver "what is this Setting's factory
-            default", and (0,0,0) is what "reset an offset" means in ordinary
-            usage: put it back at center, not at some hidden preset a
-            different operator chose. */}
-        <ButtonMenu>
-          <Button onClick={() => {
-            const { updateSetting } = this.props.ros
-            const namespace = this.state.currentRBXNamespace + "/settings"
-            offsets.forEach((offset) => {
-              updateSetting(namespace, offset.name, "Float", "0.0")
-              const el = document.getElementById("rbx_" + offset.name)
-              if (el) {
-                clearElementStyleModified(el)
-              }
-            })
-          }}>{"Reset " + titlePrefix + " Offset"}</Button>
-        </ButtonMenu>
-      </React.Fragment>
-    )
-  }
-
   renderImageViewer() {
-    const { updateSetting } = this.props.ros
-    const namespace = this.state.currentRBXNamespace
-    // The camera_view_mode Setting (FIRST_PERSON/THIRD_PERSON) only exists on
-    // drivers that actually define it -- gate on the real Settings list
-    // (settingsNamesList, from this device's own settings/status) rather
-    // than a capability flag that would silently no-op for a driver
-    // without it. Previously reused has_goto_location on the assumption
-    // that only the goto_location-less rover sim has a chase cam to
-    // switch, but rbx_ardupilot_node.py (a real goto_location drone) also
-    // defines camera_view_mode for its own camera-rig chase-cam feature --
-    // that assumption hid this toggle for exactly the driver it was built
-    // for.
-    // camera_controls_enabled is the Sim Connector's own "customize the
-    // capabilities that are open" toggle for this whole block -- absent
-    // Setting (a driver that doesn't define it) is treated as enabled, so a
-    // real driver without this feature is completely unaffected. Same
-    // settingEnabled pattern as NepiDeviceRBX-Controls.js's
-    // autonomous_movement_enabled check.
-    const camera_controls_enabled = !this.state.settingsNamesList.includes("camera_controls_enabled")
-      || this.state.settingsValuesDict["camera_controls_enabled"] !== "FALSE"
-    const has_camera_pov_toggle = this.state.settingsNamesList.includes("camera_view_mode") && camera_controls_enabled
-    const has_camera_offsets = this.state.settingsNamesList.includes("camera_offset_x") && camera_controls_enabled
-    const has_scene_offsets = this.state.settingsNamesList.includes("scene_offset_x") && camera_controls_enabled
     return (
       <React.Fragment>
         <Columns>
@@ -858,18 +690,6 @@ class NepiDeviceRBX extends Component {
               streamingImageQuality={50}
               streamingImageRate={10}
             />
-            <div hidden={!has_camera_pov_toggle}>
-              <ButtonMenu>
-                <Button onClick={() => updateSetting(namespace + "/settings", "camera_view_mode", "Discrete", "FIRST_PERSON")}>{"Robot View"}</Button>
-                <Button onClick={() => updateSetting(namespace + "/settings", "camera_view_mode", "Discrete", "THIRD_PERSON")}>{"Scene View"}</Button>
-              </ButtonMenu>
-            </div>
-            <div hidden={!has_camera_offsets}>
-              {this.renderCameraOffsetControls("camera_offset", "Robot View Camera")}
-            </div>
-            <div hidden={!has_scene_offsets}>
-              {this.renderCameraOffsetControls("scene_offset", "Scene View Camera")}
-            </div>
           </Column>
         </Columns>
       </React.Fragment>
@@ -936,11 +756,11 @@ class NepiDeviceRBX extends Component {
               title={"Process Controls"}
               // Passed through so autonomous_movement_enabled/
               // teleop_movement_enabled (Settings a Sim Connector robot-config
-              // toggle writes to, exactly like camera_offset_x) can hide the
-              // corresponding dropdown option entirely rather than leaving a
-              // control visible-but-inert -- capabilities alone only say
-              // WHETHER a robot type supports something, not whether the
-              // current deployment wants it exposed.
+              // toggle writes to) can hide the corresponding dropdown option
+              // entirely rather than leaving a control visible-but-inert --
+              // capabilities alone only say WHETHER a robot type supports
+              // something, not whether the current deployment wants it
+              // exposed.
               settingsNamesList={this.state.settingsNamesList}
               settingsValuesDict={this.state.settingsValuesDict}
             />
