@@ -273,7 +273,19 @@ class CameraRigControllerArdupilot:
       dz = drone_z - cam_z
       horiz_dist = math.hypot(dx, dy)
       cam_yaw = math.atan2(dy, dx)
-      cam_pitch = math.atan2(dz, horiz_dist) if horiz_dist > 1e-6 else 0.0
+      # Negated: eulerToQuat below uses the standard aerospace/sxyz
+      # convention where POSITIVE pitch tilts the look axis toward -Z (a
+      # Z-down/NED body-frame assumption), but this whole file works in
+      # Gazebo's Z-up world frame (see the world file's own <gravity>0 0
+      # -9.8</gravity> and every other use of *_z here as ordinary
+      # up-positive altitude). Feeding atan2(dz, horiz_dist) straight in
+      # therefore pitched the camera AWAY from the drone instead of toward
+      # it -- confirmed live and numerically (dz=-1 with the default chase
+      # offset produced a look vector tilted up when the target was below)
+      # -- reported as "the scene view camera doesn't even have the
+      # quadcopter visible there." Negating here converts the Z-up sign
+      # into the Z-down convention eulerToQuat expects.
+      cam_pitch = -math.atan2(dz, horiz_dist) if horiz_dist > 1e-6 else 0.0
     else:
       # Robot view: yaw-only, gimbal-stabilized -- stays level regardless of
       # the airframe's own roll/pitch (see module docstring for why).

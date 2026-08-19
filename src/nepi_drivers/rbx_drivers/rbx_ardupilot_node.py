@@ -343,6 +343,13 @@ class ArdupilotNode:
         self.device_path = self.drv_dict['DEVICE_DICT']['device_path']
         self.mav_node_name = self.drv_dict['DEVICE_DICT']['mavlink_node_name']
         self.has_fake_gps = self.drv_dict['DEVICE_DICT']['fake_gps']
+        # device_path is connection_type + "_" + address (see discoveryFunction) --
+        # a SITL connection is always "SITL_<addr>_<port>", every real connection
+        # type (SERIAL/USB/TCP/UDP to an actual FCU) is not. Computed once here,
+        # instance-wide, since it now gates three independent things: the
+        # data_source_description passed to RBXRobotIF below, the real-camera
+        # relay thread further down, and the existing Fake GPS reconcile logic.
+        self.is_sitl = str(self.device_path).upper().startswith("SITL")
     except Exception as e:
         self.msg_if.pub_warn("Failed to load Device Dict " + str(e))
         nepi_sdk.signal_shutdown(self.node_name + ": Shutting down because no valid Device Dict")
@@ -513,8 +520,7 @@ class ArdupilotNode:
     # SITL guard: see REAL_CAMERA_TOPIC_PATTERN's own comment for why this
     # must not run against a SITL instance's dev rig.
     self.real_camera_sub = None
-    is_sitl = str(self.device_path).upper().startswith("SITL")
-    if not is_sitl:
+    if not self.is_sitl:
       self.real_camera_watch_thread = threading.Thread(target = self.realCameraWatchLoop)
       self.real_camera_watch_thread.daemon = True
       self.real_camera_watch_thread.start()
@@ -591,6 +597,23 @@ class ArdupilotNode:
 
 
     self.rbx_if = RBXRobotIF(device_info = self.device_info_dict,
+                                  # RBXRobotIF's factory default is
+                                  # 'control_system' -- sim_connector_app_node.py's
+                                  # own device discovery (simDiscoveryCb) only
+                                  # matches DeviceRBXStatus publishers reporting
+                                  # 'simulator' (SIM_SOURCE_DESCRIPTION) here, the
+                                  # same fix rbx_sim_node.py already carries.
+                                  # Conditional on is_sitl (unlike the rover, which
+                                  # is never anything but a simulator) since this
+                                  # same driver also serves genuine ArduPilot
+                                  # hardware in the field. Without this, a SITL
+                                  # instance never appears in that app's
+                                  # available_simulators, so selected_simulator can
+                                  # never resolve to it -- silently defeating every
+                                  # Sim Connector control surface (image viewers,
+                                  # camera offsets, capability toggles, keybind
+                                  # editor) that depends on that discovery.
+                                  data_source_description = ('simulator' if self.is_sitl else 'control_system'),
                                   capSettings = self.cap_settings,
                                   factorySettings = self.factory_settings,
                                   settingUpdateFunction = self.settingUpdateFunction,
@@ -1389,7 +1412,7 @@ class ArdupilotNode:
     # checkOnDevice), so "once per detected vehicle" is exactly the right
     # granularity, and it deliberately does NOT fight a human who later toggles
     # Fake GPS by hand in the RUI for that same vehicle.
-    is_sitl = str(self.device_path).upper().startswith("SITL")
+    is_sitl = self.is_sitl
     try:
       # Wait for the app's subscriber to actually connect before publishing.
       # These publishers are created immediately above, and a rospy publish
@@ -1556,19 +1579,21 @@ class ArdupilotNode:
         self.rbx_if.update_error_msg(fail_msg)
     return cmd_success
 
-  ## Action Function for force-disarming then teleporting the sim back to its
-  ## original spawn position and time (via gz_reset_listener.py on the VM)
+  ## Action Function for teleporting the sim back to its original spawn
+  ## position and time (via gz_reset_listener.py on the VM), then
+  ## force-disarming now that it's actually there
   global reset_sim
   def reset_sim(self):
-    """Force-disarm, then reset the Gazebo sim's model poses and time to spawn."""
+    """Reset the Gazebo sim's model poses and time to spawn, then force-disarm."""
     self.msg_if.pub_info("Recieved Reset Sim cmd")
-    force_disarm_cmd = CommandLongRequest()
-    force_disarm_cmd.broadcast = False
-    force_disarm_cmd.command = self.MAV_CMD_COMPONENT_ARM_DISARM
-    force_disarm_cmd.confirmation = 0
-    force_disarm_cmd.param1 = 0.0                     # 0 = disarm
-    force_disarm_cmd.param2 = self.MAV_CMD_FORCE_MAGIC # bypass in-flight safety interlock
-    nepi_sdk.call_service(self.command_client, force_disarm_cmd)
+    # Reset FIRST, disarm AFTER -- the original order (disarm, then reset)
+    # cut motor thrust immediately while the vehicle was still at its
+    # pre-reset altitude, so gravity took over and it visibly free-fell for
+    # however long the gz_reset_listener round trip took before ever
+    # snapping back, reported live as "kills all the motors and makes the
+    # quadcopter just fall from the air" instead of an instant reset.
+    # Disarming only once the vehicle is already back at its resting spawn
+    # pose leaves nothing left to fall from.
     cmd_success = False
     try:
       sock = socket.create_connection((self.RESET_SIM_HOST, self.RESET_SIM_PORT), timeout=5)
@@ -1577,6 +1602,13 @@ class ArdupilotNode:
       cmd_success = reply.startswith(b'OK')
     except Exception as e:
       self.msg_if.pub_warn("Reset Sim failed to reach gz_reset_listener: " + str(e))
+    force_disarm_cmd = CommandLongRequest()
+    force_disarm_cmd.broadcast = False
+    force_disarm_cmd.command = self.MAV_CMD_COMPONENT_ARM_DISARM
+    force_disarm_cmd.confirmation = 0
+    force_disarm_cmd.param1 = 0.0                     # 0 = disarm
+    force_disarm_cmd.param2 = self.MAV_CMD_FORCE_MAGIC # bypass in-flight safety interlock
+    nepi_sdk.call_service(self.command_client, force_disarm_cmd)
     return cmd_success
 
   ### Function for switching to STABILIZE mode

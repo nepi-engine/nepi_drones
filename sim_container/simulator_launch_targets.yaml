@@ -391,6 +391,7 @@ launch_targets:
       pkill -f "[a]i_targeting_controller_ardupilot.py" 2>/dev/null;
       echo $$ > /tmp/sim_connector_quadcopter_launch.pgid;
       rostopic list > /dev/null 2>&1 || {{ nohup roscore < /dev/null > /tmp/sim_connector_quadcopter_roscore_launch.log 2>&1 & until rostopic list > /dev/null 2>&1; do sleep 1; done; }};
+      pgrep -f "gz_reset_listener.py 9021" > /dev/null || {{ nohup python3 -u $HOME/.local/bin/gz_reset_listener.py 9021 < /dev/null > /tmp/sim_connector_quadcopter_gz_reset_listener_launch.log 2>&1 & disown; }};
       sim_vehicle.py -v ArduCopter -f gazebo-iris --out=tcpin:0.0.0.0:5771 --out=tcpin:0.0.0.0:5772 --mavproxy-args="--daemon" < /dev/null > /tmp/sim_connector_quadcopter_sitl_launch.log 2>&1 & SITL_PID=$!;
       rosrun gazebo_ros gazebo $HOME/ardupilot_gazebo/worlds/iris_arducopter_cmac.world < /dev/null > /tmp/sim_connector_quadcopter_gazebo_launch.log 2>&1 & GZ_PID=$!;
       sleep 8;
@@ -419,6 +420,7 @@ launch_targets:
       pkill -f "[a]i_targeting_controller_ardupilot.py" 2>/dev/null;
       echo $$ > /tmp/sim_connector_quadcopter_launch.pgid;
       rostopic list > /dev/null 2>&1 || {{ nohup roscore < /dev/null > /tmp/sim_connector_quadcopter_roscore_launch.log 2>&1 & until rostopic list > /dev/null 2>&1; do sleep 1; done; }};
+      pgrep -f "gz_reset_listener.py 9021" > /dev/null || {{ nohup python3 -u $HOME/.local/bin/gz_reset_listener.py 9021 < /dev/null > /tmp/sim_connector_quadcopter_gz_reset_listener_launch.log 2>&1 & disown; }};
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/camera_rig_controller_ardupilot.py < /dev/null > /tmp/sim_connector_quadcopter_camera_rig_launch.log 2>&1 & CAM_PID=$!;
       sim_vehicle.py -v ArduCopter -f gazebo-iris --out=tcpin:0.0.0.0:5771 --out=tcpin:0.0.0.0:5772 --mavproxy-args="--daemon" < /dev/null > /tmp/sim_connector_quadcopter_sitl_launch.log 2>&1 & SITL_PID=$!;
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/gazebo/sim_connector_bridge_gazebo_quadcopter.py --host {device_bridge_host} --port {device_bridge_port} --mavlink tcp:127.0.0.1:5772 < /dev/null > /tmp/sim_connector_quadcopter_bridge_launch.log 2>&1 & BRIDGE_PID=$!;
@@ -438,7 +440,7 @@ launch_targets:
     # self-match-avoidance idiom genuinely fixes it here: this pattern
     # exists exactly once in this script (the pkill argument itself), not a
     # second time elsewhere the way launch_command's own text repeats it.
-    stop_command: "bash -lc 'f=/tmp/sim_connector_quadcopter_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; rm -f /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo; pkill -f \"[s]im_vehicle.py -v ArduCopter\" 2>/dev/null; pkill -f [c]amera_rig_controller_ardupilot.py 2>/dev/null; pkill -f [s]im_connector_bridge_gazebo_quadcopter.py 2>/dev/null; true'"
+    stop_command: "bash -lc 'f=/tmp/sim_connector_quadcopter_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; rm -f /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo; pkill -f \"[s]im_vehicle.py -v ArduCopter\" 2>/dev/null; pkill -f [c]amera_rig_controller_ardupilot.py 2>/dev/null; pkill -f [s]im_connector_bridge_gazebo_quadcopter.py 2>/dev/null; pkill -f [g]z_reset_listener.py 2>/dev/null; true'"
     # Same "prove THIS target's own world is up" bar as gazebo_rover's own
     # ready_check_command -- /camera_rig/camera/image_raw having a real
     # publisher proves camera_rig_controller_ardupilot.py connected to a
