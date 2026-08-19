@@ -85,8 +85,15 @@ class ArdupilotNode:
   # Added here for parity: the quadcopter's robot config (flight_robot_4_motor)
   # is exactly as much a Sim Connector-managed simulated robot as the rover's,
   # so it gets the same three configuration toggles, not a lesser set.
+  # enabled_image_sources added for parity with rbx_sim_node.py's own
+  # curation checklist Setting (NepiDeviceRBX.js's Image Source dropdown /
+  # Nepi_IF_Sim-Controls.js's renderImageSourceCuration) -- was missing here
+  # entirely, which meant that whole enable/disable-cameras UI section never
+  # rendered for this driver at all (its gate is
+  # rbxSettingsNamesList.includes("enabled_image_sources")), including the
+  # physical camera candidate the curation list would otherwise have shown.
   CAPABILITY_SETTING_NAMES = ("autonomous_movement_enabled", "teleop_movement_enabled",
-                              "camera_controls_enabled")
+                              "camera_controls_enabled", "enabled_image_sources")
 
   CAP_SETTINGS = dict(
     takeoff_height_m = {"type":"Float","name":"takeoff_height_m","options":["0.0","100.0"]},
@@ -102,7 +109,9 @@ class ArdupilotNode:
     scene_offset_z = {"type":"Float","name":"scene_offset_z","options":["-10.0","10.0"]},
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
     teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","options":["TRUE","FALSE"]},
-    camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]}
+    camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]},
+    # No fixed options -- the candidate topic set is per-deployment.
+    enabled_image_sources = {"type":"String","name":"enabled_image_sources"}
   )
 
   FACTORY_SETTINGS = dict(
@@ -127,7 +136,9 @@ class ArdupilotNode:
     # settings behaves exactly as it did before this feature existed.
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","value":"TRUE"},
     teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","value":"TRUE"},
-    camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","value":"TRUE"}
+    camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","value":"TRUE"},
+    # Empty = unrestricted -- see the CAPABILITY_SETTING_NAMES comment above.
+    enabled_image_sources = {"type":"String","name":"enabled_image_sources","value":""}
   )
 
   FACTORY_SETTINGS_OVERRIDES = dict()
@@ -889,6 +900,27 @@ class ArdupilotNode:
   def gotoPosition(self,point_enu_m,orientation_enu_deg):
     pos_str = str(point_enu_m)
     self.msg_if.pub_info("Recieved Position setpoint command: " + pos_str)
+    # RBXRobotIF (setpoint_position_local_body) only ever hands drivers an
+    # ENU OFFSET -- the requested body-frame point rotated by current yaw,
+    # NOT added to current position; its own docstring says "Commands the
+    # robot to a target position in the LOCAL BODY FRAME" and its comment
+    # explicitly notes each driver adds its own current position (see
+    # rbx_sim_node.py's identical gotoPosition, "RBXRobotIF passes the goal
+    # as an ENU offset point from the current position"). This driver
+    # skipped that addition and published point_enu_m straight to mavros's
+    # setpoint_position/local, which IS an absolute local-ENU target
+    # relative to the EKF origin (home) -- so "move forward 2m" silently
+    # became "fly to home+2m, ignoring wherever you currently are",
+    # reported live as goto_position only ever working correctly from a
+    # fresh spawn at the origin, and confirmed by a live test: commanding
+    # +2m from x=8.4m sent the vehicle toward roughly x=2m (home-relative)
+    # instead of x=10.4m (current-position-relative). Adding self.navpose_dict
+    # here makes this match rbx_sim_node.py's rover exactly, giving the
+    # quadcopter the same "move N units from wherever it is right now"
+    # capability the rover already had.
+    point_enu_m.x = point_enu_m.x + self.navpose_dict['x_m']
+    point_enu_m.y = point_enu_m.y + self.navpose_dict['y_m']
+    point_enu_m.z = point_enu_m.z + self.navpose_dict['z_m']
     # Create PoseStamped Setpoint Local ENU Message
     orientation_enu_q = nepi_nav.convert_rpy2quat(orientation_enu_deg)
     orientation_enu_quat = Quaternion()
