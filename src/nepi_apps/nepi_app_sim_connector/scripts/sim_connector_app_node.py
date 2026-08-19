@@ -1330,6 +1330,18 @@ class NepiSimConnectorApp:
       status.available_launch_target_installed_check_state = [
           self.launch_target_installed_check_state.get(k, 'unknown') for k in keys]
     status.selected_launch_target = self.selected_launch_target
+    status.active_launch_target = self.active_launch_target
+    # active_launch_target can be a hidden_from_selector target (e.g.
+    # gazebo_quadcopter), which get_available_targets() above deliberately
+    # excludes -- look its display name up directly rather than searching
+    # the (possibly not-containing-it) keys/names lists just built.
+    if self.active_launch_target and self.launcher is not None:
+      try:
+        status.active_launch_target_name = (
+            self.launcher.get_target(self.active_launch_target).get(
+                'display_name', self.active_launch_target))
+      except LauncherError:
+        status.active_launch_target_name = self.active_launch_target
     status.launcher_state = self.launcher_state
     status.last_error = self.launcher_last_error
     self.launcher_status_pub.publish(status)

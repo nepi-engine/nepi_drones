@@ -411,11 +411,31 @@ class NepiIFSimLauncher extends Component {
         ? names[running_ind] : running_target
       const selection_matches_running = (running_target === target)
 
+      // What actually launched can differ from the raw selector choice
+      // (running_name/running_target above) -- a robot config can redirect
+      // "Gazebo" to a completely different, hidden target (e.g. the
+      // quadcopter's own ArduCopter SITL + iris world). Reported live
+      // (2026-08-19) as genuine confusion -- "I selected Gazebo and
+      // Quadcopter but it launched the rover instead" turned out to be
+      // impossible to verify from this Status line alone, since it only
+      // ever showed the selector's own name regardless of the real target.
+      // active_launch_target_name is empty on a not-yet-redeployed backend
+      // (older SimLauncherStatus.msg) -- falls back to the selector name
+      // exactly as before in that case.
+      const active_name = (status_msg.active_launch_target_name !== undefined
+                           && status_msg.active_launch_target_name !== '')
+        ? status_msg.active_launch_target_name : running_name
+      const status_text = (status_msg.active_launch_target !== undefined
+                           && status_msg.active_launch_target !== ''
+                           && status_msg.active_launch_target !== running_target)
+        ? "You have " + running_name + " open (actually running: " + active_name + ")"
+        : "You have " + active_name + " open"
+
       return (
         <React.Fragment>
 
           <Label title={"Status"}>
-            <Input disabled value={"You have " + running_name + " open"} />
+            <Input disabled value={status_text} />
           </Label>
 
           {error_row}
