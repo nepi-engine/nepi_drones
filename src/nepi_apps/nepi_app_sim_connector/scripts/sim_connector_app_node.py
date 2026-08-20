@@ -117,7 +117,7 @@ from nepi_sdk import nepi_nav
 from nepi_sdk import nepi_img
 from nepi_sdk import nepi_system
 
-from std_msgs.msg import Bool, Empty, String
+from std_msgs.msg import Bool, Empty, String, Float32
 from sensor_msgs.msg import Image
 from geographic_msgs.msg import GeoPoint
 
@@ -330,28 +330,53 @@ class NepiSimConnectorApp:
     self.selected_simulator = ""
 
     ##############################
-    # Common robot_view/scene_view mirror -- a stable, simulator-agnostic
-    # viewing point for whichever robot is currently selected_simulator,
-    # regardless of which underlying driver/bridge type it is. Distinct from
+    # Common six-topic mirror -- a stable, simulator-agnostic viewing point
+    # for whichever robot is currently selected_simulator, regardless of
+    # which underlying driver/bridge type it is. Distinct from
     # image_pub/color_2d_image below (the generic-connector bridge protocol's
     # own relay, fed over the TCP bridge for a simulator with no RBX driver
     # of its own): every simulator actually launchable today (Gazebo rover/
     # quadcopter, Webots rover/quadcopter) instead goes through an RBX
     # driver that already publishes real ROS Image topics on this same ROS
     # master -- see rbx_sim_node.py/rbx_ardupilot_node.py's own
-    # color_2d_image/robot_view + .../scene_view topics -- so this mirror is
-    # a plain re-subscribe, not a protocol decode. Reported live
-    # (2026-08-18): the operator wants one topic to look at "no matter the
-    # simulator" rather than needing to know the current instance's own
-    # device-name-qualified topic. scene_view has no publisher at all for a
-    # robot that honestly has no scene camera (the Webots drivers) -- an
+    # color_2d_image/robot_color + .../scene_color + depth/depth_map topics
+    # -- so this mirror is a plain re-subscribe, not a protocol decode.
+    # Reported live (2026-08-18): the operator wants one topic to look at
+    # "no matter the simulator" rather than needing to know the current
+    # instance's own device-name-qualified topic. Expanded 2026-08-20 from
+    # two topics (robot_view/scene_view) to six (color, colorized-depth-view,
+    # raw-depth-map x robot/scene), matching the driver-side removal of the
+    # depth_map_enabled toggle in favor of always-simultaneous publishing.
+    # Any of the six can have no publisher at all for a robot that honestly
+    # has no scene camera or no depth sensor (the Webots drivers) -- an
     # absent feed there is accurate, not a bug.
-    self.robot_view_pub = nepi_sdk.create_publisher(self.node_name + "/robot_view", Image, queue_size = 1)
-    self.scene_view_pub = nepi_sdk.create_publisher(self.node_name + "/scene_view", Image, queue_size = 1)
-    self.robot_view_sub = None
-    self.scene_view_sub = None
-    self.robot_view_source_topic = None
-    self.scene_view_source_topic = None
+    self.MIRROR_VIEWS = ["robot_color", "scene_color", "robot_depth", "scene_depth",
+                         "robot_depth_map", "scene_depth_map"]
+    self.mirror_pubs = dict()
+    self.mirror_subs = dict()
+    self.mirror_source_topics = dict()
+    for view in self.MIRROR_VIEWS:
+      self.mirror_pubs[view] = nepi_sdk.create_publisher(self.node_name + "/" + view, Image, queue_size = 1)
+      self.mirror_subs[view] = None
+      self.mirror_source_topics[view] = None
+
+    ##############################
+    # FOV data -- published as plain, latched Float32 topics rather than
+    # extending any .msg (avoids a catkin message-regeneration rebuild for
+    # this). horizontal_fov is the SDF's static camera sensor value, shared
+    # identically by every camera_rig/camera_rig_chase model in this sim;
+    # vertical_fov is derived from it via the standard pinhole relation for
+    # the sensor's fixed 640x480 resolution. Read once here (mount time)
+    # since neither ever changes at runtime.
+    self.CAMERA_HORIZONTAL_FOV_DEG = 80.0
+    self.CAMERA_VERTICAL_FOV_DEG = 2.0 * np.degrees(np.arctan(
+        np.tan(np.radians(self.CAMERA_HORIZONTAL_FOV_DEG) / 2.0) * (480.0 / 640.0)))
+    self.camera_horizontal_fov_pub = nepi_sdk.create_publisher(
+        self.node_name + "/sim/camera_horizontal_fov_deg", Float32, queue_size = 1, latch = True)
+    self.camera_vertical_fov_pub = nepi_sdk.create_publisher(
+        self.node_name + "/sim/camera_vertical_fov_deg", Float32, queue_size = 1, latch = True)
+    self.camera_horizontal_fov_pub.publish(Float32(data = self.CAMERA_HORIZONTAL_FOV_DEG))
+    self.camera_vertical_fov_pub.publish(Float32(data = self.CAMERA_VERTICAL_FOV_DEG))
 
     ##############################
     # Home position state -- reused GeoPoint plumbing with its three floats
@@ -884,7 +909,7 @@ class NepiSimConnectorApp:
     self.updateCommonViewSubscriptions()
 
   def updateCommonViewSubscriptions(self):
-    # Re-points robot_view_pub/scene_view_pub at whichever real Image topics
+    # Re-points each of the six mirror_pubs at whichever real Image topics
     # the currently selected_simulator's own RBX driver publishes -- see
     # those publishers' own comment in __init__ for the full reasoning.
     # selected_simulator is the DeviceRBXStatus publisher's namespace, e.g.
@@ -893,59 +918,63 @@ class NepiSimConnectorApp:
     # NepiDeviceRBX.js's createImageOptions relies on for the same reason.
     node_namespace = self.selected_simulator.split('/rbx')[0] if self.selected_simulator else ""
 
+    sources = dict()
     if node_namespace == "":
-      robot_source = ""
-      scene_source = ""
+      for view in self.MIRROR_VIEWS:
+        sources[view] = ""
     else:
       base = node_namespace + "/color_2d_image"
-      # Try the split robot_view/scene_view convention first (Gazebo-based
-      # drivers); fall back to the bare topic for a driver honestly
-      # reporting one single camera (the Webots drivers).
-      robot_source = nepi_sdk.find_topic(base + "/robot_view")
-      if robot_source == "":
-        robot_source = nepi_sdk.find_topic(base, exact = True)
-      scene_source = nepi_sdk.find_topic(base + "/scene_view")
+      for view in self.MIRROR_VIEWS:
+        sources[view] = nepi_sdk.find_topic(base + "/" + view)
+      # Fall back to the bare topic for a driver honestly reporting one
+      # single camera (the Webots drivers) -- only robot_color has a
+      # single-camera fallback; there is no depth/scene equivalent to fall
+      # back to.
+      if sources["robot_color"] == "":
+        sources["robot_color"] = nepi_sdk.find_topic(base, exact = True)
 
-    self.repointCommonViewSub("robot_view", robot_source)
-    self.repointCommonViewSub("scene_view", scene_source)
+    for view in self.MIRROR_VIEWS:
+      self.repointCommonViewSub(view, sources[view])
 
   def repointCommonViewSub(self, which, source_topic):
-    sub_attr = which + "_sub"
-    source_attr = which + "_source_topic"
-    pub = self.robot_view_pub if which == "robot_view" else self.scene_view_pub
-    old_source = getattr(self, source_attr)
+    pub = self.mirror_pubs[which]
+    old_source = self.mirror_source_topics[which]
     if old_source == source_topic:
       return  # Already pointed at the right thing (including both empty).
-    old_sub = getattr(self, sub_attr)
+    old_sub = self.mirror_subs[which]
     if old_sub is not None:
       try:
         old_sub.unregister()
       except Exception:
         pass
-      setattr(self, sub_attr, None)
-    setattr(self, source_attr, source_topic)
+      self.mirror_subs[which] = None
+    self.mirror_source_topics[which] = source_topic
     if source_topic == "":
       # The underlying RBX driver's own image topic just disappeared (SITL/
-      # the sim killed, driver node gone) -- without this, robot_view_pub/
-      # scene_view_pub simply stop receiving new frames and every viewer
-      # (this app's own preview, the generic Robot Viewer, image_viewer)
-      # freezes on the last real frame forever, since ROS/web_video_server
-      # have no "the source went away" signal of their own. Publishing one
-      # blank frame here makes that state visibly obvious instead of looking
-      # like a stuck-but-still-live feed. Only when there WAS a real source
-      # before (old_source not empty) -- otherwise this fires once at
-      # startup for every never-yet-connected view, which is just noise.
+      # the sim killed, driver node gone) -- without this, the mirror_pubs
+      # simply stop receiving new frames and every viewer (this app's own
+      # preview, the generic Robot Viewer, image_viewer) freezes on the last
+      # real frame forever, since ROS/web_video_server have no "the source
+      # went away" signal of their own. Publishing one blank frame here
+      # makes that state visibly obvious instead of looking like a
+      # stuck-but-still-live feed. Only when there WAS a real source before
+      # (old_source not empty) -- otherwise this fires once at startup for
+      # every never-yet-connected view, which is just noise.
       if old_source != "":
-        self.publishBlankCommonViewFrame(pub)
+        self.publishBlankCommonViewFrame(pub, which)
       return
     new_sub = nepi_sdk.create_subscriber(source_topic, Image, self.commonViewImageCb,
                                         queue_size = 1, callback_args = (pub,))
-    setattr(self, sub_attr, new_sub)
+    self.mirror_subs[which] = new_sub
 
-  def publishBlankCommonViewFrame(self, pub):
+  def publishBlankCommonViewFrame(self, pub, which):
     try:
-      blank = np.zeros((480, 640, 3), dtype = np.uint8)
-      pub.publish(nepi_img.cv2img_to_rosimg(blank, encoding = "bgr8"))
+      if which in ("robot_depth_map", "scene_depth_map"):
+        blank = np.zeros((480, 640), dtype = np.float32)
+        pub.publish(nepi_img.cv2img_to_rosimg(blank, encoding = "32FC1"))
+      else:
+        blank = np.zeros((480, 640, 3), dtype = np.uint8)
+        pub.publish(nepi_img.cv2img_to_rosimg(blank, encoding = "bgr8"))
     except Exception as e:
       self.msg_if.pub_warn("Failed to publish blank common-view frame: " + str(e))
 

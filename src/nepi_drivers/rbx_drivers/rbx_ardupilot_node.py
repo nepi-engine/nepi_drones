@@ -72,13 +72,16 @@ class ArdupilotNode:
   # topic switched by this Setting, teleporting the SAME single Gazebo
   # camera model between two poses -- reworked so both are separate,
   # always-live Gazebo models (camera_rig_controller_ardupilot.py) and
-  # separate ROS Image topics (see image_pub_robot_view/image_pub_scene_view
+  # separate ROS Image topics (see image_pub_robot_color/image_pub_scene_color
   # below), after a live report that a single reassignable topic and a
   # single teleported camera model meant the "third-person view" wasn't
-  # really an independent thing a client could rely on.
+  # really an independent thing a client could rely on. Further expanded
+  # 2026-08-20: each of the two views now always publishes three
+  # simultaneous topics (color, colorized-depth-view, raw-depth-map) instead
+  # of switching between color and depth via a depth_map_enabled toggle --
+  # see CAMERA_PUB_ATTR/DEPTH_MAP_CAMERAS below.
   CAMERA_SETTING_NAMES = ("camera_offset_x", "camera_offset_y", "camera_offset_z",
-                          "scene_offset_x", "scene_offset_y", "scene_offset_z",
-                          "depth_map_enabled")
+                          "scene_offset_x", "scene_offset_y", "scene_offset_z")
 
   # Sim Connector "customize the capabilities that are open" toggles -- same
   # mechanism and same three names as rbx_sim_node.py's own
@@ -108,9 +111,6 @@ class ArdupilotNode:
     scene_offset_x = {"type":"Float","name":"scene_offset_x","options":["-10.0","10.0"]},
     scene_offset_y = {"type":"Float","name":"scene_offset_y","options":["-10.0","10.0"]},
     scene_offset_z = {"type":"Float","name":"scene_offset_z","options":["-10.0","10.0"]},
-    # See rbx_sim_node.py's own depth_map_enabled comment -- same feature,
-    # same convention, ported here for parity.
-    depth_map_enabled = {"type":"Discrete","name":"depth_map_enabled","options":["TRUE","FALSE"]},
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
     teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","options":["TRUE","FALSE"]},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]},
@@ -136,8 +136,6 @@ class ArdupilotNode:
     scene_offset_x = {"type":"Float","name":"scene_offset_x","value":"-2.0"},
     scene_offset_y = {"type":"Float","name":"scene_offset_y","value":"0.0"},
     scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"1.0"},
-    # Default off, same as rbx_sim_node.py.
-    depth_map_enabled = {"type":"Discrete","name":"depth_map_enabled","value":"FALSE"},
     # All default to enabled: a robot config that never touches these
     # settings behaves exactly as it did before this feature existed.
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","value":"TRUE"},
@@ -192,7 +190,7 @@ class ArdupilotNode:
   # (see __init__): a SITL instance runs on a dev rig that can have an
   # unrelated physical camera plugged in (e.g. a USB webcam used for other
   # testing), and this substring match has no way to tell that apart from a
-  # genuine onboard camera -- confirmed live hijacking robot_view away from
+  # genuine onboard camera -- confirmed live hijacking robot_color away from
   # the sim bridge's own camera_rig feed the moment any such camera existed
   # on the device. Real hardware has no such ambiguity.
   REAL_CAMERA_TOPIC_PATTERN = "idx/color_image"
@@ -501,17 +499,29 @@ class ArdupilotNode:
     # colliding with a DIFFERENT RBX driver (e.g. rbx_sim) that might be
     # running on this same device and left at RBXRobotIF's bare
     # "color_2d_image" factory default.
-    # Two always-live topics (robot_view/scene_view), not one bare topic --
-    # see CAMERA_SETTING_NAMES's own comment for why. A real onboard camera
-    # (REAL_CAMERA_TOPIC_PATTERN below) only ever feeds robot_view -- a real
-    # airframe has no chase-cam concept, so scene_view simply stays idle
-    # (topic exists, nothing ever publishes to it) on real hardware, an
-    # honest reflection of reality rather than a fabricated second feed.
+    # Six always-live topics (color/depth-view/raw-depth-map x robot/scene),
+    # not one bare topic -- see CAMERA_SETTING_NAMES's own comment for why,
+    # and rbx_sim_node.py's matching comment for the full 2026-08-20 redesign
+    # (superseding the old depth_map_enabled toggle with simultaneous
+    # publishing on all six). A real onboard camera (REAL_CAMERA_TOPIC_PATTERN
+    # below) only ever feeds robot_color -- a real airframe has no chase-cam
+    # concept and no depth stream, so scene_color/robot_depth/scene_depth/
+    # robot_depth_map/scene_depth_map simply stay idle (topics exist, nothing
+    # ever publishes to them) on real hardware, an honest reflection of
+    # reality rather than a fabricated feed.
     self.image_topic_name = self.device_name + "/color_2d_image"
-    self.robot_view_topic_name = self.image_topic_name + "/robot_view"
-    self.scene_view_topic_name = self.image_topic_name + "/scene_view"
-    self.image_pub_robot_view = nepi_sdk.create_publisher(self.robot_view_topic_name, Image, queue_size = 1)
-    self.image_pub_scene_view = nepi_sdk.create_publisher(self.scene_view_topic_name, Image, queue_size = 1)
+    self.robot_color_topic_name = self.image_topic_name + "/robot_color"
+    self.scene_color_topic_name = self.image_topic_name + "/scene_color"
+    self.robot_depth_topic_name = self.image_topic_name + "/robot_depth"
+    self.scene_depth_topic_name = self.image_topic_name + "/scene_depth"
+    self.robot_depth_map_topic_name = self.image_topic_name + "/robot_depth_map"
+    self.scene_depth_map_topic_name = self.image_topic_name + "/scene_depth_map"
+    self.image_pub_robot_color = nepi_sdk.create_publisher(self.robot_color_topic_name, Image, queue_size = 1)
+    self.image_pub_scene_color = nepi_sdk.create_publisher(self.scene_color_topic_name, Image, queue_size = 1)
+    self.image_pub_robot_depth = nepi_sdk.create_publisher(self.robot_depth_topic_name, Image, queue_size = 1)
+    self.image_pub_scene_depth = nepi_sdk.create_publisher(self.scene_depth_topic_name, Image, queue_size = 1)
+    self.image_pub_robot_depth_map = nepi_sdk.create_publisher(self.robot_depth_map_topic_name, Image, queue_size = 1)
+    self.image_pub_scene_depth_map = nepi_sdk.create_publisher(self.scene_depth_map_topic_name, Image, queue_size = 1)
 
     # Camera bridge client state and connection thread -- see
     # camera_rig_controller_ardupilot.py and CAMERA_BRIDGE_HOST/PORT above.
@@ -671,14 +681,15 @@ class ArdupilotNode:
     time.sleep(1)
 
     ## Point the interface's image-source search at this instance's own
-    ## device-name-qualified robot_view topic by default (see the
-    ## image_pub_robot_view comment above) -- overrides RBXRobotIF's plain
+    ## device-name-qualified robot_color topic by default (see the
+    ## image_pub_robot_color comment above) -- overrides RBXRobotIF's plain
     ## "color_2d_image" factory default/any stale persisted config every
     ## startup, matching rbx_sim_node.py's own deterministic-per-startup
     ## rationale. This is "the" camera on real hardware too, so the default
     ## is correct there as well as in SITL; the operator can still switch to
-    ## scene_view (SITL only) any time via the ordinary Image Source dropdown.
-    self.rbx_if.setImageTopicCb(String(data = self.robot_view_topic_name))
+    ## any of the other five topics (SITL only) any time via the ordinary
+    ## Image Source dropdown.
+    self.rbx_if.setImageTopicCb(String(data = self.robot_color_topic_name))
 
     ## Start goto setpoint check/send loop
     setpoint_pub_interval = float(1) / self.SETPOINT_PUBLISH_RATE_HZ
@@ -1776,9 +1787,10 @@ class ArdupilotNode:
   def realCameraImageCb(self, image_msg):
     # Straight relay -- both ends are already sensor_msgs/Image, no
     # decode/re-encode needed (unlike the sim bridge's base64-JPEG frames).
-    # Always robot_view: a real airframe has no chase-cam concept, so there
-    # is nothing to relay to scene_view.
-    self.image_pub_robot_view.publish(image_msg)
+    # Always robot_color: a real airframe has no chase-cam concept and no
+    # depth stream, so there is nothing to relay to any of the other five
+    # topics.
+    self.image_pub_robot_color.publish(image_msg)
 
   #######################
   # Camera Bridge Processes (Universal Simulator Bridge camera feature,
@@ -1855,23 +1867,45 @@ class ArdupilotNode:
     else:
       self.msg_if.pub_warn("Unrecognized camera bridge line type: " + str(msg.get('type')))
 
+  # "camera" (added alongside camera_rig_controller_ardupilot.py's six-topic
+  # split) picks which of the six publishers a frame goes to; an older
+  # sender with no "camera" field defaults to robot_color, matching the
+  # original single-topic behavior. depth_map cameras carry a 16-bit PNG
+  # (millimeters) instead of a JPEG -- see camera_rig_controller_ardupilot.py
+  # and rbx_sim_node.py's matching CAMERA_PUB_ATTR/DEPTH_MAP_CAMERAS comment
+  # for the full wire-format rationale (this is the numpy-array
+  # reconstruction the platform actually needs to read depth data).
+  CAMERA_PUB_ATTR = {
+    "robot_color": "image_pub_robot_color",
+    "scene_color": "image_pub_scene_color",
+    "robot_depth": "image_pub_robot_depth",
+    "scene_depth": "image_pub_scene_depth",
+    "robot_depth_map": "image_pub_robot_depth_map",
+    "scene_depth_map": "image_pub_scene_depth_map",
+  }
+  DEPTH_MAP_CAMERAS = ("robot_depth_map", "scene_depth_map")
+
   def processCameraImageLine(self, msg):
-    # Bridge image frame -> decode the relayed JPEG and republish as a raw
+    # Bridge image frame -> decode the relayed frame and republish as a raw
     # sensor_msgs/Image on this instance's own namespaced image topic (see
-    # the image_pub_robot_view/setImageTopicCb comments in __init__).
-    # "camera" (added alongside camera_rig_controller_ardupilot.py's
-    # robot_view/scene_view rig split) picks which of the two publishers
-    # this frame goes to; an older sender with no "camera" field defaults to
-    # robot_view, matching the pre-split single topic's behavior.
+    # the image_pub_robot_color/setImageTopicCb comments in __init__).
     try:
-      camera = msg.get('camera', 'robot_view')
-      image_pub = self.image_pub_scene_view if camera == 'scene_view' else self.image_pub_robot_view
-      jpeg_bytes = base64.b64decode(msg['data'])
-      arr = np.frombuffer(jpeg_bytes, dtype = np.uint8)
-      cv2_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-      if cv2_img is None:
-        raise ValueError("cv2.imdecode returned None")
-      ros_img = nepi_img.cv2img_to_rosimg(cv2_img, encoding = "bgr8")
+      camera = msg.get('camera', 'robot_color')
+      pub_attr = self.CAMERA_PUB_ATTR.get(camera, "image_pub_robot_color")
+      image_pub = getattr(self, pub_attr)
+      encoded_bytes = base64.b64decode(msg['data'])
+      arr = np.frombuffer(encoded_bytes, dtype = np.uint8)
+      if camera in self.DEPTH_MAP_CAMERAS:
+        depth_mm = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+        if depth_mm is None or depth_mm.dtype != np.uint16:
+          raise ValueError("cv2.imdecode did not return a 16-bit depth map")
+        depth_m = depth_mm.astype(np.float32) / 1000.0
+        ros_img = nepi_img.cv2img_to_rosimg(depth_m, encoding = "32FC1")
+      else:
+        cv2_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if cv2_img is None:
+          raise ValueError("cv2.imdecode returned None")
+        ros_img = nepi_img.cv2img_to_rosimg(cv2_img, encoding = "bgr8")
       image_pub.publish(ros_img)
       self.camera_last_frame_time = nepi_utils.get_time()
     except Exception as e:
@@ -1924,7 +1958,6 @@ class ArdupilotNode:
       'scene_offset_x': float(self.settings_dict['scene_offset_x']['value']),
       'scene_offset_y': float(self.settings_dict['scene_offset_y']['value']),
       'scene_offset_z': float(self.settings_dict['scene_offset_z']['value']),
-      'depth_map_enabled': self.settings_dict['depth_map_enabled']['value'] == "TRUE",
     }
     self.sendLineToCameraBridge(cmd, "Camera settings")
 

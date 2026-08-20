@@ -78,14 +78,17 @@ class SimNode:
   # Camera-rover feature. Both cameras are rigid links welded onto
   # generic_rover itself (fixed joint poses in generic_rover/model.sdf), not a
   # single repositionable rig -- that's what makes them lag-free. Both are now
-  # relayed simultaneously as two always-live ROS Image topics (ROBOT_VIEW/
-  # SCENE_VIEW_TOPIC_SUFFIX below), not switched between via a camera_view_mode
-  # Setting: reworked (2026-08-18) after a live report that a single topic
-  # whose content gets reassigned depending on a mode setting isn't a real
-  # second view a client can rely on ("the third-person view doesn't really
-  # exist"). The existing Image Source dropdown's find_topics_by_msg('Image')
-  # discovery picks up both with no new RUI plumbing needed (see
-  # NepiDeviceRBX.js's createImageOptions).
+  # relayed simultaneously as six always-live ROS Image topics (see the
+  # *_TOPIC_SUFFIX constants below: color, colorized depth view, and raw
+  # depth map, for each of robot/scene), not switched between via a
+  # camera_view_mode Setting: reworked (2026-08-18) after a live report that
+  # a single topic whose content gets reassigned depending on a mode setting
+  # isn't a real second view a client can rely on ("the third-person view
+  # doesn't really exist"), then widened again (2026-08-20) so color and
+  # depth are simultaneously available instead of a depth_map_enabled toggle
+  # swapping one topic's content. The existing Image Source dropdown's
+  # find_topics_by_msg('Image') discovery picks up all of them with no new
+  # RUI plumbing needed (see NepiDeviceRBX.js's createImageOptions).
   #
   # Camera offsets ARE still runtime-adjustable, a separate concept from which
   # view a client is looking at: an offset change is applied by respawning the
@@ -102,14 +105,21 @@ class SimNode:
   # hard-coded camera_link (0.2, 0, 0.65) and camera_link_chase
   # (-2.5, 0, 1.65) poses exactly, so the default view is unchanged.
   CAMERA_SETTING_NAMES = ("camera_offset_x", "camera_offset_y", "camera_offset_z",
-                          "scene_offset_x", "scene_offset_y", "scene_offset_z",
-                          "depth_map_enabled")
+                          "scene_offset_x", "scene_offset_y", "scene_offset_z")
 
-  # Suffixes for the two always-live ROS Image topics published off
+  # Suffixes for the six always-live ROS topics published off
   # self.image_topic_name -- see processImageLine's routing by the bridge
-  # line's "camera" field.
-  ROBOT_VIEW_TOPIC_SUFFIX = "robot_view"
-  SCENE_VIEW_TOPIC_SUFFIX = "scene_view"
+  # line's "camera" field. color/depth (colorized, for viewing) replace the
+  # old robot_view/scene_view pair once depth_map_enabled was removed
+  # (2026-08-20) in favor of always publishing both simultaneously rather
+  # than toggling which one a single topic shows; depth_map is the raw
+  # 32FC1-meters data, for later processing rather than viewing.
+  ROBOT_COLOR_TOPIC_SUFFIX = "robot_color"
+  SCENE_COLOR_TOPIC_SUFFIX = "scene_color"
+  ROBOT_DEPTH_TOPIC_SUFFIX = "robot_depth"
+  SCENE_DEPTH_TOPIC_SUFFIX = "scene_depth"
+  ROBOT_DEPTH_MAP_TOPIC_SUFFIX = "robot_depth_map"
+  SCENE_DEPTH_MAP_TOPIC_SUFFIX = "scene_depth_map"
 
   # Environment: was originally two RBX_SETUP_ACTIONS entries
   # (OBSTACLE_COURSE_ON/OFF), then a dedicated "Environment" dropdown was
@@ -164,15 +174,6 @@ class SimNode:
     scene_offset_x = {"type":"Float","name":"scene_offset_x","options":["-10.0","10.0"]},
     scene_offset_y = {"type":"Float","name":"scene_offset_y","options":["-10.0","10.0"]},
     scene_offset_z = {"type":"Float","name":"scene_offset_z","options":["-10.0","10.0"]},
-    # Colorized depth (close = blue, far = red -- see camera_rig_controller.py's
-    # depthToColorImg) in place of the plain color frame on both robot_view and
-    # scene_view, once generic_rover/model.sdf's camera sensors were switched to
-    # depth cameras. In CAMERA_SETTING_NAMES (routed through the existing
-    # sendCameraSettings()/sim_bridge_node.py channel), not CAPABILITY_SETTING_
-    # NAMES -- this has a real driver-side effect on every frame, the same kind
-    # of live operational toggle camera_offset_* already is, not a pure
-    # visibility/capability gate like camera_controls_enabled.
-    depth_map_enabled = {"type":"Discrete","name":"depth_map_enabled","options":["TRUE","FALSE"]},
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
     teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","options":["TRUE","FALSE"]},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]},
@@ -192,9 +193,6 @@ class SimNode:
     scene_offset_x = {"type":"Float","name":"scene_offset_x","value":"-2.5"},
     scene_offset_y = {"type":"Float","name":"scene_offset_y","value":"0.0"},
     scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"1.65"},
-    # Default off: a robot config that never touches this Setting sees the
-    # plain color feed exactly as before this feature existed.
-    depth_map_enabled = {"type":"Discrete","name":"depth_map_enabled","value":"FALSE"},
     # Both default to enabled: a robot config that never touches these
     # settings behaves exactly as every robot config did before this feature
     # existed.
@@ -388,15 +386,27 @@ class SimNode:
     # against the shared device-wide namespace), but now distinguished by
     # content, so /nepi/<device>/sim_rover1/color_2d_image and
     # .../sim_rover2/color_2d_image never collide.
-    # Two always-live topics (robot_view/scene_view), not one bare topic --
-    # see CAMERA_SETTING_NAMES's own comment for why. image_topic_name stays
-    # the shared, device-name-qualified BASE both are built from, so the
-    # cross-instance collision fix above still applies identically to both.
+    # Six always-live topics (robot/scene x color/depth-view/depth_map), not
+    # one bare topic -- see CAMERA_SETTING_NAMES's own comment for why.
+    # image_topic_name stays the shared, device-name-qualified BASE all six
+    # are built from, so the cross-instance collision fix above still
+    # applies identically to all of them.
     self.image_topic_name = self.device_name + "/color_2d_image"
-    self.robot_view_topic_name = self.image_topic_name + "/" + self.ROBOT_VIEW_TOPIC_SUFFIX
-    self.scene_view_topic_name = self.image_topic_name + "/" + self.SCENE_VIEW_TOPIC_SUFFIX
-    self.image_pub_robot_view = nepi_sdk.create_publisher(self.robot_view_topic_name, Image, queue_size = 1)
-    self.image_pub_scene_view = nepi_sdk.create_publisher(self.scene_view_topic_name, Image, queue_size = 1)
+    self.robot_color_topic_name = self.image_topic_name + "/" + self.ROBOT_COLOR_TOPIC_SUFFIX
+    self.scene_color_topic_name = self.image_topic_name + "/" + self.SCENE_COLOR_TOPIC_SUFFIX
+    self.robot_depth_topic_name = self.image_topic_name + "/" + self.ROBOT_DEPTH_TOPIC_SUFFIX
+    self.scene_depth_topic_name = self.image_topic_name + "/" + self.SCENE_DEPTH_TOPIC_SUFFIX
+    self.robot_depth_map_topic_name = self.image_topic_name + "/" + self.ROBOT_DEPTH_MAP_TOPIC_SUFFIX
+    self.scene_depth_map_topic_name = self.image_topic_name + "/" + self.SCENE_DEPTH_MAP_TOPIC_SUFFIX
+    self.image_pub_robot_color = nepi_sdk.create_publisher(self.robot_color_topic_name, Image, queue_size = 1)
+    self.image_pub_scene_color = nepi_sdk.create_publisher(self.scene_color_topic_name, Image, queue_size = 1)
+    self.image_pub_robot_depth = nepi_sdk.create_publisher(self.robot_depth_topic_name, Image, queue_size = 1)
+    self.image_pub_scene_depth = nepi_sdk.create_publisher(self.scene_depth_topic_name, Image, queue_size = 1)
+    # Raw depth maps: 32FC1 meters, not compressed-and-decompressed color --
+    # published straight through once decoded (see processImageLine), for
+    # later processing rather than live viewing.
+    self.image_pub_robot_depth_map = nepi_sdk.create_publisher(self.robot_depth_map_topic_name, Image, queue_size = 1)
+    self.image_pub_scene_depth_map = nepi_sdk.create_publisher(self.scene_depth_map_topic_name, Image, queue_size = 1)
 
     ##############################
     # Goto controller state
@@ -541,16 +551,17 @@ class SimNode:
     self.rbx_if.setCmdTimeoutCb(UInt32(data = self.GOTO_CMD_TIMEOUT_SEC))
 
     ## Point the interface's image-source search at this instance's own
-    ## per-device-name-qualified robot_view topic by default (matching the old
-    ## FIRST_PERSON factory default, back when there was one switchable topic
-    ## instead of two always-live ones -- see the image_pub_robot_view comment
-    ## above) -- overrides RBXRobotIF's plain "color_2d_image" factory
-    ## default/any stale persisted config every startup, same rationale as the
-    ## cmd_timeout override just above: deterministic per-instance behavior
-    ## regardless of what a previous run left in config. The operator can
-    ## still switch to scene_view any time via the ordinary Image Source
-    ## dropdown, same as picking any other camera topic.
-    self.rbx_if.setImageTopicCb(String(data = self.robot_view_topic_name))
+    ## per-device-name-qualified robot_color topic by default (matching the
+    ## old FIRST_PERSON factory default, back when there was one switchable
+    ## topic instead of six always-live ones -- see the image_pub_robot_color
+    ## comment above) -- overrides RBXRobotIF's plain "color_2d_image"
+    ## factory default/any stale persisted config every startup, same
+    ## rationale as the cmd_timeout override just above: deterministic
+    ## per-instance behavior regardless of what a previous run left in
+    ## config. The operator can still switch to any of the other five any
+    ## time via the ordinary Image Source dropdown, same as picking any other
+    ## camera topic.
+    self.rbx_if.setImageTopicCb(String(data = self.robot_color_topic_name))
 
     ## Start the closed-loop goto controller
     controller_interval = float(1) / self.CONTROLLER_RATE_HZ
@@ -976,27 +987,56 @@ class SimNode:
     else:
       self.processTelemetryLine(msg)
 
+  # Which publisher each bridge "camera" tag routes to. Built once as a class
+  # dict of attribute names (not direct publisher references) since the
+  # actual publishers don't exist yet at class-definition time -- resolved
+  # against self in processImageLine below.
+  CAMERA_PUB_ATTR = {
+    "robot_color": "image_pub_robot_color",
+    "scene_color": "image_pub_scene_color",
+    "robot_depth": "image_pub_robot_depth",
+    "scene_depth": "image_pub_scene_depth",
+    "robot_depth_map": "image_pub_robot_depth_map",
+    "scene_depth_map": "image_pub_scene_depth_map",
+  }
+  # Raw depth maps travel as 16-bit millimeter PNGs (see
+  # camera_rig_controller.py's depthToMillimeterPng) -- matches the encoding
+  # this file's own DEPTH_MAP_MAX_MM-equivalent uses on the sending side.
+  DEPTH_MAP_CAMERAS = ("robot_depth_map", "scene_depth_map")
+
   def processImageLine(self, msg):
-    # Bridge image frame -> decode the relayed JPEG and republish as a raw
+    # Bridge image frame -> decode the relayed frame and republish as a raw
     # sensor_msgs/Image on this instance's own namespaced image topic (see
-    # the image_pub_robot_view / setImageTopicCb comments in __init__ for why
-    # the topic name is device_name-qualified and RBXRobotIF is pointed at
-    # one of them via set_image_topic). "camera" (added alongside
-    # sim_bridge_node.py's robot_view/scene_view topic split -- see
-    # camera_rig_controller.py's own module docstring) picks which of the
-    # two publishers this frame goes to; an older sender with no "camera"
-    # field defaults to robot_view, matching the pre-split single topic's
-    # behavior.
+    # the image_pub_robot_color / setImageTopicCb comments in __init__ for
+    # why the topic name is device_name-qualified and RBXRobotIF is pointed
+    # at one of them via set_image_topic). "camera" picks which of the six
+    # publishers this frame goes to; an older sender with no "camera" field
+    # defaults to robot_color, matching the original single-topic behavior.
+    #
+    # The two depth_map cameras carry 16-bit millimeter PNGs, not JPEG color
+    # -- decoded back into a genuine 32FC1-meters NumPy array (float32,
+    # meters) before republishing, since that raw array -- not the PNG
+    # bytes -- is what every NEPI depth-map consumer (and cv2/numpy in
+    # general) expects an Image message's data to already be.
     try:
-      camera = msg.get('camera', self.ROBOT_VIEW_TOPIC_SUFFIX)
-      image_pub = (self.image_pub_scene_view if camera == self.SCENE_VIEW_TOPIC_SUFFIX
-                   else self.image_pub_robot_view)
-      jpeg_bytes = base64.b64decode(msg['data'])
-      arr = np.frombuffer(jpeg_bytes, dtype = np.uint8)
-      cv2_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-      if cv2_img is None:
-        raise ValueError("cv2.imdecode returned None")
-      ros_img = nepi_img.cv2img_to_rosimg(cv2_img, encoding = "bgr8")
+      camera = msg.get('camera', self.ROBOT_COLOR_TOPIC_SUFFIX)
+      pub_attr = self.CAMERA_PUB_ATTR.get(camera, "image_pub_robot_color")
+      image_pub = getattr(self, pub_attr)
+      encoded_bytes = base64.b64decode(msg['data'])
+      arr = np.frombuffer(encoded_bytes, dtype = np.uint8)
+      if camera in self.DEPTH_MAP_CAMERAS:
+        depth_mm = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+        if depth_mm is None or depth_mm.dtype != np.uint16:
+          raise ValueError("cv2.imdecode did not return a 16-bit depth map")
+        # NumPy array in actual meters, float32 -- the format every
+        # depth-map consumer downstream expects, not raw millimeter PNG bytes.
+        depth_m = depth_mm.astype(np.float32) / 1000.0
+        ros_img = nepi_img.cv2img_to_rosimg(depth_m, encoding = "32FC1")
+      else:
+        cv2_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if cv2_img is None:
+          raise ValueError("cv2.imdecode returned None")
+        ros_img = nepi_img.cv2img_to_rosimg(cv2_img, encoding = "bgr8")
       image_pub.publish(ros_img)
     except Exception as e:
       self.msg_if.pub_warn("Failed to process camera image frame: " + str(e), throttle_s = 5.0)
@@ -1058,7 +1098,6 @@ class SimNode:
       'scene_offset_x': float(self.settings_dict['scene_offset_x']['value']),
       'scene_offset_y': float(self.settings_dict['scene_offset_y']['value']),
       'scene_offset_z': float(self.settings_dict['scene_offset_z']['value']),
-      'depth_map_enabled': self.settings_dict['depth_map_enabled']['value'] == "TRUE",
     }
     self.sendLineToBridge(cmd, "Camera settings")
 

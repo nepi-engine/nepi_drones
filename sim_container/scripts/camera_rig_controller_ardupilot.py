@@ -117,6 +117,8 @@ SCENE_VIEW_DEPTH_TOPIC = '/camera_rig_chase/camera/depth/image_raw'
 # convention and reasoning as camera_rig_controller.py's own constants.
 DEPTH_MIN_RANGE_M = 0.3
 DEPTH_MAX_RANGE_M = 15.0
+# Millimeters, uint16 -- see camera_rig_controller.py's own constant.
+DEPTH_MAP_MAX_MM = 65535
 
 # Pose-follow update rate: matches the rover controller's own rationale --
 # smooth relative to the ~1-10 Hz MAVLink telemetry rate elsewhere in this
@@ -125,6 +127,11 @@ CONTROL_RATE_HZ = 20.0
 # Modest frame rate/quality per the same tunnel-bandwidth convention used by
 # every prior phase of this feature.
 IMAGE_RATE_HZ = 7.0
+# Raw depth map is for later processing, not live viewing (that's what the
+# colorized robot_depth/scene_depth feeds are for) -- same reasoning as
+# camera_rig_controller.py's own DEPTH_MAP_RATE_HZ for keeping it off the
+# tunnel's video-rate budget.
+DEPTH_MAP_RATE_HZ = 2.0
 JPEG_QUALITY = 60
 
 # Camera bridge TCP server: next free port in the 902x sim-utility block
@@ -179,7 +186,6 @@ class CameraRigControllerArdupilot:
     self.latest_scene_view_img = None
     self.latest_robot_view_depth = None
     self.latest_scene_view_depth = None
-    self.depth_map_enabled = False
 
     self.client_lock = threading.Lock()
     self.client_conn = None
@@ -196,6 +202,8 @@ class CameraRigControllerArdupilot:
 
     self.control_timer = rospy.Timer(rospy.Duration(1.0 / CONTROL_RATE_HZ), self.controlCb)
     self.image_timer = rospy.Timer(rospy.Duration(1.0 / IMAGE_RATE_HZ), self.imagePublishCb)
+    self.depth_map_timer = rospy.Timer(rospy.Duration(1.0 / DEPTH_MAP_RATE_HZ),
+                                       self.depthMapPublishCb)
 
     self.server_thread = threading.Thread(target = self.bridgeServerLoop)
     self.server_thread.daemon = True
@@ -274,6 +282,19 @@ class CameraRigControllerArdupilot:
     scaled = ((clipped - DEPTH_MIN_RANGE_M) *
               (255.0 / (DEPTH_MAX_RANGE_M - DEPTH_MIN_RANGE_M))).astype(np.uint8)
     return cv2.applyColorMap(scaled, cv2.COLORMAP_JET)
+
+  def depthToMillimeterPng(self, depth_img):
+    """Encode a 32FC1-meters depth frame as a 16-bit PNG in millimeters --
+    see camera_rig_controller.py's own version of this method."""
+    if depth_img is None:
+      return None
+    depth_img = np.nan_to_num(depth_img, nan = 0.0, posinf = 0.0, neginf = 0.0)
+    depth_mm = np.clip(depth_img * 1000.0, 0, DEPTH_MAP_MAX_MM).astype(np.uint16)
+    ok, encoded = cv2.imencode('.png', depth_mm)
+    if not ok:
+      rospy.logwarn_throttle(5.0, PKG_NAME + ": Depth map PNG encode failed")
+      return None
+    return encoded
 
   def controlCb(self, timer_event):
     with self.pose_lock:
@@ -372,26 +393,36 @@ class CameraRigControllerArdupilot:
       scene_img = self.latest_scene_view_img
       robot_depth = self.latest_robot_view_depth
       scene_depth = self.latest_scene_view_depth
-    if self.depth_map_enabled:
-      # cv2.applyColorMap's return is a numpy array -- an explicit None
-      # check avoids `or`'s ambiguous-truth-value error on it.
-      robot_colorized = self.depthToColorImg(robot_depth)
-      scene_colorized = self.depthToColorImg(scene_depth)
-      robot_img = robot_colorized if robot_colorized is not None else robot_img
-      scene_img = scene_colorized if scene_colorized is not None else scene_img
-    self.encodeAndSend(robot_img, 'robot_view')
-    self.encodeAndSend(scene_img, 'scene_view')
+    self.encodeAndSend(robot_img, 'robot_color', '.jpg', [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY], 'jpeg')
+    self.encodeAndSend(scene_img, 'scene_color', '.jpg', [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY], 'jpeg')
+    self.encodeAndSend(self.depthToColorImg(robot_depth), 'robot_depth', '.jpg',
+                       [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY], 'jpeg')
+    self.encodeAndSend(self.depthToColorImg(scene_depth), 'scene_depth', '.jpg',
+                       [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY], 'jpeg')
 
-  def encodeAndSend(self, cv_img, camera):
+  def depthMapPublishCb(self, timer_event):
+    with self.image_lock:
+      robot_depth = self.latest_robot_view_depth
+      scene_depth = self.latest_scene_view_depth
+    self.sendEncoded(self.depthToMillimeterPng(robot_depth), 'robot_depth_map', 'png16')
+    self.sendEncoded(self.depthToMillimeterPng(scene_depth), 'scene_depth_map', 'png16')
+
+  def encodeAndSend(self, cv_img, camera, ext, params, fmt):
     if cv_img is None:
       return
-    ok, encoded = cv2.imencode('.jpg', cv_img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    ok, encoded = cv2.imencode(ext, cv_img, params)
     if not ok:
-      rospy.logwarn_throttle(5.0, PKG_NAME + ": JPEG encode failed")
+      rospy.logwarn_throttle(5.0, PKG_NAME + ": Image encode failed")
+      return
+    self.sendEncoded(encoded, camera, fmt)
+
+  def sendEncoded(self, encoded, camera, fmt):
+    if encoded is None:
       return
     line = {
       'type': 'image',
       'camera': camera,
+      'format': fmt,
       'data': base64.b64encode(encoded.tobytes()).decode('ascii'),
       'stamp': rospy.Time.now().to_sec(),
     }
@@ -405,13 +436,6 @@ class CameraRigControllerArdupilot:
       self.scene_offset_x = float(cmd.get('scene_offset_x', DEFAULT_SCENE_OFFSET_X))
       self.scene_offset_y = float(cmd.get('scene_offset_y', DEFAULT_SCENE_OFFSET_Y))
       self.scene_offset_z = float(cmd.get('scene_offset_z', DEFAULT_SCENE_OFFSET_Z))
-    # No respawn needed here (unlike the rover's offset path) -- both rig
-    # models' SDF already carries a depth sensor unconditionally, so this
-    # flag only ever changes what imagePublishCb does with data already
-    # arriving. Optional key: absent on an older rbx_ardupilot_node.py,
-    # leaves the existing value (default False) untouched.
-    if cmd.get('depth_map_enabled') is not None:
-      self.depth_map_enabled = bool(cmd['depth_map_enabled'])
 
   def sendLineToClient(self, line_dict):
     with self.client_lock:
