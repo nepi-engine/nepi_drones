@@ -8,6 +8,11 @@
 # Edited via the Sim Connector RUI's "Environment Dimensions" controls, or by
 # hand followed by `python3 generate_model_sdf.py obstacle_course`. Takes
 # effect on the next simulator Launch, not live.
+#
+# NOTE: a live edit through the RUI/topics round-trips this file through
+# YAML parse/dump on the device and VM, which strips comments like this one
+# -- expected, not a bug (comments aren't part of the YAML data model). This
+# header only survives in the checked-in repo copy.
 
 course_start_x_m: 2.0
 corridor_width_m: 6.0
