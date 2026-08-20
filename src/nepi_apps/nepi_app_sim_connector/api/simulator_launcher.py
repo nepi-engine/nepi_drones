@@ -281,6 +281,50 @@ class SimulatorLauncher(object):
       raise LauncherError("SSH command timed out after " + str(timeout_sec) + "s: " + str(e))
     return result
 
+  def _push_file_content(self, target, remote_path, content):
+    """Writes `content` to `remote_path` on the VM over the same ssh channel
+    launch/stop/ready-check already use -- no scp binary or extra credential
+    needed. `remote_path` is expected to be one of this app's own fixed
+    model paths (never user-supplied text), so no shell-injection concern
+    from interpolating it directly into the remote command string."""
+    ssh_cmd = self._ssh_cmd(target, "cat > " + remote_path)
+    try:
+      result = subprocess.run(ssh_cmd, input=content, capture_output=True, text=True,
+                               timeout=SSH_CONNECT_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired as e:
+      raise LauncherError("SSH push to " + remote_path + " timed out: " + str(e))
+    if result.returncode != 0:
+      raise LauncherError("SSH push to " + remote_path + " failed: " + (result.stderr or "unknown error"))
+
+  def push_dimensions(self, target, model_name, dimensions_yaml_text, sdf_override_text):
+    """Pushes one model's editable geometry to the VM ahead of a launch --
+    see sim_connector_app_node.py's device-side dimensions store for the
+    full design (the device is the authoritative copy, surviving a
+    container restart; this VM copy is just a synced deployment target,
+    re-pushed whenever it changes or the app restarts).
+
+    sdf_override_text (raw-SDF-upload escape hatch) takes precedence and is
+    written directly to model.sdf, bypassing generation entirely.
+    Otherwise dimensions_yaml_text (curated fields) is written to
+    dimensions.yaml and generate_model_sdf.py is invoked remotely to render
+    model.sdf from it. Raises LauncherError on any failure -- callers decide
+    whether that should block the launch it's ahead of (see
+    sim_connector_app_node.py's pushDirtyDimensions, which treats this as
+    best-effort and logs rather than aborting)."""
+    remote_dir = "$HOME/nepi_engine_ws/nepi_drones/sim_container/models/" + model_name
+    if sdf_override_text:
+      self._push_file_content(target, remote_dir + "/model.sdf", sdf_override_text)
+      return
+    if not dimensions_yaml_text:
+      return
+    self._push_file_content(target, remote_dir + "/dimensions.yaml", dimensions_yaml_text)
+    generate_cmd = ("python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/"
+                    "generate_model_sdf.py " + model_name)
+    result = self._run_remote(target, generate_cmd, timeout_sec=SSH_CONNECT_TIMEOUT_SEC + 10)
+    if result.returncode != 0:
+      raise LauncherError("generate_model_sdf.py failed for " + model_name + ": " +
+                          (result.stderr or result.stdout or "unknown error"))
+
   def _is_connection_level_failure(self, result):
     """True when the ssh CLIENT itself never reached the remote command --
     connection refused, timed out, host unreachable, auth rejected -- as

@@ -165,6 +165,34 @@ FACTORY_ROBOT_CONFIG_NAME = 'default'
 # checked-in config key.
 UPLOADED_ROBOT_CONFIG_NAME = 'custom_uploaded'
 
+# Physical-dimension editing (robot chassis/wheel geometry, environment
+# corridor/ramp geometry) -- distinct from robot_configs' driver-capability
+# profiles above, which never touch Gazebo geometry at all. Two roles for
+# v1, each backed by one in-repo Gazebo model: 'robot' -> generic_rover (the
+# quadcopter's airframe geometry is a vendored third-party Gazebo/ArduPilot
+# model living outside this repo, nothing here to point a role at), and
+# 'environment' -> obstacle_course. See generate_model_sdf.py for how
+# curated dimensions.yaml fields become model.sdf, and
+# SimulatorLauncher.push_dimensions for how they reach the VM.
+ROBOT_DIMENSIONS_MODEL = 'generic_rover'
+ENVIRONMENT_DIMENSIONS_MODEL = 'obstacle_course'
+DIMENSION_ROLES = ('robot', 'environment')
+DIMENSION_ROLE_MODEL = {'robot': ROBOT_DIMENSIONS_MODEL, 'environment': ENVIRONMENT_DIMENSIONS_MODEL}
+
+# Device-side authoritative store for the above -- survives a Docker
+# container restart (unlike the container's own writable layer), the same
+# persistence category as nepi_app_onvif_mgr's own /mnt/nepi_storage/
+# user_cfg/ usage. The VM's copy under sim_container/models/<model>/ is a
+# synced DEPLOYMENT TARGET, not the source of truth: pushed here via
+# pushDirtyDimensions whenever a value changes or this app restarts.
+DIMENSIONS_STORAGE_DIR = '/mnt/nepi_storage/databases/nepi_app_sim_connector/dimensions'
+
+# Default target used to push dimensions on app startup, before any
+# simulator has been launched/selected this session -- gazebo_rover is the
+# primary, always-available Gazebo target on this VM, matching the same
+# fallback several other code paths already use.
+DEFAULT_DIMENSIONS_PUSH_TARGET = 'gazebo_rover'
+
 FACTORY_ROBOT_CONFIG = dict(
     description = 'No capabilities. Safe default until a robot config is selected.',
     # Internal fallback only -- never a real choice an operator should be
@@ -537,6 +565,55 @@ class NepiSimConnectorApp:
     nepi_sdk.create_subscriber(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/get_robot_config'),
         String, self.getRobotConfigCb, queue_size = 1)
+
+    ##############################
+    # Physical-dimension editing (robot chassis/wheel + environment
+    # corridor/ramp geometry) -- see DIMENSION_ROLES's own comment above for
+    # the robot/environment -> model mapping. Curated-fields set/get mirrors
+    # the robot_configs pattern just above; upload_*_model_sdf is the raw-
+    # SDF escape hatch. dimensions_dirty seeds from whatever's ALREADY in
+    # the device-side store at startup (not just False) -- otherwise a
+    # container restart would silently forget that the VM's own copy still
+    # needs a re-push, since the VM is a separate machine whose own state
+    # this app has no other way to know is stale.
+    self.dimensions_dirty = dict()
+    self.dimensions_dirty_pubs = dict()
+    self.dimensions_yaml_pubs = dict()
+    for role in DIMENSION_ROLES:
+      has_stored = bool(self.readStoredDimensionsYaml(role)) or bool(self.readStoredSdfOverride(role))
+      self.dimensions_dirty[role] = has_stored
+      self.dimensions_dirty_pubs[role] = nepi_sdk.create_publisher(
+          nepi_sdk.create_namespace(self.node_namespace, 'sim/' + role + '_dimensions_dirty'),
+          Bool, queue_size = 1, latch = True)
+      self.dimensions_dirty_pubs[role].publish(Bool(data = has_stored))
+      self.dimensions_yaml_pubs[role] = nepi_sdk.create_publisher(
+          nepi_sdk.create_namespace(self.node_namespace, 'sim/' + role + '_dimensions_yaml'),
+          String, queue_size = 1, latch = True)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/set_robot_dimensions'),
+        String, self.setRobotDimensionsCb, queue_size = 1)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/set_environment_dimensions'),
+        String, self.setEnvironmentDimensionsCb, queue_size = 1)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/upload_robot_model_sdf'),
+        String, self.uploadRobotModelSdfCb, queue_size = 1)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/upload_environment_model_sdf'),
+        String, self.uploadEnvironmentModelSdfCb, queue_size = 1)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/get_robot_dimensions'),
+        Empty, self.getRobotDimensionsCb, queue_size = 1)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/get_environment_dimensions'),
+        Empty, self.getEnvironmentDimensionsCb, queue_size = 1)
+    # Best-effort: the VM may not be reachable yet at startup (tunnel not up,
+    # device just booted) -- pushDirtyDimensions logs and moves on rather
+    # than blocking init, and the next real Launch will retry via the same
+    # dirty flags this left set on failure.
+    if any(self.dimensions_dirty.values()):
+      self.pushDirtyDimensions(DEFAULT_DIMENSIONS_PUSH_TARGET)
+
     # Latched, so a client that subscribes after startup still gets a real
     # report (available targets, "idle") instead of waiting for the first
     # launch/stop -- the same reasoning SimStatus's own latch already uses.
@@ -803,6 +880,171 @@ class NepiSimConnectorApp:
       return
     self.robot_config_yaml_pub.publish(String(data = yaml_text))
     self.setSelectedRobotConfig(UPLOADED_ROBOT_CONFIG_NAME)
+
+  #**********************
+  # Physical-dimension editing (robot chassis/wheel + environment
+  # corridor/ramp geometry) -- see DIMENSION_ROLES's own comment for the
+  # role -> model mapping and the device-store-is-authoritative design.
+
+  def dimensionsYamlStoragePath(self, role):
+    return os.path.join(DIMENSIONS_STORAGE_DIR, role + '.yaml')
+
+  def sdfOverrideStoragePath(self, role):
+    return os.path.join(DIMENSIONS_STORAGE_DIR, role + '.sdf')
+
+  def readStoredDimensionsYaml(self, role):
+    path = self.dimensionsYamlStoragePath(role)
+    if not os.path.exists(path):
+      return ''
+    try:
+      with open(path, 'r') as f:
+        return f.read()
+    except Exception as e:
+      self.msg_if.pub_warn("Failed to read stored " + role + " dimensions: " + str(e))
+      return ''
+
+  def writeStoredDimensionsYaml(self, role, yaml_text):
+    path = self.dimensionsYamlStoragePath(role)
+    try:
+      os.makedirs(os.path.dirname(path), exist_ok = True)
+      with open(path, 'w') as f:
+        f.write(yaml_text)
+    except Exception as e:
+      self.msg_if.pub_warn("Failed to write stored " + role + " dimensions: " + str(e))
+
+  def readStoredSdfOverride(self, role):
+    path = self.sdfOverrideStoragePath(role)
+    if not os.path.exists(path):
+      return ''
+    try:
+      with open(path, 'r') as f:
+        return f.read()
+    except Exception as e:
+      self.msg_if.pub_warn("Failed to read stored " + role + " SDF override: " + str(e))
+      return ''
+
+  def writeStoredSdfOverride(self, role, sdf_text):
+    path = self.sdfOverrideStoragePath(role)
+    try:
+      os.makedirs(os.path.dirname(path), exist_ok = True)
+      with open(path, 'w') as f:
+        f.write(sdf_text)
+    except Exception as e:
+      self.msg_if.pub_warn("Failed to write stored " + role + " SDF override: " + str(e))
+
+  def clearStoredSdfOverride(self, role):
+    path = self.sdfOverrideStoragePath(role)
+    try:
+      if os.path.exists(path):
+        os.remove(path)
+    except Exception as e:
+      self.msg_if.pub_warn("Failed to clear stored " + role + " SDF override: " + str(e))
+
+  def markDimensionsDirty(self, role):
+    self.dimensions_dirty[role] = True
+    self.publishDimensionsDirty(role)
+
+  def publishDimensionsDirty(self, role):
+    pub = self.dimensions_dirty_pubs.get(role)
+    if pub is not None:
+      pub.publish(Bool(data = self.dimensions_dirty.get(role, False)))
+
+  def pushDirtyDimensions(self, target_key):
+    # Called right before a real Launch (see runLaunch) and once at startup
+    # for whatever the device-side store already had persisted -- best
+    # effort either way: a failed push leaves the dirty flag set so the
+    # next attempt retries, rather than silently giving up.
+    if self.launcher is None:
+      return
+    try:
+      target = self.launcher.get_target(target_key)
+    except Exception as e:
+      self.msg_if.pub_warn("Could not resolve launch target '" + target_key +
+                           "' to push dimensions: " + str(e))
+      return
+    for role in DIMENSION_ROLES:
+      if not self.dimensions_dirty.get(role, False):
+        continue
+      model_name = DIMENSION_ROLE_MODEL[role]
+      try:
+        self.launcher.push_dimensions(target, model_name,
+            self.readStoredDimensionsYaml(role), self.readStoredSdfOverride(role))
+        self.dimensions_dirty[role] = False
+        self.publishDimensionsDirty(role)
+        self.msg_if.pub_info("Pushed " + role + " dimensions (" + model_name + ") to the sim VM")
+      except LauncherError as e:
+        self.msg_if.pub_warn("Failed to push " + role + " dimensions to the sim VM: " + str(e))
+
+  def setRobotDimensionsCb(self, msg):
+    self.setDimensionsCb('robot', msg)
+
+  def setEnvironmentDimensionsCb(self, msg):
+    self.setDimensionsCb('environment', msg)
+
+  def setDimensionsCb(self, role, msg):
+    # Curated-fields path -- validate the uploaded text really is a YAML
+    # mapping of dimension fields before persisting it, same "reject
+    # clearly rather than fail later" convention as uploadRobotConfigCb.
+    # generate_model_sdf.py itself fills in any field this doesn't set with
+    # its own default, so a partial edit (only the field that changed)
+    # doesn't need to carry every other field along.
+    try:
+      fields = yaml.safe_load(str(msg.data))
+    except yaml.YAMLError as e:
+      self.msg_if.pub_warn(role + " dimensions is not valid YAML: " + str(e))
+      return
+    if not isinstance(fields, dict):
+      self.msg_if.pub_warn(role + " dimensions must be a YAML mapping of fields (got " +
+                           type(fields).__name__ + ")")
+      return
+    try:
+      yaml_text = yaml.safe_dump(fields, default_flow_style = False, sort_keys = False)
+    except yaml.YAMLError as e:
+      self.msg_if.pub_warn("Failed to serialize " + role + " dimensions: " + str(e))
+      return
+    self.writeStoredDimensionsYaml(role, yaml_text)
+    # A curated-fields edit supersedes any earlier raw-SDF-upload override --
+    # otherwise pushDirtyDimensions would keep re-applying the stale raw SDF
+    # (push_dimensions gives it precedence) and the new curated values would
+    # silently never take effect.
+    self.clearStoredSdfOverride(role)
+    self.markDimensionsDirty(role)
+    self.msg_if.pub_info("Updated " + role + " dimensions: " + yaml_text.replace(chr(10), ' '))
+
+  def uploadRobotModelSdfCb(self, msg):
+    self.uploadModelSdfCb('robot', msg)
+
+  def uploadEnvironmentModelSdfCb(self, msg):
+    self.uploadModelSdfCb('environment', msg)
+
+  def uploadModelSdfCb(self, role, msg):
+    # Raw-SDF-upload escape hatch -- bypasses generate_model_sdf.py entirely,
+    # for geometry the curated fields don't cover. No XML validation here
+    # (this app has no SDF parser); a bad upload surfaces the same way a bad
+    # hand-edit would -- Gazebo refusing/misbehaving on the next launch --
+    # rather than this node trying to second-guess Gazebo's own validation.
+    sdf_text = str(msg.data)
+    if not sdf_text.strip():
+      self.msg_if.pub_warn(role + " SDF upload was empty, ignoring")
+      return
+    self.writeStoredSdfOverride(role, sdf_text)
+    self.markDimensionsDirty(role)
+    self.msg_if.pub_info("Uploaded raw model.sdf override for " + role)
+
+  def getRobotDimensionsCb(self, msg):
+    self.getDimensionsCb('robot')
+
+  def getEnvironmentDimensionsCb(self, msg):
+    self.getDimensionsCb('environment')
+
+  def getDimensionsCb(self, role):
+    yaml_text = self.readStoredDimensionsYaml(role)
+    pub = self.dimensions_yaml_pubs.get(role)
+    if pub is None:
+      return
+    if not yaml_text:
+      yaml_text = "# No stored " + role + " dimensions yet -- using factory defaults"
+    pub.publish(String(data = yaml_text))
 
   #**********************
   # Simulator selector. Discovery is a timer scan of the live ROS graph, matched
@@ -1316,6 +1558,12 @@ class NepiSimConnectorApp:
     self.launcher_state = 'launching'
     self.launcher_last_error = ''
     self.publishLauncherStatus()
+    # Push any pending dimension edits before starting a FRESH gzserver --
+    # unlike the attach path above, this one actually loads the world/models
+    # from disk, so this is the one moment a pushed model.sdf can take
+    # effect. Best-effort (pushDirtyDimensions never raises); a push failure
+    # here should not block the launch it's ahead of.
+    self.pushDirtyDimensions(actual_target)
     try:
       self.launcher.launch(actual_target)
       ready = self.launcher.wait_until_ready(actual_target)
