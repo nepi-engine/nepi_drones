@@ -1216,7 +1216,18 @@ class RBXRobotIF:
             m_len = len(self.getMotorControlRatios())
             if m_ind > (m_len -1):
                 self.update_error_msg("New Motor Control Ind " + str(m_ind) + " is out of range")
-            elif m_sr < 0 or m_sr > 1:
+            elif m_sr < -1 or m_sr > 1:
+                # Widened from 0..1 (2026-08-20): this generic gate was
+                # rejecting reverse commands before they ever reached a
+                # driver's own setMotorControlRatio, even for a driver whose
+                # motors genuinely do reverse (a wheeled rover) -- 0..1 only
+                # ever made sense for drivers like the ArduPilot one where a
+                # motor "speed ratio" really is a forward-only test throttle.
+                # Each driver's own setMotorControlRatio still enforces
+                # whatever range is actually meaningful for it (e.g.
+                # rbx_ardupilot_node.py still clamps to 0..1 internally) --
+                # this is just the wire-level sanity bound now, matching
+                # MotorControl.msg's own float32 field, not a semantic one.
                 self.update_error_msg("New Motor Control Speed Ratio " + str(m_sr) + " is out of range")
             elif self.setMotorControlRatio is not None:
                 self.setMotorControlRatio(m_ind,m_sr)
@@ -2197,16 +2208,28 @@ class RBXRobotIF:
         ## Update image source topic and subscriber if changed from last time.
         image_source = self.node_if.get_param('image_source')
         image_topic = nepi_sdk.find_topic(image_source)
+        # Unsubscribe-if-changed used to live INSIDE the "if image_topic != ''"
+        # branch below, so it only ever ran when switching between two real
+        # topics -- clearing the source to "None" left the old subscriber
+        # alive and still firing imageSubscriberCb on every frame the old
+        # camera published, which kept overwriting self.cv2_img with real
+        # frames faster than this tick's own blank-image assignment below
+        # could ever make it stick (confirmed live 2026-08-20: rbx_sim_node.py
+        # never actually saw the real image go blank on "None" as a result --
+        # only stayed "unlucky" for the ArduPilot driver because it happened
+        # to have never subscribed to anything yet at the time it was
+        # tested). Moved out here so a transition TO "" also tears the old
+        # subscriber down, not just a transition between two non-empty ones.
+        if image_topic != self.rbx_image_source_last:
+            if self.rbx_image_sub != None:
+                try:
+                  self.msg_if.pub_info("Unsubscribing from image source: " + self.rbx_image_source_last)
+                  self.rbx_image_sub.unregister()
+                  self.rbx_image_sub = None
+                  time.sleep(1)
+                except Exception as e:
+                  self.msg_if.pub_info(e)
         if image_topic != "":
-          if image_topic != self.rbx_image_source_last:
-              if self.rbx_image_sub != None:
-                  try:
-                    self.msg_if.pub_info("Unsubscribing from image source: " + image_topic)
-                    self.rbx_image_sub.unregister()
-                    self.rbx_image_sub = None
-                    time.sleep(1)
-                  except Exception as e:
-                    self.msg_if.pub_info(e)
           if self.rbx_image_sub == None:
             self.msg_if.pub_info("Subscribing to image topic: " + image_topic)
             self.rbx_image_sub = nepi_sdk.create_subscriber(image_topic, Image, self.imageSubscriberCb, queue_size = 1)

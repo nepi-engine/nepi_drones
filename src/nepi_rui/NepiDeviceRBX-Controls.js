@@ -32,32 +32,25 @@ import { SliderAdjustment } from "./AdjustmentWidgets"
 
 
 import { onEnterSetStateFloatValue, createMenuListFromStrList, onUpdateSetStateValue, onDropdownSelectedSetState, setElementStyleModified, clearElementStyleModified } from "./Utilities"
+import { buildTeleopKeyMap, loadTeleopBindings } from "./TeleopKeymap"
 
 // Motors above this ratio are considered high speed for the props-off warning
 const MOTOR_WARNING_RATIO = 0.5
 
 // Teleop key bindings -- each entry is a [linear_x, linear_y, linear_z,
 // angular_z] RATIO contribution (summed across every currently-held mapped
-// key, then clamped to [-1,1] per axis, so e.g. W+A held together drives
-// forward while turning). W/S (forward/back) and A/D (yaw) work identically
-// for a rover or a drone; Q/E (lateral/roll-equivalent) and the up/down arrow
-// keys (altitude) are axes only a drone has any meaning for -- rbx_sim_node.py's
-// own setTeleopVelocity ignores linear_y/linear_z entirely for the rover.
+// key, then clamped to [-1,1] per axis, so e.g. holding two keys together
+// drives forward while turning). Forward/back and turn-left/turn-right work
+// identically for a rover or a drone; strafe and altitude are axes only a
+// drone has any meaning for -- rbx_sim_node.py's own setTeleopVelocity
+// ignores linear_y/linear_z entirely for the rover.
 //
-// A/D are mapped EXACTLY as requested -- "w would move a rover forward, s
-// backwards, a right, d left" -- which is the reverse of the conventional
-// WASD scheme (a=left, d=right) used almost everywhere else. If that was a
-// slip rather than intentional, swap the two angular_z signs below.
-const TELEOP_KEY_MAP = {
-  'w': [1, 0, 0, 0],
-  's': [-1, 0, 0, 0],
-  'a': [0, 0, 0, -1],
-  'd': [0, 0, 0, 1],
-  'q': [0, -1, 0, 0],
-  'e': [0, 1, 0, 0],
-  'arrowup': [0, 0, 1, 0],
-  'arrowdown': [0, 0, -1, 0],
-}
+// Rebindable from the Sim Connector's keybind editor (TeleopKeymap.js is the
+// shared source of truth for both sides) -- this is no longer a fixed
+// constant, it's rebuilt fresh every time teleop key capture starts so an
+// edit made before switching a robot's control type to Teleop takes effect
+// without a page reload.
+//
 // How often a still-held key re-sends its command (ms). Comfortably inside
 // rbx_sim_node.py's TELEOP_CMD_TIMEOUT_SEC (750ms) so a single dropped
 // WebSocket frame is invisible in normal operation.
@@ -116,6 +109,7 @@ class NepiDeviceControls extends Component {
       errors_prev: [0, 0, 0, 0, 0, 0, 0],
       cmd_success: null,
       manual_ready: null,
+      teleop_ready: null,
       autonomous_ready: null,
       last_cmd_str: null,
       last_error_message: null,
@@ -167,6 +161,10 @@ class NepiDeviceControls extends Component {
       // so keyboard input elsewhere on the page (typing in an unrelated text
       // box) is never hijacked as a drive command.
       teleop_capture_active: false,
+      // key -> ratio vector, rebuilt from current bindings (possibly rebound
+      // via the Sim Connector's keybind editor) each time capture starts --
+      // see startTeleopKeyCapture and TeleopKeymap.js.
+      teleop_key_map: buildTeleopKeyMap(),
 
       roll_deg: 0,
       pitch_deg: 0,
@@ -258,11 +256,21 @@ class NepiDeviceControls extends Component {
     const { sendTeleopVelocityMsg } = this.props.ros
     const namespace = this.props.rbxNamespace
     if (namespace == null || namespace === 'None') {
+      // Held-key UI state (teleop_active_keys, driving the "W (held)" label
+      // in renderTeleopControls) is purely local React state -- it renders
+      // correctly regardless of whether rbxNamespace actually resolved, so
+      // this silent return used to look identical to "broken" from the RUI:
+      // holding a key showed as held with zero visible effect and no way to
+      // tell "no device selected in this page's own dropdown" apart from an
+      // actual bug. Surfaced the same way last_error_message already is.
+      if (this.state.last_error_message !== "No robot selected -- pick one above before using Teleop") {
+        this.setState({ last_error_message: "No robot selected -- pick one above before using Teleop" })
+      }
       return
     }
     var vec = [0, 0, 0, 0]
     Object.keys(activeKeys).forEach((key) => {
-      const contribution = TELEOP_KEY_MAP[key]
+      const contribution = this.state.teleop_key_map[key]
       if (contribution) {
         for (var i = 0; i < 4; i++) {
           vec[i] += contribution[i]
@@ -275,7 +283,7 @@ class NepiDeviceControls extends Component {
 
   handleTeleopKeyDown(event) {
     const key = event.key.toLowerCase()
-    if (!(key in TELEOP_KEY_MAP)) {
+    if (!(key in this.state.teleop_key_map)) {
       return
     }
     // Stop the browser's own scrolling on the arrow keys/space -- this panel
@@ -295,7 +303,7 @@ class NepiDeviceControls extends Component {
 
   handleTeleopKeyUp(event) {
     const key = event.key.toLowerCase()
-    if (!(key in TELEOP_KEY_MAP)) {
+    if (!(key in this.state.teleop_key_map)) {
       return
     }
     const keys = Object.assign({}, this.state.teleop_active_keys)
@@ -312,9 +320,12 @@ class NepiDeviceControls extends Component {
     if (this.state.teleop_capture_active) {
       return
     }
+    // Refresh from current bindings every time capture starts -- picks up
+    // any rebind made via the Sim Connector's keybind editor since the last
+    // time Teleop was selected, without needing a page reload.
     window.addEventListener('keydown', this.handleTeleopKeyDown)
     window.addEventListener('keyup', this.handleTeleopKeyUp)
-    this.setState({ teleop_capture_active: true })
+    this.setState({ teleop_capture_active: true, teleop_key_map: buildTeleopKeyMap() })
   }
 
   stopTeleopKeyCapture() {
@@ -341,15 +352,48 @@ class NepiDeviceControls extends Component {
       return null
     }
     const held = this.state.teleop_active_keys
+    // Bindings, not just this.state.teleop_key_map's keys -- reading them
+    // fresh (rather than reversing teleop_key_map back into an action name)
+    // keeps this legend correct even if a future rebind hasn't triggered a
+    // capture restart yet. Cheap: a few localStorage reads on a legend that
+    // only renders while Teleop is selected.
+    const bindings = loadTeleopBindings()
     const heldLabel = (key) => (held[key] ? key.toUpperCase() + " (held)" : key.toUpperCase())
+    // Driven by teleop_control_mode_ready (DeviceRBXStatus.msg), the same
+    // driver-supplied teleopControlsReadyFunction every command already
+    // gets checked against -- NOT a hardcoded "armed + GUIDED + airborne"
+    // assumption here, since a rover's own readiness criteria (bridge
+    // connected, teleop_movement_enabled) look nothing like a drone's. The
+    // driver decides what "ready" means for whatever it's actually
+    // talking to; this just displays that decision live, continuously,
+    // rather than only ever surfacing a rejection reason after the fact
+    // once a held key already silently did nothing (last_error_message
+    // below still covers that, for a driver that hasn't been rebuilt with
+    // this status field yet).
+    const teleop_ready = this.state.teleop_ready === true
     return (
       <React.Fragment>
+        <Label title={"Teleop Ready"}>
+          <BooleanIndicator value={teleop_ready} />
+        </Label>
         <Label title={"Teleop: click this page, then use the keys below"}/>
-        <Label title={heldLabel('w') + " forward, " + heldLabel('s') + " back, "
-                     + heldLabel('a') + " turn right, " + heldLabel('d') + " turn left"}/>
-        <Label title={"Drone only -- " + heldLabel('q') + "/" + heldLabel('e')
-                     + " strafe left/right, " + heldLabel('arrowup') + "/" + heldLabel('arrowdown')
+        <Label title={heldLabel(bindings.forward) + " forward, " + heldLabel(bindings.backward) + " back, "
+                     + heldLabel(bindings.turn_right) + " turn right, " + heldLabel(bindings.turn_left) + " turn left"}/>
+        <Label title={"Drone only -- " + heldLabel(bindings.strafe_left) + "/" + heldLabel(bindings.strafe_right)
+                     + " strafe left/right, " + heldLabel(bindings.altitude_up) + "/" + heldLabel(bindings.altitude_down)
                      + " altitude up/down"}/>
+        <Label title={"Keybinds can be changed in the Sim Connector app"}/>
+        {/* Held keys send commands regardless of whether the vehicle is
+            actually in a state that can act on them (e.g. a drone must be
+            armed, in GUIDED mode, and airborne) -- the driver rejects a
+            not-ready command silently over the wire, so without this the
+            RUI shows "W (held)" forever with no visible effect and no way
+            to tell "rejected" apart from "broken". last_error_message is
+            already tracked in state (controlsStatusListener) but was never
+            rendered anywhere before this. */}
+        {(this.state.last_error_message) ?
+          <Label title={"Last error: " + this.state.last_error_message}/>
+        : null}
       </React.Fragment>
     )
   }
@@ -373,6 +417,7 @@ class NepiDeviceControls extends Component {
       errors_prev: [message.errors_prev.x_m, message.errors_prev.y_m, message.errors_prev.z_m, message.errors_prev.heading_deg, message.errors_prev.roll_deg, message.errors_prev.pitch_deg, message.errors_prev.yaw_deg],
       cmd_success: message.cmd_success,
       manual_ready: message.manual_control_mode_ready,
+      teleop_ready: message.teleop_control_mode_ready,
       autonomous_ready: message.autonomous_control_mode_ready,
       last_cmd_str: message.last_cmd_string,
       last_error_message: message.last_error_message,
@@ -713,7 +758,7 @@ class NepiDeviceControls extends Component {
   // Routes a main-slider move (drag or typed) to the right behavior above,
   // depending on whether the motors currently agree.
   setMainSliderTarget(new_percent) {
-    const clamped = Math.max(0, Math.min(100, new_percent))
+    const clamped = Math.max(-100, Math.min(100, new_percent))
     if (this.motorsInSync()) {
       this.sendMainSliderRatio(clamped)
     } else {
@@ -768,7 +813,7 @@ class NepiDeviceControls extends Component {
   onMotorPercentInputSubmit(motor_ind, text) {
     const value = parseFloat(text)
     if (!isNaN(value)) {
-      this.sendMotorRatio(motor_ind, Math.max(0, Math.min(100, value)))
+      this.sendMotorRatio(motor_ind, Math.max(-100, Math.min(100, value)))
     }
   }
 
@@ -966,7 +1011,7 @@ class NepiDeviceControls extends Component {
                     msgType={"nepi_interfaces/MotorControl"}
                     adjustment={this.state.main_slider_value}
                     onSliderChangeOverride={(value) => this.setMainSliderTarget(value)}
-                    min={0}
+                    min={-100}
                     max={100}
                     unit={"%"}
                   />
@@ -1014,7 +1059,7 @@ class NepiDeviceControls extends Component {
                       msgType={"nepi_interfaces/MotorControl"}
                       adjustment={(this.state.motor_slider_values[i] !== undefined) ? this.state.motor_slider_values[i] : 0}
                       onSliderChangeOverride={(value) => this.sendMotorRatio(motor.motor_ind, value)}
-                      min={0}
+                      min={-100}
                       max={100}
                       unit={"%"}
                     />

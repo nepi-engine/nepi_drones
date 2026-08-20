@@ -32,6 +32,7 @@ import { SliderAdjustment } from "./AdjustmentWidgets"
 import { setElementStyleModified, clearElementStyleModified } from "./Utilities"
 
 import NepiIFImageViewer from "./Nepi_IF_ImageViewer"
+import { TELEOP_ACTIONS, loadTeleopBindings, saveTeleopBindings, resetTeleopBindings } from "./TeleopKeymap"
 
 @inject("ros")
 @observer
@@ -124,8 +125,14 @@ class NepiIFSimControls extends Component {
       // (updateSetting has nothing live to reach), same as this app's own
       // documented "no-ops every command" pattern elsewhere. Once a real
       // simulator connects, rbxSettingsNamesList/rbxSettingsValuesDict take
-      // over and the same controls become genuinely live -- this flag never
-      // gates anything once live.
+      // over and the same controls become genuinely live.
+      //
+      // Auto-flips to true on the not-live -> live transition (see
+      // componentDidUpdate) so the pre-existing default (settings visible as
+      // soon as a simulator connects) is unchanged -- but unlike before
+      // (2026-08-19), it now genuinely gates visibility even while live too,
+      // so the Hide Settings button actually hides something instead of
+      // disappearing the moment there's something worth hiding.
       show_settings: false,
 
       // Live control of the RBX driver's own Settings (camera_offset_x/y/z,
@@ -165,6 +172,16 @@ class NepiIFSimControls extends Component {
       // NepiDeviceRBX.js's own onSelectEnvironment convention exactly.
       selected_environment_setting: 'Flat Ground',
 
+      // Teleop keybind editor -- explicitly requested here even though
+      // teleop itself lives in the Robot Viewer (it isn't sim-only, unlike
+      // the camera offsets/environment above). See TeleopKeymap.js for the
+      // shared action list/persistence this reads and writes, and
+      // NepiDeviceRBX-Controls.js for the consumer side (the actual
+      // keyboard capture, which rebuilds its key map from this same
+      // storage each time Teleop control is (re)selected).
+      teleop_bindings: loadTeleopBindings(),
+      teleop_rebinding_action: null,
+
     }
 
     this.updateStatusListener = this.updateStatusListener.bind(this)
@@ -194,6 +211,11 @@ class NepiIFSimControls extends Component {
     this.onEnterSetRbxFloatSetting = this.onEnterSetRbxFloatSetting.bind(this)
     this.renderCameraOffsetControls = this.renderCameraOffsetControls.bind(this)
     this.renderEnvironmentSetting = this.renderEnvironmentSetting.bind(this)
+    this.renderDepthMapToggle = this.renderDepthMapToggle.bind(this)
+    this.renderTeleopKeybindEditor = this.renderTeleopKeybindEditor.bind(this)
+    this.startRebindingAction = this.startRebindingAction.bind(this)
+    this.handleRebindKeyDown = this.handleRebindKeyDown.bind(this)
+    this.resetTeleopKeybinds = this.resetTeleopKeybinds.bind(this)
 
     this.renderLiveControls = this.renderLiveControls.bind(this)
     this.renderConfigControls = this.renderConfigControls.bind(this)
@@ -307,7 +329,18 @@ class NepiIFSimControls extends Component {
     // is the status topic minus its trailing '/status'").
     const selected_simulator = (status_msg.selected_simulator !== undefined) ? status_msg.selected_simulator : ''
     if (selected_simulator !== prevState.rbx_namespace) {
-      this.setState({ rbx_namespace: selected_simulator })
+      const was_live = (prevState.rbx_namespace !== null && prevState.rbx_namespace !== ''
+        && prevState.rbx_namespace !== 'None')
+      const updates = { rbx_namespace: selected_simulator }
+      // Auto-open on the not-live -> live transition, matching the
+      // longstanding default (settings always visible once live) that
+      // existed before the Show/Hide button carried any real effect while
+      // live -- see the button's own comment for why it now does.
+      if (!was_live && selected_simulator !== null && selected_simulator !== ''
+          && selected_simulator !== 'None') {
+        updates.show_settings = true
+      }
+      this.setState(updates)
       this.updateRbxSettingsListener(selected_simulator)
     }
 
@@ -868,7 +901,7 @@ class NepiIFSimControls extends Component {
   // working exactly as before -- simply without a control for it here.
   renderRobotCapabilityControls() {
     const live = this.isRbxLive()
-    if (!live && !this.state.show_settings) {
+    if (!this.state.show_settings) {
       return null
     }
     const settings = this.state.rbxSettingsNamesList
@@ -904,32 +937,39 @@ class NepiIFSimControls extends Component {
 
         <Label title={"Robot Capabilities"} labelStyle={{ fontWeight: 'bold' }}/>
 
-        {(has_autonomous_toggle === true) ?
-          <Label title={"Automated Movement"}>
-            <Toggle
-              checked={values["autonomous_movement_enabled"] !== "FALSE"}
-              onClick={() => setToggle("autonomous_movement_enabled", values["autonomous_movement_enabled"] === "FALSE")}
-            />
-          </Label>
-        : null}
+        <Columns>
+          <Column>
+            {(has_autonomous_toggle === true) ?
+              <Label title={"Automated Movement"}>
+                <Toggle
+                  checked={values["autonomous_movement_enabled"] !== "FALSE"}
+                  onClick={() => setToggle("autonomous_movement_enabled", values["autonomous_movement_enabled"] === "FALSE")}
+                />
+              </Label>
+            : null}
 
-        {(has_teleop_toggle === true) ?
-          <Label title={"Teleoperative Movement"}>
-            <Toggle
-              checked={values["teleop_movement_enabled"] !== "FALSE"}
-              onClick={() => setToggle("teleop_movement_enabled", values["teleop_movement_enabled"] === "FALSE")}
-            />
-          </Label>
-        : null}
+            {(has_camera_toggle === true) ?
+              <Label title={"Camera Controls"}>
+                <Toggle
+                  checked={values["camera_controls_enabled"] !== "FALSE"}
+                  onClick={() => setToggle("camera_controls_enabled", values["camera_controls_enabled"] === "FALSE")}
+                />
+              </Label>
+            : null}
+          </Column>
+          <Column>
+            {(has_teleop_toggle === true) ?
+              <Label title={"Teleoperative Movement"}>
+                <Toggle
+                  checked={values["teleop_movement_enabled"] !== "FALSE"}
+                  onClick={() => setToggle("teleop_movement_enabled", values["teleop_movement_enabled"] === "FALSE")}
+                />
+              </Label>
+            : null}
 
-        {(has_camera_toggle === true) ?
-          <Label title={"Camera Controls"}>
-            <Toggle
-              checked={values["camera_controls_enabled"] !== "FALSE"}
-              onClick={() => setToggle("camera_controls_enabled", values["camera_controls_enabled"] === "FALSE")}
-            />
-          </Label>
-        : null}
+            {this.renderTeleopKeybindEditor()}
+          </Column>
+        </Columns>
 
         {this.renderImageSourceCuration()}
 
@@ -969,10 +1009,30 @@ class NepiIFSimControls extends Component {
       return null
     }
     const image_topics = this.props.ros.imageTopics || []
-    const nodeNamespace = rbx_ns.split('/rbx')[0]
-    const ownImageTopic = nodeNamespace + "/image"
+    // Exclude every raw "color_2d_image" topic (this app's own dead
+    // bridge-relay bare topic, AND every RBX driver's raw per-robot
+    // color_2d_image/robot_view/scene_view topics) -- those are internal
+    // sources the generic mirror topics below already relay from, for
+    // whichever robot/simulator is actually selected, so surfacing them
+    // separately here is redundant no matter which robot type is running
+    // (works for any robot, not just a hardcoded name). The two mirror
+    // topics themselves (renderCommonImageViewer's appNamespace +
+    // "/robot_view"/"/scene_view") don't contain "color_2d_image" in their
+    // name at all, so they pass through this filter untouched.
+    //
+    // Also exclude any bare "<namespace>/image" topic -- device_if_rbx.py's
+    // own ImageIF republishes whatever image_source is currently selected
+    // under every RBX driver's own namespace this exact way (confirmed via
+    // ardupilot_sitl/image showing up as a 4th candidate alongside the two
+    // mirrors and the physical camera). Same redundancy as color_2d_image:
+    // the universal mirrors already cover "whatever this robot's camera
+    // is" for any robot type, so this generic per-driver echo doesn't need
+    // its own curation entry either. endsWith, not includes, so a genuine
+    // future topic that merely contains "/image" elsewhere in its name
+    // isn't accidentally caught.
     const candidates = image_topics.filter((topic) =>
-      topic !== ownImageTopic && topic.includes('zed_node') === false)
+      topic.includes('color_2d_image') === false && topic.includes('zed_node') === false
+      && topic.endsWith('/image') === false)
     if (candidates.length === 0) {
       return null
     }
@@ -1047,7 +1107,7 @@ class NepiIFSimControls extends Component {
   // down to just that once a live connection reports the real list.
   renderCameraOffsetControls(namePrefix, titlePrefix) {
     const live = this.isRbxLive()
-    if (!live && !this.state.show_settings) {
+    if (!this.state.show_settings) {
       return null
     }
     const settings = this.state.rbxSettingsNamesList
@@ -1087,6 +1147,41 @@ class NepiIFSimControls extends Component {
     )
   }
 
+  // "Depth Map" toggle for the RBX driver's own depth_map_enabled Setting --
+  // colorizes both camera views (close = blue, far = red) in place of plain
+  // color. Same gating as renderCameraOffsetControls (live presence check,
+  // camera_controls_enabled) since it's a sibling camera Setting, not a
+  // capability toggle -- see rbx_sim_node.py's depth_map_enabled comment.
+  renderDepthMapToggle() {
+    const live = this.isRbxLive()
+    if (!this.state.show_settings) {
+      return null
+    }
+    const settings = this.state.rbxSettingsNamesList
+    const values = this.state.rbxSettingsValuesDict
+    const camera_controls_enabled = !live || !settings.includes("camera_controls_enabled")
+      || values["camera_controls_enabled"] !== "FALSE"
+    if ((live && !settings.includes("depth_map_enabled")) || !camera_controls_enabled) {
+      return null
+    }
+
+    const { updateSetting } = this.props.ros
+    return (
+      <Label title={"Depth Map"}>
+        <Toggle
+          checked={values["depth_map_enabled"] === "TRUE"}
+          onClick={() => {
+            if (!live) {
+              return
+            }
+            updateSetting(this.state.rbx_namespace + "/settings", "depth_map_enabled", "Discrete",
+              values["depth_map_enabled"] === "TRUE" ? "FALSE" : "TRUE")
+          }}
+        />
+      </Label>
+    )
+  }
+
   // "Flat Ground"/"Obstacle Course" dropdown for the RBX driver's own
   // "environment" Setting -- distinct from renderEnvironmentControls below
   // (a different, currently-dead-for-every-deployable-target mechanism, see
@@ -1094,7 +1189,7 @@ class NepiIFSimControls extends Component {
   // NepiDeviceRBX.js's onSelectEnvironment, same hardcoded label convention.
   renderEnvironmentSetting() {
     const live = this.isRbxLive()
-    if (!live && !this.state.show_settings) {
+    if (!this.state.show_settings) {
       return null
     }
     if (live && !this.state.rbxSettingsNamesList.includes("environment")) {
@@ -1119,6 +1214,68 @@ class NepiIFSimControls extends Component {
           <Option value="Obstacle Course">{"Obstacle Course"}</Option>
         </Select>
       </Label>
+    )
+  }
+
+  // Begins capturing the next keydown as action's new binding. One listener
+  // added on demand rather than a permanent one gated on a flag, matching
+  // NepiDeviceRBX-Controls.js's own startTeleopKeyCapture/stopTeleopKeyCapture
+  // pattern for the same "only steal keyboard input while actually needed"
+  // reasoning -- this one just needs a single keypress, not a held-key
+  // stream, so it removes itself as soon as it fires.
+  startRebindingAction(action) {
+    if (this.state.teleop_rebinding_action !== null) {
+      return
+    }
+    this.setState({ teleop_rebinding_action: action })
+    window.addEventListener('keydown', this.handleRebindKeyDown)
+  }
+
+  handleRebindKeyDown(event) {
+    const action = this.state.teleop_rebinding_action
+    if (action === null) {
+      return
+    }
+    event.preventDefault()
+    window.removeEventListener('keydown', this.handleRebindKeyDown)
+    // Escape cancels without changing the current binding.
+    if (event.key === 'Escape') {
+      this.setState({ teleop_rebinding_action: null })
+      return
+    }
+    const key = event.key.toLowerCase()
+    const bindings = { ...this.state.teleop_bindings, [action]: key }
+    saveTeleopBindings(bindings)
+    this.setState({ teleop_bindings: bindings, teleop_rebinding_action: null })
+  }
+
+  resetTeleopKeybinds() {
+    resetTeleopBindings()
+    this.setState({ teleop_bindings: loadTeleopBindings(), teleop_rebinding_action: null })
+  }
+
+  // Editable keybind list -- requested directly ("keybinds should also be
+  // editable in the simulation editor"). Lives here rather than next to the
+  // Teleoperative Movement toggle above just for a natural pairing; nothing
+  // about it is sim-specific (see the teleop_bindings state comment).
+  renderTeleopKeybindEditor() {
+    const rebinding = this.state.teleop_rebinding_action
+    return (
+      <React.Fragment>
+        <Label title={"Teleop Keybinds"} labelStyle={{ fontWeight: 'bold' }}/>
+        {TELEOP_ACTIONS.map((entry) => (
+          <Label key={entry.action} title={entry.label}>
+            <Button
+              onClick={() => this.startRebindingAction(entry.action)}
+            >
+              {(rebinding === entry.action) ? "Press a key…" : this.state.teleop_bindings[entry.action].toUpperCase()}
+            </Button>
+          </Label>
+        ))}
+        <Label title={""}>
+          <Button onClick={this.resetTeleopKeybinds}>{"Reset to Defaults"}</Button>
+        </Label>
+      </React.Fragment>
     )
   }
 
@@ -1149,21 +1306,22 @@ class NepiIFSimControls extends Component {
 
         <Label title={"Camera Viewer"} labelStyle={{ fontWeight: 'bold' }}/>
 
-        <Label title={"Robot View"}>
-          <NepiIFImageViewer
-            id={"simConnectorRobotViewViewer"}
-            image_topic={appNamespace + "/robot_view"}
-            title={""}
-          />
-        </Label>
-
-        <Label title={"Scene View"}>
-          <NepiIFImageViewer
-            id={"simConnectorSceneViewViewer"}
-            image_topic={appNamespace + "/scene_view"}
-            title={""}
-          />
-        </Label>
+        <Columns>
+          <Column>
+            <NepiIFImageViewer
+              id={"simConnectorRobotViewViewer"}
+              image_topic={appNamespace + "/robot_view"}
+              title={"Robot View"}
+            />
+          </Column>
+          <Column>
+            <NepiIFImageViewer
+              id={"simConnectorSceneViewViewer"}
+              image_topic={appNamespace + "/scene_view"}
+              title={"Scene View"}
+            />
+          </Column>
+        </Columns>
 
       </React.Fragment>
     )
@@ -1263,9 +1421,22 @@ class NepiIFSimControls extends Component {
       <React.Fragment>
         {this.renderCommonImageViewer()}
         {this.renderRobotCapabilityControls()}
-        {this.renderCameraOffsetControls("camera_offset", "Robot View Camera")}
-        {this.renderCameraOffsetControls("scene_offset", "Scene View Camera")}
-        {this.renderEnvironmentSetting()}
+        <Columns>
+          <Column>
+            {this.renderCameraOffsetControls("camera_offset", "Robot View Camera")}
+          </Column>
+          <Column>
+            {this.renderCameraOffsetControls("scene_offset", "Scene View Camera")}
+          </Column>
+        </Columns>
+        <Columns>
+          <Column>
+            {this.renderDepthMapToggle()}
+          </Column>
+          <Column>
+            {this.renderEnvironmentSetting()}
+          </Column>
+        </Columns>
         {this.renderEnvironmentControls()}
       </React.Fragment>
     )
@@ -1285,23 +1456,25 @@ class NepiIFSimControls extends Component {
       )
     }
 
-    const live = this.isRbxLive()
-
     return (
       <React.Fragment>
 
         {(show_live_controls === true) ? this.renderLiveControls() : null}
 
-        {/* Only offered pre-deploy: once a real simulator is live, the
-            settings below always render anyway (same as before this
-            control existed), so there is nothing left to reveal. */}
-        {(!live) ?
-          <Label title={"Sim Control Settings"}>
-            <Button onClick={this.toggleShowSettings}>
-              {(this.state.show_settings === true) ? "Hide Settings" : "Show Settings"}
-            </Button>
-          </Label>
-        : null}
+        {/* Always offered, live or not -- show_settings auto-opens on the
+            not-live -> live transition (see componentDidUpdate) so the
+            default behavior is unchanged (settings visible as soon as a
+            simulator connects), but the operator can still collapse this
+            whole section afterward if the robot/scene image views and
+            controls are taking up space they want back. Previously hidden
+            entirely once live, on the assumption there was "nothing left to
+            reveal" -- true for visibility, but that also meant no way to
+            HIDE it again once a sim was running (found live 2026-08-19). */}
+        <Label title={"Sim Control Settings"}>
+          <Button onClick={this.toggleShowSettings}>
+            {(this.state.show_settings === true) ? "Hide Settings" : "Show Settings"}
+          </Button>
+        </Label>
 
         {this.renderConfigControls()}
 

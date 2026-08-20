@@ -178,8 +178,7 @@ class NepiIFSim extends Component {
     this.onLaunchTargetSelected = this.onLaunchTargetSelected.bind(this)
 
     this.renderRobotConfigSelector = this.renderRobotConfigSelector.bind(this)
-    this.renderRobotConfigUpload = this.renderRobotConfigUpload.bind(this)
-    this.renderRobotConfigViewer = this.renderRobotConfigViewer.bind(this)
+    this.renderRobotConfigSettings = this.renderRobotConfigSettings.bind(this)
     this.renderFieldPair = this.renderFieldPair.bind(this)
     this.renderData = this.renderData.bind(this)
   }
@@ -431,39 +430,25 @@ class NepiIFSim extends Component {
     )
   }
 
-  // Upload-your-own-robot option, offered right alongside the Robot Config
-  // selector above rather than buried somewhere else -- uploading one both
-  // adds it to that selector (as whatever display_name it declares) and
-  // selects it immediately, so this and the selector are really one choice,
-  // not two features. Download Sample gives a concrete, correctly-shaped
-  // starting point instead of requiring a reference to the schema
-  // documented anywhere else.
-  renderRobotConfigUpload() {
-    return (
-      <React.Fragment>
-        <input
-          type="file"
-          accept=".yaml,.yml,text/yaml"
-          ref={this.uploadInputRef}
-          style={{ display: 'none' }}
-          onChange={this.onUploadConfigFileChange}
-        />
-        <ButtonMenu>
-          <Button onClick={this.onUploadConfigClicked}>{"Upload Robot Config"}</Button>
-          <Button onClick={this.onDownloadSampleConfigClicked}>{"Download Sample Config"}</Button>
-        </ButtonMenu>
-      </React.Fragment>
-    )
-  }
-
-  // Per-config "View" button (one per available_robot_configs entry --
-  // "each one that I have preset right now... downloadable too, and some
-  // viewer where they can see each config") plus the shared display/download
-  // area below. Deliberately keyed on available_robot_configs, not a
-  // hardcoded drone/rover pair: whatever this deployment's
-  // sim_connector_app_params.yaml actually offers is what gets a View button,
-  // so a future third preset needs no RUI change to be viewable.
-  renderRobotConfigViewer() {
+  // Robot Config Settings -- collapsed by default (same show/hide toggle
+  // pattern as before, just relabeled: "View Robot Configs" undersold what
+  // this section does once upload/download live here too, not just viewing).
+  // Combines what used to be two separate always-visible render methods:
+  //   - Upload-your-own-robot + Download Sample Config (previously rendered
+  //     unconditionally right next to the Robot Config selector -- moved in
+  //     here since they're config-management actions, not part of the
+  //     pick-and-deploy flow Deploy now sits right under).
+  //   - Per-config "View" button (one per available_robot_configs entry --
+  //     "each one that I have preset right now... downloadable too, and some
+  //     viewer where they can see each config") plus the shared display/
+  //     download area below. Deliberately keyed on available_robot_configs,
+  //     not a hardcoded drone/rover pair: whatever this deployment's
+  //     sim_connector_app_params.yaml actually offers gets a View button, so
+  //     a future third preset needs no RUI change to be viewable.
+  // Wrapped in Section (bordered box + title) once expanded so it reads as
+  // its own distinct panel -- previously just a bare top border on the same
+  // black background as everything else, easy to miss entirely.
+  renderRobotConfigSettings() {
     const status_msg = this.state.status_msg
     if (status_msg == null) {
       return null
@@ -472,46 +457,59 @@ class NepiIFSim extends Component {
       ? status_msg.available_robot_configs : []
     const names = (status_msg.available_robot_config_names !== undefined)
       ? status_msg.available_robot_config_names : []
-    if (available.length === 0) {
-      return null
-    }
 
     return (
       <React.Fragment>
         <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
         <ButtonMenu>
           <Button onClick={() => this.setState({ show_robot_config_viewer: !this.state.show_robot_config_viewer })}>
-            {(this.state.show_robot_config_viewer ? "Hide" : "View") + " Robot Configs"}
+            {(this.state.show_robot_config_viewer ? "Hide" : "Show") + " Robot Config Settings"}
           </Button>
         </ButtonMenu>
         {(this.state.show_robot_config_viewer === true) ?
-          <React.Fragment>
+          <Section title={"Robot Config Settings"}>
+            <input
+              type="file"
+              accept=".yaml,.yml,text/yaml"
+              ref={this.uploadInputRef}
+              style={{ display: 'none' }}
+              onChange={this.onUploadConfigFileChange}
+            />
             <ButtonMenu>
-              {available.map((configName, i) => (
-                <Button key={configName} onClick={() => this.onViewConfigClicked(configName)}>
-                  {(names[i] !== undefined && names[i] !== '') ? names[i] : configName}
-                </Button>
-              ))}
+              <Button onClick={this.onUploadConfigClicked}>{"Upload Robot Config"}</Button>
+              <Button onClick={this.onDownloadSampleConfigClicked}>{"Download Sample Config"}</Button>
             </ButtonMenu>
-            {(this.state.robot_config_yaml !== '') ?
+            {(available.length > 0) ?
               <React.Fragment>
-                {/* Was rows=16/width=100% -- filled most of the page for a
-                    handful-of-fields config. A fixed, modest box with its own
-                    scrollbar keeps this from dominating the panel regardless
-                    of how long any one config's YAML gets. */}
-                <textarea
-                  readOnly
-                  value={this.state.robot_config_yaml}
-                  rows={8}
-                  style={{ width: "60%", maxWidth: "40em", fontFamily: "monospace",
-                          whiteSpace: "pre", overflow: "auto", display: "block" }}
-                />
+                <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
                 <ButtonMenu>
-                  <Button onClick={this.onDownloadConfigClicked}>{"Download " + this.state.viewing_config_name + ".yaml"}</Button>
+                  {available.map((configName, i) => (
+                    <Button key={configName} onClick={() => this.onViewConfigClicked(configName)}>
+                      {(names[i] !== undefined && names[i] !== '') ? names[i] : configName}
+                    </Button>
+                  ))}
                 </ButtonMenu>
+                {(this.state.robot_config_yaml !== '') ?
+                  <React.Fragment>
+                    {/* Was rows=16/width=100% -- filled most of the page for a
+                        handful-of-fields config. A fixed, modest box with its own
+                        scrollbar keeps this from dominating the panel regardless
+                        of how long any one config's YAML gets. */}
+                    <textarea
+                      readOnly
+                      value={this.state.robot_config_yaml}
+                      rows={8}
+                      style={{ width: "60%", maxWidth: "40em", fontFamily: "monospace",
+                              whiteSpace: "pre", overflow: "auto", display: "block" }}
+                    />
+                    <ButtonMenu>
+                      <Button onClick={this.onDownloadConfigClicked}>{"Download " + this.state.viewing_config_name + ".yaml"}</Button>
+                    </ButtonMenu>
+                  </React.Fragment>
+                : null}
               </React.Fragment>
             : null}
-          </React.Fragment>
+          </Section>
         : null}
       </React.Fragment>
     )
@@ -658,26 +656,24 @@ class NepiIFSim extends Component {
               onTargetSelected={this.onLaunchTargetSelected}
             />
             {this.renderRobotConfigSelector()}
-            {this.renderRobotConfigUpload()}
-            {this.renderRobotConfigViewer()}
 
             {/* Deploy/Kill/Install controls -- right after picking WHAT to
-                run (simulator) and WHICH robot config, before the
-                capability-configuration controls below. Moved up from the
-                very bottom of the page per request: those controls only
-                shape what a robot exposes once running, not the pick-and-go
-                deploy decision -- keeping Deploy right under the two things
-                that actually decide what gets deployed. */}
-            {(show_selectors === true) ?
-              <NepiIFSimLauncher
-                namespace={namespace}
-                make_section={false}
-                only={"deploy"}
-                selected_target={this.state.selected_launch_target}
-                onTargetSelected={this.onLaunchTargetSelected}
-                selected_robot_config={this.getSelectedRobotConfig()}
-              />
-            : null}
+                run (simulator) and WHICH robot config, before Robot Config
+                Settings and the capability-configuration controls below.
+                Those only shape what a robot exposes once running (or, for
+                Robot Config Settings, manage config presets), not the
+                pick-and-go deploy decision -- keeping Deploy right under the
+                two things that actually decide what gets deployed. */}
+            <NepiIFSimLauncher
+              namespace={namespace}
+              make_section={false}
+              only={"deploy"}
+              selected_target={this.state.selected_launch_target}
+              onTargetSelected={this.onLaunchTargetSelected}
+              selected_robot_config={this.getSelectedRobotConfig()}
+            />
+
+            {this.renderRobotConfigSettings()}
           </React.Fragment>
         : null}
 

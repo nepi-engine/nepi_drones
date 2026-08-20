@@ -102,7 +102,8 @@ class SimNode:
   # hard-coded camera_link (0.2, 0, 0.65) and camera_link_chase
   # (-2.5, 0, 1.65) poses exactly, so the default view is unchanged.
   CAMERA_SETTING_NAMES = ("camera_offset_x", "camera_offset_y", "camera_offset_z",
-                          "scene_offset_x", "scene_offset_y", "scene_offset_z")
+                          "scene_offset_x", "scene_offset_y", "scene_offset_z",
+                          "depth_map_enabled")
 
   # Suffixes for the two always-live ROS Image topics published off
   # self.image_topic_name -- see processImageLine's routing by the bridge
@@ -163,6 +164,15 @@ class SimNode:
     scene_offset_x = {"type":"Float","name":"scene_offset_x","options":["-10.0","10.0"]},
     scene_offset_y = {"type":"Float","name":"scene_offset_y","options":["-10.0","10.0"]},
     scene_offset_z = {"type":"Float","name":"scene_offset_z","options":["-10.0","10.0"]},
+    # Colorized depth (close = blue, far = red -- see camera_rig_controller.py's
+    # depthToColorImg) in place of the plain color frame on both robot_view and
+    # scene_view, once generic_rover/model.sdf's camera sensors were switched to
+    # depth cameras. In CAMERA_SETTING_NAMES (routed through the existing
+    # sendCameraSettings()/sim_bridge_node.py channel), not CAPABILITY_SETTING_
+    # NAMES -- this has a real driver-side effect on every frame, the same kind
+    # of live operational toggle camera_offset_* already is, not a pure
+    # visibility/capability gate like camera_controls_enabled.
+    depth_map_enabled = {"type":"Discrete","name":"depth_map_enabled","options":["TRUE","FALSE"]},
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
     teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","options":["TRUE","FALSE"]},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]},
@@ -182,6 +192,9 @@ class SimNode:
     scene_offset_x = {"type":"Float","name":"scene_offset_x","value":"-2.5"},
     scene_offset_y = {"type":"Float","name":"scene_offset_y","value":"0.0"},
     scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"1.65"},
+    # Default off: a robot config that never touches this Setting sees the
+    # plain color feed exactly as before this feature existed.
+    depth_map_enabled = {"type":"Discrete","name":"depth_map_enabled","value":"FALSE"},
     # Both default to enabled: a robot config that never touches these
     # settings behaves exactly as every robot config did before this feature
     # existed.
@@ -393,12 +406,26 @@ class SimNode:
 
     ##############################
     # Manual motor-ratio state: RBX_EXTERNAL_HARDWARE_INTERFACES.md worked
-    # example (section 6) -- models a CAN-bus-style two-motor tank drive
-    # (0=left, 1=right) on top of this same simulated rover, converted to a
-    # Twist by sim_bridge_node.py's motorRatiosToTwist and applied through the
-    # same Gazebo diff-drive plugin the closed-loop goto controller already
-    # drives. See setMotorControlRatio/getMotorControlRatios below.
-    self.motor_ratios = [0.0, 0.0]
+    # example (section 6) originally modeled a CAN-bus-style two-motor tank
+    # drive (0=left, 1=right). Widened to 4 (2026-08-20): generic_rover/
+    # model.sdf is a genuine 4-joint skid-steer (front_left, front_right,
+    # rear_left, rear_right -- see its own diff_drive_controller plugin
+    # comment), and RBXRobotIF's own motor_count capability is derived
+    # generically as len(getMotorControlRatios()), the same mechanism that
+    # already makes the ArduPilot driver "automatically show all 4 motors"
+    # (its own self.motor_ratios is sized from motor_count) -- hardcoding 2
+    # here regardless of the selected robot config's declared motor_count
+    # left the Motor Controls panel showing only 2 sliders even for
+    # ground_robot_4_wheel. Order matches the SDF's own joint order: [0]
+    # front_left, [1] front_right, [2] rear_left, [3] rear_right.
+    # libgazebo_ros_diff_drive only ever takes ONE velocity per side (see
+    # that plugin's repeated <leftJoint>/<rightJoint> tags driving both
+    # front+rear identically), so genuinely independent per-wheel speeds
+    # aren't physically realizable here -- motorControlToVelocity below
+    # averages each side's pair, which means all 4 sliders are individually
+    # movable and each has a real effect, but front/rear on the same side
+    # can't diverge from each other.
+    self.motor_ratios = [0.0, 0.0, 0.0, 0.0]
 
     ##############################
     # Teleop (keyboard-driven) velocity state -- already-scaled m/s and rad/s,
@@ -614,7 +641,10 @@ class SimNode:
     if motor_ind < 0 or motor_ind >= len(self.motor_ratios):
       self.msg_if.pub_warn("Motor control ignored: motor index " + str(motor_ind) + " out of range")
       return
-    self.motor_ratios[motor_ind] = max(0.0, min(1.0, speed_ratio))
+    # -1.0..1.0, not 0.0..1.0 -- a wheeled rover's motors genuinely reverse,
+    # unlike the ArduPilot driver's motor TEST (a prop spin-up check, which
+    # has no meaningful reverse direction and stays 0..1 on its own class).
+    self.motor_ratios[motor_ind] = max(-1.0, min(1.0, speed_ratio))
 
   def getMotorControlRatios(self):
     return self.motor_ratios
@@ -858,8 +888,11 @@ class SimNode:
     self.sendVelocityCmd(lin, ang)
 
   def motorControlToVelocity(self):
-    left = self.motor_ratios[0]
-    right = self.motor_ratios[1]
+    # [0]=front_left, [1]=front_right, [2]=rear_left, [3]=rear_right --
+    # averaged per side since the diff-drive plugin only takes one command
+    # per side (see self.motor_ratios' own comment).
+    left = (self.motor_ratios[0] + self.motor_ratios[2]) / 2.0
+    right = (self.motor_ratios[1] + self.motor_ratios[3]) / 2.0
     lin = (left + right) / 2.0 * self.MOTOR_MAX_LINEAR_MPS
     ang = (right - left) / self.MOTOR_WHEEL_BASE_M * self.MOTOR_MAX_LINEAR_MPS
     return lin, ang
@@ -1025,6 +1058,7 @@ class SimNode:
       'scene_offset_x': float(self.settings_dict['scene_offset_x']['value']),
       'scene_offset_y': float(self.settings_dict['scene_offset_y']['value']),
       'scene_offset_z': float(self.settings_dict['scene_offset_z']['value']),
+      'depth_map_enabled': self.settings_dict['depth_map_enabled']['value'] == "TRUE",
     }
     self.sendLineToBridge(cmd, "Camera settings")
 

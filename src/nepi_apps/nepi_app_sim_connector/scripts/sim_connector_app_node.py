@@ -167,6 +167,12 @@ UPLOADED_ROBOT_CONFIG_NAME = 'custom_uploaded'
 
 FACTORY_ROBOT_CONFIG = dict(
     description = 'No capabilities. Safe default until a robot config is selected.',
+    # Internal fallback only -- never a real choice an operator should be
+    # offered (there is no robot it describes). getAvailableRobotConfigs
+    # already has a mechanism for exactly this (skip from the offered list,
+    # stay fully valid for setSelectedRobotConfig/buildProfileFromConfig) --
+    # see that method's own comment.
+    hidden_from_selector = True,
     wheel_count = 0,
     motor_count = 0,
     has_goto_position = False,
@@ -284,6 +290,17 @@ class NepiSimConnectorApp:
     # whatever the yaml says, so there is never a state with no valid selection.
     if FACTORY_ROBOT_CONFIG_NAME not in self.robot_configs:
       self.robot_configs[FACTORY_ROBOT_CONFIG_NAME] = copy.deepcopy(FACTORY_ROBOT_CONFIG)
+    # Enforced here, not just on FACTORY_ROBOT_CONFIG's own definition above:
+    # found live (2026-08-19) that sim_connector_app_params.yaml ALSO checks
+    # in a "default" entry of its own (predating hidden_from_selector, and
+    # missing the flag), which is what deployments actually load -- the
+    # FACTORY_ROBOT_CONFIG fallback above is only ever reached when the yaml
+    # doesn't define one at all. Setting it unconditionally here means "the
+    # capability-empty placeholder is never a real offered choice" holds
+    # regardless of which of the two sources actually provided this entry, or
+    # whether an older/hand-edited params file forgets the flag.
+    if isinstance(self.robot_configs.get(FACTORY_ROBOT_CONFIG_NAME), dict):
+      self.robot_configs[FACTORY_ROBOT_CONFIG_NAME]['hidden_from_selector'] = True
 
     default_config = str(self.vehicle_dict.get('default_robot_config', FACTORY_ROBOT_CONFIG_NAME))
     if default_config not in self.robot_configs:
@@ -481,6 +498,20 @@ class NepiSimConnectorApp:
     nepi_sdk.create_subscriber(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/upload_robot_config'),
         String, self.uploadRobotConfigCb, queue_size = 1)
+    # Backend counterpart of the RUI's per-config "View" button
+    # (Nepi_IF_Sim.js's onViewConfigClicked/renderRobotConfigViewer) -- that
+    # side was fully built already (request publisher, latched-reply
+    # listener, a YAML text box, a download button) but nothing here ever
+    # subscribed to answer it, so every click silently went nowhere (found
+    # live 2026-08-19). Latched so a client that (re)subscribes after the
+    # request already went out -- e.g. RUI reload mid-view -- still gets the
+    # last-requested config's text rather than nothing.
+    self.robot_config_yaml_pub = nepi_sdk.create_publisher(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/robot_config_yaml'),
+        String, queue_size = 1, latch = True)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/get_robot_config'),
+        String, self.getRobotConfigCb, queue_size = 1)
     # Latched, so a client that subscribes after startup still gets a real
     # report (available targets, "idle") instead of waiting for the first
     # launch/stop -- the same reasoning SimStatus's own latch already uses.
@@ -725,6 +756,27 @@ class NepiSimConnectorApp:
     entry['display_name'] = display_name
     self.robot_configs[UPLOADED_ROBOT_CONFIG_NAME] = entry
     self.msg_if.pub_info("Uploaded robot config '" + display_name + "', applying it now")
+
+  def getRobotConfigCb(self, msg):
+    # Answers with whatever this app's OWN self.robot_configs dict currently
+    # holds for that key -- real, currently-loaded configs, same source
+    # setSelectedRobotConfig reads from -- see onViewConfigClicked's own
+    # comment in Nepi_IF_Sim.js for why the sample/uploaded configs aren't
+    # reachable this way (they're not real entries a device round-trip
+    # through get_robot_config would find).
+    config_name = str(msg.data)
+    entry = self.robot_configs.get(config_name)
+    if entry is None:
+      self.msg_if.pub_warn("Robot config '" + config_name + "' not found, cannot show it")
+      self.robot_config_yaml_pub.publish(String(data =
+          "# Robot config '" + config_name + "' not found"))
+      return
+    try:
+      yaml_text = yaml.safe_dump(entry, default_flow_style = False, sort_keys = False)
+    except yaml.YAMLError as e:
+      self.msg_if.pub_warn("Failed to serialize robot config '" + config_name + "': " + str(e))
+      return
+    self.robot_config_yaml_pub.publish(String(data = yaml_text))
     self.setSelectedRobotConfig(UPLOADED_ROBOT_CONFIG_NAME)
 
   #**********************
@@ -861,7 +913,8 @@ class NepiSimConnectorApp:
     sub_attr = which + "_sub"
     source_attr = which + "_source_topic"
     pub = self.robot_view_pub if which == "robot_view" else self.scene_view_pub
-    if getattr(self, source_attr) == source_topic:
+    old_source = getattr(self, source_attr)
+    if old_source == source_topic:
       return  # Already pointed at the right thing (including both empty).
     old_sub = getattr(self, sub_attr)
     if old_sub is not None:
@@ -872,10 +925,29 @@ class NepiSimConnectorApp:
       setattr(self, sub_attr, None)
     setattr(self, source_attr, source_topic)
     if source_topic == "":
+      # The underlying RBX driver's own image topic just disappeared (SITL/
+      # the sim killed, driver node gone) -- without this, robot_view_pub/
+      # scene_view_pub simply stop receiving new frames and every viewer
+      # (this app's own preview, the generic Robot Viewer, image_viewer)
+      # freezes on the last real frame forever, since ROS/web_video_server
+      # have no "the source went away" signal of their own. Publishing one
+      # blank frame here makes that state visibly obvious instead of looking
+      # like a stuck-but-still-live feed. Only when there WAS a real source
+      # before (old_source not empty) -- otherwise this fires once at
+      # startup for every never-yet-connected view, which is just noise.
+      if old_source != "":
+        self.publishBlankCommonViewFrame(pub)
       return
     new_sub = nepi_sdk.create_subscriber(source_topic, Image, self.commonViewImageCb,
                                         queue_size = 1, callback_args = (pub,))
     setattr(self, sub_attr, new_sub)
+
+  def publishBlankCommonViewFrame(self, pub):
+    try:
+      blank = np.zeros((480, 640, 3), dtype = np.uint8)
+      pub.publish(nepi_img.cv2img_to_rosimg(blank, encoding = "bgr8"))
+    except Exception as e:
+      self.msg_if.pub_warn("Failed to publish blank common-view frame: " + str(e))
 
   def commonViewImageCb(self, msg, args):
     pub = args[0] if isinstance(args, tuple) else args
@@ -958,7 +1030,21 @@ class NepiSimConnectorApp:
       self.launcher_thread.start()
 
   def stopSimulatorCb(self, msg):
-    if self.launcher is None or not self.selected_launch_target:
+    # Checks BOTH, not just selected_launch_target -- an app restart (e.g.
+    # nepicommit restarting the whole container) resets this node's
+    # in-memory selected_launch_target/active_launch_target to '' even
+    # while a simulator launched by a PREVIOUS process instance is still
+    # genuinely running on the VM (nothing there depends on this app's own
+    # process lifetime). Guarding on selected_launch_target alone made this
+    # a silent no-op in exactly that case -- launcher_state was already
+    # sitting at its fresh-boot 'idle' default, so it read as "stop
+    # succeeded" without runStop (and therefore the actual remote
+    # stop_command) ever being attempted, leaving the orphaned sim running
+    # and blocking the next launch attempt's own "already running" guard.
+    # Confirmed live as the actual mechanism behind repeated "stop reports
+    # idle but the process is still there" reports this session -- matches
+    # the same active-or-selected fallback stop_target already uses below.
+    if self.launcher is None or not (self.active_launch_target or self.selected_launch_target):
       return
     with self.launcher_lock:
       if self.launcher_thread is not None and self.launcher_thread.is_alive():
@@ -999,7 +1085,15 @@ class NepiSimConnectorApp:
     # than duplicating their logic -- this method IS just those two run
     # back-to-back on the one background thread redeploySimulatorCb already
     # started.
-    if self.launcher_state == 'running' and self.selected_launch_target:
+    #
+    # Checks active_launch_target too, not just launcher_state == 'running'
+    # -- same reasoning as stopSimulatorCb's own guard: an app restart
+    # resets launcher_state to its fresh-boot 'idle' even while a simulator
+    # launched by a previous process instance is genuinely still running on
+    # the VM. Skipping runStop here because launcher_state said 'idle' left
+    # the real orphan alive, so runLaunch below hit the launch script's own
+    # "already running" refuse-guard instead of actually redeploying.
+    if (self.launcher_state == 'running' or self.active_launch_target) and (self.active_launch_target or self.selected_launch_target):
       self.runStop(self.active_launch_target or self.selected_launch_target)
       if self.launcher_state == 'failed':
         return  # runStop already published the failure; nothing more to do
@@ -1129,6 +1223,15 @@ class NepiSimConnectorApp:
         self.publishLauncherStatus()
         return
       if not ready:
+        # Same orphan-prevention reasoning as the non-attach path below:
+        # launch(attach=True) still starts this target's OWN bridge/camera
+        # scripts against the pre-existing gzserver, and those are exactly
+        # what's left running (and blocking every retry) if the ready-check
+        # times out without a stop() call here.
+        try:
+          self.launcher.stop(actual_target)
+        except LauncherError as stop_err:
+          self.msg_if.pub_warn("Best-effort stop after failed ready-check also failed: " + str(stop_err))
         self.launcher_state = 'failed'
         self.launcher_last_error = ('Timed out waiting for the simulator to become ready -- '
                                     'the gazebo that was already running may not have had the '
@@ -1198,6 +1301,21 @@ class NepiSimConnectorApp:
       self.publishLauncherStatus()
       return
     if not ready:
+      # Best-effort cleanup before reporting failed -- active_launch_target
+      # was already set above (needed so a mid-launch status query shows
+      # something), and it stayed set on every prior version of this
+      # timeout path even though the VM-side session the launch_command
+      # started (gzserver, SITL, bridge scripts) is still genuinely running
+      # there. That left a live, untracked orphan blocking every recovery
+      # path: a plain retry hits launch_command's own "already running"
+      # guard, "Use Existing" hits the same ArduCopter-port guard, and
+      # "Launch New" (kill_all_gazebo) only ever pkills gzserver/gzclient,
+      # never SITL. Stopping here, before reporting failed, means a timeout
+      # actually leaves nothing behind for the operator to manually clean up.
+      try:
+        self.launcher.stop(actual_target)
+      except LauncherError as stop_err:
+        self.msg_if.pub_warn("Best-effort stop after failed ready-check also failed: " + str(stop_err))
       self.launcher_state = 'failed'
       self.launcher_last_error = 'Timed out waiting for the simulator to become ready'
       self.publishLauncherStatus()

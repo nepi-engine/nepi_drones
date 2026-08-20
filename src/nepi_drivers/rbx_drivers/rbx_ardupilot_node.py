@@ -77,7 +77,8 @@ class ArdupilotNode:
   # single teleported camera model meant the "third-person view" wasn't
   # really an independent thing a client could rely on.
   CAMERA_SETTING_NAMES = ("camera_offset_x", "camera_offset_y", "camera_offset_z",
-                          "scene_offset_x", "scene_offset_y", "scene_offset_z")
+                          "scene_offset_x", "scene_offset_y", "scene_offset_z",
+                          "depth_map_enabled")
 
   # Sim Connector "customize the capabilities that are open" toggles -- same
   # mechanism and same three names as rbx_sim_node.py's own
@@ -107,6 +108,9 @@ class ArdupilotNode:
     scene_offset_x = {"type":"Float","name":"scene_offset_x","options":["-10.0","10.0"]},
     scene_offset_y = {"type":"Float","name":"scene_offset_y","options":["-10.0","10.0"]},
     scene_offset_z = {"type":"Float","name":"scene_offset_z","options":["-10.0","10.0"]},
+    # See rbx_sim_node.py's own depth_map_enabled comment -- same feature,
+    # same convention, ported here for parity.
+    depth_map_enabled = {"type":"Discrete","name":"depth_map_enabled","options":["TRUE","FALSE"]},
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
     teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","options":["TRUE","FALSE"]},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]},
@@ -132,6 +136,8 @@ class ArdupilotNode:
     scene_offset_x = {"type":"Float","name":"scene_offset_x","value":"-2.0"},
     scene_offset_y = {"type":"Float","name":"scene_offset_y","value":"0.0"},
     scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"1.0"},
+    # Default off, same as rbx_sim_node.py.
+    depth_map_enabled = {"type":"Discrete","name":"depth_map_enabled","value":"FALSE"},
     # All default to enabled: a robot config that never touches these
     # settings behaves exactly as it did before this feature existed.
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","value":"TRUE"},
@@ -1918,6 +1924,7 @@ class ArdupilotNode:
       'scene_offset_x': float(self.settings_dict['scene_offset_x']['value']),
       'scene_offset_y': float(self.settings_dict['scene_offset_y']['value']),
       'scene_offset_z': float(self.settings_dict['scene_offset_z']['value']),
+      'depth_map_enabled': self.settings_dict['depth_map_enabled']['value'] == "TRUE",
     }
     self.sendLineToCameraBridge(cmd, "Camera settings")
 

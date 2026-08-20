@@ -53,6 +53,10 @@ SIM_VEHICLE_DICT:
     # capabilities_query with all-False and no-ops every command.
     default:
       display_name: Default
+      # Never a real offered choice -- see sim_connector_app_node.py's own
+      # enforcement of this on load, which applies even if this flag is ever
+      # removed here by accident.
+      hidden_from_selector: true
       description: No capabilities. Safe default until a robot config is selected.
       wheel_count: 0
       motor_count: 0

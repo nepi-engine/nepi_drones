@@ -429,8 +429,40 @@ class SimulatorLauncher(object):
         continue
       seen_hosts.add(host_key)
       try:
-        self._run_remote(target, "pkill -x gzclient 2>/dev/null; pkill -x gzserver 2>/dev/null; true",
-                         timeout_sec=SSH_CONNECT_TIMEOUT_SEC + 5)
+        # Beyond gzclient/gzserver themselves: every helper/bridge process
+        # either target's own stop_command knows how to reach ONLY when it
+        # was launched (and pgid-tracked) by THIS app -- exactly the case
+        # this escape hatch exists for is when it wasn't (a leftover
+        # standalone `sim_vehicle.py`/manual VM session, etc). Found live
+        # (2026-08-19): killing gazebo out from under a still-running
+        # ArduCopter SITL left MAVProxy/ArduCopter orphaned exactly like the
+        # already-fixed "stop doesn't kill SITL" bug, just reached via this
+        # button instead. mavproxy.py needs -9 specifically -- see
+        # gazebo_quadcopter's own stop_command comment on why plain SIGTERM
+        # doesn't work on it (--daemon forks it out of the launching
+        # process's session, and it resists SIGTERM even directly).
+        self._run_remote(target,
+            "pkill -x gzclient 2>/dev/null; pkill -x gzserver 2>/dev/null; "
+            "pkill -f \"[s]im_bridge_node.py\" 2>/dev/null; "
+            "pkill -f \"[s]im_heartbeat_listener.py\" 2>/dev/null; "
+            "pkill -f \"[c]amera_rig_controller.py\" 2>/dev/null; "
+            "pkill -f \"[s]im_vehicle.py -v ArduCopter\" 2>/dev/null; "
+            "pkill -9 -f \"[m]avproxy.py\" 2>/dev/null; "
+            # The actual ArduCopter SITL binary (a grandchild of sim_vehicle.py,
+            # run inside its own xterm) -- not reached by any pattern above.
+            # stop_command's own pgid kill happens to catch this one too (it's
+            # a descendant of the tracked launch group), but kill_all_gazebo
+            # has no pgid to fall back on -- it exists precisely for sessions
+            # this app never launched. Missing this left the binary itself as
+            # a live orphan, confirmed live (2026-08-19): every process this
+            # command DOES match died, but arducopter kept running and holding
+            # port 5760, blocking the next launch's own "already running"
+            # guard exactly like the bug this method was written to fix.
+            "pkill -f \"[a]rducopter -S\" 2>/dev/null; "
+            "pkill -f \"[c]amera_rig_controller_ardupilot.py\" 2>/dev/null; "
+            "pkill -f \"[s]im_connector_bridge_gazebo_quadcopter.py\" 2>/dev/null; "
+            "pkill -f \"[g]z_reset_listener.py\" 2>/dev/null; true",
+            timeout_sec=SSH_CONNECT_TIMEOUT_SEC + 5)
       except LauncherError as e:
         errors.append(str(e))
     if errors:

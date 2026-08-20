@@ -279,14 +279,28 @@ class NepiDeviceRBX extends Component {
     var items = []
     items.push(<Option>{"None"}</Option>)
     var device_name = ""
+    var device_names = []
     for (var i = 0; i < topics.length; i++) {
       device_name = topics[i].split('/rbx')[0].split('/').pop()
+      device_names.push(device_name)
       items.push(<Option value={topics[i]}>{device_name}</Option>)
     }
     // Check that our current selection hasn't disappeared as an available option
     const { currentRBXNamespace } = this.state
     if ((currentRBXNamespace != null) && (!topics.includes(currentRBXNamespace))) {
       this.clearTopicRBXSelection()
+    } else if (currentRBXNamespace == null && topics.length === 1) {
+      // Auto-select the sole discovered device, mirroring
+      // sim_connector_app_node.py's simDiscoveryCb (auto-select when nothing
+      // is selected and exactly one candidate exists). Without this,
+      // currentRBXNamespace stays null on every fresh mount -- including
+      // every page reload -- and the entire Process Controls panel
+      // (Teleop included) stays unrendered until this dropdown is manually
+      // re-picked, an easy step to miss after a refresh.
+      this.setState({
+        currentRBXNamespace: topics[0],
+        currentRBXNamespaceText: device_names[0],
+      })
     }
     return items
   }
@@ -336,14 +350,17 @@ class NepiDeviceRBX extends Component {
     // Sim Connector's own "choose what image sources are good and what
     // aren't" curation -- enabled_image_sources is a comma-separated
     // allowlist Setting (see rbx_sim_node.py's CAPABILITY_SETTING_NAMES).
-    // Empty (a driver that doesn't define it, or hasn't set it) means
-    // unrestricted -- the namespace-scoped list above stays exactly as it
-    // was, so a deployment that hasn't touched this Setting is unaffected.
-    // curationActive gates the unscoped fallback below: without it, a
-    // curated-down-to-zero list (e.g. every allowed topic happens to be
-    // temporarily unpublished) would silently fall through to "show
-    // everything unfiltered" -- defeating the curation the operator
-    // explicitly set up, exactly when it looks like it worked.
+    // Empty (a driver that doesn't define it, or hasn't set it, or every
+    // candidate is simply left at its default-enabled state) means
+    // unrestricted -- every discovered topic is offered, matching
+    // Nepi_IF_Sim-Controls.js's own renderImageSourceCuration, which shows
+    // every candidate as already checked for this exact state. Non-empty
+    // means the operator has deliberately narrowed the list to specific
+    // topics -- curationRestricted gates that path so a curated-down-to-zero
+    // list (e.g. every allowed topic happens to be temporarily unpublished)
+    // doesn't silently fall through to "show everything unfiltered",
+    // defeating the curation the operator explicitly set up exactly when it
+    // looks like it worked.
     //
     // When active, the allowlist can ADD topics from OUTSIDE this robot's
     // own namespace, not just narrow the namespace-scoped list -- found live
@@ -358,29 +375,102 @@ class NepiDeviceRBX extends Component {
     // wherever the topic actually lives, not silently re-scoped back to
     // "this robot's own" after the fact.
     const enabledSourcesRaw = this.state.settingsValuesDict["enabled_image_sources"]
-    const curationActive = (enabledSourcesRaw !== undefined && String(enabledSourcesRaw).trim() !== '')
-    if (curationActive) {
+    const curationRestricted = (enabledSourcesRaw !== undefined && String(enabledSourcesRaw).trim() !== '')
+    if (curationRestricted) {
       const allowlist = String(enabledSourcesRaw).split(',').map((s) => s.trim()).filter((s) => s !== '')
       const namespaceScoped = img_topics.filter((topic) => allowlist.includes(topic))
       const allowlistedElsewhere = image_topics.filter((topic) =>
         allowlist.includes(topic) && topic !== ownImageTopic && !namespaceScoped.includes(topic))
       img_topics = namespaceScoped.concat(allowlistedElsewhere)
-    }
-
-    // Fall back to the unscoped list rather than offering nothing but "None":
-    // a robot driver that publishes no camera of its own would otherwise have
-    // no selectable source at all, which is strictly worse than a longer
-    // list. Robots that DO publish their own camera (the ArduPilot driver's
-    // color_2d_image, the sim rover's) never reach this. Skipped entirely
-    // while curationActive -- see above.
-    if (img_topics.length === 0 && curationActive === false) {
+    } else {
+      // Empty enabled_image_sources means unrestricted -- Nepi_IF_Sim-
+      // Controls.js's own renderImageSourceCuration shows EVERY candidate as
+      // already checked/enabled for exactly this state, so this dropdown
+      // needs to actually match that: every other discovered topic (not just
+      // a "no topics of our own" fallback) gets offered too. Previously this
+      // only ran when img_topics was completely empty, so a robot that
+      // already publishes its own camera (any Gazebo-based driver) could
+      // never also offer a physical camera the operator left at its
+      // enabled-by-default state -- found live (2026-08-19): nexigo_02/idx/
+      // color_image stayed missing from this dropdown even though the
+      // curation checklist showed it enabled, because sim_rover1 already had
+      // its own raw topics and the old fallback condition never triggered.
+      //
+      // Same color_2d_image/bare-"/image" exclusion as renderImageSourceCuration's
+      // own candidate filter, not just ownImageTopic/zed_node -- without it,
+      // OTHER devices' internal relay-source echoes (e.g. a second robot's
+      // own color_2d_image/robot_view, or app_sim_connector's own bare
+      // color_2d_image topic) got added here as extra, redundant options
+      // alongside the real mirrors below (found live 2026-08-19).
       for (var j = 0; j < image_topics.length; j++) {
         const other = image_topics[j]
-        if (other === ownImageTopic || other.includes('zed_node') === true) {
+        if (other === ownImageTopic || other.includes('zed_node') === true
+            || other.includes('color_2d_image') === true || other.endsWith('/image') === true) {
           continue
         }
-        img_topics.push(other)
+        if (!img_topics.includes(other)) {
+          img_topics.push(other)
+        }
       }
+    }
+
+    // app_sim_connector's robot_view/scene_view mirrors exist specifically so
+    // this panel doesn't need to know a simulated robot's own raw topic names
+    // (sim_rover1/..., a quadcopter's own namespace, etc.) -- see
+    // sim_connector_app_node.py's commonViewImageCb, which republishes
+    // whichever robot is currently active under these two fixed names. They
+    // live under this device's root, one level above nodeNamespace, not
+    // under nodeNamespace itself, so the scoping loop above never finds
+    // them, and they were previously reachable only via the Sim Connector's
+    // own separate enabled_image_sources curation step.
+    //
+    // When live (this IS a simulator-backed device), the mirrors REPLACE only
+    // the robot's own literal color_2d_image/robot_view + .../scene_view
+    // duplicates -- NOT the whole list. An earlier version of this replaced
+    // img_topics wholesale, which also silently dropped every curation-
+    // allowlisted topic from OUTSIDE the robot's own namespace (found live
+    // 2026-08-19: nexigo_02/idx/color_image, explicitly enabled via the Sim
+    // Connector's own curation checklist, disappeared from this dropdown the
+    // moment a simulator was active) -- exactly the case the allowlist logic
+    // above was written to support. Filtered against the live image_topics
+    // list so a physical (non-simulated) device never gets offered mirrors
+    // that don't actually exist, in which case nothing here changes.
+    const deviceRoot = nodeNamespace.split('/').slice(0, -1).join('/')
+    const simMirrorTopics = [
+      deviceRoot + "/app_sim_connector/robot_view",
+      deviceRoot + "/app_sim_connector/scene_view"
+    ].filter((topic) => image_topics.includes(topic))
+    if (simMirrorTopics.length > 0) {
+      const ownDuplicateTopics = [
+        nodeNamespace + "/color_2d_image/robot_view",
+        nodeNamespace + "/color_2d_image/scene_view"
+      ]
+      // Exclude simMirrorTopics themselves too, not just ownDuplicateTopics --
+      // the unrestricted branch above already adds every other discovered
+      // topic (including these same two mirrors) when nothing is curated, so
+      // without this they were being prepended a second time (found live
+      // 2026-08-19: robot_view/scene_view each appeared twice in the
+      // dropdown).
+      img_topics = simMirrorTopics.concat(
+        img_topics.filter((topic) => !ownDuplicateTopics.includes(topic) && !simMirrorTopics.includes(topic)))
+    }
+
+    // If the currently-active source (this.state.image_source, driven by the
+    // device's own status report -- see statusListener) just fell out of the
+    // computed list -- e.g. the operator unchecked it in the Sim Connector's
+    // curation checklist -- proactively tell the device to go back to "None"
+    // rather than leaving it silently relaying from a topic this dropdown no
+    // longer even offers. Found live (2026-08-19): unchecking nexigo_02 in
+    // the curation list made it disappear from this dropdown, but the
+    // device's OWN image_source param was untouched (curation is a pure RUI/
+    // Settings-list concept; the topic itself is still publishing), so it
+    // kept right on relaying nexigo's feed -- with the Select unable to
+    // match its own bound value against any remaining <Option>, LOOKING like
+    // "None" was selected while the backend silently disagreed.
+    const activeSource = this.state.image_source
+    if (activeSource && activeSource !== 'None' && !img_topics.includes(activeSource)) {
+      const { sendStringMsg } = this.props.ros
+      sendStringMsg(RBXDeviceNamespace + "/set_image_topic", "None")
     }
 
     const img_topics_short = createShortValuesFromNamespaces(img_topics)
@@ -525,6 +615,17 @@ class NepiDeviceRBX extends Component {
                   </Toggle>
                 </Label>
 
+                {/* Depth Map deliberately NOT here -- tried putting it on
+                    this generic panel (2026-08-19) reasoning it was device-
+                    agnostic, but it isn't: the colorized feed comes from
+                    camera_rig_controller.py reading Gazebo's own depth
+                    sensor plugin, entirely independent of whatever this
+                    Image_Source dropdown has selected. Toggling it while a
+                    real camera (e.g. nexigo_02) is the selected source has
+                    no effect on that camera at all -- confirmed live, this
+                    is Sim-only for real, not just Sim-first. Stays in
+                    Nepi_IF_Sim-Controls.js exclusively, same reasoning that
+                    already keeps camera_offset_x/y/z out of this panel. */}
                 <Label title="">
                 </Label>
 

@@ -381,6 +381,20 @@ launch_targets:
     # nepi_sitl_dev_env.sh's own sitl_gazebo_full() already passes it for its
     # nohup'd headless launch and calls it "required, not optional". Same
     # reasoning applies verbatim here; stdin is plain /dev/null now.
+    # The gz_reset_listener guard below is bracket-escaped ("[g]z_reset_..."),
+    # not "gz_reset_listener.py 9021" plain -- found live (2026-08-19) as the
+    # reason RESET_SIM had silently stopped working: this whole launch_command
+    # runs as ONE long-lived `bash -lc '...'` process (it stays alive doing
+    # `wait $SITL_PID ...` at the bottom), and its own command line contains
+    # this exact literal text. A plain `pgrep -f "gz_reset_listener.py 9021"`
+    # matches THAT PARENT PROCESS's own command line immediately, every time,
+    # before the nohup'd listener is ever started -- so the `||` branch never
+    # ran and no listener was ever actually launched, while every future check
+    # kept reporting (falsely) that one already was. RESET_SIM's setup action
+    # (rbx_ardupilot_node.py's resetSimAction) then simply had nothing on
+    # port 9021 to connect to and failed silently. Same self-match class as
+    # the ai_targeting_controller_ardupilot.py pkill guard just above, which
+    # was already bracket-escaped for the same reason.
     launch_command: >-
       bash -lc '
       source /opt/ros/noetic/setup.bash;
@@ -391,10 +405,10 @@ launch_targets:
       pkill -f "[a]i_targeting_controller_ardupilot.py" 2>/dev/null;
       echo $$ > /tmp/sim_connector_quadcopter_launch.pgid;
       rostopic list > /dev/null 2>&1 || {{ nohup roscore < /dev/null > /tmp/sim_connector_quadcopter_roscore_launch.log 2>&1 & until rostopic list > /dev/null 2>&1; do sleep 1; done; }};
-      pgrep -f "gz_reset_listener.py 9021" > /dev/null || {{ nohup python3 -u $HOME/.local/bin/gz_reset_listener.py 9021 < /dev/null > /tmp/sim_connector_quadcopter_gz_reset_listener_launch.log 2>&1 & disown; }};
+      pgrep -f "[g]z_reset_listener.py 9021" > /dev/null || {{ nohup python3 -u $HOME/.local/bin/gz_reset_listener.py 9021 < /dev/null > /tmp/sim_connector_quadcopter_gz_reset_listener_launch.log 2>&1 & disown; }};
       sim_vehicle.py -v ArduCopter -f gazebo-iris --out=tcpin:0.0.0.0:5771 --out=tcpin:0.0.0.0:5772 --mavproxy-args="--daemon" < /dev/null > /tmp/sim_connector_quadcopter_sitl_launch.log 2>&1 & SITL_PID=$!;
       rosrun gazebo_ros gazebo $HOME/ardupilot_gazebo/worlds/iris_arducopter_cmac.world < /dev/null > /tmp/sim_connector_quadcopter_gazebo_launch.log 2>&1 & GZ_PID=$!;
-      sleep 8;
+      gz_wait=0; until rostopic list 2>/dev/null | grep -q "^/gazebo/model_states$"; do sleep 1; gz_wait=$((gz_wait+1)); if [ $gz_wait -ge 30 ]; then break; fi; done;
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/camera_rig_controller_ardupilot.py < /dev/null > /tmp/sim_connector_quadcopter_camera_rig_launch.log 2>&1 & CAM_PID=$!;
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/gazebo/sim_connector_bridge_gazebo_quadcopter.py --host {device_bridge_host} --port {device_bridge_port} --mavlink tcp:127.0.0.1:5772 < /dev/null > /tmp/sim_connector_quadcopter_bridge_launch.log 2>&1 & BRIDGE_PID=$!;
       wait $SITL_PID $GZ_PID $CAM_PID $BRIDGE_PID
@@ -411,6 +425,9 @@ launch_targets:
     # still can't reach a gzserver this launch never started, and
     # ready_check_command below still catches the wrong-world case as a
     # clean "failed to become ready" rather than a false success.
+    # gz_reset_listener guard bracket-escaped here too -- see launch_command's
+    # own comment above for why (this attach path is the same kind of
+    # long-lived `bash -lc '...'` process, same self-match risk).
     attach_launch_command: >-
       bash -lc '
       source /opt/ros/noetic/setup.bash;
@@ -420,7 +437,7 @@ launch_targets:
       pkill -f "[a]i_targeting_controller_ardupilot.py" 2>/dev/null;
       echo $$ > /tmp/sim_connector_quadcopter_launch.pgid;
       rostopic list > /dev/null 2>&1 || {{ nohup roscore < /dev/null > /tmp/sim_connector_quadcopter_roscore_launch.log 2>&1 & until rostopic list > /dev/null 2>&1; do sleep 1; done; }};
-      pgrep -f "gz_reset_listener.py 9021" > /dev/null || {{ nohup python3 -u $HOME/.local/bin/gz_reset_listener.py 9021 < /dev/null > /tmp/sim_connector_quadcopter_gz_reset_listener_launch.log 2>&1 & disown; }};
+      pgrep -f "[g]z_reset_listener.py 9021" > /dev/null || {{ nohup python3 -u $HOME/.local/bin/gz_reset_listener.py 9021 < /dev/null > /tmp/sim_connector_quadcopter_gz_reset_listener_launch.log 2>&1 & disown; }};
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/camera_rig_controller_ardupilot.py < /dev/null > /tmp/sim_connector_quadcopter_camera_rig_launch.log 2>&1 & CAM_PID=$!;
       sim_vehicle.py -v ArduCopter -f gazebo-iris --out=tcpin:0.0.0.0:5771 --out=tcpin:0.0.0.0:5772 --mavproxy-args="--daemon" < /dev/null > /tmp/sim_connector_quadcopter_sitl_launch.log 2>&1 & SITL_PID=$!;
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/gazebo/sim_connector_bridge_gazebo_quadcopter.py --host {device_bridge_host} --port {device_bridge_port} --mavlink tcp:127.0.0.1:5772 < /dev/null > /tmp/sim_connector_quadcopter_bridge_launch.log 2>&1 & BRIDGE_PID=$!;
@@ -440,14 +457,44 @@ launch_targets:
     # self-match-avoidance idiom genuinely fixes it here: this pattern
     # exists exactly once in this script (the pkill argument itself), not a
     # second time elsewhere the way launch_command's own text repeats it.
-    stop_command: "bash -lc 'f=/tmp/sim_connector_quadcopter_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; rm -f /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo; pkill -f \"[s]im_vehicle.py -v ArduCopter\" 2>/dev/null; pkill -f [c]amera_rig_controller_ardupilot.py 2>/dev/null; pkill -f [s]im_connector_bridge_gazebo_quadcopter.py 2>/dev/null; pkill -f [g]z_reset_listener.py 2>/dev/null; true'"
+    # mavproxy.py needs its own pkill, with -9: confirmed live this was the
+    # actual orphan surviving every prior version of this stop_command --
+    # sim_vehicle.py's own ArduCopter binary child dies correctly with the
+    # pgid kill above, but MAVProxy started with --mavproxy-args="--daemon"
+    # (required earlier for a different reason -- see launch_command's own
+    # comment on stdin/EOF) double-forks/detaches into its own session
+    # (confirmed: PPID becomes 1, immune to the pgid kill), and a plain
+    # SIGTERM pkill did not kill it either in that same live test -- only
+    # SIGKILL did. Left alive, it keeps holding ports 5771/5772 forever,
+    # which is exactly what made the NEXT launch attempt fail in a way that
+    # looked like "launching doesn't launch the SITL" (the fresh
+    # sim_vehicle.py's own MAVProxy can't bind those ports).
+    stop_command: "bash -lc 'f=/tmp/sim_connector_quadcopter_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; rm -f /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo; pkill -f \"[s]im_vehicle.py -v ArduCopter\" 2>/dev/null; pkill -9 -f \"[m]avproxy.py\" 2>/dev/null; pkill -f \"[a]rducopter -S\" 2>/dev/null; pkill -f [c]amera_rig_controller_ardupilot.py 2>/dev/null; pkill -f [s]im_connector_bridge_gazebo_quadcopter.py 2>/dev/null; pkill -f [g]z_reset_listener.py 2>/dev/null; sleep 1; if timeout 1 bash -c \"cat < /dev/null > /dev/tcp/127.0.0.1/5771\" 2>/dev/null; then echo \"WARNING: port 5771 still bound after stop -- a MAVProxy/ArduCopter orphan may have survived\" >&2; fi; true'"
     # Same "prove THIS target's own world is up" bar as gazebo_rover's own
     # ready_check_command -- /camera_rig/camera/image_raw having a real
     # publisher proves camera_rig_controller_ardupilot.py connected to a
     # genuinely-loaded iris_arducopter_cmac.world (that script itself
     # requires finding the iris_demo model in /gazebo/model_states before it
     # publishes anything), not just that some gazebo process exists.
-    ready_check_command: "bash -lc \"source /opt/ros/noetic/setup.bash; pgrep -f 'gzserver.*iris_arducopter_cmac.world' > /dev/null && pgrep -f 'sim_vehicle.py -v ArduCopter' > /dev/null && pgrep -f sim_connector_bridge_gazebo_quadcopter.py > /dev/null && rostopic info /camera_rig/camera/image_raw 2>/dev/null | grep -A1 '^Publishers:' | grep -q ' \\* /'\""
+    #
+    # The final clause is new: every check above only proves PROCESSES
+    # exist, none of them prove ArduCopter SITL itself ever came up --
+    # sim_connector_bridge_gazebo_quadcopter.py's own MAVLink connect loop
+    # (wait_heartbeat) retries forever on failure, so pgrep on the bridge
+    # script stays true even if SITL crashed or never bound its port,
+    # reported live as "launching quadcopter doesn't launch the SITL" while
+    # this ready-check still reported success. sim_connector_bridge_gazebo_
+    # quadcopter.py logs "MAVLink heartbeat from ..." via plain rospy.loginfo
+    # (no nepi_sdk.init_node here) the FIRST time wait_heartbeat succeeds --
+    # that log line, like every plain-rospy node's, lands in
+    # ~/.ros/log/sim_connector_bridge_gazebo_quadcopter.log, not the
+    # /tmp/..._bridge_launch.log stdout redirect (confirmed the hard way
+    # earlier this session for a different node -- rospy's own logging
+    # doesn't reliably follow a shell stdout redirect). Its mere presence in
+    # that file is genuine, one-time proof MAVLink was actually alive at
+    # some point in this launch, which none of the process-existence checks
+    # above can offer.
+    ready_check_command: "bash -lc \"source /opt/ros/noetic/setup.bash; pgrep -f 'gzserver.*iris_arducopter_cmac.world' > /dev/null && pgrep -f 'sim_vehicle.py -v ArduCopter' > /dev/null && pgrep -f sim_connector_bridge_gazebo_quadcopter.py > /dev/null && rostopic info /camera_rig/camera/image_raw 2>/dev/null | grep -A1 '^Publishers:' | grep -q ' \\* /' && grep -q 'MAVLink heartbeat' ~/.ros/log/sim_connector_bridge_gazebo_quadcopter.log 2>/dev/null\""
     default_robot_config: flight_robot_4_motor
 
   # webots_rover and pybullet_rover below are checkable and

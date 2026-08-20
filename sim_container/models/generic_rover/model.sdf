@@ -380,7 +380,13 @@
           <diffuse>0.8 0.2 0.2 1</diffuse>
         </material>
       </visual>
-      <sensor type="camera" name="rover_camera_sensor">
+      <!-- type="depth" + libgazebo_ros_openni_kinect.so is Gazebo Classic's
+           standard RGBD sensor -- publishes the same image_raw as before
+           PLUS a 32FC1 raw depth image from this same link, so the
+           depth-map feature (rbx_sim_node.py's depth_map_enabled Setting,
+           colorized via nepi_img.npDepthMap_to_cv2ColorImg) needs no
+           second sensor. -->
+      <sensor type="depth" name="rover_camera_sensor">
         <!-- Reverted the earlier 960x720/20Hz bump -- the real bottleneck
              turned out to be downstream, not here: the NEPI device is a
              Raspberry Pi (NEPI_HW_TYPE=rpi), and web_video_server (which
@@ -406,12 +412,29 @@
             <far>100.0</far>
           </clip>
         </camera>
-        <plugin name="camera_controller" filename="libgazebo_ros_camera.so">
-          <robotNamespace>/</robotNamespace>
+        <plugin name="camera_controller" filename="libgazebo_ros_openni_kinect.so">
+          <baseline>0.2</baseline>
+          <alwaysOn>true</alwaysOn>
+          <updateRate>15.0</updateRate>
           <cameraName>rover/camera</cameraName>
           <imageTopicName>image_raw</imageTopicName>
           <cameraInfoTopicName>camera_info</cameraInfoTopicName>
+          <depthImageTopicName>depth/image_raw</depthImageTopicName>
+          <depthImageInfoTopicName>depth/camera_info</depthImageInfoTopicName>
+          <pointCloudTopicName>depth/points</pointCloudTopicName>
           <frameName>camera_link</frameName>
+          <pointCloudCutoff>0.05</pointCloudCutoff>
+          <pointCloudCutoffMax>100.0</pointCloudCutoffMax>
+          <distortionK1>0</distortionK1>
+          <distortionK2>0</distortionK2>
+          <distortionK3>0</distortionK3>
+          <distortionT1>0</distortionT1>
+          <distortionT2>0</distortionT2>
+          <CxPrime>0</CxPrime>
+          <Cx>0</Cx>
+          <Cy>0</Cy>
+          <focalLength>0</focalLength>
+          <hackBaseline>0</hackBaseline>
         </plugin>
       </sensor>
     </link>
@@ -463,7 +486,9 @@
           <diffuse>0.2 0.8 0.2 1</diffuse>
         </material>
       </visual>
-      <sensor type="camera" name="rover_camera_chase_sensor">
+      <!-- See camera_link's rover_camera_sensor above for why this is
+           type="depth" + libgazebo_ros_openni_kinect.so. -->
+      <sensor type="depth" name="rover_camera_chase_sensor">
         <update_rate>15.0</update_rate>
         <always_on>true</always_on>
         <visualize>false</visualize>
@@ -479,12 +504,29 @@
             <far>100.0</far>
           </clip>
         </camera>
-        <plugin name="camera_chase_controller" filename="libgazebo_ros_camera.so">
-          <robotNamespace>/</robotNamespace>
+        <plugin name="camera_chase_controller" filename="libgazebo_ros_openni_kinect.so">
+          <baseline>0.2</baseline>
+          <alwaysOn>true</alwaysOn>
+          <updateRate>15.0</updateRate>
           <cameraName>rover/camera_chase</cameraName>
           <imageTopicName>image_raw</imageTopicName>
           <cameraInfoTopicName>camera_info</cameraInfoTopicName>
+          <depthImageTopicName>depth/image_raw</depthImageTopicName>
+          <depthImageInfoTopicName>depth/camera_info</depthImageInfoTopicName>
+          <pointCloudTopicName>depth/points</pointCloudTopicName>
           <frameName>camera_link_chase</frameName>
+          <pointCloudCutoff>0.05</pointCloudCutoff>
+          <pointCloudCutoffMax>100.0</pointCloudCutoffMax>
+          <distortionK1>0</distortionK1>
+          <distortionK2>0</distortionK2>
+          <distortionK3>0</distortionK3>
+          <distortionT1>0</distortionT1>
+          <distortionT2>0</distortionT2>
+          <CxPrime>0</CxPrime>
+          <Cx>0</Cx>
+          <Cy>0</Cy>
+          <focalLength>0</focalLength>
+          <hackBaseline>0</hackBaseline>
         </plugin>
       </sensor>
     </link>

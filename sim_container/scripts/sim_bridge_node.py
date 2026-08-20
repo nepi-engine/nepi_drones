@@ -34,11 +34,12 @@
 # distinguished from the above by key presence rather than a mandatory "type"
 # tag (kept backward compatible with the already-verified velocity/telemetry
 # shapes above, which carry none):
-#   in  -- {"type":"camera_settings","offset_x":...,"scene_offset_x":...}
-#           from rbx_sim_node.py's settings mechanism -- camera_offset_x/y/z
-#           (robot view) and scene_offset_x/y/z (scene view), applied by
-#           editing generic_rover/model.sdf's camera_link/camera_link_chase
-#           <pose> and respawning the rover (see applyCameraSettings/
+#   in  -- {"type":"camera_settings","offset_x":...,"scene_offset_x":...,
+#           "depth_map_enabled":bool} from rbx_sim_node.py's settings
+#           mechanism -- camera_offset_x/y/z (robot view) and
+#           scene_offset_x/y/z (scene view), applied by editing
+#           generic_rover/model.sdf's camera_link/camera_link_chase <pose>
+#           and respawning the rover (see applyCameraSettings/
 #           respawnRoverWithCameraOffsets below). No view_mode field any
 #           more (2026-08-18): both camera views used to be relayed on ONE
 #           topic, switched by a view_mode RBX setting pushed here as a
@@ -46,6 +47,13 @@
 #           both are always-live, separately-named topics instead (see that
 #           file's own module docstring for the full reasoning), leaving
 #           nothing left for this node to forward but the offsets.
+#           depth_map_enabled is a plain relay, not a respawn: both camera
+#           links' SDF already carries a depth sensor unconditionally (see
+#           generic_rover/model.sdf), so flipping this only needs to reach
+#           camera_rig_controller.py, which is on this same VM-local ROS
+#           master -- relayed via a small latched Bool topic
+#           (DEPTH_MAP_ENABLED_TOPIC) rather than folded into the socket
+#           protocol further, since nothing on the device side needs it.
 #   out -- {"type":"image","camera":"robot_view"|"scene_view",
 #           "data":"<base64 jpeg>","stamp":...} relayed straight through
 #           from camera_rig_controller.py's own /camera_rig/robot_view/
@@ -99,7 +107,7 @@ import time
 
 import rospy
 
-from std_msgs.msg import Header
+from std_msgs.msg import Header, Bool
 from geometry_msgs.msg import Twist, Pose
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CompressedImage
@@ -130,6 +138,10 @@ TELEMETRY_RATE_HZ = 10.0
 # of one topic selected via a ROS param.
 ROBOT_VIEW_COMPRESSED_TOPIC = '/camera_rig/robot_view/image_compressed'
 SCENE_VIEW_COMPRESSED_TOPIC = '/camera_rig/scene_view/image_compressed'
+# Latched relay for the depth_map_enabled Setting -- see the module docstring
+# above. camera_rig_controller.py subscribes to this directly rather than
+# this node forwarding raw depth frames itself.
+DEPTH_MAP_ENABLED_TOPIC = '/camera_rig/depth_map_enabled'
 
 # RESET_SIM target: generic_rover.world's containing <model> name and its
 # (unmodified, default) spawn pose -- world origin, identity orientation.
@@ -237,6 +249,10 @@ class SimBridgeNode:
     self.scene_view_sub = rospy.Subscriber(SCENE_VIEW_COMPRESSED_TOPIC, CompressedImage,
                                            self.sceneViewImageCompressedCb)
     self.model_state_pub = rospy.Publisher(MODEL_STATE_TOPIC, ModelState, queue_size=1)
+    self.depth_map_enabled_pub = rospy.Publisher(DEPTH_MAP_ENABLED_TOPIC, Bool,
+                                                 queue_size=1, latch=True)
+    self.applied_depth_map_enabled = False
+    self.depth_map_enabled_pub.publish(Bool(data=False))
 
     # Obstacle-course model, read once here rather than per-toggle -- the
     # file never changes at runtime, no reason to re-read it on every
@@ -530,6 +546,16 @@ class SimBridgeNode:
     self.model_state_pub.publish(state)
 
   def applyCameraSettings(self, cmd):
+    # depth_map_enabled is independent of the offset fields below (no
+    # respawn needed -- see DEPTH_MAP_ENABLED_TOPIC's own comment), so it's
+    # handled first and separately; a message carrying only this field
+    # (or only offsets) is valid and common, not malformed.
+    if cmd.get('depth_map_enabled') is not None:
+      enabled = bool(cmd['depth_map_enabled'])
+      if enabled != self.applied_depth_map_enabled:
+        self.applied_depth_map_enabled = enabled
+        self.depth_map_enabled_pub.publish(Bool(data=enabled))
+
     # offset_x/y/z (robot view) and scene_offset_x/y/z (scene/chase view) are
     # optional in this wire message: absent on any deployment still running
     # an older rbx_sim_node.py. get() with None sentinels, then bail without
