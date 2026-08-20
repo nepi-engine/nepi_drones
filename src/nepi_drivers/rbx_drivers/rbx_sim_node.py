@@ -944,6 +944,16 @@ class SimNode:
       # params it last had, so an explicit push avoids relying on both sides
       # coincidentally matching factory defaults.
       self.sendCameraSettings()
+      # Same reasoning, same fix, for the environment/obstacle_course state
+      # -- found live (2026-08-20): a fresh driver launch defaults its own
+      # settings_dict['environment'] to FLAT_GROUND but never told the
+      # bridge, so a Gazebo/bridge session left over from an earlier test
+      # (obstacle_course already spawned, sim_bridge_node.py's own
+      # obstacle_course_spawned tracking still True) stayed in obstacle mode
+      # indefinitely -- "flat ground" only took effect once an operator
+      # happened to manually re-toggle the Environment dropdown, which is
+      # the only other code path that calls setObstacleCourseAction.
+      self.setObstacleCourseAction(self.settings_dict['environment']['value'] == "OBSTACLE_COURSE")
       buf = b''
       while not nepi_sdk.is_shutdown():
         try:
