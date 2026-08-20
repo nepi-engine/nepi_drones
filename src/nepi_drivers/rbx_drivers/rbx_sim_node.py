@@ -271,7 +271,15 @@ class SimNode:
   # differentially steer but cannot reverse or spin in place -- an honest
   # limitation of the wire format, not this conversion. MOTOR_WHEEL_BASE_M is
   # an approximation of generic_rover's actual wheel track width.
-  MOTOR_MAX_LINEAR_MPS = 0.5
+  #
+  # No MOTOR_MAX_LINEAR_MPS constant here on purpose (removed 2026-08-20) --
+  # motorControlToVelocity reads settings_dict['max_linear_speed_mps'] live,
+  # same as gotoControlCb/teleop already do, so 100% motor always means
+  # "whatever max_linear_speed_mps currently is," and changing that Setting
+  # rescales manual motor control instantly too. A hardcoded 0.5 here used to
+  # silently match only the Setting's OWN factory default -- changing
+  # max_linear_speed_mps rescaled goto/teleop but left manual motor control's
+  # 100% pinned at the old value, found live 2026-08-20.
   MOTOR_WHEEL_BASE_M = 0.4
 
   # Closed-loop goto controller shape: proportional gains, plus a
@@ -904,8 +912,9 @@ class SimNode:
     # per side (see self.motor_ratios' own comment).
     left = (self.motor_ratios[0] + self.motor_ratios[2]) / 2.0
     right = (self.motor_ratios[1] + self.motor_ratios[3]) / 2.0
-    lin = (left + right) / 2.0 * self.MOTOR_MAX_LINEAR_MPS
-    ang = (right - left) / self.MOTOR_WHEEL_BASE_M * self.MOTOR_MAX_LINEAR_MPS
+    max_lin = float(self.settings_dict['max_linear_speed_mps']['value'])
+    lin = (left + right) / 2.0 * max_lin
+    ang = (right - left) / self.MOTOR_WHEEL_BASE_M * max_lin
     return lin, ang
 
   def normalizeAngle(self,angle_rad):
