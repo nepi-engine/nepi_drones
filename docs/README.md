@@ -18,6 +18,9 @@ new to this repo; everything else here goes deeper on one piece of what it descr
   per-simulator status table lives here.
 - **`SIMULATOR_AUTO_LAUNCH_PLAN.md`** — the SSH-based remote auto-launch feature (deploy/
   start/stop a simulator on a dev VM from the app itself) — design and build log.
+- **`SCAN_TO_SIM_ENVIRONMENT_PLAN.md`** — design plan (not yet built) for converting a
+  phone LiDAR/IMU scan (Stray Scanner) of a real obstacle course into a spawnable Gazebo
+  environment, so a course can be tested in sim without hand-authoring an SDF world.
 - **`RBX_CAPABILITIES.md`** — the canonical RBX (robot) interface reference: namespaces,
   capabilities/status contract, command topics, the goto handshake, building a new RBX
   driver. Includes the motor-control-ratios deep dive as its own section.

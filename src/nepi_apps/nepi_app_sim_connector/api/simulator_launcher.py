@@ -28,6 +28,7 @@
 # convention every deploy_*.sh script in this repo already uses.
 
 import os
+import re
 import subprocess
 import time
 
@@ -323,6 +324,83 @@ class SimulatorLauncher(object):
     result = self._run_remote(target, generate_cmd, timeout_sec=SSH_CONNECT_TIMEOUT_SEC + 10)
     if result.returncode != 0:
       raise LauncherError("generate_model_sdf.py failed for " + model_name + ": " +
+                          (result.stderr or result.stdout or "unknown error"))
+
+  _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+  def _require_safe_name(self, name, what):
+    # Unlike push_dimensions' model_name (always one of this app's own fixed
+    # model names, never user-supplied), scan_name/environment_name below
+    # originate from a phone-scan upload -- real user-controlled text -- and
+    # get interpolated directly into a remote shell command string. Reject
+    # anything outside a safe charset rather than trying to shell-escape it.
+    if not name or not self._SAFE_NAME_RE.match(name):
+      raise LauncherError(
+          "Unsafe " + what + " (must be non-empty, letters/digits/-/_ only): " + repr(name))
+
+  def push_scan_directory(self, target, local_scan_dir, remote_scan_name, timeout_sec=300):
+    """Copies a raw phone-scan folder (rgb.mp4, depth/, confidence/, *.csv --
+    binary and ~1400 files, not the single small text file push_dimensions
+    handles) onto the VM under sim_container/scan_data/raw/<remote_scan_name>/.
+    Uses scp rather than _push_file_content's cat pipe -- a text=True
+    subprocess pipe would corrupt binary frame data, and per-file ssh
+    round-trips over ~1400 depth/confidence PNGs would be far too slow.
+    Raises LauncherError on failure."""
+    self._require_safe_name(remote_scan_name, "remote_scan_name")
+    if not os.path.isdir(local_scan_dir):
+      raise LauncherError("Local scan directory not found: " + local_scan_dir)
+    remote_parent = "$HOME/nepi_engine_ws/nepi_drones/sim_container/scan_data/raw"
+    remote_dir = remote_parent + "/" + remote_scan_name
+    # Only the PARENT is pre-created. scp -r flattens a source directory's
+    # contents into the destination only when the destination does NOT
+    # already exist -- pre-creating remote_dir itself would make scp nest an
+    # extra local_scan_dir-basename-named directory inside it instead
+    # (confirmed empirically), so remote_dir is left for scp to create fresh.
+    mkdir_result = self._run_remote(target, "mkdir -p " + remote_parent,
+                                    timeout_sec=SSH_CONNECT_TIMEOUT_SEC)
+    if mkdir_result.returncode != 0:
+      raise LauncherError("Failed to create remote scan directory: " +
+                          (mkdir_result.stderr or "unknown error"))
+    ssh_key = self._ssh_key()
+    host = target["host"]
+    user = target["ssh_user"]
+    port = int(target.get("ssh_port", 22))
+    scp_cmd = [
+        "scp", "-r",
+        "-i", ssh_key,
+        "-P", str(port),
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "ConnectTimeout=" + str(SSH_CONNECT_TIMEOUT_SEC),
+        local_scan_dir,
+        user + "@" + host + ":" + remote_dir,
+    ]
+    try:
+      result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=timeout_sec)
+    except subprocess.TimeoutExpired as e:
+      raise LauncherError("scp of scan directory timed out after " +
+                          str(timeout_sec) + "s: " + str(e))
+    if result.returncode != 0:
+      raise LauncherError("scp of scan directory failed: " + (result.stderr or "unknown error"))
+
+  def convert_scan_to_environment(self, target, remote_scan_name, environment_name,
+                                  timeout_sec=1800):
+    """Remotely invokes scan_to_environment.py on the VM against a scan
+    already pushed there by push_scan_directory -- the same remote-invocation
+    pattern push_dimensions already uses for generate_model_sdf.py, just a
+    much heavier script (TSDF fusion + convex decomposition over ~1400 frames
+    takes minutes, hence the generous default timeout -- see
+    docs/SCAN_TO_SIM_ENVIRONMENT_PLAN.md). Output lands directly in the VM's
+    own sim_container/models/<environment_name>/ -- no push-back needed,
+    Gazebo only needs it VM-local. Raises LauncherError on failure."""
+    self._require_safe_name(remote_scan_name, "remote_scan_name")
+    self._require_safe_name(environment_name, "environment_name")
+    remote_scan_dir = ("$HOME/nepi_engine_ws/nepi_drones/sim_container/scan_data/raw/" +
+                       remote_scan_name)
+    convert_cmd = ("python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/"
+                  "scan_to_environment.py " + remote_scan_dir + " " + environment_name)
+    result = self._run_remote(target, convert_cmd, timeout_sec=timeout_sec)
+    if result.returncode != 0:
+      raise LauncherError("scan_to_environment.py failed for " + environment_name + ": " +
                           (result.stderr or result.stdout or "unknown error"))
 
   def _is_connection_level_failure(self, result):

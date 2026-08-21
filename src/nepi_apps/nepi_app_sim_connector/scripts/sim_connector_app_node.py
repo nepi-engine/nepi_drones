@@ -193,6 +193,14 @@ DIMENSIONS_STORAGE_DIR = '/mnt/nepi_storage/databases/nepi_app_sim_connector/dim
 # fallback several other code paths already use.
 DEFAULT_DIMENSIONS_PUSH_TARGET = 'gazebo_rover'
 
+# Phone-scan (Stray Scanner) uploads land here, device-side -- same
+# persistent-storage category as DIMENSIONS_STORAGE_DIR above, so an upload
+# survives a container restart. Populating this directory (the actual
+# browser -> device upload) is not implemented yet -- see
+# docs/SCAN_TO_SIM_ENVIRONMENT_PLAN.md phase 1; convertPhoneScanCb below only
+# handles the already-uploaded-here -> VM-converted half of the pipeline.
+SCAN_UPLOADS_STORAGE_DIR = '/mnt/nepi_storage/databases/nepi_app_sim_connector/phone_scans'
+
 FACTORY_ROBOT_CONFIG = dict(
     description = 'No capabilities. Safe default until a robot config is selected.',
     # Internal fallback only -- never a real choice an operator should be
@@ -607,6 +615,23 @@ class NepiSimConnectorApp:
     nepi_sdk.create_subscriber(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/get_environment_dimensions'),
         Empty, self.getEnvironmentDimensionsCb, queue_size = 1)
+
+    ##############################
+    # Phone-scan -> Gazebo environment conversion (see
+    # docs/SCAN_TO_SIM_ENVIRONMENT_PLAN.md). Separate from the dimensions/
+    # SDF-override system above -- a scanned mesh environment isn't a
+    # dimensions.yaml field set, and running scan_to_environment.py takes
+    # minutes (TSDF fusion + convex decomposition over ~1400 frames), so it
+    # runs in its own background thread rather than blocking like
+    # pushDirtyDimensions does for the small text pushes.
+    self.scan_conversion_status_pub = nepi_sdk.create_publisher(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/phone_scan_conversion_status'),
+        String, queue_size = 1, latch = True)
+    self.scan_conversion_status_pub.publish(String(data = 'idle'))
+    self.scan_conversion_thread = None
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/convert_phone_scan'),
+        String, self.convertPhoneScanCb, queue_size = 1)
     # Best-effort: the VM may not be reachable yet at startup (tunnel not up,
     # device just booted) -- pushDirtyDimensions logs and moves on rather
     # than blocking init, and the next real Launch will retry via the same
@@ -1030,6 +1055,63 @@ class NepiSimConnectorApp:
     self.writeStoredSdfOverride(role, sdf_text)
     self.markDimensionsDirty(role)
     self.msg_if.pub_info("Uploaded raw model.sdf override for " + role)
+
+  def convertPhoneScanCb(self, msg):
+    # msg.data is a scan name -- the raw scan folder must already exist at
+    # SCAN_UPLOADS_STORAGE_DIR/<name>/ (see that constant's own comment: the
+    # browser -> device upload step that would populate it isn't built yet).
+    # One conversion at a time -- a second request while one is already
+    # running is rejected rather than queued, same "reject clearly" instinct
+    # as uploadModelSdfCb's empty-upload check.
+    scan_name = str(msg.data).strip()
+    if self.scan_conversion_thread is not None and self.scan_conversion_thread.is_alive():
+      self.msg_if.pub_warn("Ignoring convert_phone_scan for '" + scan_name +
+                           "' -- a conversion is already running")
+      return
+    self.scan_conversion_thread = threading.Thread(
+        target = self.runPhoneScanConversion, args = (scan_name,))
+    self.scan_conversion_thread.start()
+
+  def runPhoneScanConversion(self, scan_name):
+    # Runs in its own thread (see convertPhoneScanCb) -- push_scan_directory
+    # (scp of ~100MB+ of video/PNG frames) and convert_scan_to_environment
+    # (TSDF fusion + convex decomposition, minutes) are both far too slow for
+    # a subscriber callback. Uses DEFAULT_DIMENSIONS_PUSH_TARGET, the same
+    # fixed VM target the dimensions system already pushes to -- there is
+    # only the one dev VM in this setup today.
+    self.scan_conversion_status_pub.publish(String(data = 'running: ' + scan_name))
+    local_scan_dir = os.path.join(SCAN_UPLOADS_STORAGE_DIR, scan_name)
+    if not os.path.isdir(local_scan_dir):
+      msg = ("failed: scan '" + scan_name + "' not found at " + local_scan_dir +
+             " (upload it first)")
+      self.msg_if.pub_warn(msg)
+      self.scan_conversion_status_pub.publish(String(data = msg))
+      return
+    if self.launcher is None:
+      msg = "failed: simulator launcher not configured"
+      self.msg_if.pub_warn(msg)
+      self.scan_conversion_status_pub.publish(String(data = msg))
+      return
+    try:
+      target = self.launcher.get_target(DEFAULT_DIMENSIONS_PUSH_TARGET)
+      self.launcher.push_scan_directory(target, local_scan_dir, scan_name)
+      self.launcher.convert_scan_to_environment(target, scan_name, scan_name)
+    except LauncherError as e:
+      msg = "failed: " + str(e)
+      self.msg_if.pub_warn("Phone scan conversion failed for '" + scan_name + "': " + str(e))
+      self.scan_conversion_status_pub.publish(String(data = msg))
+      return
+    # The new model now exists at sim_container/models/<scan_name>/ on the
+    # VM, alongside obstacle_course -- but rbx_sim_node.py's `environment`
+    # Setting option list is read once at driver construction (see
+    # docs/SCAN_TO_SIM_ENVIRONMENT_PLAN.md section 2.1), so it won't appear
+    # as a selectable option until the rover driver (re)starts or the sim is
+    # relaunched. Said plainly here rather than implying this is immediately
+    # selectable.
+    msg = ("done: '" + scan_name + "' ready on the VM -- restart the rover driver or "
+           "relaunch the sim to select it as an environment")
+    self.msg_if.pub_info(msg)
+    self.scan_conversion_status_pub.publish(String(data = msg))
 
   def getRobotDimensionsCb(self, msg):
     self.getDimensionsCb('robot')

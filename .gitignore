@@ -30,3 +30,12 @@ __pycache__/
 # .gitignore containing "*", so it is already effectively ignored; listed
 # here too so that stays true if that inner file ever goes away.
 .codegraph/
+
+# Raw phone-scan uploads (Stray Scanner exports) feeding scan_to_environment.py --
+# binary, ~100MB+ per scan, grows unbounded as new scans are uploaded. Generated
+# models (sim_container/models/<scan_name>/) are the actual build artifact and
+# stay committable; the raw scan and intermediate meshes behind them do not need
+# to be.
+sim_container/scan_data/raw/
+sim_container/scan_data/processed/*
+!sim_container/scan_data/processed/.gitkeep

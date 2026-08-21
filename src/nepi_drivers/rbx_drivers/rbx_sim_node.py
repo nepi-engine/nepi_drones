@@ -246,6 +246,26 @@ class SimNode:
   RECONNECT_INTERVAL_SEC = 3.0
   SOCKET_TIMEOUT_SEC = 5.0
 
+  # Bounded window, at startup only, for the VM to report its available
+  # environment models (see processEnvironmentOptionsLine) before this
+  # driver's capabilities are baked into RBXRobotIF -- RBX capabilities have
+  # no live-refresh path once constructed (see
+  # docs/SCAN_TO_SIM_ENVIRONMENT_PLAN.md section 2.1), so this is the only
+  # window this process gets. Same scale as SOCKET_TIMEOUT_SEC; never blocks
+  # startup indefinitely -- if the VM doesn't answer in time, CAP_SETTINGS'
+  # environment.options (below) and ENVIRONMENT_VALUE_TO_MODEL (just below
+  # that) simply keep the two literal values they already had, unchanged
+  # from this driver's pre-scanned-environments behavior.
+  ENVIRONMENT_OPTIONS_WAIT_SEC = 5.0
+
+  # Discrete-option-value -> spawnable model name, updated in place by
+  # processEnvironmentOptionsLine when the VM reports scanned models
+  # (environment_models.py, VM-side). Starts as this literal two-entry
+  # mapping (FLAT_GROUND -> nothing spawned, OBSTACLE_COURSE -> the one
+  # model this driver has always known about) so setEnvironmentAction always
+  # has something to look up even if the VM never answers.
+  ENVIRONMENT_VALUE_TO_MODEL = {"FLAT_GROUND": None, "OBSTACLE_COURSE": "obstacle_course"}
+
   # Raised from 10 -- at the higher end of the now-settable max_linear_speed_mps
   # range (up to 5.0 m/s), a 10Hz control tick lets the rover travel up to 0.5m
   # between heading corrections, which is coarse enough to overshoot and
@@ -484,9 +504,16 @@ class SimNode:
 
     ##############################
     # Bridge client thread: connects, reads telemetry, reconnects on failure
+    self.environment_options_received_event = threading.Event()
     self.bridge_thread = threading.Thread(target = self.bridgeLoop)
     self.bridge_thread.daemon = True
     self.bridge_thread.start()
+    # Bounded wait (see ENVIRONMENT_OPTIONS_WAIT_SEC's own comment) so that,
+    # when the VM answers quickly, CAP_SETTINGS['environment']['options'] and
+    # ENVIRONMENT_VALUE_TO_MODEL already reflect its scanned models by the
+    # time RBXRobotIF bakes capabilities in below -- and when it doesn't,
+    # startup proceeds anyway with the two-entry fallback unchanged.
+    self.environment_options_received_event.wait(timeout = self.ENVIRONMENT_OPTIONS_WAIT_SEC)
 
     ##############################
     # Launch the NEPI RBX interface -- this takes care of initializing all
@@ -613,7 +640,7 @@ class SimNode:
         if setting_name in self.CAMERA_SETTING_NAMES:
           self.sendCameraSettings()
         if setting_name in self.ENVIRONMENT_SETTING_NAMES:
-          self.setObstacleCourseAction(setting['value'] == "OBSTACLE_COURSE")
+          self.setEnvironmentAction(setting['value'])
     else:
       msg = (self.node_name  + " Setting data" + setting_str + " is not valid")
     return success, msg
@@ -818,17 +845,25 @@ class SimNode:
     self.sendLineToBridge({'type': 'reset'}, "Reset sim")
     return True
 
-  def setObstacleCourseAction(self, enabled):
+  def setEnvironmentAction(self, environment_value):
     # Fire-and-forget over the bridge, same pattern as resetSimAction: the VM
     # side (sim_bridge_node.py) owns the actual Gazebo spawn/delete service
-    # calls and its own already-spawned/not-spawned bookkeeping, so this side
-    # just needs a live connection to send the request on.
+    # calls and its own currently-spawned bookkeeping (environment_models.py's
+    # EnvironmentModelSpawner), so this side just needs a live connection to
+    # send the request on. environment_value is a Discrete option string
+    # (FLAT_GROUND, OBSTACLE_COURSE, or an uppercased scanned model name);
+    # ENVIRONMENT_VALUE_TO_MODEL maps it to the real model directory name to
+    # spawn, or None for "nothing spawned" (FLAT_GROUND). Formerly
+    # setObstacleCourseAction(enabled: bool), generalized from a single
+    # hardcoded model to any of the models environment_options reports (see
+    # docs/SCAN_TO_SIM_ENVIRONMENT_PLAN.md section 5.6).
     with self.sock_lock:
       connected = self.sock is not None
     if not connected:
       return False
-    self.sendLineToBridge({'type': 'obstacle_course', 'enabled': enabled},
-                          "Obstacle course " + ("on" if enabled else "off"))
+    model_name = self.ENVIRONMENT_VALUE_TO_MODEL.get(environment_value)
+    self.sendLineToBridge({'type': 'environment', 'model_name': model_name},
+                          "Environment set to " + environment_value)
     return True
 
   #######################
@@ -953,16 +988,22 @@ class SimNode:
       # params it last had, so an explicit push avoids relying on both sides
       # coincidentally matching factory defaults.
       self.sendCameraSettings()
-      # Same reasoning, same fix, for the environment/obstacle_course state
-      # -- found live (2026-08-20): a fresh driver launch defaults its own
+      # Same reasoning, same fix, for the environment state -- found live
+      # (2026-08-20): a fresh driver launch defaults its own
       # settings_dict['environment'] to FLAT_GROUND but never told the
       # bridge, so a Gazebo/bridge session left over from an earlier test
-      # (obstacle_course already spawned, sim_bridge_node.py's own
-      # obstacle_course_spawned tracking still True) stayed in obstacle mode
-      # indefinitely -- "flat ground" only took effect once an operator
-      # happened to manually re-toggle the Environment dropdown, which is
-      # the only other code path that calls setObstacleCourseAction.
-      self.setObstacleCourseAction(self.settings_dict['environment']['value'] == "OBSTACLE_COURSE")
+      # (some model already spawned, sim_bridge_node.py's own spawner state
+      # still tracking it) stayed in that mode indefinitely -- "flat ground"
+      # only took effect once an operator happened to manually re-toggle the
+      # Environment dropdown, which is the only other code path that calls
+      # setEnvironmentAction. On the very first connect (this thread hasn't
+      # reached the receive loop yet, so ENVIRONMENT_VALUE_TO_MODEL is still
+      # whatever __init__ left it as) this is always FLAT_GROUND -> None,
+      # which is correct regardless -- settings_dict only ever holds a
+      # scanned-model value once a user has explicitly selected one, and
+      # that can't happen until after __init__'s bounded wait has already
+      # completed.
+      self.setEnvironmentAction(self.settings_dict['environment']['value'])
       buf = b''
       while not nepi_sdk.is_shutdown():
         try:
@@ -994,7 +1035,8 @@ class SimNode:
     # Single entry point for every line off the bridge socket: parse once,
     # then dispatch by key presence (no mandatory "type" tag on the
     # already-verified telemetry shape, which predates this dispatch and
-    # carries none) -- image frames carry "type":"image"; everything else is
+    # carries none) -- image frames carry "type":"image", environment-model
+    # announcements carry "type":"environment_options"; everything else is
     # telemetry, the only other shape the bridge server ever sends.
     try:
       msg = json.loads(line)
@@ -1003,8 +1045,28 @@ class SimNode:
       return
     if msg.get('type') == 'image':
       self.processImageLine(msg)
+    elif msg.get('type') == 'environment_options':
+      self.processEnvironmentOptionsLine(msg)
     else:
       self.processTelemetryLine(msg)
+
+  def processEnvironmentOptionsLine(self, msg):
+    # Sent by sim_bridge_node.py on every (re)connect, listing whatever
+    # environment_models.py finds on the VM (obstacle_course plus any
+    # scan_to_environment.py output) -- see
+    # docs/SCAN_TO_SIM_ENVIRONMENT_PLAN.md section 5.6. Rebuilds both
+    # CAP_SETTINGS['environment']['options'] (what the Discrete setting
+    # reports as selectable) and ENVIRONMENT_VALUE_TO_MODEL (what a selected
+    # option string actually spawns) from the same list, wholesale --
+    # FLAT_GROUND always means "nothing spawned" and is not itself a model
+    # directory. self.environment_options_received_event.set() unblocks the
+    # bounded startup wait in __init__ as soon as the first announcement
+    # arrives, rather than waiting out the full timeout.
+    model_names = [str(n) for n in msg.get('options', [])]
+    self.CAP_SETTINGS['environment']['options'] = ["FLAT_GROUND"] + [n.upper() for n in model_names]
+    self.ENVIRONMENT_VALUE_TO_MODEL = {"FLAT_GROUND": None}
+    self.ENVIRONMENT_VALUE_TO_MODEL.update({n.upper(): n for n in model_names})
+    self.environment_options_received_event.set()
 
   # Which publisher each bridge "camera" tag routes to. Built once as a class
   # dict of attribute names (not direct publisher references) since the

@@ -108,6 +108,12 @@ from sensor_msgs.msg import CompressedImage
 from gazebo_msgs.msg import ModelState
 from gazebo_msgs.srv import SpawnModel, DeleteModel, GetWorldProperties
 
+# Sibling module in this same scripts/ directory -- see its own docstring
+# (the obstacle_course spawn/delete pattern used to be hand-copied here and
+# in sim_connector_bridge_gazebo.py; this is the shared, generalized version,
+# see docs/SCAN_TO_SIM_ENVIRONMENT_PLAN.md section 7).
+import environment_models
+
 PKG_NAME = 'SIM_BRIDGE'  # Use in display menus
 FILE_TYPE = 'NODE'
 
@@ -147,16 +153,6 @@ ROVER_MODEL_NAME = 'generic_rover_demo'
 # itself is not safe.
 ROVER_MODEL_NAME_CUSTOM = 'generic_rover_demo_custom'
 
-# OBSTACLE_COURSE_ON/OFF target: models/obstacle_course/model.sdf, read once
-# at startup and spawned/deleted whole by model name via the stock Gazebo
-# services. Path resolved relative to this script, not GAZEBO_MODEL_PATH --
-# this node reads the raw SDF text itself rather than asking Gazebo to
-# resolve a model:// URI, so it works whether or not the model happens to be
-# on that path.
-OBSTACLE_COURSE_MODEL_NAME = 'obstacle_course'
-OBSTACLE_COURSE_SDF_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), '..', 'models',
-    'obstacle_course', 'model.sdf')
 SPAWN_MODEL_SERVICE = '/gazebo/spawn_sdf_model'
 DELETE_MODEL_SERVICE = '/gazebo/delete_model'
 GET_WORLD_PROPERTIES_SERVICE = '/gazebo/get_world_properties'
@@ -253,20 +249,12 @@ class SimBridgeNode:
                                                 self.sceneDepthMapImageCompressedCb)
     self.model_state_pub = rospy.Publisher(MODEL_STATE_TOPIC, ModelState, queue_size=1)
 
-    # Obstacle-course model, read once here rather than per-toggle -- the
-    # file never changes at runtime, no reason to re-read it on every
-    # OBSTACLE_COURSE_ON. self.obstacle_course_spawned tracks which state
-    # Gazebo is actually in so repeated ON/ON or OFF/OFF toggles (e.g. a
-    # stale RUI button double-click) don't send a doomed second spawn (name
-    # collision) or a doomed second delete (already gone) to the service.
-    try:
-      with open(OBSTACLE_COURSE_SDF_PATH, 'r') as f:
-        self.obstacle_course_sdf = f.read()
-    except Exception as e:
-      rospy.logwarn(PKG_NAME + ": Failed to read obstacle course SDF at " +
-                    OBSTACLE_COURSE_SDF_PATH + ": " + str(e))
-      self.obstacle_course_sdf = None
-    self.obstacle_course_spawned = False
+    # Environment model spawn/delete-by-name, generalized from the old
+    # single-hardcoded-obstacle_course toggle -- see environment_models.py.
+    # Tracks which model (if any) Gazebo actually has spawned so repeated
+    # same-value settings (e.g. a stale RUI double-click) don't send a
+    # doomed second spawn (name collision) or delete (already gone).
+    self.env_spawner = environment_models.EnvironmentModelSpawner(log_prefix = PKG_NAME)
 
     # Rover model SDF, read once here for the same reason as the obstacle
     # course file above (the file's structure never changes at runtime -- only
@@ -665,38 +653,6 @@ class SimBridgeNode:
     rospy.loginfo(PKG_NAME + ": Applied camera offsets, robot=(%.2f,%.2f,%.2f) scene=(%.2f,%.2f,%.2f), model now '%s'"
                   % (offsets + (new_name,)))
 
-  def setObstacleCourse(self, enabled):
-    if self.obstacle_course_sdf is None:
-      rospy.logwarn(PKG_NAME + ": Obstacle course SDF not loaded, ignoring toggle")
-      return
-    if enabled == self.obstacle_course_spawned:
-      return  # Already in the requested state -- avoid a doomed duplicate spawn/delete
-    if enabled:
-      try:
-        rospy.wait_for_service(SPAWN_MODEL_SERVICE, timeout=GAZEBO_SERVICE_WAIT_SEC)
-        spawn = rospy.ServiceProxy(SPAWN_MODEL_SERVICE, SpawnModel)
-        resp = spawn(OBSTACLE_COURSE_MODEL_NAME, self.obstacle_course_sdf,
-                    '', Pose(), 'world')
-        if resp.success:
-          self.obstacle_course_spawned = True
-          rospy.loginfo(PKG_NAME + ": Obstacle course spawned")
-        else:
-          rospy.logwarn(PKG_NAME + ": Obstacle course spawn failed: " + resp.status_message)
-      except Exception as e:
-        rospy.logwarn(PKG_NAME + ": Obstacle course spawn service call failed: " + str(e))
-    else:
-      try:
-        rospy.wait_for_service(DELETE_MODEL_SERVICE, timeout=GAZEBO_SERVICE_WAIT_SEC)
-        delete = rospy.ServiceProxy(DELETE_MODEL_SERVICE, DeleteModel)
-        resp = delete(OBSTACLE_COURSE_MODEL_NAME)
-        if resp.success:
-          self.obstacle_course_spawned = False
-          rospy.loginfo(PKG_NAME + ": Obstacle course removed")
-        else:
-          rospy.logwarn(PKG_NAME + ": Obstacle course delete failed: " + resp.status_message)
-      except Exception as e:
-        rospy.logwarn(PKG_NAME + ": Obstacle course delete service call failed: " + str(e))
-
   def bridgeServerLoop(self):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -718,6 +674,14 @@ class SimBridgeNode:
       rospy.loginfo(PKG_NAME + ": Bridge client connected")
       with self.client_lock:
         self.client_conn = conn
+      # Tell the device which environment models exist on this VM right
+      # away, same "push state on connect" instinct as rbx_sim_node.py's own
+      # camera-settings resync -- see docs/SCAN_TO_SIM_ENVIRONMENT_PLAN.md
+      # section 5.6 (this is the only window rbx_sim_node.py's capabilities
+      # get to learn about scanned models, since RBX capabilities don't
+      # live-refresh after construction).
+      self.sendLineToClient({'type': 'environment_options',
+                            'options': environment_models.list_environment_models()})
       self.serveClient(conn)
       with self.client_lock:
         if self.client_conn is conn:
@@ -762,8 +726,8 @@ class SimBridgeNode:
         if cmd.get('type') == 'reset':
           self.resetRover()
           continue
-        if cmd.get('type') == 'obstacle_course':
-          self.setObstacleCourse(bool(cmd.get('enabled', False)))
+        if cmd.get('type') == 'environment':
+          self.env_spawner.set_active_model(cmd.get('model_name'))
           continue
         twist = Twist()
         twist.linear.x = float(cmd.get('linear_x', 0.0))
