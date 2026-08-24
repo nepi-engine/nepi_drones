@@ -281,6 +281,53 @@ constructed (section 2.1), so "the announcement arrived" and "the RUI can
 select it this session" are only the same moment on a fresh connect, not on
 every later announcement after that.
 
+### Full-stack live verification, no physical device required
+
+Beyond the VM-side wire-protocol test above, `rbx_sim_node.py` itself (the
+actual device-side driver code, not just its wire format) was run standalone
+against a bare `roscore` + `gzserver` + `sim_bridge_node.py`, using
+`~/sim_connector_test_ws` (a pre-existing disposable scratch catkin
+workspace, per `test_device_if_sim_harness.py`'s own docstring) for
+`nepi_interfaces`' compiled message bindings, with the device-wide
+`debug_mode`/`user_folders` params pre-seeded per
+`docs/completed/SIM_CONNECTOR_NAVPOSE_HANG_BUG.md`'s documented fix (else a
+bare-roscore `wait_for_param(timeout=1000)` genuinely blocks ~16.7 minutes).
+Two real environment-setup issues were found and fixed along the way, both
+in the disposable test workspace, not in any shared/committed code:
+`sim_connector_test_ws`'s own `nepi_api/device_if_rbx.py` and `nepi_interfaces`
+message bindings were stale relative to the current sandbox (missing
+`teleopControlsReadyFunction`/`teleop_control_mode_ready`, unrelated to this
+feature) -- fixed by copying the current file in and rebuilding that one
+package (`catkin_make --pkg nepi_interfaces`).
+
+With that environment up, confirmed via real ROS calls (not just log
+inspection):
+
+- `rbx/settings/capabilities_query` reported the `environment` Discrete
+  setting's `options_list` as `[FLAT_GROUND, OBSTACLE_COURSE, OFFICE_SCAN_RBX_TEST]`
+  -- the scanned model, converted moments earlier, showing up correctly
+  because the driver was started *after* conversion (the documented
+  restart-to-see-it caveat above, working as intended).
+- Publishing a real `nepi_interfaces/Setting` update
+  (`{type: Discrete, name: environment, value: OFFICE_SCAN_RBX_TEST}`) to
+  `rbx/settings/update_setting` -- the exact mechanism a real RUI uses --
+  was received, applied, and confirmed via `/gazebo/get_world_properties` to
+  have actually spawned `office_scan_rbx_test` in the live Gazebo world.
+
+This is full end-to-end proof, from the real NEPI RBX Settings API down to
+Gazebo, with no physical/Docker device involved at any point. One
+unrelated, benign artifact observed during this test and root-caused (not a
+bug): the bridge connection cycled every ~5 seconds throughout, because no
+rover model was ever spawned into the bare `empty.world`, so
+`sim_bridge_node.py`'s `telemetryPushLoop` had nothing to send
+(`self.latest_telemetry` is only set by `odomCb`, which needs a real
+`/rover/odom` publisher) -- `rbx_sim_node.py`'s bridge client treats 5
+seconds of silence as a dead connection and reconnects. Confirmed harmless
+here (each reconnect correctly re-ran the environment-options handshake) and
+is pre-existing behavior, unrelated to this feature -- would not occur
+against `generic_rover.world`, which always has a real rover publishing
+odometry.
+
 ## 6. Integration point: extend the app-level dynamic mechanism, not the RBX static one
 
 Per §2.1: build this on `device_if_sim.py`'s `available_environment_options` /
