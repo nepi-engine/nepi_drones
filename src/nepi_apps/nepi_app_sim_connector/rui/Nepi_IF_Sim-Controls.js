@@ -988,23 +988,40 @@ class NepiIFSimControls extends Component {
       return null
     }
     const image_topics = this.props.ros.imageTopics || []
-    // Scoped (2026-08-26) to this robot's own namespace plus the sim
-    // connector app's own mirror namespace -- previously filtered the
-    // ENTIRE system-wide image topic list (this.props.ros.imageTopics is
-    // every Image topic on the device, from every app and every physical
-    // camera), so "enabled_image_sources" candidates included totally
-    // unrelated things like app_ai_targeting/targeting_image,
-    // app_file_pub_img/color_image, and a physical webcam's own
-    // idx/color_image -- none of which could ever actually BE this robot's
-    // camera. Reported live: "still a trillion camera images" on the
-    // quadcopter Gazebo panel. rbx_ns is this robot's own device
-    // namespace; appNamespace (same derivation renderCommonImageViewer
-    // already uses) is the sim connector app's own namespace, whose mirror
-    // topics (robot_color/scene_color/etc) are this robot's live camera
-    // feed when it's the currently-connected sim.
+    // Scoped (2026-08-26, widened 2026-08-27) to exclude only OTHER apps'
+    // own generated/derived images, not to a namespace allowlist -- an
+    // earlier version of this filter required a topic to start with this
+    // robot's own namespace or the sim connector app's own mirror
+    // namespace, which correctly dropped unrelated app output
+    // (app_ai_targeting/targeting_image, app_file_pub_img/color_image) but
+    // ALSO dropped a genuinely relevant physical camera connected to this
+    // same device (nexigo_02/idx/color_image) that isn't part of either
+    // namespace -- reported live: "the sim app shows the right sim
+    // cameras, but its missing the nexigo physical camera". A real device's
+    // own topics (anything NOT published by another "app_*" node) are
+    // always fair candidates for "what does this robot's camera look
+    // like", the same way NepiDeviceRBX.js's own createImageOptions
+    // already treats them -- only another app's derived/processed output
+    // is the kind of noise this curation exists to hide (see that
+    // "trillion camera images" report above, which was about app outputs,
+    // not physical cameras). base_namespace is this device's root (one
+    // level above the sim connector app's own namespace); own_app_segment
+    // is this app's own node name, so its mirror topics
+    // (robot_color/scene_color/etc, which live one level under
+    // base_namespace) still pass even though "app_sim_connector" itself
+    // starts with "app_".
     const appNamespace = this.props.namespace.split('/sim')[0]
-    const candidates = image_topics.filter((topic) =>
-      (topic.startsWith(rbx_ns + '/') || topic.startsWith(appNamespace + '/'))
+    const base_namespace = appNamespace.substring(0, appNamespace.lastIndexOf('/'))
+    const own_app_segment = appNamespace.substring(appNamespace.lastIndexOf('/') + 1)
+    const candidates = image_topics.filter((topic) => {
+      if (topic.startsWith(base_namespace + '/') === false) {
+        return false
+      }
+      const owner_segment = topic.substring(base_namespace.length + 1).split('/')[0]
+      const is_other_app_output = owner_segment.startsWith('app_') && owner_segment !== own_app_segment
+      if (is_other_app_output) {
+        return false
+      }
       // Exclude every raw "color_2d_image" topic (this app's own dead
       // bridge-relay bare topic, AND every RBX driver's raw per-robot
       // color_2d_image/robot_view/scene_view topics) -- those are internal
@@ -1041,8 +1058,9 @@ class NepiIFSimControls extends Component {
       // aren't redundant as DATA (colorized-for-viewing vs. raw-for-processing
       // serve different consumers), just both wrongly offered in a
       // viewing-only picker.
-      && topic.includes('color_2d_image') === false && topic.includes('zed_node') === false
-      && topic.endsWith('/image') === false && topic.endsWith('_depth_map') === false)
+      return topic.includes('color_2d_image') === false && topic.includes('zed_node') === false
+        && topic.endsWith('/image') === false && topic.endsWith('_depth_map') === false
+    })
     if (candidates.length === 0) {
       return null
     }
