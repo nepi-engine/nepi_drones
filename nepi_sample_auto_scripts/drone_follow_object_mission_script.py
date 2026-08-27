@@ -61,6 +61,7 @@ import sys
 import os
 import time
 import math
+import socket
 from nepi_sdk import nepi_ros
 from nepi_sdk import nepi_settings
 from nepi_api.messages_if import MsgIF
@@ -144,6 +145,17 @@ CMD_ACTION_TIMEOUT_SEC = 60
 # also had to be fixed to actually pass this value.
 CMD_GOTO_TIMEOUT_SEC = 30
 
+# Sim target teardown (added 2026-08-26) -- best-effort signal to the dev
+# VM's ai_targeting_controller_ardupilot.py (see its TEARDOWN_PORT) to
+# despawn the simulated "chair" when this script stops, over the same
+# reverse-tunnel-forwarded loopback the RESET_SIM setup action's
+# gz_reset_listener already uses. A no-op (times out quietly) against real
+# hardware or when no sim is running -- this script has no way to know
+# which it's talking to, and doesn't need to.
+SIM_TEARDOWN_HOST = "127.0.0.1"
+SIM_TEARDOWN_PORT = 9029
+SIM_TEARDOWN_TIMEOUT_SEC = 5.0
+
 #########################################
 # Node Class
 #########################################
@@ -182,6 +194,15 @@ class drone_follow_object_mission(object):
     rbx_namespace = (robot_namespace + "rbx/")
     self.msg_if.pub_info("Using rbx namesapce " + rbx_namespace)
     self.rbx_initialize(rbx_namespace)
+    # Registered as soon as the rbx_* publishers cleanup_actions() needs
+    # actually exist -- fires on a normal RUI stop (StopScript -> rospy
+    # shutdown) as well as any other clean rospy shutdown, covering
+    # virtually this whole script's runtime. Previously cleanup_actions()
+    # was dead code (defined, never wired to anything) -- confirmed live
+    # 2026-08-26 that stopping the script via the RUI left the drone armed/
+    # airborne and the sim chair frozen in place with nothing tearing
+    # either down.
+    rospy.on_shutdown(self.cleanup_actions)
     time.sleep(1)
     self.msg_if.pub_info("Waiting for status message")
     while self.rbx_status is None and not rospy.is_shutdown():
@@ -362,7 +383,7 @@ class drone_follow_object_mission(object):
     # this node's own advertised-topic list. Harmless only because
     # ENABLE_FAKE_GPS is now False; with it True the enable publish went to a
     # topic nothing subscribes to, silently doing nothing.
-    FAKE_GPS_NAMESPACE = os.path.join(self.base_namespace, "app_fake_gps")
+    FAKE_GPS_NAMESPACE = os.path.join(self.base_namespace, "app_fake_gps") + "/"
     self.fake_gps_enable_pub = nepi_ros.create_publisher(FAKE_GPS_NAMESPACE + "enable", Bool, queue_size=1)
 
     self.msg_if.pub_info("RBX initialize process complete")
@@ -590,9 +611,24 @@ class drone_follow_object_mission(object):
       if target_class == TARGET_TO_FOLLOW and target_range_m != -999:
         self.msg_if.pub_info("Detected a " + TARGET_TO_FOLLOW + "with valid range")
         setpoint_range_m = target_range_m - TARGET_OFFSET_GOAL_M
-        sp_x_m = setpoint_range_m * math.cos(math.radians(target_yaw_d))  # X is Forward
-        sp_y_m = setpoint_range_m * math.sin(math.radians(target_yaw_d)) # Y is Right
-        sp_z_m = - setpoint_range_m * math.sin(math.radians(target_pitch_d)) # Z is Down
+        # Y/Z were computed in the AI-targeting sensor's own convention
+        # (X forward, Y RIGHT, Z DOWN -- see ai_targeting_controller_ardupilot.py's
+        # own docstring), but goto_rbx_position() ultimately calls
+        # device_if_rbx.py's setpoint_position_local_body(), whose docstring
+        # states its body frame is X forward, Y LEFT, Z UP -- the opposite
+        # sign on both axes. Sending the sensor's raw right/down values
+        # there means "descend toward a low target" got interpreted as
+        # "climb", and left/right got mirrored too. Confirmed live
+        # 2026-08-26: the drone climbed to ~18m (10m takeoff + ~8m of
+        # wrong-direction climb) chasing a target near ground level, instead
+        # of descending to meet it -- exactly the ~8-9m magnitude of the
+        # elevation-driven Z command being applied with the wrong sign.
+        # Fixed by negating both axes when building the driver-frame
+        # setpoint, rather than touching the sensor's own (correct, and
+        # shared with other consumers) right/down convention.
+        sp_x_m = setpoint_range_m * math.cos(math.radians(target_yaw_d))  # X is Forward in both conventions
+        sp_y_m = -setpoint_range_m * math.sin(math.radians(target_yaw_d)) # sensor Y is Right -> driver Y is Left
+        sp_z_m = setpoint_range_m * math.sin(math.radians(target_pitch_d)) # sensor Z is Down -> driver Z is Up
         sp_yaw_d = target_yaw_d
         if IGNORE_YAW_CONTROL:
           sp_yaw_d = -999
@@ -636,6 +672,32 @@ class drone_follow_object_mission(object):
 
   def cleanup_actions(self):
     self.msg_if.pub_info("Shutting down: Executing script cleanup actions")
+    # RESET_SIM force-disarms (works regardless of current flight state --
+    # mid-goto, hovering, etc., unlike a plain mode change) and teleports
+    # back to the origin/base position -- the same mechanism the driver's
+    # own RESET_SIM RUI action uses. This is what actually satisfies
+    # "stopping the script resets the drone to unarmed at the base
+    # position." A no-op against real hardware (RESET_SIM won't be in
+    # rbx_cap_setup_actions there) or if the RBX pubs never finished
+    # initializing.
+    try:
+      if "RESET_SIM" in self.rbx_cap_setup_actions:
+        self.setup_rbx_action("RESET_SIM", timeout_sec = CMD_ACTION_TIMEOUT_SEC)
+      else:
+        self.msg_if.pub_info("RESET_SIM not available (real hardware?) -- skipping")
+    except Exception as e:
+      self.msg_if.pub_warn("RESET_SIM on cleanup failed: " + str(e))
+
+    # Ask the sim to despawn the chair -- see SIM_TEARDOWN_PORT above.
+    try:
+      sock = socket.create_connection((SIM_TEARDOWN_HOST, SIM_TEARDOWN_PORT),
+                                       timeout = SIM_TEARDOWN_TIMEOUT_SEC)
+      sock.settimeout(SIM_TEARDOWN_TIMEOUT_SEC)
+      sock.recv(200)
+      sock.close()
+      self.msg_if.pub_info("Sim target teardown triggered")
+    except Exception as e:
+      self.msg_if.pub_info("Sim target teardown not reachable (expected on real hardware): " + str(e))
 
 #########################################
 # Main

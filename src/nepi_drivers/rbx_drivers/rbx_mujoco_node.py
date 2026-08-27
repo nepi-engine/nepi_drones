@@ -16,25 +16,26 @@
 # - mailto:nepi@numurus.com
 #
 
-# RBX driver node for a Webots simulated robot -- rbx_gazebo_node.py's exact
-# pattern, ported. The whole point of matching rbx_webots_bridge.py's wire
-# protocol to sim_bridge_node.py's (see that bridge's own docstring) is that
-# this file needed only renaming, not new logic: same bridge-loop/reconnect
-# shape, same closed-loop 2D goto controller (a Webots controller robot has no
-# onboard autopilot to delegate to either), same capability gaps for the same
-# reasons (no arm/disarm, no battery, no WGS84 location).
+# RBX driver node for a MuJoCo simulated robot -- rbx_webots_node.py's exact
+# pattern, ported (which was itself ported from rbx_gazebo_node.py). The
+# whole point of matching mujoco_rbx_bridge.py's wire protocol to
+# sim_bridge_node.py's/webots_rbx_bridge.py's (see that bridge's own
+# docstring) is the same reason this file needed only renaming, not new
+# logic: same bridge-loop/reconnect shape, same closed-loop 2D goto
+# controller (a MuJoCo bridge process has no onboard autopilot to delegate to
+# either), same capability gaps for the same reasons (no arm/disarm, no
+# battery, no WGS84 location) -- except RESET_SIM, which is genuine here (see
+# resetSimAction below).
 #
 # ############################################################################
-# Single-camera, single-topic: this world (rbx_rover.wbt, copied from
-# sim_connector_rover.wbt) has only ONE Camera device with no repositionable
-# rig, unlike Gazebo's generic_rover which has two independently-posed camera
-# links. An earlier version of this driver reported the one camera under two
-# names (SCENE_CAMERA/ROBOT_CAMERA) with a camera_view_mode Setting to
-# "switch" between them, copied from the Gazebo rover's pattern -- but that
-# offered a view that does not exist here (same issue found and fixed in
-# rbx_webots_quadcopter_node.py). Now reported under a single CAMERA_NAME
-# topic, no view-mode Setting. Reference frames/offsets are still
-# declarative-only, matching rbx_gazebo_node.py's own gap.
+# 4 independently-actuated wheels, not 2: rbx_rover.xml (this model) has no
+# shared-side-motor constraint the way Gazebo's diff-drive plugin or Webots'
+# 2-motor-device model does -- MuJoCo actuates each of the 4 wheel joints
+# independently. So this driver exposes 4 motor slots, matching
+# rbx_sim_node.py's (Gazebo's) current pattern, not rbx_webots_node.py's
+# 2-slot one: motorControlToVelocity averages each side's pair before sending
+# a single lin/ang command over the wire (mujoco_rbx_bridge.py only ever
+# receives one lin/ang pair, same as every other bridge here).
 # ############################################################################
 
 import base64
@@ -63,7 +64,7 @@ from geographic_msgs.msg import GeoPoint
 from nepi_api.device_if_rbx import RBXRobotIF
 from nepi_api.messages_if import MsgIF
 
-PKG_NAME = 'RBX_WEBOTS' # Use in display menus
+PKG_NAME = 'RBX_MUJOCO' # Use in display menus
 FILE_TYPE = 'NODE'
 
 
@@ -71,49 +72,32 @@ FILE_TYPE = 'NODE'
 # Node Class
 #########################################
 
-class WebotsNode:
+class MujocoNode:
 
-  # This world has exactly one fixed Camera device with no repositionable
-  # rig -- reported under a single honest topic name. An earlier version of
-  # this driver reported it under two names (SCENE_CAMERA/ROBOT_CAMERA) with
-  # a camera_view_mode Setting to "switch" between them, copied from
-  # rbx_sim_node.py's rover pattern -- but the Gazebo rover's two names
-  # correspond to two REAL, independently-posed camera links, while this
-  # world has exactly one, so that Setting was a pure UI fiction offering a
-  # view that does not exist (same issue found and fixed in
-  # rbx_webots_quadcopter_node.py -- see that file's CAMERA_NAME comment).
+  # rbx_rover.xml has exactly one fixed Camera device with no repositionable
+  # rig -- reported under a single honest topic name, same reasoning as
+  # rbx_webots_node.py's own CAMERA_NAME comment.
   CAMERA_NAME = "robot_camera"
 
   ROBOT_MAIN_REFERENCE_FRAME = "base_link"
 
-  # This world has no obstacle-course model -- environment options are an
-  # honest no-op on the bridge side (matching sim_connector_bridge_webots.py's
-  # own documented gap), but still declared here so the capability/UI surface
-  # is consistent with the Gazebo driver rather than silently absent.
+  # rbx_rover.xml has no obstacle-course model yet -- environment options are
+  # an honest no-op on the bridge side (matching mujoco_rbx_bridge.py's own
+  # documented gap, same as Webots'), but still declared here so the
+  # capability/UI surface is consistent with the Gazebo/Webots drivers.
   ENVIRONMENT_OPTIONS = ["FLAT_GROUND", "OBSTACLE_COURSE"]
   OBSTACLE_COURSE_OPTION = "OBSTACLE_COURSE"
 
-  # Ported from rbx_sim_node.py (the Gazebo rover's real, current driver --
-  # see docs/WEBOTS_RBX_DRIVER_PLAN.md's note on this file having been built
-  # from the stale rbx_gazebo_node.py template originally, before RBX_SIM's
-  # camera-offset/capability-toggle Settings existed). Unlike Gazebo's rover,
-  # this world has ONE fixed Camera device, not a repositionable rig or two
-  # independently-posed camera links -- camera_offset_x/y/z are declared here
-  # (kept as an honest "not wired up yet" placeholder, unlike camera_view_mode
-  # and scene_offset_x/y/z, which are gone entirely -- there genuinely is one
-  # real camera that could someday get a repositionable mount, unlike a
-  # second camera that simply does not exist) so the RUI renders the same
-  # offset control surface Gazebo's rover has, but sendCameraSettings below
-  # sends them to webots_rbx_bridge.py as a documented no-op, matching this
-  # driver's existing honest treatment of RESET_SIM/environment.
+  # Ported from rbx_webots_node.py -- camera_offset_x/y/z declared here as an
+  # honest "not wired up yet" placeholder (rbx_rover.xml's one camera is
+  # rigidly mounted, no repositionable rig), matching that driver's identical
+  # gap.
   CAMERA_SETTING_NAMES = ("camera_offset_x", "camera_offset_y", "camera_offset_z")
   ENVIRONMENT_SETTING_NAMES = ("environment",)
 
   # Sim Connector's own per-robot-config "customize the capabilities that are
-  # open" toggles -- same mechanism and same names as rbx_sim_node.py's own
-  # CAPABILITY_SETTING_NAMES (see that file's comment for the full reasoning).
-  # Enforced in autonomousControlsReady below, not just hidden in the RUI, so
-  # a client bypassing the RUI can't do what was turned off either.
+  # open" toggles -- same mechanism and same names as rbx_sim_node.py's/
+  # rbx_webots_node.py's own CAPABILITY_SETTING_NAMES.
   CAPABILITY_SETTING_NAMES = ("autonomous_movement_enabled",
                               "camera_controls_enabled", "enabled_image_sources")
 
@@ -130,19 +114,17 @@ class WebotsNode:
     enabled_image_sources = {"type":"String","name":"enabled_image_sources"}
   )
 
-  # max_linear_speed_mps factory/range lower than rbx_sim_node.py's: this
-  # world's MOTOR_MAX_LINEAR_MPS (0.3, see sim_connector_bridge_webots.py) is
-  # itself lower than Gazebo's (0.5) -- matching the physical model, not an
-  # arbitrary choice.
+  # max_linear_speed_mps factory/range matches rbx_sim_node.py's (Gazebo's):
+  # rbx_rover.xml uses the SAME physical dimensions as generic_rover/
+  # model.sdf (see that model's dimensions.yaml), so the same speed range is
+  # physically appropriate here too -- unlike rbx_webots_node.py's lower
+  # range, which matches rbx_rover.wbt's smaller/different physical scale.
   FACTORY_SETTINGS = dict(
-    max_linear_speed_mps = {"type":"Float","name":"max_linear_speed_mps","value":"0.3"},
+    max_linear_speed_mps = {"type":"Float","name":"max_linear_speed_mps","value":"0.5"},
     max_angular_rate_dps = {"type":"Float","name":"max_angular_rate_dps","value":"45.0"},
     environment = {"type":"Discrete","name":"environment","value":ENVIRONMENT_OPTIONS[0]},
-    # Placeholder factory values, not measured against this world's single
-    # fixed camera pose (there is no physical offset to reproduce here the
-    # way rbx_sim_node.py's values reproduce generic_rover/model.sdf's real
-    # camera_link poses) -- these exist so the RUI's offset inputs have
-    # something sane to show, not because moving them does anything yet.
+    # Placeholder factory values -- rbx_rover.xml's one camera has no
+    # repositionable mount yet, same gap as rbx_webots_node.py's own.
     camera_offset_x = {"type":"Float","name":"camera_offset_x","value":"0.0"},
     camera_offset_y = {"type":"Float","name":"camera_offset_y","value":"0.0"},
     camera_offset_z = {"type":"Float","name":"camera_offset_z","value":"0.0"},
@@ -158,13 +140,11 @@ class WebotsNode:
 
   RBX_STATES = []
   RBX_MODES = []
-  # RESET_SIM is a real setup action here, same as Gazebo's, but the bridge
-  # side is a logged no-op: this world's Robot node is not a Supervisor, so it
-  # cannot teleport itself (matching sim_connector_bridge_webots.py's own
-  # documented RESET gap). Kept in the action list rather than omitted so the
-  # capability surface matches Gazebo's -- the command is honestly accepted
-  # and forwarded, just not honored physically, which is what "return False"
-  # would otherwise misreport (the bridge send itself succeeds).
+  # RESET_SIM is a REAL setup action here -- unlike rbx_webots_node.py's
+  # honestly-accepted-but-not-physically-honored version (that Robot node
+  # isn't a Supervisor), mujoco_rbx_bridge.py owns the physics state directly
+  # and genuinely teleports the model back to its initial pose via
+  # mujoco.mj_resetData. See resetSimAction below.
   RBX_SETUP_ACTIONS = ["RESET_SIM", "RETURN_HOME"]
   RBX_GO_ACTIONS = []
 
@@ -178,13 +158,14 @@ class WebotsNode:
   NAVPOSE_UPDATE_RATE = 10
   TELEMETRY_FRESH_SEC = 2.0
 
-  # Motor 0 = left side (wheel1+wheel3), motor 1 = right side (wheel2+wheel4)
-  # on rbx_rover.wbt -- a 4-wheel model driven as a 2-sided tank drive, exactly
-  # like Gazebo's 4-wheel generic_rover. MOTOR_MAX_LINEAR_MPS/WHEEL_BASE_M
-  # match sim_connector_bridge_webots.py's own MOTOR_MAX_LINEAR_MPS/WHEEL_TRACK_M
-  # constants -- this conversion has to agree with the bridge's physical model.
-  MOTOR_MAX_LINEAR_MPS = 0.3
-  MOTOR_WHEEL_BASE_M = 0.12
+  # 4 independently-actuated wheels (see module docstring): [0]=front_left,
+  # [1]=front_right, [2]=rear_left, [3]=rear_right -- same ordering
+  # convention rbx_sim_node.py's/rbx_rover.xml's wheel1-4 use.
+  # MOTOR_MAX_LINEAR_MPS/MOTOR_WHEEL_BASE_M match mujoco_rbx_bridge.py's own
+  # WHEEL_RADIUS_M/WHEEL_TRACK_M-derived physical model -- this conversion
+  # has to agree with the bridge's.
+  MOTOR_MAX_LINEAR_MPS = 0.5
+  MOTOR_WHEEL_BASE_M = 0.34
 
   GOTO_KP_LIN = 0.5
   GOTO_KP_ANG = 1.5
@@ -254,8 +235,9 @@ class WebotsNode:
     self.stop_triggered = False
 
     ##############################
-    # Manual motor-ratio state: motor 0 = left, motor 1 = right
-    self.motor_ratios = [0.0, 0.0]
+    # Manual motor-ratio state: 4 independently-actuated wheels (see module
+    # docstring), [0]=front_left, [1]=front_right, [2]=rear_left, [3]=rear_right.
+    self.motor_ratios = [0.0, 0.0, 0.0, 0.0]
 
     ##############################
     # Home position state: local ENU x/y/z meters (see rbx_gazebo_node.py's
@@ -414,7 +396,8 @@ class WebotsNode:
     if motor_ind < 0 or motor_ind >= len(self.motor_ratios):
       self.msg_if.pub_warn("Motor control ignored: motor index " + str(motor_ind) + " out of range")
       return
-    self.motor_ratios[motor_ind] = max(0.0, min(1.0, speed_ratio))
+    # -1.0..1.0, not 0.0..1.0 -- rbx_rover.xml's wheels genuinely reverse.
+    self.motor_ratios[motor_ind] = max(-1.0, min(1.0, speed_ratio))
 
   def getMotorControlRatios(self):
     return self.motor_ratios
@@ -423,8 +406,7 @@ class WebotsNode:
     # Gates all goto commands: require the Sim Connector's own
     # autonomous_movement_enabled toggle (checked here, not just hidden in
     # the RUI, so a client bypassing the RUI can't do what was turned off
-    # either -- see rbx_sim_node.py's identical check for the full
-    # reasoning), plus a live bridge connection with fresh telemetry so goto
+    # either), plus a live bridge connection with fresh telemetry so goto
     # targets are computed from a real current position.
     if self.settings_dict['autonomous_movement_enabled']['value'] != 'TRUE':
       return False
@@ -504,11 +486,12 @@ class WebotsNode:
     return False
 
   def resetSimAction(self):
-    # Fire-and-forget, same as rbx_gazebo_node.py's -- but see the class-level
-    # RBX_SETUP_ACTIONS note: this world's Robot node is not a Supervisor, so
-    # the bridge logs this and does not actually teleport. Returns True/False
-    # based on whether the command was actually sent, not on whether a physical
-    # reset happened (which this driver has no way to confirm either way).
+    # Genuine reset -- see module/class docstrings. mujoco_rbx_bridge.py
+    # owns the physics state directly (no external Supervisor restriction the
+    # way Webots' Robot node has), so this actually teleports the model back
+    # to its initial pose. Returns True/False based on whether the command
+    # was actually sent (same as every other driver here) -- the bridge
+    # applies it synchronously once received.
     self.clearGotoTarget()
     self.sendVelocityCmd(0.0, 0.0)
     with self.sock_lock:
@@ -519,9 +502,9 @@ class WebotsNode:
     return True
 
   def setEnvironmentAction(self, environment_value):
-    # Fire-and-forget, same as rbx_gazebo_node.py's -- this world has no
-    # obstacle-course model, so the bridge logs this and does not spawn/delete
-    # anything (see the ENVIRONMENT_OPTIONS class comment).
+    # Fire-and-forget, same as rbx_webots_node.py's -- rbx_rover.xml has no
+    # obstacle-course model yet, so the bridge logs this and does not spawn/
+    # delete anything (see the ENVIRONMENT_OPTIONS class comment).
     with self.sock_lock:
       connected = self.sock is not None
     if not connected:
@@ -583,10 +566,15 @@ class WebotsNode:
     self.sendVelocityCmd(lin, ang)
 
   def motorControlToVelocity(self):
-    left = self.motor_ratios[0]
-    right = self.motor_ratios[1]
-    lin = (left + right) / 2.0 * self.MOTOR_MAX_LINEAR_MPS
-    ang = (right - left) / self.MOTOR_WHEEL_BASE_M * self.MOTOR_MAX_LINEAR_MPS
+    # [0]=front_left, [1]=front_right, [2]=rear_left, [3]=rear_right --
+    # averaged per side since the wire protocol only ever carries one lin/ang
+    # pair (see module docstring); each of the 4 sliders is still
+    # individually movable and has a real effect on its own side's average.
+    left = (self.motor_ratios[0] + self.motor_ratios[2]) / 2.0
+    right = (self.motor_ratios[1] + self.motor_ratios[3]) / 2.0
+    max_lin = float(self.settings_dict['max_linear_speed_mps']['value'])
+    lin = (left + right) / 2.0 * max_lin
+    ang = (right - left) / self.MOTOR_WHEEL_BASE_M * max_lin
     return lin, ang
 
   def normalizeAngle(self, angle_rad):
@@ -703,9 +691,9 @@ class WebotsNode:
   def sendCameraSettings(self):
     # No view_mode -- see CAMERA_NAME's own comment, there is nothing to
     # switch between. offset_x/y/z included for parity with rbx_sim_node.py's
-    # wire shape -- webots_rbx_bridge.py currently logs-and-ignores them
-    # (this world's single fixed Camera device has no repositionable rig),
-    # matching this driver's existing honest treatment of RESET_SIM/environment.
+    # wire shape -- mujoco_rbx_bridge.py currently logs-and-ignores them
+    # (rbx_rover.xml's single fixed camera has no repositionable rig),
+    # matching this driver's existing honest treatment of environment.
     cmd = {
       'type': 'camera_settings',
       'offset_x': float(self.settings_dict['camera_offset_x']['value']),
@@ -739,4 +727,4 @@ class WebotsNode:
 # Main
 #########################################
 if __name__ == '__main__':
-  WebotsNode()
+  MujocoNode()

@@ -23,8 +23,9 @@
 # with manual motor-ratio control removed entirely -- a Supervisor-velocity
 # body (see webots_rbx_bridge_quadcopter.py) has no per-rotor ratio that means
 # anything, matching how even the real ArduPilot RBX driver doesn't expose
-# raw motor mixing via manual control either. Teleop (3D velocity + yaw rate)
-# IS exposed -- natural fit for "manually fly it".
+# raw motor mixing via manual control either. Autonomous goto is the only
+# movement control surface exposed here -- teleop has been removed from the
+# RUI entirely (2026-08-26).
 #
 # No ARM/DISARM state machine (RBX_STATES/RBX_MODES stay empty, same
 # simplicity level as the rover): a Supervisor-injected-velocity body has no
@@ -104,11 +105,10 @@ class WebotsQuadcopterNode:
   ENVIRONMENT_SETTING_NAMES = ("environment",)
 
   # Sim Connector's own per-robot-config capability toggles -- same mechanism
-  # as rbx_webots_node.py/rbx_sim_node.py. teleop_movement_enabled gates
-  # teleopControlsReady below; autonomous_movement_enabled gates
+  # as rbx_webots_node.py/rbx_sim_node.py. autonomous_movement_enabled gates
   # autonomousControlsReady (goto AND takeoff/land, which are just goto
   # targets under the hood).
-  CAPABILITY_SETTING_NAMES = ("autonomous_movement_enabled", "teleop_movement_enabled",
+  CAPABILITY_SETTING_NAMES = ("autonomous_movement_enabled",
                               "camera_controls_enabled", "enabled_image_sources")
 
   CAP_SETTINGS = dict(
@@ -121,7 +121,6 @@ class WebotsQuadcopterNode:
     camera_offset_y = {"type":"Float","name":"camera_offset_y","options":["-10.0","10.0"]},
     camera_offset_z = {"type":"Float","name":"camera_offset_z","options":["-10.0","10.0"]},
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
-    teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","options":["TRUE","FALSE"]},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]},
     enabled_image_sources = {"type":"String","name":"enabled_image_sources"}
   )
@@ -147,7 +146,6 @@ class WebotsQuadcopterNode:
     camera_offset_y = {"type":"Float","name":"camera_offset_y","value":"0.0"},
     camera_offset_z = {"type":"Float","name":"camera_offset_z","value":"0.0"},
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","value":"TRUE"},
-    teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","value":"TRUE"},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","value":"TRUE"},
     enabled_image_sources = {"type":"String","name":"enabled_image_sources","value":""}
   )
@@ -181,7 +179,6 @@ class WebotsQuadcopterNode:
   CONTROLLER_RATE_HZ = 20
   NAVPOSE_UPDATE_RATE = 10
   TELEMETRY_FRESH_SEC = 2.0
-  TELEOP_CMD_TIMEOUT_SEC = 0.75
 
   GOTO_KP_LIN = 0.5
   GOTO_KP_ANG = 1.5
@@ -256,17 +253,9 @@ class WebotsQuadcopterNode:
     self.stop_triggered = False
 
     ##############################
-    # Teleop state -- full 3D this time (linear_y/linear_z are real strafe/
-    # climb axes for a quadcopter, unlike the rover's ground-only teleop).
-    self.teleop_linear_x = 0.0
-    self.teleop_linear_y = 0.0
-    self.teleop_linear_z = 0.0
-    self.teleop_angular_z = 0.0
-    self.teleop_last_cmd_time = 0.0
-
-    ##############################
     # No motor-ratio state -- see module docstring, manual motor control is
-    # not exposed for this robot type at all.
+    # not exposed for this robot type at all. Autonomous goto is the only
+    # movement control surface exposed here (teleop removed).
 
     ##############################
     # Home position state: local ENU x/y/z meters (see rbx_webots_node.py's
@@ -334,8 +323,6 @@ class WebotsQuadcopterNode:
                              manualControlsReadyFunction = None,
                              getMotorControlRatios = None,
                              setMotorControlRatio = None,
-                             teleopControlsReadyFunction = self.teleopControlsReady,
-                             setTeleopVelocityFunction = self.setTeleopVelocity,
                              autonomousControlsReadyFunction = self.autonomousControlsReady,
                              getHomeFunction = self.getHome,
                              setHomeFunction = self.setHome,
@@ -422,27 +409,6 @@ class WebotsQuadcopterNode:
     triggered = self.stop_triggered
     self.stop_triggered = False
     return triggered
-
-  def teleopControlsReady(self):
-    if self.settings_dict['teleop_movement_enabled']['value'] != 'TRUE':
-      return False
-    with self.sock_lock:
-      return self.sock is not None
-
-  def setTeleopVelocity(self, linear_x, linear_y, linear_z, angular_z):
-    # Full 3D this time -- linear_y (strafe) and linear_z (climb/descend) are
-    # both real axes for a quadcopter, unlike the rover's ground-only teleop.
-    # Ratios in [-1,1], scaled by the same max_linear_speed_mps/
-    # max_vertical_speed_mps/max_angular_rate_dps Settings that already cap
-    # goto speed.
-    max_lin = float(self.settings_dict['max_linear_speed_mps']['value'])
-    max_vert = float(self.settings_dict['max_vertical_speed_mps']['value'])
-    max_ang = math.radians(float(self.settings_dict['max_angular_rate_dps']['value']))
-    self.teleop_linear_x = max(-1.0, min(1.0, linear_x)) * max_lin
-    self.teleop_linear_y = max(-1.0, min(1.0, linear_y)) * max_lin
-    self.teleop_linear_z = max(-1.0, min(1.0, linear_z)) * max_vert
-    self.teleop_angular_z = max(-1.0, min(1.0, angular_z)) * max_ang
-    self.teleop_last_cmd_time = nepi_utils.get_time()
 
   def autonomousControlsReady(self):
     # Gates goto AND takeoff/land (both just goto targets under the hood) --
@@ -650,14 +616,6 @@ class WebotsQuadcopterNode:
       if horiz_done and vert_done:
         self.clearGotoTarget()
         self.msg_if.pub_info("Goto target reached")
-    elif (nepi_utils.get_time() - self.teleop_last_cmd_time) < self.TELEOP_CMD_TIMEOUT_SEC and \
-         (self.teleop_linear_x != 0.0 or self.teleop_linear_y != 0.0 or
-          self.teleop_linear_z != 0.0 or self.teleop_angular_z != 0.0):
-      # No active goto -- a recent, non-zero teleop command takes over this
-      # same tick, same reasoning as rbx_webots_node.py's identical block.
-      self.sendVelocityCmd(self.teleop_linear_x, self.teleop_linear_y,
-                           self.teleop_linear_z, self.teleop_angular_z)
-      return
     self.sendVelocityCmd(lin, 0.0, vert, ang)
 
   def normalizeAngle(self, angle_rad):

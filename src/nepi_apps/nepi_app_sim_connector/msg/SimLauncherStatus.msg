@@ -55,3 +55,13 @@ string launcher_state
 
 # Empty when launcher_state is not "failed"
 string last_error
+
+# Copy-paste terminal commands for the operator to run manually as a
+# worst-case fallback -- populated whenever a launch/install fails because a
+# dependency is missing (see simulator_launcher.py's
+# get_manual_fallback_commands), and for a target like gazebo_quadcopter that
+# has no auto-install at all. One command per line, meant to be rendered
+# verbatim (a <pre>/copyable text block), not parsed. Empty whenever there is
+# nothing to offer -- e.g. launcher_state isn't "failed", or the target that
+# failed has neither install_command nor manual_fallback_commands configured.
+string manual_fallback_commands

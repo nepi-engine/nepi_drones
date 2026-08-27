@@ -491,6 +491,13 @@ class NepiSimConnectorApp:
     self.launcher_thread = None
     self.launcher_state = 'idle'
     self.launcher_last_error = ''
+    # Which target a dependency-related failure was actually about -- NOT
+    # always active_launch_target (runInstall can fail for a target that
+    # isn't the one currently running/attempted), so publishLauncherStatus's
+    # manual_fallback_commands derivation keys off this instead. Cleared at
+    # the top of every runLaunch/runInstall attempt so a stale fallback from
+    # an earlier, unrelated failure never lingers into a new one.
+    self.launcher_failed_target = ''
     self.selected_launch_target = ''
     # The target actually running, once resolve_launch_target has done its
     # work -- may differ from selected_launch_target (the operator's own
@@ -1639,7 +1646,43 @@ class NepiSimConnectorApp:
     self.active_launch_target = actual_target
     self.launcher_state = 'launching'
     self.launcher_last_error = ''
+    self.launcher_failed_target = ''
     self.publishLauncherStatus()
+
+    # Auto-install before attempting to launch, so a bare VM missing a
+    # target's dependencies still comes up from a single Deploy click --
+    # previously Install and Deploy were two fully separate actions (see
+    # installSimulatorCb/runInstall below), and an operator on a fresh VM had
+    # to notice the not_installed state and click Install first before Deploy
+    # even appeared (Nepi_IF_SimLauncher.js's renderDeployControls). Skipped
+    # on the attach path above (attach=True returns before reaching here) --
+    # attaching only ever targets an ALREADY-running foreign gzserver, which
+    # implies the dependency is already present. A failed installed-check
+    # (e.g. a dead tunnel) falls through to the real launch attempt below
+    # rather than blocking here on something this app can't confirm is
+    # actually needed -- that attempt fails with its own clear error if the
+    # dependency truly is missing.
+    try:
+      needs_install = not self.launcher.is_installed(actual_target)
+    except LauncherError:
+      needs_install = False
+    if needs_install:
+      self.launcher_state = 'installing'
+      self.launch_target_installed_check_state[actual_target] = 'checking'
+      self.publishLauncherStatus()
+      try:
+        self.launcher.install(actual_target)
+      except LauncherError as e:
+        self.launcher_state = 'failed'
+        self.launcher_last_error = str(e)
+        self.launcher_failed_target = actual_target
+        self.checkInstalledOne(actual_target)
+        self.publishLauncherStatus()
+        return
+      self.checkInstalledOne(actual_target)
+      self.launcher_state = 'launching'
+      self.publishLauncherStatus()
+
     # Push any pending dimension edits before starting a FRESH gzserver --
     # unlike the attach path above, this one actually loads the world/models
     # from disk, so this is the one moment a pushed model.sdf can take
@@ -1739,6 +1782,7 @@ class NepiSimConnectorApp:
   def runInstall(self, target_key):
     self.launcher_state = 'installing'
     self.launcher_last_error = ''
+    self.launcher_failed_target = ''
     self.launch_target_installed_check_state[target_key] = 'checking'
     self.publishLauncherStatus()
     try:
@@ -1746,6 +1790,7 @@ class NepiSimConnectorApp:
     except LauncherError as e:
       self.launcher_state = 'failed'
       self.launcher_last_error = str(e)
+      self.launcher_failed_target = target_key
       # Not marked 'not_installed' here -- the install command failing
       # doesn't necessarily mean the dependency is confirmed absent (could
       # be a transient network/package-mirror failure), so re-check for real
@@ -1821,6 +1866,21 @@ class NepiSimConnectorApp:
         status.active_launch_target_name = self.active_launch_target
     status.launcher_state = self.launcher_state
     status.last_error = self.launcher_last_error
+    # Derived, not stored -- computed fresh from state this app already
+    # tracks (launcher_failed_target, launch_target_installed) rather than
+    # threaded through every individual failure site that sets
+    # launcher_last_error. Keyed off launcher_failed_target, NOT
+    # active_launch_target -- runInstall can fail for a target that was
+    # never the one actively running/attempted. Only shown once a failure is
+    # confirmed dependency-related (the target is known NOT installed), so a
+    # timeout/conflict/network failure with a perfectly good install doesn't
+    # get an irrelevant wall of install commands attached to it.
+    if (self.launcher_state == 'failed' and self.launcher_failed_target
+        and self.launch_target_installed.get(self.launcher_failed_target, True) is False):
+      status.manual_fallback_commands = self.launcher.get_manual_fallback_commands(
+          self.launcher_failed_target)
+    else:
+      status.manual_fallback_commands = ''
     self.launcher_status_pub.publish(status)
 
   #**********************

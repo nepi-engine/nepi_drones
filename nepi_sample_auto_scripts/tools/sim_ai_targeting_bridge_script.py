@@ -108,23 +108,53 @@ def find_image_topic(candidates, timeout = 20):
   return ""
 
 
+LAUNCH_TRIGGER_RETRY_ATTEMPTS = 8
+LAUNCH_TRIGGER_RETRY_INTERVAL_SEC = 3.0
+
 def trigger_remote_sim_launch(msg_if):
-  # Fire-and-forget: connect, read one reply line (or time out), close.
-  # sitl_gazebo_full itself takes 15-20s and is idempotent, so there's
-  # nothing further to do here -- the caller's own retry loops already
-  # tolerate the VM side not being ready yet.
-  try:
-    sock = socket.create_connection((LAUNCH_TRIGGER_HOST, LAUNCH_TRIGGER_PORT),
-                                     timeout = LAUNCH_TRIGGER_TIMEOUT_SEC)
-    sock.settimeout(LAUNCH_TRIGGER_TIMEOUT_SEC)
-    reply = sock.recv(200)
-    sock.close()
-    msg_if.pub_info("Triggered remote sim launch: " + reply.decode(errors = "replace").strip())
-  except Exception as e:
-    msg_if.pub_warn("Could not reach sim_launch_listener at " + LAUNCH_TRIGGER_HOST + ":" +
-                     str(LAUNCH_TRIGGER_PORT) + " (" + str(e) + ") -- if the dev VM has never " +
-                     "run sitl_gazebo/sitl_gazebo_full this session, start one of those there " +
-                     "manually first")
+  # Was a genuine one-shot (single connect attempt, no retry) -- confirmed
+  # live 2026-08-26 that this loses a real race: if this script starts
+  # around the same time as sitl_gazebo/sitl_gazebo_full on the dev VM
+  # (e.g. both kicked off right after a device/VM reboot), the reverse SSH
+  # tunnel's sshd accepts the TCP connection immediately (it doesn't know
+  # sim_launch_listener isn't bound yet), then closes it the instant it
+  # finds nothing listening on the VM side -- this script reads that as a
+  # normal (if empty) reply and never tries again, so
+  # ai_targeting_controller_ardupilot/camera_rig_controller_ardupilot never
+  # actually start. The drone would still arm/take off fine (RBX driver
+  # doesn't depend on this), but no chair would ever spawn and
+  # move_to_object_callback would wait forever for a detection that never
+  # arrives. Retrying a few times over ~20s comfortably covers
+  # sim_launch_listener's own startup window (a few seconds into
+  # sitl_gazebo's own sequence) without meaningfully delaying this script's
+  # own init on the normal case where sim_launch_listener is already up.
+  for attempt in range(LAUNCH_TRIGGER_RETRY_ATTEMPTS):
+    try:
+      sock = socket.create_connection((LAUNCH_TRIGGER_HOST, LAUNCH_TRIGGER_PORT),
+                                       timeout = LAUNCH_TRIGGER_TIMEOUT_SEC)
+      sock.settimeout(LAUNCH_TRIGGER_TIMEOUT_SEC)
+      reply = sock.recv(200)
+      sock.close()
+      reply_str = reply.decode(errors = "replace").strip()
+      if reply_str:
+        msg_if.pub_info("Triggered remote sim launch: " + reply_str)
+        return
+      # Empty reply -- the exact signature of the tunnel-accepted-but-
+      # nothing-was-listening race described above. A real
+      # sim_launch_listener always replies "OK triggered" or "ERR ...".
+      msg_if.pub_warn("Remote sim launch trigger got an empty reply (attempt " +
+                       str(attempt + 1) + "/" + str(LAUNCH_TRIGGER_RETRY_ATTEMPTS) +
+                       ") -- sim_launch_listener likely isn't bound yet, retrying...")
+    except Exception as e:
+      msg_if.pub_warn("Could not reach sim_launch_listener at " + LAUNCH_TRIGGER_HOST + ":" +
+                       str(LAUNCH_TRIGGER_PORT) + " (" + str(e) + "), attempt " +
+                       str(attempt + 1) + "/" + str(LAUNCH_TRIGGER_RETRY_ATTEMPTS) + " -- retrying...")
+    if attempt < LAUNCH_TRIGGER_RETRY_ATTEMPTS - 1:
+      time.sleep(LAUNCH_TRIGGER_RETRY_INTERVAL_SEC)
+  msg_if.pub_warn("Giving up triggering remote sim launch after " +
+                   str(LAUNCH_TRIGGER_RETRY_ATTEMPTS) + " attempts -- if the dev VM has never " +
+                   "run sitl_gazebo/sitl_gazebo_full this session, start one of those there " +
+                   "manually")
 
 
 class sim_ai_targeting_bridge(object):

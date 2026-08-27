@@ -32,7 +32,6 @@ import { SliderAdjustment } from "./AdjustmentWidgets"
 import { setElementStyleModified, clearElementStyleModified } from "./Utilities"
 
 import NepiIFImageViewer from "./Nepi_IF_ImageViewer"
-import { TELEOP_ACTIONS, loadTeleopBindings, saveTeleopBindings, resetTeleopBindings } from "./TeleopKeymap"
 
 @inject("ros")
 @observer
@@ -73,6 +72,13 @@ class NepiIFSimControls extends Component {
       info_msg: null,
       infoListener: null,
       selected_view_mode: '',
+
+      // Which of the always-live color/depth mirror topics each half of
+      // renderCommonImageViewer's preview currently shows -- independent
+      // per column, so the operator can e.g. watch robot color while
+      // watching scene depth at the same time.
+      robot_view_mode: 'robot_color',
+      scene_view_mode: 'scene_color',
 
       // Cached capabilities response. The capability flags are decided by the
       // device, not by this component.
@@ -116,7 +122,7 @@ class NepiIFSimControls extends Component {
       // genuinely can't exist without a live device (the image-source
       // candidate list, the live camera preview) but wrong for the Settings
       // every RBX sim driver declares unconditionally (autonomous_movement_
-      // enabled/teleop_movement_enabled/camera_controls_enabled are declared
+      // enabled/camera_controls_enabled are declared
       // identically in rbx_sim_node.py, rbx_ardupilot_node.py,
       // rbx_webots_node.py, and rbx_webots_quadcopter_node.py -- confirmed by
       // direct inspection, not assumed). Toggling this on renders those
@@ -146,11 +152,11 @@ class NepiIFSimControls extends Component {
       // Settings is not to duplicate their live control, only to configure
       // (elsewhere in this file) whether the corresponding CONTROL SURFACE is
       // exposed at all for the current robot config -- e.g. autonomous
-      // movement, teleop movement below.
+      // movement below.
       //
       // The RBX-namespace resolution machinery stays: rbxSettingsNamesList is
       // still how this component knows whether the connected RBX driver
-      // defines autonomous_movement_enabled/teleop_movement_enabled at all
+      // defines autonomous_movement_enabled at all
       // (an older driver without this feature keeps working exactly as before,
       // simply without a Sim Connector control for it), and
       // updateRbxSettingsListener/rbxSettingsListener publish/read those
@@ -171,16 +177,6 @@ class NepiIFSimControls extends Component {
       // Course" labels for FLAT_GROUND/OBSTACLE_COURSE, matching
       // NepiDeviceRBX.js's own onSelectEnvironment convention exactly.
       selected_environment_setting: 'Flat Ground',
-
-      // Teleop keybind editor -- explicitly requested here even though
-      // teleop itself lives in the Robot Viewer (it isn't sim-only, unlike
-      // the camera offsets/environment above). See TeleopKeymap.js for the
-      // shared action list/persistence this reads and writes, and
-      // NepiDeviceRBX-Controls.js for the consumer side (the actual
-      // keyboard capture, which rebuilds its key map from this same
-      // storage each time Teleop control is (re)selected).
-      teleop_bindings: loadTeleopBindings(),
-      teleop_rebinding_action: null,
 
     }
 
@@ -212,10 +208,6 @@ class NepiIFSimControls extends Component {
     this.renderCameraOffsetControls = this.renderCameraOffsetControls.bind(this)
     this.renderEnvironmentSetting = this.renderEnvironmentSetting.bind(this)
     this.renderDepthMapToggle = this.renderDepthMapToggle.bind(this)
-    this.renderTeleopKeybindEditor = this.renderTeleopKeybindEditor.bind(this)
-    this.startRebindingAction = this.startRebindingAction.bind(this)
-    this.handleRebindKeyDown = this.handleRebindKeyDown.bind(this)
-    this.resetTeleopKeybinds = this.resetTeleopKeybinds.bind(this)
 
     this.renderLiveControls = this.renderLiveControls.bind(this)
     this.renderConfigControls = this.renderConfigControls.bind(this)
@@ -892,9 +884,9 @@ class NepiIFSimControls extends Component {
   // live): these toggles decide WHETHER a control surface the robot type
   // structurally supports is exposed at all, on both this app's own panel
   // (has_goto_position etc, unaffected by these toggles) and the generic RBX
-  // device panel (which gates on autonomous_movement_enabled/
-  // teleop_movement_enabled the same way it already gates on camera_offset_x --
-  // see NepiDeviceRBX-Controls.js). Gated on rbxSettingsNamesList, not on
+  // device panel (which gates on autonomous_movement_enabled the same way it
+  // already gates on camera_offset_x -- see NepiDeviceRBX-Controls.js). Gated
+  // on rbxSettingsNamesList, not on
   // SimCapabilitiesQuery: this is a property of the connected RBX DRIVER
   // (rbx_sim_node.py's CAPABILITY_SETTING_NAMES), same delivery path as the
   // camera Settings always used, so an older driver without this feature keeps
@@ -914,10 +906,9 @@ class NepiIFSimControls extends Component {
     // Image-source curation stays live-only -- there is no candidate topic
     // list to curate before a real camera exists.
     const has_autonomous_toggle = live ? settings.includes("autonomous_movement_enabled") : true
-    const has_teleop_toggle = live ? settings.includes("teleop_movement_enabled") : true
     const has_camera_toggle = live ? settings.includes("camera_controls_enabled") : true
     const has_image_curation = live && settings.includes("enabled_image_sources")
-    if (has_autonomous_toggle === false && has_teleop_toggle === false
+    if (has_autonomous_toggle === false
         && has_camera_toggle === false && has_image_curation === false) {
       return null
     }
@@ -956,18 +947,6 @@ class NepiIFSimControls extends Component {
                 />
               </Label>
             : null}
-          </Column>
-          <Column>
-            {(has_teleop_toggle === true) ?
-              <Label title={"Teleoperative Movement"}>
-                <Toggle
-                  checked={values["teleop_movement_enabled"] !== "FALSE"}
-                  onClick={() => setToggle("teleop_movement_enabled", values["teleop_movement_enabled"] === "FALSE")}
-                />
-              </Label>
-            : null}
-
-            {this.renderTeleopKeybindEditor()}
           </Column>
         </Columns>
 
@@ -1009,29 +988,45 @@ class NepiIFSimControls extends Component {
       return null
     }
     const image_topics = this.props.ros.imageTopics || []
-    // Exclude every raw "color_2d_image" topic (this app's own dead
-    // bridge-relay bare topic, AND every RBX driver's raw per-robot
-    // color_2d_image/robot_view/scene_view topics) -- those are internal
-    // sources the generic mirror topics below already relay from, for
-    // whichever robot/simulator is actually selected, so surfacing them
-    // separately here is redundant no matter which robot type is running
-    // (works for any robot, not just a hardcoded name). The two mirror
-    // topics themselves (renderCommonImageViewer's appNamespace +
-    // "/robot_view"/"/scene_view") don't contain "color_2d_image" in their
-    // name at all, so they pass through this filter untouched.
-    //
-    // Also exclude any bare "<namespace>/image" topic -- device_if_rbx.py's
-    // own ImageIF republishes whatever image_source is currently selected
-    // under every RBX driver's own namespace this exact way (confirmed via
-    // ardupilot_sitl/image showing up as a 4th candidate alongside the two
-    // mirrors and the physical camera). Same redundancy as color_2d_image:
-    // the universal mirrors already cover "whatever this robot's camera
-    // is" for any robot type, so this generic per-driver echo doesn't need
-    // its own curation entry either. endsWith, not includes, so a genuine
-    // future topic that merely contains "/image" elsewhere in its name
-    // isn't accidentally caught.
+    // Scoped (2026-08-26) to this robot's own namespace plus the sim
+    // connector app's own mirror namespace -- previously filtered the
+    // ENTIRE system-wide image topic list (this.props.ros.imageTopics is
+    // every Image topic on the device, from every app and every physical
+    // camera), so "enabled_image_sources" candidates included totally
+    // unrelated things like app_ai_targeting/targeting_image,
+    // app_file_pub_img/color_image, and a physical webcam's own
+    // idx/color_image -- none of which could ever actually BE this robot's
+    // camera. Reported live: "still a trillion camera images" on the
+    // quadcopter Gazebo panel. rbx_ns is this robot's own device
+    // namespace; appNamespace (same derivation renderCommonImageViewer
+    // already uses) is the sim connector app's own namespace, whose mirror
+    // topics (robot_color/scene_color/etc) are this robot's live camera
+    // feed when it's the currently-connected sim.
+    const appNamespace = this.props.namespace.split('/sim')[0]
     const candidates = image_topics.filter((topic) =>
-      topic.includes('color_2d_image') === false && topic.includes('zed_node') === false
+      (topic.startsWith(rbx_ns + '/') || topic.startsWith(appNamespace + '/'))
+      // Exclude every raw "color_2d_image" topic (this app's own dead
+      // bridge-relay bare topic, AND every RBX driver's raw per-robot
+      // color_2d_image/robot_view/scene_view topics) -- those are internal
+      // sources the generic mirror topics below already relay from, for
+      // whichever robot/simulator is actually selected, so surfacing them
+      // separately here is redundant no matter which robot type is running
+      // (works for any robot, not just a hardcoded name). The two mirror
+      // topics themselves (renderCommonImageViewer's appNamespace +
+      // "/robot_view"/"/scene_view") don't contain "color_2d_image" in their
+      // name at all, so they pass through this filter untouched.
+      //
+      // Also exclude any bare "<namespace>/image" topic -- device_if_rbx.py's
+      // own ImageIF republishes whatever image_source is currently selected
+      // under every RBX driver's own namespace this exact way (confirmed via
+      // ardupilot_sitl/image showing up as a 4th candidate alongside the two
+      // mirrors and the physical camera). Same redundancy as color_2d_image:
+      // the universal mirrors already cover "whatever this robot's camera
+      // is" for any robot type, so this generic per-driver echo doesn't need
+      // its own curation entry either. endsWith, not includes, so a genuine
+      // future topic that merely contains "/image" elsewhere in its name
+      // isn't accidentally caught.
+      && topic.includes('color_2d_image') === false && topic.includes('zed_node') === false
       && topic.endsWith('/image') === false)
     if (candidates.length === 0) {
       return null
@@ -1217,82 +1212,23 @@ class NepiIFSimControls extends Component {
     )
   }
 
-  // Begins capturing the next keydown as action's new binding. One listener
-  // added on demand rather than a permanent one gated on a flag, matching
-  // NepiDeviceRBX-Controls.js's own startTeleopKeyCapture/stopTeleopKeyCapture
-  // pattern for the same "only steal keyboard input while actually needed"
-  // reasoning -- this one just needs a single keypress, not a held-key
-  // stream, so it removes itself as soon as it fires.
-  startRebindingAction(action) {
-    if (this.state.teleop_rebinding_action !== null) {
-      return
-    }
-    this.setState({ teleop_rebinding_action: action })
-    window.addEventListener('keydown', this.handleRebindKeyDown)
-  }
-
-  handleRebindKeyDown(event) {
-    const action = this.state.teleop_rebinding_action
-    if (action === null) {
-      return
-    }
-    event.preventDefault()
-    window.removeEventListener('keydown', this.handleRebindKeyDown)
-    // Escape cancels without changing the current binding.
-    if (event.key === 'Escape') {
-      this.setState({ teleop_rebinding_action: null })
-      return
-    }
-    const key = event.key.toLowerCase()
-    const bindings = { ...this.state.teleop_bindings, [action]: key }
-    saveTeleopBindings(bindings)
-    this.setState({ teleop_bindings: bindings, teleop_rebinding_action: null })
-  }
-
-  resetTeleopKeybinds() {
-    resetTeleopBindings()
-    this.setState({ teleop_bindings: loadTeleopBindings(), teleop_rebinding_action: null })
-  }
-
-  // Editable keybind list -- requested directly ("keybinds should also be
-  // editable in the simulation editor"). Lives here rather than next to the
-  // Teleoperative Movement toggle above just for a natural pairing; nothing
-  // about it is sim-specific (see the teleop_bindings state comment).
-  renderTeleopKeybindEditor() {
-    const rebinding = this.state.teleop_rebinding_action
-    return (
-      <React.Fragment>
-        <Label title={"Teleop Keybinds"} labelStyle={{ fontWeight: 'bold' }}/>
-        {TELEOP_ACTIONS.map((entry) => (
-          <Label key={entry.action} title={entry.label}>
-            <Button
-              onClick={() => this.startRebindingAction(entry.action)}
-            >
-              {(rebinding === entry.action) ? "Press a key…" : this.state.teleop_bindings[entry.action].toUpperCase()}
-            </Button>
-          </Label>
-        ))}
-        <Label title={""}>
-          <Button onClick={this.resetTeleopKeybinds}>{"Reset to Defaults"}</Button>
-        </Label>
-      </React.Fragment>
-    )
-  }
-
   // Live preview of the currently selected_simulator's own robot/scene
   // camera feeds -- requested live (2026-08-18) as "another camera viewer
   // panel in the sim connector, just like how it is in the robot scene."
-  // Points at sim_connector_app_node.py's own robot_view/scene_view mirror
-  // topics (always the currently selected robot's real feeds, re-pointed
-  // automatically as selected_simulator changes -- see that node's own
-  // comment) rather than duplicating a topic-selector here; this is a
-  // preview, not a second control surface. this.props.namespace is
-  // ".../app_sim_connector/sim" (the SimDeviceIF sub-namespace); the mirror
-  // topics are siblings of it under the app's own bare node namespace.
-  // scene_view naturally shows nothing for a robot with no scene camera
-  // (the Webots drivers) -- NepiIFImageViewer already renders a blank/
-  // waiting state for a topic with no publisher, an honest reflection of
-  // "this robot has no scene camera," not a bug.
+  // Points at sim_connector_app_node.py's own six-topic mirror set (always
+  // the currently selected robot's real feeds, re-pointed automatically as
+  // selected_simulator changes -- see that node's own comment) rather than
+  // duplicating a topic-selector here; the only per-column choice is color
+  // vs. depth (renamed from the old, now-dead robot_view/scene_view names
+  // 2026-08-20, when those became two of six always-live topics instead of
+  // one toggled feed -- found live: the stale names left this panel
+  // permanently subscribed to publisher-less topics). this.props.namespace
+  // is ".../app_sim_connector/sim" (the SimDeviceIF sub-namespace); the
+  // mirror topics are siblings of it under the app's own bare node
+  // namespace. scene_view naturally shows nothing for a robot with no scene
+  // camera (the Webots drivers) -- NepiIFImageViewer already renders a
+  // blank/waiting state for a topic with no publisher, an honest reflection
+  // of "this robot has no scene camera," not a bug.
   renderCommonImageViewer() {
     const live = this.isRbxLive()
     if (!live) {
@@ -1308,17 +1244,35 @@ class NepiIFSimControls extends Component {
 
         <Columns>
           <Column>
+            <Label title={"Robot View"}>
+              <Select
+                onChange={(event) => this.setState({ robot_view_mode: event.target.value })}
+                value={this.state.robot_view_mode}
+              >
+                <Option value={"robot_color"}>{"Color"}</Option>
+                <Option value={"robot_depth"}>{"Depth"}</Option>
+              </Select>
+            </Label>
             <NepiIFImageViewer
               id={"simConnectorRobotViewViewer"}
-              image_topic={appNamespace + "/robot_view"}
-              title={"Robot View"}
+              image_topic={appNamespace + "/" + this.state.robot_view_mode}
+              title={""}
             />
           </Column>
           <Column>
+            <Label title={"Scene View"}>
+              <Select
+                onChange={(event) => this.setState({ scene_view_mode: event.target.value })}
+                value={this.state.scene_view_mode}
+              >
+                <Option value={"scene_color"}>{"Color"}</Option>
+                <Option value={"scene_depth"}>{"Depth"}</Option>
+              </Select>
+            </Label>
             <NepiIFImageViewer
               id={"simConnectorSceneViewViewer"}
-              image_topic={appNamespace + "/scene_view"}
-              title={"Scene View"}
+              image_topic={appNamespace + "/" + this.state.scene_view_mode}
+              title={""}
             />
           </Column>
         </Columns>

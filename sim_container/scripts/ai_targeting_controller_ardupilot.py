@@ -78,6 +78,7 @@ TARGET_MODEL_NAME = 'sim_target_chair'
 TARGET_NAME = 'chair'  # matches drone_follow_object_mission_script.py's default TARGET_TO_FOLLOW
 MODEL_STATE_TOPIC = '/gazebo/set_model_state'
 SPAWN_MODEL_SERVICE = '/gazebo/spawn_sdf_model'
+DELETE_MODEL_SERVICE = '/gazebo/delete_model'
 GAZEBO_SERVICE_WAIT_SEC = 5
 
 SDF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -100,10 +101,25 @@ MAX_DETECTION_RANGE_M = 20.0
 
 # Bridge streaming rate -- independent of the internal control tick, matching
 # camera_rig_controller_ardupilot.py's own CONTROL_RATE_HZ/IMAGE_RATE_HZ split.
-CONTROL_RATE_HZ = 20.0
+# CONTROL_RATE_HZ was 20.0 -- visibly steppy/jittery motion (user-reported
+# 2026-08-25), since each /gazebo/set_model_state teleport is a discrete
+# 50ms jump with nothing interpolating between them. Raised into the
+# 45-60 Hz range requested so consecutive teleports are close enough
+# together to read as smooth continuous motion.
+CONTROL_RATE_HZ = 50.0
 TARGET_STREAM_RATE_HZ = 5.0
 
 BRIDGE_PORT = 9027
+
+# Teardown trigger -- added 2026-08-26 so the real mission script
+# (drone_follow_object_mission_script.py, via its cleanup_actions()) can ask
+# the sim to make the chair actually disappear on stop, not just leave it
+# frozen in place. Next free port in the 902x sim-utility block after the
+# AI-targeting bridge's own 9027. Shuts this whole node down after
+# despawning (rather than looping to accept further connections) so a
+# later launch-trigger cleanly respawns a fresh controller + chair, instead
+# of this instance quietly running forever with no target to report.
+TEARDOWN_PORT = 9029
 
 
 class AiTargetingControllerArdupilot:
@@ -136,10 +152,15 @@ class AiTargetingControllerArdupilot:
     self.server_thread.daemon = True
     self.server_thread.start()
 
+    self.teardown_thread = threading.Thread(target = self.teardownServerLoop)
+    self.teardown_thread.daemon = True
+    self.teardown_thread.start()
+
     rospy.loginfo(PKG_NAME + ": Target '" + TARGET_NAME + "' circling center (" +
                   str(CIRCLE_CENTER_X) + "," + str(CIRCLE_CENTER_Y) + "), radius " +
                   str(CIRCLE_RADIUS_M) + "m, period " + str(CIRCLE_PERIOD_SEC) + "s")
     rospy.loginfo(PKG_NAME + ": Targeting bridge server on 127.0.0.1:" + str(BRIDGE_PORT))
+    rospy.loginfo(PKG_NAME + ": Teardown listener on 127.0.0.1:" + str(TEARDOWN_PORT))
 
   def run(self):
     """Block until ROS shutdown, servicing the control/stream timers and the
@@ -171,6 +192,53 @@ class AiTargetingControllerArdupilot:
                       resp.status_message)
     except Exception as e:
       rospy.logwarn(PKG_NAME + ": Target model spawn service call failed: " + str(e))
+
+  def despawnTargetModel(self):
+    try:
+      rospy.wait_for_service(DELETE_MODEL_SERVICE, timeout = GAZEBO_SERVICE_WAIT_SEC)
+      delete = rospy.ServiceProxy(DELETE_MODEL_SERVICE, DeleteModel)
+      resp = delete(TARGET_MODEL_NAME)
+      if resp.success:
+        rospy.loginfo(PKG_NAME + ": Target model despawned")
+      else:
+        rospy.logwarn(PKG_NAME + ": Target model despawn failed: " + resp.status_message)
+    except Exception as e:
+      rospy.logwarn(PKG_NAME + ": Target model despawn service call failed: " + str(e))
+
+  def teardownServerLoop(self):
+    """Single-shot: accept exactly one teardown trigger, despawn the
+    target, then shut this whole node down -- see TEARDOWN_PORT's own
+    comment for why a full shutdown (not just despawn-and-keep-running)."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.settimeout(None)
+    try:
+      srv.bind(('127.0.0.1', TEARDOWN_PORT))
+      srv.listen(1)
+    except Exception as e:
+      rospy.logerr(PKG_NAME + ": Could not bind teardown listener on 127.0.0.1:" +
+                   str(TEARDOWN_PORT) + ": " + str(e))
+      return
+    try:
+      conn, _ = srv.accept()
+    except Exception:
+      return
+    rospy.loginfo(PKG_NAME + ": Teardown triggered -- despawning target and shutting down")
+    try:
+      self.despawnTargetModel()
+      conn.sendall(b'OK\n')
+    except Exception as e:
+      rospy.logwarn(PKG_NAME + ": Teardown response failed: " + str(e))
+    finally:
+      try:
+        conn.close()
+      except Exception:
+        pass
+      try:
+        srv.close()
+      except Exception:
+        pass
+    rospy.signal_shutdown("teardown requested")
 
   def modelStatesCb(self, msg):
     try:

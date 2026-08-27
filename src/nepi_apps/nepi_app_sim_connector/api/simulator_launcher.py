@@ -636,6 +636,23 @@ class SimulatorLauncher(object):
       raise LauncherError(
           "Install command exited " + str(result.returncode) + ": " + result.stderr.strip())
 
+  def get_manual_fallback_commands(self, target_key):
+    """Copy-paste terminal commands for a human to run as a worst-case
+    fallback, when auto-install either failed or (like gazebo_quadcopter)
+    isn't offered at all. Prefers a target's own explicit
+    manual_fallback_commands (a plain multi-line string, one command per
+    line -- readable and directly copy-pastable, unlike install_command's
+    single semicolon-joined `bash -lc` form meant for programmatic exec) if
+    one is configured; otherwise falls back to install_command's own text
+    verbatim, since for most targets that alone is already a valid thing to
+    paste into a terminal. Returns '' if neither exists -- callers treat that
+    as "no fallback to offer", not an error."""
+    target = self.get_target(target_key)
+    fallback = target.get("manual_fallback_commands", "")
+    if fallback:
+      return fallback
+    return target.get("install_command", "")
+
 
 if __name__ == "__main__":
   # Standalone smoke test -- no ROS, no app node. Usage:

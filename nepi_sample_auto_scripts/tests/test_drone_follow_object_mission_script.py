@@ -197,12 +197,12 @@ _SettingsStatus = _slot_class(
 _Target = _slot_class(
     "Target",
     [
-        "timestamp", "target_name", "target_uid", "target_confidence",
+        "timestamp", "name", "id", "uid", "confidence",
         "xmin_pixel", "xmax_pixel", "ymin_pixel", "ymax_pixel",
         "width_pixels", "height_pixels", "area_ratio", "area_pixels",
         "vel_pixels", "width_meters", "height_meters", "depth_meters",
         "area_meters", "volume_meters", "vel_xyz_mps", "center_xyz_meters",
-        "range_m", "azimuth_deg", "elevation_deg", "navpose",
+        "range_m", "azimuth_deg", "elevation_deg",
         "color_black", "color_white", "color_red", "color_blue",
         "color_yellow", "color_cyan", "color_magenta", "color_green",
         "contour_moments", "shape_triangle", "shape_rectangle",
@@ -482,7 +482,7 @@ class TestDroneFollowObjectMissionScript(unittest.TestCase):
         # appears in the module docstring's changelog note (documenting the
         # OLD topic layout) -- check the actual current-API publisher
         # construction instead.
-        self.assertIn('FAKE_GPS_NAMESPACE = self.base_namespace + "app_fake_gps/"', src)
+        self.assertIn('FAKE_GPS_NAMESPACE = os.path.join(self.base_namespace, "app_fake_gps") + "/"', src)
         self.assertNotIn("set_cmd_timeout\"", src)
         self.assertIn("MsgIF", src)
         self.assertIn("DeviceRBXInfo", src)
@@ -591,16 +591,15 @@ class TestDroneFollowObjectMissionScript(unittest.TestCase):
         self.assertEqual(published_settings[0].name_str, "takeoff_height_m")
         self.assertEqual(published_settings[0].value_str, "10.0")
 
-        # Fake GPS enabled via the standalone app_fake_gps app (plain Bool
-        # publish, fire-and-forget -- no fake_gps_enabled status to read back).
+        # Fake GPS / set-home are both deliberately OFF against a SITL target
+        # (ENABLE_FAKE_GPS = False, SET_HOME = False -- see the module's own
+        # 2026-08-12 root-cause comments: a SITL has its own GPS, and either
+        # of these actively breaks EKF convergence/home-altitude against it).
+        # The publisher topic must still be built correctly even though it's
+        # never fired this run.
         self.assertEqual(instance.fake_gps_enable_pub.topic, "/nepi/device1/app_fake_gps/enable")
-        self.assertEqual(instance.fake_gps_enable_pub.published, [True])
-
-        # Home location published as a GeoPoint with real field names.
-        home_geo = instance.rbx_set_home_pub.published[-1]
-        self.assertAlmostEqual(home_geo.latitude, 47.6540828)
-        self.assertAlmostEqual(home_geo.longitude, -122.3187578)
-        self.assertAlmostEqual(home_geo.altitude, 0.0)
+        self.assertEqual(instance.fake_gps_enable_pub.published, [])
+        self.assertEqual(instance.rbx_set_home_pub.published, [])
 
         # goto_timeout topic renamed from set_cmd_timeout, publisher exists.
         self.assertTrue(instance.rbx_set_cmd_timeout_pub.topic.endswith("set_goto_timeout"))
@@ -655,7 +654,7 @@ class TestDroneFollowObjectMissionScript(unittest.TestCase):
     # ------------------------------------------------------------
     def test_move_to_object_callback_drives_goto_on_matching_target(self):
         instance = self._build_instance()
-        target = _Target(target_name="chair", range_m=2.0, azimuth_deg=0.0, elevation_deg=0.0)
+        target = _Target(name="chair", range_m=2.0, azimuth_deg=0.0, elevation_deg=0.0)
         targets_msg = _Targets(targets=[target])
 
         instance.move_to_object_callback(targets_msg)
@@ -667,10 +666,44 @@ class TestDroneFollowObjectMissionScript(unittest.TestCase):
         # IGNORE_YAW_CONTROL is True in this script's USER SETTINGS -> -999 sentinel.
         self.assertEqual(goto_msg.yaw_deg, -999)
 
+    def test_move_to_object_callback_converts_sensor_frame_to_driver_frame(self):
+        # Regression test for the 2026-08-26 sign-inversion bug: the
+        # az=0/el=0 case above can't distinguish right-vs-left or
+        # down-vs-up since sin(0) == 0 on both axes. Use nonzero angles so
+        # a reintroduced sign flip actually fails this test.
+        #
+        # ai_targeting_controller_ardupilot.py's sensor convention: X
+        # forward, Y RIGHT, Z DOWN; azimuth+ = target to the right,
+        # elevation+ = target above the drone.
+        #
+        # device_if_rbx.py's setpoint_position_local_body() driver
+        # convention (its own docstring): X forward, Y LEFT, Z UP.
+        #
+        # A target 10m out, 30 deg to the right (azimuth=+30) and 20 deg
+        # above (elevation=+20) must therefore produce a NEGATIVE
+        # y_meters (right, in a Y-is-left frame) and a POSITIVE z_meters
+        # (above, in a Z-is-up frame).
+        instance = self._build_instance()
+        target = _Target(name="chair", range_m=10.0, azimuth_deg=30.0, elevation_deg=20.0)
+        targets_msg = _Targets(targets=[target])
+
+        instance.move_to_object_callback(targets_msg)
+
+        goto_msg = instance.rbx_goto_position_pub.published[-1]
+        setpoint_range_m = 10.0 - self.module.TARGET_OFFSET_GOAL_M
+        expected_x = setpoint_range_m * math.cos(math.radians(30.0))
+        expected_y = -setpoint_range_m * math.sin(math.radians(30.0))
+        expected_z = setpoint_range_m * math.sin(math.radians(20.0))
+        self.assertAlmostEqual(goto_msg.x_meters, expected_x, places=5)
+        self.assertAlmostEqual(goto_msg.y_meters, expected_y, places=5)
+        self.assertAlmostEqual(goto_msg.z_meters, expected_z, places=5)
+        self.assertLess(goto_msg.y_meters, 0.0, "target to the right must be negative y (driver's y+ is left)")
+        self.assertGreater(goto_msg.z_meters, 0.0, "target above must be positive z (driver's z+ is up)")
+
     def test_move_to_object_callback_ignores_non_matching_target_and_invalid_range(self):
         instance = self._build_instance()
-        other_target = _Target(target_name="person", range_m=2.0, azimuth_deg=0.0, elevation_deg=0.0)
-        invalid_range_target = _Target(target_name="chair", range_m=-999, azimuth_deg=0.0, elevation_deg=0.0)
+        other_target = _Target(name="person", range_m=2.0, azimuth_deg=0.0, elevation_deg=0.0)
+        invalid_range_target = _Target(name="chair", range_m=-999, azimuth_deg=0.0, elevation_deg=0.0)
         targets_msg = _Targets(targets=[other_target, invalid_range_target])
 
         before = list(instance.rbx_goto_position_pub.published)

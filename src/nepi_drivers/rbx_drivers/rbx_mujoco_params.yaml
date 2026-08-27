@@ -1,0 +1,58 @@
+# MuJoCo simulated robot RBX driver -- params / manifest.
+# Mirrors rbx_webots_params.yaml exactly; see that file's own comments for the
+# reasoning behind each field. Port numbers differ (9051/9056) to stay clear
+# of the existing reserved ports (see docs/MULTI_SIMULATOR_INTEGRATION_PLAN.md's
+# port table: 9021 gz-reset, 9022/9023 Gazebo heartbeat/bridge, 9030 generic-
+# contract app port, 9041/9046 + 9042/9047 Webots rover/quadcopter).
+
+driver:
+  pkg_name: RBX_MUJOCO
+  display_name: MuJoCo Simulated Robot
+  description: Driver package for MuJoCo-simulated robots reached over a JSON-lines bridge
+  type: RBX
+  group_id: MUJOCO
+
+  NODE_DICT:
+    file_name: rbx_mujoco_node.py
+    class_name: MujocoNode
+
+  # No separate driver file: all robot I/O goes over the bridge connection the
+  # node holds open, same as the gazebo/webots/ardupilot drivers have no
+  # driver file of their own.
+  DRIVER_DICT:
+    file_name: None
+    class_name: None
+
+  DISCOVERY_DICT:
+    file_name: rbx_mujoco_discovery.py
+    class_name: MujocoDiscovery
+    process: CALL
+    OPTIONS:
+      # Host serving the MuJoCo bridge (the dev VM running
+      # mujoco_rbx_bridge.py). 'localhost' covers a same-host case; set a
+      # real address for a MuJoCo instance reached over the network/tunnel.
+      host:
+        type: String
+        options:
+          - ''
+        default: 'localhost'
+        value: 'localhost'
+      # Port the MuJoCo-side heartbeat listener answers on. Discovery
+      # requires the ALIVE reply, not merely a successful connect -- same
+      # reasoning as the Gazebo/Webots drivers.
+      heartbeat_port:
+        type: Int
+        options:
+          - '1024'
+          - '65535'
+        default: '9051'
+        value: '9051'
+      # Port serving the persistent JSON-lines command/telemetry bridge that
+      # the launched node connects to.
+      bridge_port:
+        type: Int
+        options:
+          - '1024'
+          - '65535'
+        default: '9056'
+        value: '9056'

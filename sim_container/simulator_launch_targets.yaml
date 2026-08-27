@@ -78,7 +78,43 @@ launch_targets:
     # on this target already sources setup.bash first; this one just hadn't
     # caught up yet.
     check_installed_command: "bash -lc \"source /opt/ros/noetic/setup.bash; command -v gzserver > /dev/null && command -v roscore > /dev/null\""
-    install_command: "bash -lc \"sudo apt-get update && sudo apt-get install -y ros-noetic-gazebo-ros-pkgs ros-noetic-gazebo-ros-control\""
+    # Widened (2026-08-26) from a bare `apt-get install ros-noetic-gazebo-*`
+    # to a real fresh-Ubuntu-20.04 bootstrap: the old version silently assumed
+    # ROS Noetic and the ROS apt repo/key were ALREADY present, so on a
+    # genuinely fresh VM (no ROS at all) `ros-noetic-gazebo-ros-pkgs` couldn't
+    # even be found and the whole install failed outright. The apt-repo/key/
+    # ros-noetic-desktop-full steps are the same ones already proven in
+    # nepi_setup/scripts/ros_setup.sh (written for the NEPI device's own
+    # container, reused here verbatim for the sim VM's different purpose).
+    # Each stage is skip-if-already-done so re-running this on a
+    # partially-set-up box (ROS present but Gazebo missing, the common case)
+    # is harmless and fast rather than redundantly reinstalling ROS itself.
+    install_command: >-
+      bash -lc '
+      set -e;
+      if [ ! -f /etc/apt/sources.list.d/ros-latest.list ]; then
+      sudo sh -c "echo \"deb http://packages.ros.org/ros/ubuntu $(lsb_release -sc) main\" > /etc/apt/sources.list.d/ros-latest.list";
+      sudo apt-get install -y curl;
+      curl -s https://raw.githubusercontent.com/ros/rosdistro/master/ros.asc | sudo apt-key add -;
+      fi;
+      sudo apt-get update --fix-missing;
+      if ! dpkg -s ros-noetic-desktop-full > /dev/null 2>&1; then
+      sudo apt-get install -y ros-noetic-desktop-full;
+      fi;
+      sudo apt-get install -y ros-noetic-gazebo-ros-pkgs ros-noetic-gazebo-ros-control
+      '
+    # Copy of install_command's own steps, laid out one command per line for
+    # the RUI to show verbatim as a copy-paste fallback if auto-install ever
+    # fails (network blip, apt mirror down, etc.) -- see
+    # sim_connector_app_node.py's runInstall/runLaunch and
+    # Nepi_IF_SimLauncher.js's error_row rendering.
+    manual_fallback_commands: |-
+      echo "deb http://packages.ros.org/ros/ubuntu $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/ros-latest.list
+      sudo apt-get install -y curl
+      curl -s https://raw.githubusercontent.com/ros/rosdistro/master/ros.asc | sudo apt-key add -
+      sudo apt-get update --fix-missing
+      sudo apt-get install -y ros-noetic-desktop-full
+      sudo apt-get install -y ros-noetic-gazebo-ros-pkgs ros-noetic-gazebo-ros-control
     # Launches Gazebo (generic_rover.world) plus the RBX_SIM stack --
     # sim_heartbeat_listener.py (9022), camera_rig_controller.py and
     # sim_bridge_node.py (9023) -- i.e. exactly what sim_rover_gazebo() in
@@ -320,6 +356,20 @@ launch_targets:
     # offered a matching Install button (there is no visible selector row
     # for this target to show one on regardless).
     check_installed_command: "bash -lc \"source /opt/ros/noetic/setup.bash; command -v gzserver > /dev/null && command -v roscore > /dev/null && command -v sim_vehicle.py > /dev/null && python3 -c 'import pymavlink' > /dev/null 2>&1 && test -f $HOME/ardupilot_gazebo/worlds/iris_arducopter_cmac.world\""
+    # No install_command (see the comment above), so this is the ONLY
+    # fallback the RUI has for this target -- shown as copy-paste text when a
+    # Deploy attempt fails because ArduPilot SITL isn't set up. Steps are
+    # ArduPilot's own documented from-source build (already used as this
+    # project's own reference -- see docs/DISCOVERY_EXPLAINED.md's "Standing
+    # up ArduPilot SITL" appendix), quoted here rather than re-derived so the
+    # two copies can't drift silently.
+    manual_fallback_commands: |-
+      git clone --recurse-submodules https://github.com/ArduPilot/ardupilot
+      cd ardupilot
+      Tools/environment_install/install-prereqs-ubuntu.sh -y
+      . ~/.profile
+      ./waf configure --board sitl
+      ./waf copter
     # Same fragile-YAML-folding caution as gazebo_rover's own launch_command
     # above applies here verbatim -- every line stays at the SAME
     # indentation on purpose. Verify with
@@ -497,19 +547,24 @@ launch_targets:
     ready_check_command: "bash -lc \"source /opt/ros/noetic/setup.bash; pgrep -f 'gzserver.*iris_arducopter_cmac.world' > /dev/null && pgrep -f 'sim_vehicle.py -v ArduCopter' > /dev/null && pgrep -f sim_connector_bridge_gazebo_quadcopter.py > /dev/null && rostopic info /camera_rig/camera/image_raw 2>/dev/null | grep -A1 '^Publishers:' | grep -q ' \\* /' && grep -q 'MAVLink heartbeat' ~/.ros/log/sim_connector_bridge_gazebo_quadcopter.log 2>/dev/null\""
     default_robot_config: flight_robot_4_motor
 
-  # webots_rover and pybullet_rover below are checkable and
+  # pybullet_rover/wpilib_rover below (see those entries) are checkable and
   # installable, but NOT yet launchable -- launch_command/ready_check_command/
   # stop_command are intentionally absent (launch() raises a clear
   # LauncherError naming this if attempted, rather than silently doing
-  # nothing). Gazebo was the one target this session actually verified
-  # end-to-end against a real VM; these three exist so the "which simulators
-  # exist and are they installed" half of the picture is real and honest for
-  # all four simulators today, per the stated general vision, without
-  # overclaiming a launch path that hasn't been built and tested yet. The
-  # bridge scripts these will eventually shell out to already exist under
+  # nothing). Gazebo, Webots, and MuJoCo below all have full launch paths,
+  # verified end-to-end; these two exist so the "which simulators exist and
+  # are they installed" half of the picture is real and honest for all five
+  # simulators today, per the stated general vision, without overclaiming a
+  # launch path that hasn't been built and tested yet. The bridge scripts
+  # these will eventually shell out to already exist under
   # sim_container/bridges/ -- wiring an actual launch_command through them is
   # exactly steps 2-5 of docs/SIMULATOR_AUTO_LAUNCH_PLAN.md's own build order,
   # repeated per simulator, once each is prioritized.
+  #
+  # (This comment previously also claimed webots_rover/webots_quadcopter had
+  # no launch_command -- stale as of the 2026-08-17 RBX-driver work below,
+  # which gave both full launch/stop/ready-check commands. Left this note
+  # rather than silently erasing the history.)
   webots_rover:
     display_name: "Webots"
     host: "127.0.0.1"
@@ -520,9 +575,19 @@ launch_targets:
     # install time, rather than hardcoding a version string in this file
     # that would silently go stale. cyberbotics/webots is the upstream
     # project's own repo.
+    # Widened (2026-08-26) the same way gazebo_rover's own install_command
+    # was: a fresh Ubuntu 20.04 VM cannot be assumed to already have curl/
+    # wget on PATH (neither ships in the minimal server image), so the
+    # original version's first real command -- calling curl -- could fail
+    # outright with "command not found" before ever reaching Webots itself.
+    # `apt-get install -y curl wget` is safe to run unconditionally (a no-op
+    # if already present, unlike the ROS apt-repo/key steps that genuinely
+    # need a skip-if-already-done guard).
     install_command: >-
       bash -lc '
       set -e;
+      sudo apt-get update -qq;
+      sudo apt-get install -y curl wget;
       DEB_URL=$(curl -fsSL https://api.github.com/repos/cyberbotics/webots/releases/latest
       | grep -o "https://[^\"]*_amd64\.deb" | head -1);
       test -n "$DEB_URL";
@@ -531,6 +596,17 @@ launch_targets:
       sudo apt-get install -y /tmp/webots_latest_amd64.deb;
       rm -f /tmp/webots_latest_amd64.deb
       '
+    # Copy of install_command's own steps, one command per line, for the RUI
+    # to show verbatim as a copy-paste fallback -- same convention as
+    # gazebo_rover's own manual_fallback_commands.
+    manual_fallback_commands: |-
+      sudo apt-get update -qq
+      sudo apt-get install -y curl wget
+      DEB_URL=$(curl -fsSL https://api.github.com/repos/cyberbotics/webots/releases/latest | grep -o 'https://[^"]*_amd64\.deb' | head -1)
+      wget -q "$DEB_URL" -O /tmp/webots_latest_amd64.deb
+      sudo apt-get update
+      sudo apt-get install -y /tmp/webots_latest_amd64.deb
+      rm -f /tmp/webots_latest_amd64.deb
     # Launches rbx_rover.wbt, whose Robot node's controller field points at
     # webots_rbx_bridge -- a genuine TCP server (heartbeat on 9041, bridge on
     # 9046, both forwarded through the reverse tunnel) that Webots starts
@@ -613,9 +689,14 @@ launch_targets:
     ssh_user: "suraj"
     ssh_port: 12222
     check_installed_command: "bash -lc \"command -v webots > /dev/null\""
+    # Same install steps as webots_rover -- it's the same Webots binary,
+    # only the world file launched below differs. See webots_rover's own
+    # comment for why curl/wget are installed explicitly (2026-08-26).
     install_command: >-
       bash -lc '
       set -e;
+      sudo apt-get update -qq;
+      sudo apt-get install -y curl wget;
       DEB_URL=$(curl -fsSL https://api.github.com/repos/cyberbotics/webots/releases/latest
       | grep -o "https://[^\"]*_amd64\.deb" | head -1);
       test -n "$DEB_URL";
@@ -624,6 +705,14 @@ launch_targets:
       sudo apt-get install -y /tmp/webots_latest_amd64.deb;
       rm -f /tmp/webots_latest_amd64.deb
       '
+    manual_fallback_commands: |-
+      sudo apt-get update -qq
+      sudo apt-get install -y curl wget
+      DEB_URL=$(curl -fsSL https://api.github.com/repos/cyberbotics/webots/releases/latest | grep -o 'https://[^"]*_amd64\.deb' | head -1)
+      wget -q "$DEB_URL" -O /tmp/webots_latest_amd64.deb
+      sudo apt-get update
+      sudo apt-get install -y /tmp/webots_latest_amd64.deb
+      rm -f /tmp/webots_latest_amd64.deb
     # Same launch mechanics as webots_rover -- see that target's own comments
     # for the full reasoning (DISPLAY/XAUTHORITY resolution, the `pgrep -x
     # webots` self-match fix, session-lifetime process group). Only the
@@ -641,6 +730,76 @@ launch_targets:
     # rbx_webots_quadcopter_params.yaml.
     ready_check_command: "bash -lc \"pgrep -f 'webots.*rbx_quadcopter.wbt' > /dev/null && (exec 3<>/dev/tcp/127.0.0.1/9042) 2>/dev/null && exec 3<&-\""
     default_robot_config: flight_robot_4_motor
+
+  mujoco_rover:
+    display_name: "MuJoCo"
+    host: "127.0.0.1"
+    ssh_user: "suraj"
+    ssh_port: 12222
+    check_installed_command: "bash -lc \"python3 -c 'import mujoco' > /dev/null 2>&1\""
+    # Widened (2026-08-26), same reasoning as gazebo_rover/webots_rover's own
+    # install_command: a fresh Ubuntu 20.04 VM has neither pip3
+    # (python3-pip isn't part of the base install) nor the system OpenGL/EGL
+    # libraries MuJoCo's headless `MUJOCO_GL=egl` renderer links against --
+    # confirmed working on THIS dev VM only because Gazebo/Webots had
+    # already pulled in mesa/GL packages as their own dependencies, which a
+    # MuJoCo-only fresh VM would never get. All of these are safe to
+    # apt-get install unconditionally (small, idempotent, no skip-if-present
+    # guard needed).
+    install_command: >-
+      bash -lc '
+      set -e;
+      sudo apt-get update -qq;
+      sudo apt-get install -y python3-pip libgl1 libegl1 libopengl0 libosmesa6 libglx0;
+      pip3 install --user mujoco
+      '
+    manual_fallback_commands: |-
+      sudo apt-get update -qq
+      sudo apt-get install -y python3-pip libgl1 libegl1 libopengl0 libosmesa6 libglx0
+      pip3 install --user mujoco
+    # Unlike Gazebo/Webots, there is no separate simulator binary --
+    # mujoco_rbx_bridge.py IS the simulator (a plain Python process owning
+    # both the physics loop and the heartbeat/bridge TCP sockets). It DOES
+    # still need a real DISPLAY/XAUTHORITY for its visible
+    # mujoco.viewer.launch_passive window, same as gazebo_rover/webots_rover
+    # -- same nepi_sim_display_env.sh resolution, sourced below. The camera
+    # image relay (a separate offscreen render context) works either way, so
+    # a missing display degrades to a warning inside the bridge rather than
+    # failing this launch.
+    #
+    # Refuse-to-launch-if-already-running guard, same reasoning as
+    # webots_rover/gazebo_rover (no RUI "conflict" recovery flow exists yet)
+    # -- but checked via the heartbeat PORT, not `pgrep -f`. Confirmed the
+    # hard way: `pgrep -f mujoco_rbx_bridge.py` matches even when nothing is
+    # running, because THIS bash -lc invocation's own argv already contains
+    # that literal text (the launch_command string itself names the script
+    # it's about to run) -- the exact self-match failure mode webots_rover's
+    # own comment warns about for `-f` patterns in general, just triggered a
+    # different way here (no `-x`-able binary name to fall back on, since
+    # this runs as `python3 <script>`, and `-x python3` would match every
+    # unrelated python3 process on the host). A port-liveness check has no
+    # such self-match risk.
+    #
+    # Session-lifetime process group, same as every other target here.
+    launch_command: >-
+      bash -lc '
+      . $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/nepi_sim_display_env.sh;
+      if (exec 3<>/dev/tcp/127.0.0.1/9051) 2>/dev/null; then exec 3<&-; echo "REFUSING TO LAUNCH: a MuJoCo bridge instance is already running on this host (port 9051 is live). Stop the existing simulation first." >&2; exit 3; fi;
+      echo $$ > /tmp/sim_connector_mujoco_launch.pgid;
+      python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/mujoco/mujoco_rbx_bridge.py < /dev/null > /tmp/sim_connector_mujoco_launch.log 2>&1 & MUJOCO_PID=$!;
+      wait $MUJOCO_PID
+      '
+    # Kills only this launch's own process group -- same PGID-scoped
+    # precision as every other target's stop_command.
+    stop_command: "bash -lc 'f=/tmp/sim_connector_mujoco_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; true'"
+    # Port-liveness only, no `pgrep -f` -- see launch_command's own comment
+    # for why a text-pattern process check self-matches here. The /dev/tcp
+    # probe against the heartbeat port is real proof mujoco_rbx_bridge.py's
+    # listener thread is actually accepting connections.
+    ready_check_command: "bash -lc \"(exec 3<>/dev/tcp/127.0.0.1/9051) 2>/dev/null && exec 3<&-\""
+    # rbx_rover.xml has 4 independently-actuated wheels (see that model's own
+    # comment) -- ground_robot_4_wheel, same profile Gazebo/Webots rovers use.
+    default_robot_config: ground_robot_4_wheel
 
   pybullet_rover:
     display_name: "PyBullet"

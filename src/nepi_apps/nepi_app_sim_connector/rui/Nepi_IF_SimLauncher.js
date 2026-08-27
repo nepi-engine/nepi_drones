@@ -382,6 +382,29 @@ class NepiIFSimLauncher extends Component {
       </Label>
     : null
 
+    // Worst-case copy-paste fallback -- populated by the backend
+    // (publishLauncherStatus) only once a failure is confirmed
+    // dependency-related, for a human to run directly in a terminal when
+    // auto-install either failed or (like the ArduPilot SITL quadcopter
+    // target) was never offered in the first place. A <pre> block, not an
+    // <Input> or the plain wrapping <div> error_row uses -- these are
+    // multi-line shell commands meant to be selected and copied verbatim,
+    // where preserved line breaks and a monospace font both matter.
+    const manual_fallback_commands = (status_msg.manual_fallback_commands !== undefined)
+      ? status_msg.manual_fallback_commands : ''
+    const manual_fallback_row = (manual_fallback_commands !== '') ?
+      <Label title={"Run These Commands Manually"}>
+        <pre style={{
+          textAlign: "left",
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-word",
+          userSelect: "text",
+        }}>
+          {manual_fallback_commands}
+        </pre>
+      </Label>
+    : null
+
     // A real choice, not a dead end: launch_command's own refuse-to-launch
     // guard means a gazebo is already up but isn't tracked as this app's
     // own launch (see runLaunch's own comment). Checked before the
@@ -393,6 +416,7 @@ class NepiIFSimLauncher extends Component {
         <React.Fragment>
 
           {error_row}
+          {manual_fallback_row}
 
           <ButtonMenu>
             <Button disabled={busy} onClick={this.onLaunchNewClicked}>{"Launch New"}</Button>
@@ -439,6 +463,7 @@ class NepiIFSimLauncher extends Component {
           </Label>
 
           {error_row}
+          {manual_fallback_row}
 
           <ButtonMenu>
             {selection_matches_running ?
@@ -461,6 +486,7 @@ class NepiIFSimLauncher extends Component {
           </Label>
 
           {error_row}
+          {manual_fallback_row}
 
           <ButtonMenu>
             <Button disabled={busy} onClick={this.onInstallClicked}>{"Install"}</Button>
@@ -475,6 +501,7 @@ class NepiIFSimLauncher extends Component {
     return (
       <React.Fragment>
         {error_row}
+        {manual_fallback_row}
         <ButtonMenu>
           <Button disabled={deploy_disabled} onClick={this.onDeployClicked}>{"Deploy"}</Button>
         </ButtonMenu>
