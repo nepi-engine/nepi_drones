@@ -72,33 +72,13 @@ SIM_VEHICLE_DICT:
       available_camera_view_modes: []
       has_environment_controls: false
 
-    # Two-wheel differential-drive ground robot. Moves in the ground plane, so
-    # local position and yaw are commandable but attitude is not, and it has no
-    # global location reference of its own.
-    ground_robot_2_wheel:
-      display_name: 2-Wheel Rover
-      description: Two-wheel differential-drive ground robot, local position control only
-      wheel_count: 2
-      motor_count: 2
-      has_goto_position: true
-      has_goto_pose: false
-      has_goto_location: false
-      has_go_home: true
-      has_set_home: true
-      has_go_stop: true
-      setup_actions:
-      - RESET
-      - RETURN_HOME
-      go_actions: []
-      has_camera_view_control: true
-      available_camera_view_modes:
-      - SCENE_CAMERA
-      - ROBOT_CAMERA
-      has_environment_controls: true
-
-    # Four-wheel ground robot, otherwise the same control surface as the
-    # two-wheel entry. Present to show that a robot's kind, not the simulator,
-    # is what a config selects.
+    # Four-wheel ground robot -- the profile every launchable rover target
+    # (Gazebo, Webots, MuJoCo) actually uses. A 2-wheel entry existed here
+    # previously but was removed (2026-08-26): none of those targets' rover
+    # models are actually 2-wheeled (see gazebo_rover's own
+    # default_robot_config comment in simulator_launch_targets.yaml), so it
+    # only ever misled -- selecting it silently got you a 4-wheel robot
+    # anyway. Judged not useful enough to keep as a selectable option.
     ground_robot_4_wheel:
       display_name: 4-Wheel Rover
       description: Four-wheel ground robot, local position control only
@@ -119,35 +99,6 @@ SIM_VEHICLE_DICT:
       - SCENE_CAMERA
       - ROBOT_CAMERA
       has_environment_controls: true
-
-    # Two-wheel ground robot with a real, working RESET but no camera/
-    # environment control -- added for MULTI_SIMULATOR_INTEGRATION_PLAN.md
-    # Phase 6 (WPILib HAL Sim). This bridge's RESET is a real, working teleport
-    # (physics.py/shared_state.py's reset_requested flag), so it gets its own
-    # config rather than the camera/environment-capable ground_robot_2_wheel.
-    # hidden_from_selector: this is what WPILib's own simulation stack
-    # supports, not a distinct robot an operator chooses. wpilib_rover's
-    # robot_config_overrides maps "2-Wheel Rover" to this profile
-    # automatically when deploying to WPILib.
-    wpilib_ground_robot:
-      display_name: 2-Wheel Rover (WPILib)
-      hidden_from_selector: true
-      description: Two-wheel ground robot with a working RESET, no camera or environment control
-      wheel_count: 2
-      motor_count: 2
-      has_goto_position: true
-      has_goto_pose: false
-      has_goto_location: false
-      has_go_home: true
-      has_set_home: true
-      has_go_stop: true
-      setup_actions:
-      - RESET
-      - RETURN_HOME
-      go_actions: []
-      has_camera_view_control: false
-      available_camera_view_modes: []
-      has_environment_controls: false
 
     # Four-motor flight robot. No wheels, full attitude control, and a real
     # global location reference, so all three goto surfaces are commandable.

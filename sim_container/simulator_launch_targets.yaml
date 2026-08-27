@@ -547,19 +547,13 @@ launch_targets:
     ready_check_command: "bash -lc \"source /opt/ros/noetic/setup.bash; pgrep -f 'gzserver.*iris_arducopter_cmac.world' > /dev/null && pgrep -f 'sim_vehicle.py -v ArduCopter' > /dev/null && pgrep -f sim_connector_bridge_gazebo_quadcopter.py > /dev/null && rostopic info /camera_rig/camera/image_raw 2>/dev/null | grep -A1 '^Publishers:' | grep -q ' \\* /' && grep -q 'MAVLink heartbeat' ~/.ros/log/sim_connector_bridge_gazebo_quadcopter.log 2>/dev/null\""
     default_robot_config: flight_robot_4_motor
 
-  # pybullet_rover/wpilib_rover below (see those entries) are checkable and
-  # installable, but NOT yet launchable -- launch_command/ready_check_command/
-  # stop_command are intentionally absent (launch() raises a clear
-  # LauncherError naming this if attempted, rather than silently doing
-  # nothing). Gazebo, Webots, and MuJoCo below all have full launch paths,
-  # verified end-to-end; these two exist so the "which simulators exist and
-  # are they installed" half of the picture is real and honest for all five
-  # simulators today, per the stated general vision, without overclaiming a
-  # launch path that hasn't been built and tested yet. The bridge scripts
-  # these will eventually shell out to already exist under
-  # sim_container/bridges/ -- wiring an actual launch_command through them is
-  # exactly steps 2-5 of docs/SIMULATOR_AUTO_LAUNCH_PLAN.md's own build order,
-  # repeated per simulator, once each is prioritized.
+  # Gazebo, Webots, and MuJoCo below all have full launch paths, verified
+  # end-to-end. PyBullet and WPILib HAL Sim (which used to sit here,
+  # checkable/installable but never wired up to an actual launch_command)
+  # were removed entirely (2026-08-26) rather than left as an honest-but-
+  # incomplete placeholder -- judged not useful enough to keep offered as
+  # selectable simulators. See their targets' own former comment (git
+  # history) or docs/SIMULATOR_AUTO_LAUNCH_PLAN.md for that prior context.
   #
   # (This comment previously also claimed webots_rover/webots_quadcopter had
   # no launch_command -- stale as of the 2026-08-17 RBX-driver work below,
@@ -801,30 +795,10 @@ launch_targets:
     # comment) -- ground_robot_4_wheel, same profile Gazebo/Webots rovers use.
     default_robot_config: ground_robot_4_wheel
 
-  pybullet_rover:
-    display_name: "PyBullet"
-    host: "127.0.0.1"
-    ssh_user: "suraj"
-    ssh_port: 12222
-    check_installed_command: "bash -lc \"python3 -c 'import pybullet' > /dev/null 2>&1\""
-    install_command: "bash -lc \"pip3 install --user pybullet\""
-
-  # robotpy's WPILib HAL simulation stack (FIRST Robotics) -- see
-  # docs/MULTI_SIMULATOR_INTEGRATION_PLAN.md Phase 6. Its own bridge
-  # (sim_container/bridges/wpilib/{robot.py,physics.py,shared_state.py})
-  # already exists, confirmed working VM-side; launch_command is intentionally
-  # absent for the same reason as webots_rover/pybullet_rover
-  # above -- not yet wired through this launcher.
-  wpilib_rover:
-    display_name: "WPILib HAL Sim"
-    host: "127.0.0.1"
-    ssh_user: "suraj"
-    ssh_port: 12222
-    check_installed_command: "bash -lc \"python3 -c 'import wpilib' > /dev/null 2>&1\""
-    # Pinned per the plan doc's own finding: robotpy 2024.x needs GCC 10+/
-    # C++20, unavailable on this Ubuntu 20.04 target; 2022.4.8 is what was
-    # actually confirmed working.
-    install_command: "bash -lc \"pip3 install --user robotpy==2022.4.8\""
-    # WPILib's HAL sim has no camera or environment-control concept at all.
-    robot_config_overrides:
-      ground_robot_2_wheel: wpilib_ground_robot
+  # PyBullet and WPILib HAL Sim removed (2026-08-26) -- neither had a
+  # launch_command wired through this launcher (install-check only), and
+  # both were judged not useful enough to keep offered as selectable
+  # simulators. Their own bridge scripts under sim_container/bridges/
+  # (pybullet/, wpilib/) are left in place, just no longer reachable from
+  # the Simulator selector. See docs/MULTI_SIMULATOR_INTEGRATION_PLAN.md
+  # Phase 6 for WPILib's prior context if this is ever revisited.
