@@ -28,7 +28,8 @@ import Button, { ButtonMenu } from "./Button"
 import Styles from "./Styles"
 import BooleanIndicator from "./BooleanIndicator"
 import { Columns, Column } from "./Columns"
-import { round } from "./Utilities"
+import { round, setElementStyleModified, clearElementStyleModified } from "./Utilities"
+import yaml from "js-yaml"
 
 import NepiIFSimControls from "./Nepi_IF_Sim-Controls"
 import NepiIFSimLauncher from "./Nepi_IF_SimLauncher"
@@ -86,6 +87,43 @@ available_camera_view_modes:
 # Environment controls (e.g. lighting/weather toggles the sim bridge exposes).
 has_environment_controls: true
 `
+
+// Curated physical-dimension fields -- one entry per generate_model_sdf.py
+// independent parameter (see that script's own ROVER_DEFAULT_DIMENSIONS/
+// OBSTACLE_COURSE_DEFAULT_DIMENSIONS for the derivations these feed). Default
+// values here match the script's own defaults, shown until a real device
+// response arrives (sim/robot_dimensions_yaml / sim/environment_dimensions_yaml).
+const ROBOT_DIMENSION_FIELDS = [
+  { name: "wheel_radius_m", title: "Wheel Radius (m)", default: 0.1 },
+  { name: "wheel_width_m", title: "Wheel Width (m)", default: 0.05 },
+  { name: "track_width_m", title: "Track Width (m)", default: 0.34 },
+  { name: "wheelbase_m", title: "Wheelbase (m)", default: 0.3 },
+  { name: "chassis_length_m", title: "Chassis Length (m)", default: 0.4 },
+  { name: "chassis_width_m", title: "Chassis Width (m)", default: 0.3 },
+  { name: "chassis_height_m", title: "Chassis Height (m)", default: 0.1 },
+]
+
+const ENVIRONMENT_DIMENSION_FIELDS = [
+  { name: "course_start_x_m", title: "Course Start X (m)", default: 2.0 },
+  { name: "corridor_width_m", title: "Corridor Width (m)", default: 6.0 },
+  { name: "wall_length_m", title: "Wall Length (m)", default: 22.0 },
+  { name: "wall_thickness_m", title: "Wall Thickness (m)", default: 0.2 },
+  { name: "wall_height_m", title: "Wall Height (m)", default: 1.0 },
+  { name: "baffle_a_x_m", title: "Baffle A Position X (m)", default: 8.0 },
+  { name: "baffle_b_x_m", title: "Baffle B Position X (m)", default: 14.0 },
+  { name: "baffle_gap_m", title: "Baffle Drive-Through Gap (m)", default: 0.4 },
+  { name: "baffle_thickness_m", title: "Baffle Thickness (m)", default: 0.2 },
+  { name: "ramp_start_x_m", title: "Ramp Start X (m)", default: 18.0 },
+  { name: "ramp_rise_m", title: "Ramp Rise (m)", default: 0.35 },
+  { name: "ramp_angle_deg", title: "Ramp Angle (deg)", default: 9.97 },
+  { name: "ramp_plateau_length_m", title: "Ramp Plateau Length (m)", default: 1.0 },
+]
+
+function defaultDimensionFields(fieldDefs) {
+  var fields = {}
+  fieldDefs.forEach((f) => { fields[f.name] = f.default })
+  return fields
+}
 
 @inject("ros")
 @observer
@@ -155,17 +193,50 @@ class NepiIFSim extends Component {
       // local override yet, fall back to status_msg".
       selected_robot_config_local: null,
 
+      // FOV data -- read once (mount time) from two plain, latched
+      // std_msgs/Float32 topics published directly by sim_connector_app_node.py
+      // (sim/camera_horizontal_fov_deg, sim/camera_vertical_fov_deg). Not part
+      // of SimStatus/status_msg -- these never change at runtime, so a
+      // dedicated latched topic pair avoids extending the .msg (which would
+      // force a catkin message-regeneration rebuild) for two static numbers.
+      camera_horizontal_fov_deg: null,
+      camera_vertical_fov_deg: null,
+      cameraHorizontalFovListener: null,
+      cameraVerticalFovListener: null,
+
+      // Physical-dimension editing (robot chassis/wheel + environment
+      // corridor/ramp geometry) -- curated fields, hydrated from the
+      // device's stored dimensions.yaml on mount (sim/get_robot_dimensions
+      // / sim/get_environment_dimensions request -> sim/*_dimensions_yaml
+      // latched reply), defaulting to generate_model_sdf.py's own factory
+      // values until that reply arrives. dirty mirrors sim/*_dimensions_dirty
+      // -- true means the device has a pending edit not yet applied to the
+      // VM's own model.sdf (only happens right before the next Launch).
+      robot_dimensions_fields: defaultDimensionFields(ROBOT_DIMENSION_FIELDS),
+      environment_dimensions_fields: defaultDimensionFields(ENVIRONMENT_DIMENSION_FIELDS),
+      robot_dimensions_dirty: false,
+      environment_dimensions_dirty: false,
+      robotDimensionsYamlListener: null,
+      environmentDimensionsYamlListener: null,
+      robotDimensionsDirtyListener: null,
+      environmentDimensionsDirtyListener: null,
+
     }
 
     // Hidden <input type="file"> target for the Upload Robot Config button
     // -- a ref rather than state, since the input element itself is never
     // rendered differently; only clicked programmatically.
     this.uploadInputRef = React.createRef()
+    // Hidden <input type="file"> targets for the raw-SDF-upload escape
+    // hatch -- one per role, same reasoning as uploadInputRef above.
+    this.uploadRobotSdfInputRef = React.createRef()
+    this.uploadEnvironmentSdfInputRef = React.createRef()
 
     this.getSimNamespace = this.getSimNamespace.bind(this)
 
     this.updateStatusListener = this.updateStatusListener.bind(this)
     this.statusListener = this.statusListener.bind(this)
+    this.updateCameraFovListeners = this.updateCameraFovListeners.bind(this)
 
     this.onRobotConfigSelected = this.onRobotConfigSelected.bind(this)
     this.onUploadConfigClicked = this.onUploadConfigClicked.bind(this)
@@ -181,6 +252,14 @@ class NepiIFSim extends Component {
     this.renderRobotConfigSettings = this.renderRobotConfigSettings.bind(this)
     this.renderFieldPair = this.renderFieldPair.bind(this)
     this.renderData = this.renderData.bind(this)
+
+    this.updateDimensionsListeners = this.updateDimensionsListeners.bind(this)
+    this.onSaveDimensionsClicked = this.onSaveDimensionsClicked.bind(this)
+    this.onDownloadDimensionsClicked = this.onDownloadDimensionsClicked.bind(this)
+    this.onUploadModelSdfClicked = this.onUploadModelSdfClicked.bind(this)
+    this.onUploadModelSdfFileChange = this.onUploadModelSdfFileChange.bind(this)
+    this.renderDimensionFields = this.renderDimensionFields.bind(this)
+    this.renderDimensionsEditor = this.renderDimensionsEditor.bind(this)
   }
 
   // Resolve the sim device namespace from the namespace prop
@@ -191,6 +270,8 @@ class NepiIFSim extends Component {
   componentDidMount() {
     this.updateStatusListener()
     this.updateRobotConfigYamlListener()
+    this.updateCameraFovListeners()
+    this.updateDimensionsListeners()
   }
 
   // Lifecycle method called when the component updates.
@@ -200,6 +281,8 @@ class NepiIFSim extends Component {
     if (namespace !== this.state.namespace) {
       this.updateStatusListener()
       this.updateRobotConfigYamlListener()
+      this.updateCameraFovListeners()
+      this.updateDimensionsListeners()
     }
 
     // Once the server catches up and reports the SAME config we optimistically
@@ -222,7 +305,119 @@ class NepiIFSim extends Component {
     if (this.state.robotConfigYamlListener) {
       this.state.robotConfigYamlListener.unsubscribe()
     }
-    this.setState({ statusListener: null, robotConfigYamlListener: null })
+    if (this.state.cameraHorizontalFovListener) {
+      this.state.cameraHorizontalFovListener.unsubscribe()
+    }
+    if (this.state.cameraVerticalFovListener) {
+      this.state.cameraVerticalFovListener.unsubscribe()
+    }
+    if (this.state.robotDimensionsYamlListener) {
+      this.state.robotDimensionsYamlListener.unsubscribe()
+    }
+    if (this.state.environmentDimensionsYamlListener) {
+      this.state.environmentDimensionsYamlListener.unsubscribe()
+    }
+    if (this.state.robotDimensionsDirtyListener) {
+      this.state.robotDimensionsDirtyListener.unsubscribe()
+    }
+    if (this.state.environmentDimensionsDirtyListener) {
+      this.state.environmentDimensionsDirtyListener.unsubscribe()
+    }
+    this.setState({ statusListener: null, robotConfigYamlListener: null,
+                    cameraHorizontalFovListener: null, cameraVerticalFovListener: null,
+                    robotDimensionsYamlListener: null, environmentDimensionsYamlListener: null,
+                    robotDimensionsDirtyListener: null, environmentDimensionsDirtyListener: null })
+  }
+
+  // Function for configuring and subscribing to the two static FOV topics --
+  // see camera_horizontal_fov_deg's own comment in the constructor for why
+  // these are separate latched Float32 topics rather than part of SimStatus.
+  updateCameraFovListeners() {
+    const namespace = this.getSimNamespace()
+    if (this.state.cameraHorizontalFovListener != null) {
+      this.state.cameraHorizontalFovListener.unsubscribe()
+    }
+    if (this.state.cameraVerticalFovListener != null) {
+      this.state.cameraVerticalFovListener.unsubscribe()
+    }
+    if (namespace == null || namespace === 'None') {
+      this.setState({ cameraHorizontalFovListener: null, cameraVerticalFovListener: null,
+                      camera_horizontal_fov_deg: null, camera_vertical_fov_deg: null })
+      return
+    }
+    const hListener = this.props.ros.setupStatusListener(
+      namespace + '/camera_horizontal_fov_deg',
+      "std_msgs/Float32",
+      (message) => this.setState({ camera_horizontal_fov_deg: message.data })
+    )
+    const vListener = this.props.ros.setupStatusListener(
+      namespace + '/camera_vertical_fov_deg',
+      "std_msgs/Float32",
+      (message) => this.setState({ camera_vertical_fov_deg: message.data })
+    )
+    this.setState({ cameraHorizontalFovListener: hListener, cameraVerticalFovListener: vListener })
+  }
+
+  // Physical-dimension editing: subscribes to both roles' *_dimensions_yaml
+  // (latched reply to a get_*_dimensions request) and *_dimensions_dirty
+  // topics, then immediately requests the current values -- unlike the FOV
+  // topics above, these aren't published unprompted at startup, only in
+  // response to a request, so a freshly (re)mounted component needs to ask
+  // before it has anything real to show.
+  updateDimensionsListeners() {
+    const namespace = this.getSimNamespace()
+    ;[this.state.robotDimensionsYamlListener, this.state.environmentDimensionsYamlListener,
+      this.state.robotDimensionsDirtyListener, this.state.environmentDimensionsDirtyListener]
+      .forEach((listener) => { if (listener != null) { listener.unsubscribe() } })
+    if (namespace == null || namespace === 'None') {
+      this.setState({ robotDimensionsYamlListener: null, environmentDimensionsYamlListener: null,
+                      robotDimensionsDirtyListener: null, environmentDimensionsDirtyListener: null })
+      return
+    }
+    const robotYamlListener = this.props.ros.setupStatusListener(
+      namespace + '/robot_dimensions_yaml', "std_msgs/String",
+      (message) => this.applyDimensionsYaml('robot', message.data)
+    )
+    const environmentYamlListener = this.props.ros.setupStatusListener(
+      namespace + '/environment_dimensions_yaml', "std_msgs/String",
+      (message) => this.applyDimensionsYaml('environment', message.data)
+    )
+    const robotDirtyListener = this.props.ros.setupStatusListener(
+      namespace + '/robot_dimensions_dirty', "std_msgs/Bool",
+      (message) => this.setState({ robot_dimensions_dirty: message.data })
+    )
+    const environmentDirtyListener = this.props.ros.setupStatusListener(
+      namespace + '/environment_dimensions_dirty', "std_msgs/Bool",
+      (message) => this.setState({ environment_dimensions_dirty: message.data })
+    )
+    this.setState({ robotDimensionsYamlListener: robotYamlListener,
+                    environmentDimensionsYamlListener: environmentYamlListener,
+                    robotDimensionsDirtyListener: robotDirtyListener,
+                    environmentDimensionsDirtyListener: environmentDirtyListener })
+    this.props.ros.sendTriggerMsg(namespace + '/get_robot_dimensions')
+    this.props.ros.sendTriggerMsg(namespace + '/get_environment_dimensions')
+  }
+
+  // Parses a *_dimensions_yaml reply and merges it over the current field
+  // defaults -- "merges over defaults" rather than "replaces wholesale" so
+  // a field the device hasn't stored yet (a fresh install, or a field added
+  // to ROBOT_DIMENSION_FIELDS after some devices already have a stored
+  // dimensions.yaml) still shows its sensible default instead of blank/NaN.
+  // Silently ignores anything that isn't a real YAML mapping -- the "no
+  // stored dimensions yet" placeholder text isn't valid YAML on purpose, so
+  // this simply keeps the JS-side defaults in that case rather than erroring.
+  applyDimensionsYaml(role, yamlText) {
+    var parsed = null
+    try {
+      parsed = yaml.load(yamlText)
+    } catch (e) {
+      parsed = null
+    }
+    if (parsed === null || typeof parsed !== 'object') {
+      return
+    }
+    const fieldsKey = role + '_dimensions_fields'
+    this.setState((prevState) => ({ [fieldsKey]: { ...prevState[fieldsKey], ...parsed } }))
   }
 
   // Function for configuring and subscribing to sim/robot_config_yaml --
@@ -390,6 +585,69 @@ class NepiIFSim extends Component {
     URL.revokeObjectURL(url)
   }
 
+  // Sends the CURRENT complete fields object for one role, not just
+  // whichever single field was last edited -- matches the same "all current
+  // values together, always" convention the VM's own camera-settings push
+  // uses (sendCameraSettings): the device overwrites its stored
+  // dimensions.yaml wholesale with whatever it receives, so a partial send
+  // would silently reset every other field to its generator default.
+  onSaveDimensionsClicked(role) {
+    const namespace = this.getSimNamespace()
+    if (namespace == null || namespace === 'None') {
+      return
+    }
+    const fields = this.state[role + '_dimensions_fields']
+    const yamlText = yaml.dump(fields)
+    this.props.ros.sendStringMsg(namespace + '/set_' + role + '_dimensions', yamlText)
+  }
+
+  // Client-side only, downloads the CURRENTLY EDITED fields (not a fresh
+  // device round-trip) as YAML -- a convenience snapshot/backup of the
+  // curated values, not the actual rendered model.sdf (that only exists on
+  // the VM; fetching it would need a second SSH round trip this feature
+  // doesn't add). The raw-SDF escape hatch below is for uploading a hand-
+  // authored model.sdf, not for downloading the live one.
+  onDownloadDimensionsClicked(role) {
+    const fields = this.state[role + '_dimensions_fields']
+    const yamlText = yaml.dump(fields)
+    const blob = new Blob([yamlText], { type: 'text/yaml' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = role + '_dimensions.yaml'
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    URL.revokeObjectURL(url)
+  }
+
+  onUploadModelSdfClicked(role) {
+    const ref = (role === 'robot') ? this.uploadRobotSdfInputRef : this.uploadEnvironmentSdfInputRef
+    if (ref.current != null) {
+      ref.current.click()
+    }
+  }
+
+  // Raw-SDF-upload escape hatch -- publishes the picked file's whole text to
+  // sim/upload_robot_model_sdf or sim/upload_environment_model_sdf. No
+  // client-side XML validation (this app has no SDF parser); a bad upload
+  // surfaces the same way a bad hand-edit would on the next Launch, not as
+  // an error here.
+  onUploadModelSdfFileChange(role, event) {
+    const file = (event.target.files && event.target.files.length > 0)
+      ? event.target.files[0] : null
+    event.target.value = ''
+    const namespace = this.getSimNamespace()
+    if (file == null || namespace == null || namespace === 'None') {
+      return
+    }
+    const reader = new FileReader()
+    reader.onload = () => {
+      this.props.ros.sendStringMsg(namespace + '/upload_' + role + '_model_sdf', String(reader.result))
+    }
+    reader.readAsText(file)
+  }
+
   // Robot config selector, backed by the status message's reported list of named
   // robot configs. Selecting one tells the simulator which kind of robot is
   // wanted. Option value is always the raw config key (what select_robot_config
@@ -463,11 +721,11 @@ class NepiIFSim extends Component {
         <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
         <ButtonMenu>
           <Button onClick={() => this.setState({ show_robot_config_viewer: !this.state.show_robot_config_viewer })}>
-            {(this.state.show_robot_config_viewer ? "Hide" : "Show") + " Robot Config Settings"}
+            {(this.state.show_robot_config_viewer ? "Hide" : "Show") + " Config Settings"}
           </Button>
         </ButtonMenu>
         {(this.state.show_robot_config_viewer === true) ?
-          <Section title={"Robot Config Settings"}>
+          <Section title={"Config Settings"}>
             <input
               type="file"
               accept=".yaml,.yml,text/yaml"
@@ -509,8 +767,95 @@ class NepiIFSim extends Component {
                 : null}
               </React.Fragment>
             : null}
+            {this.renderDimensionsEditor('robot', 'Robot Dimensions', ROBOT_DIMENSION_FIELDS,
+                                          this.uploadRobotSdfInputRef)}
+            {this.renderDimensionsEditor('environment', 'Environment Dimensions', ENVIRONMENT_DIMENSION_FIELDS,
+                                          this.uploadEnvironmentSdfInputRef)}
           </Section>
         : null}
+      </React.Fragment>
+    )
+  }
+
+  // One editable Input per curated field, two per row via renderFieldPair --
+  // same editable-input pattern as the camera offset controls
+  // (Nepi_IF_Sim-Controls.js's renderCameraOffsetControls): id for
+  // setElementStyleModified targeting, onChange updates local state, Enter
+  // saves (see onSaveDimensionsClicked's own comment for why Enter sends
+  // the WHOLE fields object, not just the one edited field).
+  renderDimensionFields(role, fieldDefs) {
+    const fields = this.state[role + '_dimensions_fields']
+    var rows = []
+    for (var i = 0; i < fieldDefs.length; i += 2) {
+      const a = fieldDefs[i]
+      const b = (i + 1 < fieldDefs.length) ? fieldDefs[i + 1] : null
+      const renderOne = (f) => (
+        <Label key={f.name} title={f.title}>
+          <Input
+            id={"SimDim_" + role + "_" + f.name}
+            value={fields[f.name]}
+            onChange={(event) => {
+              const el = document.getElementById("SimDim_" + role + "_" + f.name)
+              if (el) {
+                setElementStyleModified(el)
+              }
+              const fieldsKey = role + '_dimensions_fields'
+              this.setState((prevState) => ({
+                [fieldsKey]: { ...prevState[fieldsKey], [f.name]: event.target.value }
+              }))
+            }}
+            onKeyDown={(event) => {
+              if (event.key !== 'Enter') {
+                return
+              }
+              const el = document.getElementById("SimDim_" + role + "_" + f.name)
+              if (el) {
+                clearElementStyleModified(el)
+              }
+              this.onSaveDimensionsClicked(role)
+            }}
+          />
+        </Label>
+      )
+      rows.push(
+        <React.Fragment key={a.name}>
+          {(b != null) ? this.renderFieldPair(renderOne(a), renderOne(b)) : renderOne(a)}
+        </React.Fragment>
+      )
+    }
+    return rows
+  }
+
+  // Full sub-section for one role: curated fields (renderDimensionFields
+  // above), a "changes apply on next Launch" note gated on the *_dirty
+  // status (Gazebo only reads model.sdf at spawn time, never live), and the
+  // raw-SDF-upload/download escape hatch for geometry the curated fields
+  // don't cover.
+  renderDimensionsEditor(role, title, fieldDefs, uploadInputRef) {
+    const dirty = this.state[role + '_dimensions_dirty']
+    return (
+      <React.Fragment>
+        <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
+        <Section title={title}>
+          {this.renderDimensionFields(role, fieldDefs)}
+          {(dirty === true) ?
+            <Label title={" "}>
+              <Input disabled value={"Edited -- applies on the next Launch"} />
+            </Label>
+          : null}
+          <input
+            type="file"
+            accept=".sdf,.xml,text/xml"
+            ref={uploadInputRef}
+            style={{ display: 'none' }}
+            onChange={(event) => this.onUploadModelSdfFileChange(role, event)}
+          />
+          <ButtonMenu>
+            <Button onClick={() => this.onSaveDimensionsClicked(role)}>{"Save Dimensions"}</Button>
+            <Button onClick={() => this.onDownloadDimensionsClicked(role)}>{"Download Dimensions (YAML)"}</Button>
+            <Button onClick={() => this.onUploadModelSdfClicked(role)}>{"Upload Raw model.sdf"}</Button>
+          </ButtonMenu>
+        </Section>
       </React.Fragment>
     )
   }
@@ -584,6 +929,17 @@ class NepiIFSim extends Component {
           </Label>,
           <Label title={"Sensor Topics"}>
             <Input disabled value={String(sensor_topics.length)} />
+          </Label>
+        )}
+
+        {this.renderFieldPair(
+          <Label title={"Camera Horizontal FOV (deg)"}>
+            <Input disabled value={(this.state.camera_horizontal_fov_deg != null)
+              ? round(this.state.camera_horizontal_fov_deg, 1) : ""} />
+          </Label>,
+          <Label title={"Camera Vertical FOV (deg)"}>
+            <Input disabled value={(this.state.camera_vertical_fov_deg != null)
+              ? round(this.state.camera_vertical_fov_deg, 1) : ""} />
           </Label>
         )}
 
