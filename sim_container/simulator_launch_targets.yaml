@@ -91,7 +91,23 @@ launch_targets:
     # genuinely being present, for exactly that reason. Every other command
     # on this target already sources setup.bash first; this one just hadn't
     # caught up yet.
-    check_installed_command: "bash -lc \"source /opt/ros/noetic/setup.bash; command -v gzserver > /dev/null && command -v roscore > /dev/null\""
+    # Prefixed (2026-08-28) with a check that nepi_drones itself is actually
+    # checked out on the VM -- sim_container/'s world files, bridge scripts,
+    # and listeners are what every launch_command below actually runs,
+    # completely separately from whether Gazebo/ROS are installed. nepi_drones
+    # is its OWN git repo, never a submodule of nepi_engine_ws, so deleting
+    # and re-cloning nepi_engine_ws (a real, reported scenario: "i justget rid
+    # of nepi_engine_ws due to some glitches and redownoaded it... it looks
+    # like it cant properly connect to this vm") silently wipes it with no
+    # warning. Without this check, a missing nepi_drones checkout still
+    # passed as "installed" (gzserver/roscore were untouched), so Deploy
+    # proceeded straight to launch_command, which failed referencing files
+    # that no longer existed -- surfacing only as the generic, misleading
+    # "Timed out waiting for the simulator to become ready", with nothing
+    # pointing at the actual cause. Checked first (short-circuits before the
+    # slower gzserver/roscore check) so this specific cause is what
+    # not_installed/manual_fallback_commands actually reports.
+    check_installed_command: "bash -lc \"test -d $HOME/nepi_engine_ws/nepi_drones/sim_container && source /opt/ros/noetic/setup.bash && command -v gzserver > /dev/null && command -v roscore > /dev/null\""
     # Widened (2026-08-26) from a bare `apt-get install ros-noetic-gazebo-*`
     # to a real fresh-Ubuntu-20.04 bootstrap: the old version silently assumed
     # ROS Noetic and the ROS apt repo/key were ALREADY present, so on a
@@ -103,9 +119,20 @@ launch_targets:
     # Each stage is skip-if-already-done so re-running this on a
     # partially-set-up box (ROS present but Gazebo missing, the common case)
     # is harmless and fast rather than redundantly reinstalling ROS itself.
+    # Also clones nepi_drones itself if it's missing (2026-08-28, see the
+    # check_installed_command comment above) -- best-effort: this needs the
+    # VM to already have its own git/SSH access to this org's repos, which
+    # a genuinely fresh VM may not, so a failure here still surfaces through
+    # the app's normal install-failure reporting rather than silently
+    # proceeding to a launch that can't work. manual_fallback_commands below
+    # has the same clone as a copy-paste step for when it doesn't.
     install_command: >-
       bash -lc '
       set -e;
+      if [ ! -d $HOME/nepi_engine_ws/nepi_drones/sim_container ]; then
+      mkdir -p $HOME/nepi_engine_ws;
+      git clone git@github.com:nepi-engine/nepi_drones.git $HOME/nepi_engine_ws/nepi_drones;
+      fi;
       if [ ! -f /etc/apt/sources.list.d/ros-latest.list ]; then
       sudo sh -c "echo \"deb http://packages.ros.org/ros/ubuntu $(lsb_release -sc) main\" > /etc/apt/sources.list.d/ros-latest.list";
       sudo apt-get install -y curl;
@@ -123,6 +150,7 @@ launch_targets:
     # sim_connector_app_node.py's runInstall/runLaunch and
     # Nepi_IF_SimLauncher.js's error_row rendering.
     manual_fallback_commands: |-
+      git clone git@github.com:nepi-engine/nepi_drones.git ~/nepi_engine_ws/nepi_drones
       echo "deb http://packages.ros.org/ros/ubuntu $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/ros-latest.list
       sudo apt-get install -y curl
       curl -s https://raw.githubusercontent.com/ros/rosdistro/master/ros.asc | sudo apt-key add -
@@ -369,15 +397,22 @@ launch_targets:
     # the background like every hidden_from_selector entry; just not
     # offered a matching Install button (there is no visible selector row
     # for this target to show one on regardless).
-    check_installed_command: "bash -lc \"source /opt/ros/noetic/setup.bash; command -v gzserver > /dev/null && command -v roscore > /dev/null && command -v sim_vehicle.py > /dev/null && python3 -c 'import pymavlink' > /dev/null 2>&1 && test -f $HOME/ardupilot_gazebo/worlds/iris_arducopter_cmac.world\""
+    # nepi_drones existence checked first, same as gazebo_rover -- see that
+    # target's own check_installed_command comment for the full "nepi_drones
+    # deleted and re-cloned nepi_engine_ws only" scenario this catches.
+    check_installed_command: "bash -lc \"test -d $HOME/nepi_engine_ws/nepi_drones/sim_container && source /opt/ros/noetic/setup.bash && command -v gzserver > /dev/null && command -v roscore > /dev/null && command -v sim_vehicle.py > /dev/null && python3 -c 'import pymavlink' > /dev/null 2>&1 && test -f $HOME/ardupilot_gazebo/worlds/iris_arducopter_cmac.world\""
     # No install_command (see the comment above), so this is the ONLY
     # fallback the RUI has for this target -- shown as copy-paste text when a
     # Deploy attempt fails because ArduPilot SITL isn't set up. Steps are
     # ArduPilot's own documented from-source build (already used as this
     # project's own reference -- see docs/DISCOVERY_EXPLAINED.md's "Standing
     # up ArduPilot SITL" appendix), quoted here rather than re-derived so the
-    # two copies can't drift silently.
+    # two copies can't drift silently. nepi_drones clone prepended (2026-08-28)
+    # since this target has no install_command at all to attempt it
+    # automatically -- this is the only place a missing nepi_drones checkout
+    # for THIS target ever gets a fix shown.
     manual_fallback_commands: |-
+      git clone git@github.com:nepi-engine/nepi_drones.git ~/nepi_engine_ws/nepi_drones
       git clone --recurse-submodules https://github.com/ArduPilot/ardupilot
       cd ardupilot
       Tools/environment_install/install-prereqs-ubuntu.sh -y
@@ -578,7 +613,10 @@ launch_targets:
     host: "127.0.0.1"
     ssh_user: "suraj"
     ssh_port: 12222
-    check_installed_command: "bash -lc \"command -v webots > /dev/null\""
+    # nepi_drones existence checked first, same as gazebo_rover -- see that
+    # target's own check_installed_command comment for the full "nepi_drones
+    # deleted and re-cloned nepi_engine_ws only" scenario this catches.
+    check_installed_command: "bash -lc \"test -d $HOME/nepi_engine_ws/nepi_drones/sim_container && command -v webots > /dev/null\""
     # Queries GitHub's own Releases API for whatever is actually latest at
     # install time, rather than hardcoding a version string in this file
     # that would silently go stale. cyberbotics/webots is the upstream
@@ -590,10 +628,16 @@ launch_targets:
     # outright with "command not found" before ever reaching Webots itself.
     # `apt-get install -y curl wget` is safe to run unconditionally (a no-op
     # if already present, unlike the ROS apt-repo/key steps that genuinely
-    # need a skip-if-already-done guard).
+    # need a skip-if-already-done guard). Also clones nepi_drones itself if
+    # missing (2026-08-28) -- see gazebo_rover's own install_command comment
+    # for why this is best-effort.
     install_command: >-
       bash -lc '
       set -e;
+      if [ ! -d $HOME/nepi_engine_ws/nepi_drones/sim_container ]; then
+      mkdir -p $HOME/nepi_engine_ws;
+      git clone git@github.com:nepi-engine/nepi_drones.git $HOME/nepi_engine_ws/nepi_drones;
+      fi;
       sudo apt-get update -qq;
       sudo apt-get install -y curl wget;
       DEB_URL=$(curl -fsSL https://api.github.com/repos/cyberbotics/webots/releases/latest
@@ -608,6 +652,7 @@ launch_targets:
     # to show verbatim as a copy-paste fallback -- same convention as
     # gazebo_rover's own manual_fallback_commands.
     manual_fallback_commands: |-
+      git clone git@github.com:nepi-engine/nepi_drones.git ~/nepi_engine_ws/nepi_drones
       sudo apt-get update -qq
       sudo apt-get install -y curl wget
       DEB_URL=$(curl -fsSL https://api.github.com/repos/cyberbotics/webots/releases/latest | grep -o 'https://[^"]*_amd64\.deb' | head -1)
@@ -696,13 +741,19 @@ launch_targets:
     host: "127.0.0.1"
     ssh_user: "suraj"
     ssh_port: 12222
-    check_installed_command: "bash -lc \"command -v webots > /dev/null\""
+    # nepi_drones existence checked first, same as gazebo_rover.
+    check_installed_command: "bash -lc \"test -d $HOME/nepi_engine_ws/nepi_drones/sim_container && command -v webots > /dev/null\""
     # Same install steps as webots_rover -- it's the same Webots binary,
     # only the world file launched below differs. See webots_rover's own
-    # comment for why curl/wget are installed explicitly (2026-08-26).
+    # comment for why curl/wget are installed explicitly (2026-08-26) and
+    # nepi_drones is cloned if missing (2026-08-28).
     install_command: >-
       bash -lc '
       set -e;
+      if [ ! -d $HOME/nepi_engine_ws/nepi_drones/sim_container ]; then
+      mkdir -p $HOME/nepi_engine_ws;
+      git clone git@github.com:nepi-engine/nepi_drones.git $HOME/nepi_engine_ws/nepi_drones;
+      fi;
       sudo apt-get update -qq;
       sudo apt-get install -y curl wget;
       DEB_URL=$(curl -fsSL https://api.github.com/repos/cyberbotics/webots/releases/latest
@@ -714,6 +765,7 @@ launch_targets:
       rm -f /tmp/webots_latest_amd64.deb
       '
     manual_fallback_commands: |-
+      git clone git@github.com:nepi-engine/nepi_drones.git ~/nepi_engine_ws/nepi_drones
       sudo apt-get update -qq
       sudo apt-get install -y curl wget
       DEB_URL=$(curl -fsSL https://api.github.com/repos/cyberbotics/webots/releases/latest | grep -o 'https://[^"]*_amd64\.deb' | head -1)
@@ -744,7 +796,8 @@ launch_targets:
     host: "127.0.0.1"
     ssh_user: "suraj"
     ssh_port: 12222
-    check_installed_command: "bash -lc \"python3 -c 'import mujoco' > /dev/null 2>&1\""
+    # nepi_drones existence checked first, same as gazebo_rover/webots_rover.
+    check_installed_command: "bash -lc \"test -d $HOME/nepi_engine_ws/nepi_drones/sim_container && python3 -c 'import mujoco' > /dev/null 2>&1\""
     # Widened (2026-08-26), same reasoning as gazebo_rover/webots_rover's own
     # install_command: a fresh Ubuntu 20.04 VM has neither pip3
     # (python3-pip isn't part of the base install) nor the system OpenGL/EGL
@@ -753,15 +806,20 @@ launch_targets:
     # already pulled in mesa/GL packages as their own dependencies, which a
     # MuJoCo-only fresh VM would never get. All of these are safe to
     # apt-get install unconditionally (small, idempotent, no skip-if-present
-    # guard needed).
+    # guard needed). Also clones nepi_drones first if missing (2026-08-28).
     install_command: >-
       bash -lc '
       set -e;
+      if [ ! -d $HOME/nepi_engine_ws/nepi_drones/sim_container ]; then
+      mkdir -p $HOME/nepi_engine_ws;
+      git clone git@github.com:nepi-engine/nepi_drones.git $HOME/nepi_engine_ws/nepi_drones;
+      fi;
       sudo apt-get update -qq;
       sudo apt-get install -y python3-pip libgl1 libegl1 libopengl0 libosmesa6 libglx0;
       pip3 install --user mujoco
       '
     manual_fallback_commands: |-
+      git clone git@github.com:nepi-engine/nepi_drones.git ~/nepi_engine_ws/nepi_drones
       sudo apt-get update -qq
       sudo apt-get install -y python3-pip libgl1 libegl1 libopengl0 libosmesa6 libglx0
       pip3 install --user mujoco
