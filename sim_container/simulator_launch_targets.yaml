@@ -24,8 +24,22 @@
 #      loopback in the common case:
 #        autossh -M 0 -f -N -R <ssh_port>:127.0.0.1:22 -p <device_ssh_port> \
 #          -i ~/.ssh/nepi_default_ssh_key <device_user>@<device_host>
-#      (run FROM the VM). If your device and VM already share a routable
-#      network, use the VM's real LAN address instead and skip the tunnel.
+#      (run FROM the VM; sim_container/scripts/nepi_sitl_dev_env.sh's
+#      nepi_tunnel() and its companion nepi-tunnel.service do exactly this,
+#      already wired to every port this whole project uses). If your device
+#      and VM already share a routable network, use the VM's real LAN
+#      address instead and skip the tunnel.
+#
+# ssh_user below is "suraj" for every target -- one specific developer's own
+# VM login, not a generic default. Rather than hand-editing all five blocks
+# for a different deployment, set NEPI_SIM_VM_SSH_USER (and, if host/
+# ssh_port also need to differ -- e.g. skipping the tunnel for a routable
+# VM on port 22 -- NEPI_SIM_VM_HOST / NEPI_SIM_VM_SSH_PORT) wherever
+# app_sim_connector actually runs (typically the device's own environment).
+# See simulator_launcher.py's _apply_connection_env_overrides for exactly
+# what these do, and docs/SIM_VM_CONNECTION_SETUP.md for the full
+# two-machine setup walkthrough (both directions: this leg, and the
+# device_bridge_host leg below).
 
 # Path to the SSH private key -- a PATH only, never a key, and safe to
 # commit. Needed because apps_mgr runs app nodes as root, so the launcher's
