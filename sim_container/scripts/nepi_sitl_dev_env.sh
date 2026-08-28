@@ -121,23 +121,35 @@ sim_launch_listener() {
 # SECOND autossh that would race the first for the same forwards (the loser
 # exits on ExitOnForwardFailure, but which one loses is a coin flip).
 nepi_tunnel() {
+    # NEPI_DEVICE_SSH_HOST/USER/PORT let this point at a real NEPI device
+    # other than this one specific developer's own setup, with no edit to
+    # this script -- "nepi"/"nepi"/2222 are the platform's own default
+    # device username and dev-VM-facing sshd port (see nepi_setup), not a
+    # personal value the way simulator_launcher.py's ssh_user "suraj" is,
+    # but still worth overriding for a device configured differently. See
+    # docs/SIM_VM_CONNECTION_SETUP.md for the full two-machine setup
+    # walkthrough (also covers simulator_launcher.py's own equivalent
+    # NEPI_SIM_VM_* variables for the other direction).
+    local device_host="${NEPI_DEVICE_SSH_HOST:-nepi}"
+    local device_user="${NEPI_DEVICE_SSH_USER:-nepi}"
+    local device_port="${NEPI_DEVICE_SSH_PORT:-2222}"
     if systemctl --user is-active nepi-tunnel.service > /dev/null 2>&1; then
         echo "NEPI reverse tunnel is managed by the nepi-tunnel systemd service (already active)"
         echo "  status: systemctl --user status nepi-tunnel.service"
         echo "  restart: systemctl --user restart nepi-tunnel.service"
         return 0
     fi
-    if pgrep -f "autossh.*R 5771:127.0.0.1:5771.*nepi@nepi" > /dev/null; then
+    if pgrep -f "autossh.*R 5771:127.0.0.1:5771.*${device_user}@${device_host}" > /dev/null; then
         echo "NEPI reverse tunnel already running"
         return 0
     fi
-    AUTOSSH_GATETIME=0 nohup autossh -M 0 -p 2222 -i ~/.ssh/nepi_default_ssh_key \
+    AUTOSSH_GATETIME=0 nohup autossh -M 0 -p "$device_port" -i ~/.ssh/nepi_default_ssh_key \
         -o ConnectTimeout=5 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
         -R 5760:127.0.0.1:5760 -R 5771:127.0.0.1:5771 -R 9021:127.0.0.1:9021 -R 9022:127.0.0.1:9022 -R 9023:127.0.0.1:9023 -R 9024:127.0.0.1:9024 -R 9025:127.0.0.1:9025 -R 9026:127.0.0.1:9026 -R 9027:127.0.0.1:9027 -R 9028:127.0.0.1:9028 -R 9041:127.0.0.1:9041 -R 9042:127.0.0.1:9042 -R 9046:127.0.0.1:9046 -R 9047:127.0.0.1:9047 -R 12222:127.0.0.1:22 \
-        -N nepi@nepi > /tmp/nepi_tunnel.log 2>&1 &
+        -N "${device_user}@${device_host}" > /tmp/nepi_tunnel.log 2>&1 &
     disown
     sleep 2
-    if pgrep -f "autossh.*R 5771:127.0.0.1:5771.*nepi@nepi" > /dev/null; then
+    if pgrep -f "autossh.*R 5771:127.0.0.1:5771.*${device_user}@${device_host}" > /dev/null; then
         echo "NEPI reverse tunnel started (auto-reconnecting via autossh)"
     else
         echo "NEPI reverse tunnel FAILED to start -- check /tmp/nepi_tunnel.log"
