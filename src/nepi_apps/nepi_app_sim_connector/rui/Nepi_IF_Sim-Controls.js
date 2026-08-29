@@ -178,6 +178,23 @@ class NepiIFSimControls extends Component {
       // NepiDeviceRBX.js's own onSelectEnvironment convention exactly.
       selected_environment_setting: 'Flat Ground',
 
+      // Set to the operator's own dropdown pick whenever it was made while
+      // !isRbxLive() (renderEnvironmentSetting's onChange can't send
+      // updateSetting yet -- no driver namespace exists to send it to), and
+      // cleared once it has actually been sent. Without this, a pre-launch
+      // pick was silently dropped: the freshly-launched device comes up with
+      // whatever "environment" its own Settings persistence carried over
+      // from a PREVIOUS session (independent of anything the RUI showed),
+      // rbxSettingsListener below then resyncs the dropdown to match that
+      // stale value once live, and since the dropdown already read the
+      // operator's intended value the whole time, reselecting the same
+      // option fires no onChange -- confirmed live (2026-08-28) that only
+      // toggling away and back (two genuine onChange events) actually sent
+      // anything. Tracking the pending pick here lets rbxSettingsListener
+      // send it the moment the device goes live, instead of the operator
+      // having to notice and manually force a change.
+      environment_setting_pending: null,
+
     }
 
     this.updateStatusListener = this.updateStatusListener.bind(this)
@@ -395,8 +412,24 @@ class NepiIFSimControls extends Component {
     }
     if (valuesDict["environment"] !== undefined
         && valuesDict["environment"] !== this.state.rbxSettingsValuesDict["environment"]) {
-      updates.selected_environment_setting =
-        (valuesDict["environment"] === "OBSTACLE_COURSE") ? "Obstacle Course" : "Flat Ground"
+      if (this.state.environment_setting_pending !== null) {
+        // The operator picked this before the device existed to send it to
+        // (renderEnvironmentSetting's onChange couldn't reach updateSetting
+        // yet). Now that a real SettingsStatus has arrived, the driver
+        // namespace exists -- send the pending pick for real instead of
+        // letting this status resync the dropdown back to whatever
+        // "environment" this fresh device happened to carry over from a
+        // previous session. Clearing the pending flag here, not in the
+        // onChange handler, is what makes this a one-shot catch-up rather
+        // than resending on every subsequent status tick.
+        const pending = this.state.environment_setting_pending
+        updates.environment_setting_pending = null
+        this.props.ros.updateSetting(this.state.rbx_namespace + "/settings", "environment", "Discrete",
+          pending === "Obstacle Course" ? "OBSTACLE_COURSE" : "FLAT_GROUND")
+      } else {
+        updates.selected_environment_setting =
+          (valuesDict["environment"] === "OBSTACLE_COURSE") ? "Obstacle Course" : "Flat Ground"
+      }
     }
     if (Object.keys(updates).length > 0) {
       this.setState(updates)
@@ -1229,10 +1262,14 @@ class NepiIFSimControls extends Component {
         <Select
           onChange={(event) => {
             const value = event.target.value
-            this.setState({ selected_environment_setting: value })
             if (!live) {
+              // No driver namespace to send updateSetting to yet -- remember
+              // the pick as pending so rbxSettingsListener can send it the
+              // moment this device goes live, instead of it being lost.
+              this.setState({ selected_environment_setting: value, environment_setting_pending: value })
               return
             }
+            this.setState({ selected_environment_setting: value, environment_setting_pending: null })
             updateSetting(this.state.rbx_namespace + "/settings", "environment", "Discrete",
               value === "Obstacle Course" ? "OBSTACLE_COURSE" : "FLAT_GROUND")
           }}

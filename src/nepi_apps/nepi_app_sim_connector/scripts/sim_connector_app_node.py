@@ -1375,17 +1375,49 @@ class NepiSimConnectorApp:
   # are never held up by one. launcher_lock only guards against two
   # launch/stop requests racing each other, not against the sim's own I/O.
 
+  def parseLaunchPayload(self, msg):
+    """Parses a sim/launch_simulator-family String message into
+    (target_key, robot_config). The RUI encodes both as one JSON object,
+    {"target_key": ..., "robot_config": ...}, so the operator's current
+    robot-config selection travels atomically with the launch request
+    itself. Reading self.selected_robot_config here instead -- set by
+    select_robot_config's own subscriber callback, on an independent
+    thread with no ordering guarantee relative to this one -- raced it:
+    confirmed live (2026-08-28) that a fresh page load, picking
+    Quadcopter, then an immediate Deploy could still resolve and launch
+    the rover, because resendRobotConfigIfKnown sending select_robot_config
+    first on the same websocket connection only narrows that race, it
+    doesn't close it (each topic gets its own TCPROS connection into this
+    process, and rospy dispatches each on its own thread).
+    Falls back to treating the whole payload as a bare target_key with no
+    robot_config (the topic's original plain-string format) if it isn't a
+    JSON object with a target_key field, for any caller still publishing
+    that way -- runLaunch/runRedeploy/runForceLaunch then fall back to
+    self.selected_robot_config themselves, same as before this fix."""
+    raw = str(msg.data).strip()
+    try:
+      payload = json.loads(raw)
+      if isinstance(payload, dict) and 'target_key' in payload:
+        robot_config = payload.get('robot_config')
+        robot_config = str(robot_config).strip() if robot_config else None
+        return str(payload['target_key']).strip(), robot_config
+    except ValueError:
+      pass
+    return raw, None
+
   def launchSimulatorCb(self, msg):
     if self.launcher is None:
       self.msg_if.pub_warn("Simulator auto-launch is not configured on this deployment "
                            "(no launch-targets config found), ignoring launch request")
       return
-    target_key = str(msg.data).strip()
+    target_key, robot_config = self.parseLaunchPayload(msg)
     with self.launcher_lock:
       if self.launcher_thread is not None and self.launcher_thread.is_alive():
         self.msg_if.pub_warn("A launch/stop is already in progress, ignoring")
         return
-      self.launcher_thread = threading.Thread(target = self.runLaunch, args = (target_key,))
+      self.launcher_thread = threading.Thread(target = self.runLaunch,
+                                              args = (target_key,),
+                                              kwargs = {'robot_config': robot_config})
       self.launcher_thread.daemon = True
       self.launcher_thread.start()
 
@@ -1430,16 +1462,18 @@ class NepiSimConnectorApp:
       self.msg_if.pub_warn("Simulator auto-launch is not configured on this deployment "
                            "(no launch-targets config found), ignoring redeploy request")
       return
-    target_key = str(msg.data).strip()
+    target_key, robot_config = self.parseLaunchPayload(msg)
     with self.launcher_lock:
       if self.launcher_thread is not None and self.launcher_thread.is_alive():
         self.msg_if.pub_warn("A launch/stop/install is already in progress, ignoring")
         return
-      self.launcher_thread = threading.Thread(target = self.runRedeploy, args = (target_key,))
+      self.launcher_thread = threading.Thread(target = self.runRedeploy,
+                                              args = (target_key,),
+                                              kwargs = {'robot_config': robot_config})
       self.launcher_thread.daemon = True
       self.launcher_thread.start()
 
-  def runRedeploy(self, target_key):
+  def runRedeploy(self, target_key, robot_config=None):
     # Stops whatever is currently tracked as running (if anything) then
     # launches target_key fresh. Reuses runStop/runLaunch directly rather
     # than duplicating their logic -- this method IS just those two run
@@ -1457,7 +1491,7 @@ class NepiSimConnectorApp:
       self.runStop(self.active_launch_target or self.selected_launch_target)
       if self.launcher_state == 'failed':
         return  # runStop already published the failure; nothing more to do
-    self.runLaunch(target_key)
+    self.runLaunch(target_key, robot_config=robot_config)
 
   def attachSimulatorCb(self, msg):
     # "Use Existing" -- see runLaunch's attach handling.
@@ -1465,13 +1499,13 @@ class NepiSimConnectorApp:
       self.msg_if.pub_warn("Simulator auto-launch is not configured on this deployment "
                            "(no launch-targets config found), ignoring attach request")
       return
-    target_key = str(msg.data).strip()
+    target_key, robot_config = self.parseLaunchPayload(msg)
     with self.launcher_lock:
       if self.launcher_thread is not None and self.launcher_thread.is_alive():
         self.msg_if.pub_warn("A launch/stop/install is already in progress, ignoring")
         return
       self.launcher_thread = threading.Thread(target = self.runLaunch, args = (target_key,),
-                                              kwargs = {'attach': True})
+                                              kwargs = {'attach': True, 'robot_config': robot_config})
       self.launcher_thread.daemon = True
       self.launcher_thread.start()
 
@@ -1481,16 +1515,18 @@ class NepiSimConnectorApp:
       self.msg_if.pub_warn("Simulator auto-launch is not configured on this deployment "
                            "(no launch-targets config found), ignoring launch request")
       return
-    target_key = str(msg.data).strip()
+    target_key, robot_config = self.parseLaunchPayload(msg)
     with self.launcher_lock:
       if self.launcher_thread is not None and self.launcher_thread.is_alive():
         self.msg_if.pub_warn("A launch/stop/install is already in progress, ignoring")
         return
-      self.launcher_thread = threading.Thread(target = self.runForceLaunch, args = (target_key,))
+      self.launcher_thread = threading.Thread(target = self.runForceLaunch,
+                                              args = (target_key,),
+                                              kwargs = {'robot_config': robot_config})
       self.launcher_thread.daemon = True
       self.launcher_thread.start()
 
-  def runForceLaunch(self, target_key):
+  def runForceLaunch(self, target_key, robot_config=None):
     # Clears whatever gazebo is in the way first (see
     # SimulatorLauncher.kill_all_gazebo's own docstring for why this, and
     # not stop(), is the right tool here -- the blocking gzserver isn't
@@ -1505,7 +1541,7 @@ class NepiSimConnectorApp:
       self.launcher_last_error = "Could not clear the existing gazebo: " + str(e)
       self.publishLauncherStatus()
       return
-    self.runLaunch(target_key)
+    self.runLaunch(target_key, robot_config=robot_config)
 
   def killAllGazeboCb(self, msg):
     if self.launcher is None:
@@ -1549,7 +1585,18 @@ class NepiSimConnectorApp:
     self.active_launch_target = ''
     self.publishLauncherStatus()
 
-  def runLaunch(self, target_key, attach=False):
+  def runLaunch(self, target_key, attach=False, robot_config=None):
+    # robot_config, when given, is the value the caller's own message
+    # carried (see parseLaunchPayload) and takes priority over
+    # self.selected_robot_config below -- reading self.selected_robot_config
+    # for the launch-time decision raced select_robot_config's own
+    # subscriber callback (independent thread, no cross-topic ordering
+    # guarantee), so a value passed in here explicitly is what actually
+    # fixes that race; self.selected_robot_config remains the fallback for
+    # any caller that truly doesn't know (e.g. a bare legacy string message,
+    # or "Use Open Sim" re-clicked with nothing new selected).
+    explicit_robot_config = robot_config
+
     # attach=True skips the reuse-check below (nothing is tracked as
     # running yet -- the gzserver in the way isn't this app's own, so there
     # is no in-place config update to make), but target resolution still
@@ -1563,7 +1610,7 @@ class NepiSimConnectorApp:
     # ready_check (no rover model in that world) regardless of how long it
     # waits.
     if attach:
-      robot_config = self.selected_robot_config
+      robot_config = explicit_robot_config if explicit_robot_config else self.selected_robot_config
       if not robot_config or robot_config == FACTORY_ROBOT_CONFIG_NAME:
         robot_config = self.launcher.get_default_robot_config(target_key)
       actual_target = (self.launcher.resolve_launch_target(target_key, robot_config)
@@ -1600,9 +1647,12 @@ class NepiSimConnectorApp:
         return
       self.launcher_state = 'running'
       self.publishLauncherStatus()
-      # Recomputed fresh (not reusing the pre-launch snapshot above), same
+      # explicit_robot_config still wins if the launch message carried one;
+      # otherwise recomputed fresh from self.selected_robot_config (not the
+      # pre-launch snapshot above) in case a select_robot_config arrived
+      # during the launch's several seconds of blocking I/O -- same
       # race-safety reasoning as the non-attach path below.
-      robot_config = self.selected_robot_config
+      robot_config = explicit_robot_config if explicit_robot_config else self.selected_robot_config
       if not robot_config or robot_config == FACTORY_ROBOT_CONFIG_NAME:
         robot_config = self.launcher.get_default_robot_config(actual_target)
       if robot_config:
@@ -1617,7 +1667,7 @@ class NepiSimConnectorApp:
     # launch_command entirely, not just a different config applied on top
     # of the same one -- see resolve_launch_target's docstring. Most
     # target/config combinations resolve to target_key unchanged.
-    pre_launch_robot_config = self.selected_robot_config
+    pre_launch_robot_config = explicit_robot_config if explicit_robot_config else self.selected_robot_config
     if not pre_launch_robot_config or pre_launch_robot_config == FACTORY_ROBOT_CONFIG_NAME:
       pre_launch_robot_config = self.launcher.get_default_robot_config(target_key)
     actual_target = (self.launcher.resolve_launch_target(target_key, pre_launch_robot_config)
@@ -1733,10 +1783,12 @@ class NepiSimConnectorApp:
     # default meant only for an operator who hasn't picked anything yet.
     # FACTORY_ROBOT_CONFIG_NAME ('default', capability-empty) counts as
     # "hasn't picked anything" rather than a real choice worth preserving.
-    # Recomputed fresh here (not reusing pre_launch_robot_config) since
-    # launch()/wait_until_ready() block for real seconds, during which
-    # another callback could legitimately have changed the selection.
-    robot_config = self.selected_robot_config
+    # explicit_robot_config still wins if the launch message carried one;
+    # otherwise recomputed fresh from self.selected_robot_config (not
+    # pre_launch_robot_config) since launch()/wait_until_ready() block for
+    # real seconds, during which another callback could legitimately have
+    # changed the selection.
+    robot_config = explicit_robot_config if explicit_robot_config else self.selected_robot_config
     if not robot_config or robot_config == FACTORY_ROBOT_CONFIG_NAME:
       robot_config = self.launcher.get_default_robot_config(actual_target)
     # Resolves the plain, selector-offered choice (e.g. "2-Wheel Rover") to

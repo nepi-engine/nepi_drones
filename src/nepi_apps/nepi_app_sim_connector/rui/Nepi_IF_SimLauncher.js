@@ -186,6 +186,30 @@ class NepiIFSimLauncher extends Component {
     }
   }
 
+  // Builds the payload for every sim/*_simulator topic below: a JSON object
+  // carrying target_key AND the currently-displayed robot config together,
+  // atomically, in the ONE message that triggers the launch. Sending
+  // select_robot_config first via resendRobotConfigIfKnown (still done,
+  // below, so an already-live bridge picks up the change too) is NOT enough
+  // on its own -- confirmed live (2026-08-28) that it still raced runLaunch
+  // on a fresh page load (pick Quadcopter, immediate Deploy could still
+  // launch the rover), because select_robot_config and launch_simulator are
+  // different ROS topics, each dispatched on its own independent subscriber
+  // thread backend-side with no ordering guarantee, even though both are
+  // sent back-to-back over this one websocket connection. Embedding
+  // robot_config directly in this payload gives the backend everything it
+  // needs from the ONE message its launch callback actually receives, so
+  // there is nothing left to race.
+  buildLaunchPayload(target) {
+    const robot_config = this.props.selected_robot_config
+    const has_robot_config = (robot_config !== undefined && robot_config !== null
+        && robot_config !== 'None' && robot_config !== '')
+    return JSON.stringify({
+      target_key: target,
+      robot_config: has_robot_config ? robot_config : null,
+    })
+  }
+
   // Publishes the selected target key to sim/launch_simulator. The app node
   // does the rest: ssh launch, readiness poll, then applies whatever robot
   // config is already selected in the Sim Connector panel (the existing,
@@ -203,7 +227,7 @@ class NepiIFSimLauncher extends Component {
     const target = this.getSelectedTarget()
     if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
       this.resendRobotConfigIfKnown(namespace)
-      this.props.ros.sendStringMsg(namespace + '/launch_simulator', target)
+      this.props.ros.sendStringMsg(namespace + '/launch_simulator', this.buildLaunchPayload(target))
     }
   }
 
@@ -217,7 +241,7 @@ class NepiIFSimLauncher extends Component {
     const target = this.getSelectedTarget()
     if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
       this.resendRobotConfigIfKnown(namespace)
-      this.props.ros.sendStringMsg(namespace + '/redeploy_simulator', target)
+      this.props.ros.sendStringMsg(namespace + '/redeploy_simulator', this.buildLaunchPayload(target))
     }
   }
 
@@ -250,7 +274,7 @@ class NepiIFSimLauncher extends Component {
     const target = this.getSelectedTarget()
     if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
       this.resendRobotConfigIfKnown(namespace)
-      this.props.ros.sendStringMsg(namespace + '/force_launch_simulator', target)
+      this.props.ros.sendStringMsg(namespace + '/force_launch_simulator', this.buildLaunchPayload(target))
     }
   }
 
@@ -266,7 +290,7 @@ class NepiIFSimLauncher extends Component {
     const target = this.getSelectedTarget()
     if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
       this.resendRobotConfigIfKnown(namespace)
-      this.props.ros.sendStringMsg(namespace + '/attach_simulator', target)
+      this.props.ros.sendStringMsg(namespace + '/attach_simulator', this.buildLaunchPayload(target))
     }
   }
 
