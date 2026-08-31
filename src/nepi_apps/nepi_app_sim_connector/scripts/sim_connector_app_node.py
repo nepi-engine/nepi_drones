@@ -91,6 +91,7 @@ import base64
 import copy
 import json
 import os
+import re
 import socket
 import threading
 
@@ -165,6 +166,21 @@ FACTORY_ROBOT_CONFIG_NAME = 'default'
 # checked-in config key.
 UPLOADED_ROBOT_CONFIG_NAME = 'custom_uploaded'
 
+# The three checked-in configs (sim_connector_app_params.yaml's own
+# robot_configs section) -- never deletable, and never what
+# saveRobotConfigCb writes over even if an operator names a save the same
+# as one of their display names (the KEY is what's checked here, not the
+# display name, matching how selection/deletion already work on keys
+# everywhere else in this file).
+PROTECTED_ROBOT_CONFIG_KEYS = {FACTORY_ROBOT_CONFIG_NAME, 'ground_robot_4_wheel', 'flight_robot_4_motor'}
+
+# Device-side persistent store for operator-saved robot configs -- survives
+# a container restart, same persistence category as DIMENSIONS_STORAGE_DIR
+# below (loaded back into self.robot_configs at startup, see
+# loadPersistedRobotConfigs). Distinct from UPLOADED_ROBOT_CONFIG_NAME's
+# single transient slot above: this is a real, named, growing collection.
+ROBOT_CONFIGS_STORAGE_DIR = '/mnt/nepi_storage/databases/nepi_app_sim_connector/robot_configs'
+
 # Physical-dimension editing (robot chassis/wheel geometry, environment
 # corridor/ramp geometry) -- distinct from robot_configs' driver-capability
 # profiles above, which never touch Gazebo geometry at all. Two roles for
@@ -178,6 +194,11 @@ ROBOT_DIMENSIONS_MODEL = 'generic_rover'
 ENVIRONMENT_DIMENSIONS_MODEL = 'obstacle_course'
 DIMENSION_ROLES = ('robot', 'environment')
 DIMENSION_ROLE_MODEL = {'robot': ROBOT_DIMENSIONS_MODEL, 'environment': ENVIRONMENT_DIMENSIONS_MODEL}
+
+# Named dimensions configs -- see the constructor's own comment (search
+# "Named dimensions configs") for the full design. This is the one name
+# neither role's config can ever delete.
+DEFAULT_DIMENSION_CONFIG_NAME = 'Default'
 
 # Device-side authoritative store for the above -- survives a Docker
 # container restart (unlike the container's own writable layer), the same
@@ -337,6 +358,11 @@ class NepiSimConnectorApp:
     # whether an older/hand-edited params file forgets the flag.
     if isinstance(self.robot_configs.get(FACTORY_ROBOT_CONFIG_NAME), dict):
       self.robot_configs[FACTORY_ROBOT_CONFIG_NAME]['hidden_from_selector'] = True
+    # Operator-saved configs (see saveRobotConfigCb) merge in on top of the
+    # three checked-in ones above -- persisted separately from
+    # sim_connector_app_params.yaml so a save survives independently of
+    # that file ever being redeployed/reset.
+    self.loadPersistedRobotConfigs()
 
     default_config = str(self.vehicle_dict.get('default_robot_config', FACTORY_ROBOT_CONFIG_NAME))
     if default_config not in self.robot_configs:
@@ -588,6 +614,18 @@ class NepiSimConnectorApp:
     nepi_sdk.create_subscriber(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/get_robot_config'),
         String, self.getRobotConfigCb, queue_size = 1)
+    # Persisted save/delete -- see PROTECTED_ROBOT_CONFIG_KEYS/
+    # ROBOT_CONFIGS_STORAGE_DIR's own comments and saveRobotConfigCb/
+    # deleteRobotConfigCb below. Distinct from upload_robot_config above:
+    # that is a one-shot "try this now, forgotten on restart" slot; these
+    # add a real, named, permanent entry that appears in the same selector
+    # upload's UPLOADED_ROBOT_CONFIG_NAME never does.
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/save_robot_config'),
+        String, self.saveRobotConfigCb, queue_size = 1)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/delete_robot_config'),
+        String, self.deleteRobotConfigCb, queue_size = 1)
 
     ##############################
     # Physical-dimension editing (robot chassis/wheel + environment
@@ -630,6 +668,54 @@ class NepiSimConnectorApp:
     nepi_sdk.create_subscriber(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/get_environment_dimensions'),
         Empty, self.getEnvironmentDimensionsCb, queue_size = 1)
+
+    ##############################
+    # Named dimensions configs (robot + environment) -- lets an operator save
+    # a curated field set under a name and switch back to it later, the same
+    # convenience robot_configs already has, but with real persistence and a
+    # real delete: reported live (2026-08-31) that dimensions had no way to
+    # keep more than the one currently-active set around at all. Layered on
+    # top of the existing single-file dimensionsYamlStoragePath/
+    # writeStoredDimensionsYaml mechanism above rather than replacing it --
+    # that file stays "whatever is currently active" exactly as before (what
+    # pushDirtyDimensions/generate_model_sdf.py read), and a named config is
+    # just a separate saved snapshot a client can select to become the new
+    # "currently active" one. DEFAULT_DIMENSION_CONFIG_NAME is seeded once
+    # from whatever the single file already had (see
+    # ensureDefaultDimensionConfig) so "Default" always means "the one that
+    # was already working," never a blank slate -- and is the one name this
+    # can't delete, so there is always at least one config to fall back to.
+    self.selected_dimension_config = dict()
+    self.dimension_config_names_pubs = dict()
+    self.dimension_config_selected_pubs = dict()
+    for role in DIMENSION_ROLES:
+      self.dimension_config_names_pubs[role] = nepi_sdk.create_publisher(
+          nepi_sdk.create_namespace(self.node_namespace, 'sim/' + role + '_dimensions_config_names'),
+          String, queue_size = 1, latch = True)
+      self.dimension_config_selected_pubs[role] = nepi_sdk.create_publisher(
+          nepi_sdk.create_namespace(self.node_namespace, 'sim/' + role + '_dimensions_selected_config'),
+          String, queue_size = 1, latch = True)
+      self.selected_dimension_config[role] = DEFAULT_DIMENSION_CONFIG_NAME
+      self.publishAvailableDimensionConfigs(role)
+      self.publishSelectedDimensionConfig(role)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/select_robot_dimensions_config'),
+        String, self.selectRobotDimensionsConfigCb, queue_size = 1)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/select_environment_dimensions_config'),
+        String, self.selectEnvironmentDimensionsConfigCb, queue_size = 1)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/save_robot_dimensions_config'),
+        String, self.saveRobotDimensionsConfigCb, queue_size = 1)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/save_environment_dimensions_config'),
+        String, self.saveEnvironmentDimensionsConfigCb, queue_size = 1)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/delete_robot_dimensions_config'),
+        String, self.deleteRobotDimensionsConfigCb, queue_size = 1)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/delete_environment_dimensions_config'),
+        String, self.deleteEnvironmentDimensionsConfigCb, queue_size = 1)
 
     ##############################
     # Phone-scan -> Gazebo environment conversion (see
@@ -921,6 +1007,129 @@ class NepiSimConnectorApp:
     self.robot_config_yaml_pub.publish(String(data = yaml_text))
     self.setSelectedRobotConfig(UPLOADED_ROBOT_CONFIG_NAME)
 
+  def sanitizeRobotConfigKey(self, name):
+    # A robot_configs key is a plain dict key everywhere else in this file
+    # (never exposed to the filesystem the way a dimensions config name is,
+    # see sanitizeDimensionConfigName), but a SAVED one still becomes a
+    # literal filename here (robotConfigPath) -- same safe character set for
+    # the same reason, plus a 'custom_' prefix so an operator's own name can
+    # never collide with a checked-in key by accident (e.g. someone naming
+    # their save "default").
+    name = str(name).strip()
+    safe = re.sub(r'[^A-Za-z0-9 _-]', '_', name)[:64].strip() or 'Unnamed'
+    return 'custom_' + safe.lower().replace(' ', '_')
+
+  def robotConfigPath(self, key):
+    return os.path.join(ROBOT_CONFIGS_STORAGE_DIR, key + '.yaml')
+
+  def loadPersistedRobotConfigs(self):
+    # Called once at startup (see __init__, right after the three checked-in
+    # configs are loaded) -- merges every previously-saved config back into
+    # self.robot_configs so a save survives a container restart. A file that
+    # fails to parse or validate is skipped with a warning rather than
+    # aborting the whole load, same "one bad entry doesn't take down
+    # everything else" instinct as uploadRobotConfigCb's own validation.
+    try:
+      filenames = os.listdir(ROBOT_CONFIGS_STORAGE_DIR)
+    except OSError:
+      return
+    for filename in filenames:
+      if not filename.endswith('.yaml'):
+        continue
+      key = filename[:-len('.yaml')]
+      path = os.path.join(ROBOT_CONFIGS_STORAGE_DIR, filename)
+      try:
+        with open(path, 'r') as f:
+          entry = yaml.safe_load(f)
+      except (OSError, yaml.YAMLError) as e:
+        self.msg_if.pub_warn("Failed to load persisted robot config '" + key + "': " + str(e))
+        continue
+      if not isinstance(entry, dict):
+        self.msg_if.pub_warn("Persisted robot config '" + key + "' is not a YAML mapping, skipping")
+        continue
+      try:
+        self.buildProfileFromEntry(entry)
+      except (TypeError, ValueError) as e:
+        self.msg_if.pub_warn("Persisted robot config '" + key + "' has an invalid field value, skipping: " + str(e))
+        continue
+      entry.pop('hidden_from_selector', None)
+      self.robot_configs[key] = entry
+
+  def saveRobotConfigCb(self, msg):
+    # Payload is JSON {"name": ..., "yaml": ...} -- same shape as
+    # saveDimensionConfigCb's own payload, and for the same reason (one
+    # message carrying both the chosen name and the config text). The yaml
+    # is validated exactly like an upload (buildProfileFromEntry) before
+    # anything is written, so a bad save can't leave a broken entry sitting
+    # in self.robot_configs.
+    try:
+      payload = json.loads(str(msg.data))
+    except (ValueError, TypeError) as e:
+      self.msg_if.pub_warn("Save robot config payload is not valid JSON: " + str(e))
+      return
+    if not isinstance(payload, dict):
+      self.msg_if.pub_warn("Save robot config payload must be a JSON object")
+      return
+    name = str(payload.get('name', '')).strip()
+    if not name:
+      self.msg_if.pub_warn("Cannot save a robot config with an empty name")
+      return
+    try:
+      entry = yaml.safe_load(str(payload.get('yaml', '')))
+    except yaml.YAMLError as e:
+      self.msg_if.pub_warn("Cannot save robot config '" + name + "': not valid YAML: " + str(e))
+      return
+    if not isinstance(entry, dict):
+      self.msg_if.pub_warn("Cannot save robot config '" + name + "': must be a YAML mapping")
+      return
+    entry = copy.deepcopy(entry)
+    entry.pop('hidden_from_selector', None)
+    try:
+      self.buildProfileFromEntry(entry)
+    except (TypeError, ValueError) as e:
+      self.msg_if.pub_warn("Cannot save robot config '" + name + "': invalid field value: " + str(e))
+      return
+    entry['display_name'] = name
+    key = self.sanitizeRobotConfigKey(name)
+    try:
+      os.makedirs(ROBOT_CONFIGS_STORAGE_DIR, exist_ok = True)
+      with open(self.robotConfigPath(key), 'w') as f:
+        yaml.safe_dump(entry, f, default_flow_style = False, sort_keys = False)
+    except Exception as e:
+      self.msg_if.pub_warn("Failed to save robot config '" + name + "': " + str(e))
+      return
+    self.robot_configs[key] = entry
+    self.setSelectedRobotConfig(key)
+    self.msg_if.pub_info("Saved robot config '" + name + "' as " + key)
+
+  def deleteRobotConfigCb(self, msg):
+    key = str(msg.data).strip()
+    if not key:
+      return
+    if key in PROTECTED_ROBOT_CONFIG_KEYS or key == UPLOADED_ROBOT_CONFIG_NAME:
+      self.msg_if.pub_warn("Cannot delete the built-in robot config '" + key + "'")
+      return
+    if key not in self.robot_configs:
+      self.msg_if.pub_warn("Robot config '" + key + "' not found, cannot delete")
+      return
+    path = self.robotConfigPath(key)
+    try:
+      if os.path.exists(path):
+        os.remove(path)
+    except Exception as e:
+      self.msg_if.pub_warn("Failed to delete robot config '" + key + "': " + str(e))
+      return
+    del self.robot_configs[key]
+    # Falls back to the 4-Wheel Rover, not FACTORY_ROBOT_CONFIG_NAME -- an
+    # operator who just deleted a config they were actively using almost
+    # certainly wants a REAL, capable robot to land on, not the
+    # capability-empty placeholder (the same reasoning setSelectedRobotConfig
+    # itself never applies automatically, since that placeholder is only
+    # ever a fallback for "nothing valid was ever selected").
+    if self.selected_robot_config == key:
+      self.setSelectedRobotConfig('ground_robot_4_wheel')
+    self.msg_if.pub_info("Deleted robot config '" + key + "'")
+
   #**********************
   # Physical-dimension editing (robot chassis/wheel + environment
   # corridor/ramp geometry) -- see DIMENSION_ROLES's own comment for the
@@ -1014,6 +1223,191 @@ class NepiSimConnectorApp:
         self.msg_if.pub_info("Pushed " + role + " dimensions (" + model_name + ") to the sim VM")
       except LauncherError as e:
         self.msg_if.pub_warn("Failed to push " + role + " dimensions to the sim VM: " + str(e))
+
+  #**********************
+  # Named dimensions configs -- see the constructor's own "Named dimensions
+  # configs" comment for the design. Storage is one small YAML file per
+  # named config, under a per-role subdirectory of DIMENSIONS_STORAGE_DIR --
+  # separate from (and never touched by) dimensionsYamlStoragePath's own
+  # single "currently active" file above, which these actions read from/
+  # write to as a side effect of "select"/"save" meaning "make this the
+  # active one", exactly as clicking Save Dimensions already did.
+
+  def dimensionConfigsDir(self, role):
+    return os.path.join(DIMENSIONS_STORAGE_DIR, role + '_configs')
+
+  def sanitizeDimensionConfigName(self, name):
+    # Filesystem-safe and short enough to be a sane filename -- letters,
+    # digits, spaces, underscore, hyphen only; everything else collapses to
+    # '_'. Matters because this name becomes a literal file on disk (see
+    # dimensionConfigPath), unlike a robot_configs key, which is just a
+    # dict key with no filesystem exposure.
+    name = str(name).strip()
+    safe = re.sub(r'[^A-Za-z0-9 _-]', '_', name)[:64]
+    return safe if safe else 'Unnamed'
+
+  def dimensionConfigPath(self, role, name):
+    return os.path.join(self.dimensionConfigsDir(role), self.sanitizeDimensionConfigName(name) + '.yaml')
+
+  def ensureDefaultDimensionConfig(self, role):
+    # Seeds Default.yaml ONCE, from whatever the existing single-file store
+    # already has -- so "Default" always means "the one that was already
+    # working" for an operator upgrading into this feature, never a blank
+    # slate that would silently reset their current setup. An empty '{}' is
+    # a genuinely valid config (setDimensionsCb's own comment: generate_
+    # model_sdf.py fills in its own defaults for anything a config doesn't
+    # set), so a fresh install with nothing customized yet still gets a
+    # real, working Default rather than this being skipped.
+    path = self.dimensionConfigPath(role, DEFAULT_DIMENSION_CONFIG_NAME)
+    if os.path.exists(path):
+      return
+    try:
+      os.makedirs(self.dimensionConfigsDir(role), exist_ok = True)
+      current_yaml = self.readStoredDimensionsYaml(role) or '{}\n'
+      with open(path, 'w') as f:
+        f.write(current_yaml)
+    except Exception as e:
+      self.msg_if.pub_warn("Failed to seed Default " + role + " dimensions config: " + str(e))
+
+  def listDimensionConfigs(self, role):
+    self.ensureDefaultDimensionConfig(role)
+    names = []
+    try:
+      for filename in os.listdir(self.dimensionConfigsDir(role)):
+        if filename.endswith('.yaml'):
+          names.append(filename[:-len('.yaml')])
+    except Exception as e:
+      self.msg_if.pub_warn("Failed to list " + role + " dimensions configs: " + str(e))
+    # Default always first, everything else alphabetical -- matches
+    # available_robot_configs's own sorted() convention for the rest.
+    names.sort(key = lambda n: (n != DEFAULT_DIMENSION_CONFIG_NAME, n.lower()))
+    return names
+
+  def publishAvailableDimensionConfigs(self, role):
+    pub = self.dimension_config_names_pubs.get(role)
+    if pub is not None:
+      pub.publish(String(data = json.dumps(self.listDimensionConfigs(role))))
+
+  def publishSelectedDimensionConfig(self, role):
+    pub = self.dimension_config_selected_pubs.get(role)
+    if pub is not None:
+      pub.publish(String(data = self.selected_dimension_config.get(role, DEFAULT_DIMENSION_CONFIG_NAME)))
+
+  def applyDimensionConfigByName(self, role, name):
+    # Shared by selectDimensionConfigCb (an explicit operator pick) and
+    # deleteDimensionConfigCb (falling back to Default after removing
+    # whatever was selected) -- both mean "make this saved config the
+    # active one," which is exactly writeStoredDimensionsYaml's own job,
+    # the same file pushDirtyDimensions/generate_model_sdf.py read.
+    path = self.dimensionConfigPath(role, name)
+    if not os.path.exists(path):
+      self.msg_if.pub_warn(role + " dimensions config '" + name + "' not found, ignoring")
+      return False
+    try:
+      with open(path, 'r') as f:
+        yaml_text = f.read()
+    except Exception as e:
+      self.msg_if.pub_warn("Failed to read " + role + " dimensions config '" + name + "': " + str(e))
+      return False
+    self.writeStoredDimensionsYaml(role, yaml_text)
+    self.clearStoredSdfOverride(role)
+    self.markDimensionsDirty(role)
+    self.selected_dimension_config[role] = self.sanitizeDimensionConfigName(name)
+    self.publishSelectedDimensionConfig(role)
+    # Echoes to the same latched topic applyDimensionsYaml already listens
+    # to on the RUI side, so the editable fields (and the preview diagram)
+    # refresh to match the newly-selected config without any new RUI-side
+    # listener needed for this half of the flow.
+    pub = self.dimensions_yaml_pubs.get(role)
+    if pub is not None:
+      pub.publish(String(data = yaml_text))
+    return True
+
+  def selectRobotDimensionsConfigCb(self, msg):
+    self.selectDimensionConfigCb('robot', msg)
+
+  def selectEnvironmentDimensionsConfigCb(self, msg):
+    self.selectDimensionConfigCb('environment', msg)
+
+  def selectDimensionConfigCb(self, role, msg):
+    name = str(msg.data).strip()
+    if not name:
+      return
+    if self.applyDimensionConfigByName(role, name):
+      self.msg_if.pub_info("Selected " + role + " dimensions config: " + name)
+
+  def saveRobotDimensionsConfigCb(self, msg):
+    self.saveDimensionConfigCb('robot', msg)
+
+  def saveEnvironmentDimensionsConfigCb(self, msg):
+    self.saveDimensionConfigCb('environment', msg)
+
+  def saveDimensionConfigCb(self, role, msg):
+    # Payload is JSON {"name": ..., "yaml": ...} rather than a bare string --
+    # this is the one dimensions action that needs two pieces of data in one
+    # message (matching the same shape sim_connector's own launch_simulator
+    # payload uses for target_key+robot_config, for the same reason: sending
+    # them as two separate messages would race). "Save" always also makes
+    # the new config the active one -- there is no separate "save without
+    # using" action, matching how Save Dimensions already behaves today.
+    try:
+      payload = json.loads(str(msg.data))
+    except (ValueError, TypeError) as e:
+      self.msg_if.pub_warn("Save " + role + " dimensions config payload is not valid JSON: " + str(e))
+      return
+    if not isinstance(payload, dict):
+      self.msg_if.pub_warn("Save " + role + " dimensions config payload must be a JSON object")
+      return
+    name = str(payload.get('name', '')).strip()
+    if not name:
+      self.msg_if.pub_warn("Cannot save a " + role + " dimensions config with an empty name")
+      return
+    try:
+      fields = yaml.safe_load(str(payload.get('yaml', '')))
+    except yaml.YAMLError as e:
+      self.msg_if.pub_warn("Cannot save " + role + " dimensions config '" + name + "': not valid YAML: " + str(e))
+      return
+    if not isinstance(fields, dict):
+      self.msg_if.pub_warn("Cannot save " + role + " dimensions config '" + name + "': must be a YAML mapping")
+      return
+    try:
+      clean_yaml = yaml.safe_dump(fields, default_flow_style = False, sort_keys = False)
+      os.makedirs(self.dimensionConfigsDir(role), exist_ok = True)
+      with open(self.dimensionConfigPath(role, name), 'w') as f:
+        f.write(clean_yaml)
+    except Exception as e:
+      self.msg_if.pub_warn("Failed to save " + role + " dimensions config '" + name + "': " + str(e))
+      return
+    self.publishAvailableDimensionConfigs(role)
+    self.applyDimensionConfigByName(role, name)
+    self.msg_if.pub_info("Saved " + role + " dimensions config: " + name)
+
+  def deleteRobotDimensionsConfigCb(self, msg):
+    self.deleteDimensionConfigCb('robot', msg)
+
+  def deleteEnvironmentDimensionsConfigCb(self, msg):
+    self.deleteDimensionConfigCb('environment', msg)
+
+  def deleteDimensionConfigCb(self, role, msg):
+    name = str(msg.data).strip()
+    if not name:
+      return
+    if self.sanitizeDimensionConfigName(name) == DEFAULT_DIMENSION_CONFIG_NAME:
+      self.msg_if.pub_warn("Cannot delete the Default " + role + " dimensions config")
+      return
+    path = self.dimensionConfigPath(role, name)
+    if not os.path.exists(path):
+      self.msg_if.pub_warn(role + " dimensions config '" + name + "' not found, cannot delete")
+      return
+    try:
+      os.remove(path)
+    except Exception as e:
+      self.msg_if.pub_warn("Failed to delete " + role + " dimensions config '" + name + "': " + str(e))
+      return
+    self.publishAvailableDimensionConfigs(role)
+    if self.selected_dimension_config.get(role) == self.sanitizeDimensionConfigName(name):
+      self.applyDimensionConfigByName(role, DEFAULT_DIMENSION_CONFIG_NAME)
+    self.msg_if.pub_info("Deleted " + role + " dimensions config: " + name)
 
   def setRobotDimensionsCb(self, msg):
     self.setDimensionsCb('robot', msg)
