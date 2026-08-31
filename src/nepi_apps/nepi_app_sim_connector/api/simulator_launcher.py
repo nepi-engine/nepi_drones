@@ -64,7 +64,42 @@ INSTALL_TIMEOUT_SEC = 600
 
 
 class LauncherError(Exception):
-  pass
+  """manual_fallback_commands, when set, overrides whatever per-target
+  install fallback sim_connector_app_node.py's publishLauncherStatus would
+  otherwise attach -- used for a reverse-tunnel connectivity diagnosis
+  (see _classify_connection_failure), where the actual fix has nothing to
+  do with that target's own install_command."""
+  def __init__(self, message, manual_fallback_commands=None):
+    super().__init__(message)
+    self.manual_fallback_commands = manual_fallback_commands
+
+
+# Every default target's host is "127.0.0.1" by design -- the device SSHes
+# to a LOCAL port that only means anything because nepi_tunnel()/
+# nepi-tunnel.service's autossh, running FROM the sim VM, forwards it back
+# from the VM's own sshd (see docs/SIM_VM_CONNECTION_SETUP.md). A
+# connection-level failure against that specific host therefore has one
+# most-likely explanation worth naming outright: nothing is listening
+# there because that reverse tunnel isn't running, not a generic "can't
+# reach the VM" -- which is what made the very first report of this
+# ("Timed out waiting for the simulator to become ready") so hard to act
+# on: the real cause was two hops away from the symptom. Covers both
+# hosting setups this has been reported from: a VirtualBox VM (systemd
+# --user works out of the box) and WSL/WSL2 (systemd is opt-in via
+# /etc/wsl.conf, so a manual nepi_tunnel fallback is offered too).
+REVERSE_TUNNEL_FALLBACK_COMMANDS = """VirtualBox VM:
+  systemctl --user status nepi-tunnel.service
+  systemctl --user enable --now nepi-tunnel.service   # if inactive
+
+WSL / WSL2 (systemd is not enabled by default):
+  echo -e "[boot]\\nsystemd=true" | sudo tee -a /etc/wsl.conf
+  # From PowerShell: wsl --shutdown, then reopen your WSL terminal, then:
+  systemctl --user enable --now nepi-tunnel.service
+  # Or, without enabling systemd, start it manually each session instead:
+  nepi_tunnel &
+
+Full setup (SSH keys, env var overrides for a non-default device/VM
+username): nepi_drones/docs/SIM_VM_CONNECTION_SETUP.md"""
 
 
 def find_config_path():
@@ -431,6 +466,31 @@ class SimulatorLauncher(object):
     )
     return any(phrase in stderr for phrase in connection_phrases)
 
+  def _classify_connection_failure(self, target, stderr):
+    """Returns a clearer message for a connection-level SSH failure against
+    a loopback-host target (see REVERSE_TUNNEL_FALLBACK_COMMANDS above), or
+    None to leave the caller's generic message alone. "Permission denied"
+    gets its own message: the tunnel itself is evidently up (something
+    answered and rejected the key), so pointing at the tunnel commands
+    would send the operator to fix the wrong thing -- Step 1 (SSH keys) in
+    the setup doc is the real fix there. A non-loopback host's failure is a
+    real network/host problem this has no special insight into."""
+    host = target.get("host", "")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+      return None
+    stderr_lower = (stderr or "").lower()
+    if "permission denied (publickey" in stderr_lower:
+      return ("Reached your sim VM, but this device's SSH key isn't authorized there (or the "
+              "VM's key isn't authorized on this device) -- see Step 1 (SSH keys) in "
+              "nepi_drones/docs/SIM_VM_CONNECTION_SETUP.md.")
+    connection_phrases = ("connection refused", "connection timed out", "operation timed out",
+                         "no route to host", "connection closed by remote host",
+                         "connection reset by peer")
+    if any(phrase in stderr_lower for phrase in connection_phrases):
+      return ("Could not reach your sim VM -- the reverse SSH tunnel between this device and "
+              "the VM does not appear to be running. See the fallback commands to start it.")
+    return None
+
   def launch(self, target_key, attach=False):
     """Starts the target's launch_command over SSH and leaves the
     connection open, held by a tracked Popen, for as long as the simulator
@@ -472,6 +532,9 @@ class SimulatorLauncher(object):
     time.sleep(LAUNCH_STARTUP_GRACE_SEC)
     if proc.poll() is not None:
       _, stderr = proc.communicate()
+      tunnel_message = self._classify_connection_failure(target, stderr)
+      if tunnel_message:
+        raise LauncherError(tunnel_message, manual_fallback_commands=REVERSE_TUNNEL_FALLBACK_COMMANDS)
       raise LauncherError(
           "Launch ssh session exited " + str(proc.returncode) + " within "
           + str(LAUNCH_STARTUP_GRACE_SEC) + "s: " + stderr.strip())
@@ -616,6 +679,9 @@ class SimulatorLauncher(object):
       return True
     result = self._run_remote(target, check_command, timeout_sec=SSH_CONNECT_TIMEOUT_SEC + 5)
     if self._is_connection_level_failure(result):
+      tunnel_message = self._classify_connection_failure(target, result.stderr)
+      if tunnel_message:
+        raise LauncherError(tunnel_message, manual_fallback_commands=REVERSE_TUNNEL_FALLBACK_COMMANDS)
       raise LauncherError(
           "Could not reach '" + target.get("display_name", target_key) + "' to check: "
           + result.stderr.strip())
@@ -632,6 +698,10 @@ class SimulatorLauncher(object):
       raise LauncherError(
           "'" + target.get("display_name", target_key) + "' has no install_command configured yet.")
     result = self._run_remote(target, install_command, timeout_sec=INSTALL_TIMEOUT_SEC)
+    if self._is_connection_level_failure(result):
+      tunnel_message = self._classify_connection_failure(target, result.stderr)
+      if tunnel_message:
+        raise LauncherError(tunnel_message, manual_fallback_commands=REVERSE_TUNNEL_FALLBACK_COMMANDS)
     if result.returncode != 0:
       raise LauncherError(
           "Install command exited " + str(result.returncode) + ": " + result.stderr.strip())

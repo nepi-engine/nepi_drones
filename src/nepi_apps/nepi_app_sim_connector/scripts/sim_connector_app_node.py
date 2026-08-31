@@ -491,6 +491,14 @@ class NepiSimConnectorApp:
     self.launcher_thread = None
     self.launcher_state = 'idle'
     self.launcher_last_error = ''
+    # Set alongside launcher_last_error (via setLauncherError below) only
+    # when the LauncherError that produced it carries its own
+    # manual_fallback_commands -- currently just the reverse-tunnel
+    # connectivity diagnosis in simulator_launcher.py's
+    # _classify_connection_failure. Takes priority over the per-target
+    # install fallback in publishLauncherStatus, since a dead tunnel isn't
+    # fixed by that target's own install_command.
+    self.launcher_tunnel_fallback_commands = ''
     # Which target a dependency-related failure was actually about -- NOT
     # always active_launch_target (runInstall can fail for a target that
     # isn't the one currently running/attempted), so publishLauncherStatus's
@@ -1375,6 +1383,20 @@ class NepiSimConnectorApp:
   # are never held up by one. launcher_lock only guards against two
   # launch/stop requests racing each other, not against the sim's own I/O.
 
+  def setLauncherError(self, error):
+    """Single place that sets both launcher_last_error and
+    launcher_tunnel_fallback_commands, so every call site (there are over a
+    dozen) doesn't need its own copy of "does this LauncherError carry a
+    manual_fallback_commands override" logic. Accepts either a plain string
+    (the '' clear case, or a hand-built message that was never a
+    LauncherError) or an exception -- str(error) becomes the message either
+    way, and manual_fallback_commands is read off the exception if present
+    (see simulator_launcher.LauncherError/_classify_connection_failure),
+    else cleared, so a fallback from a PREVIOUS failure never lingers onto
+    an unrelated new one."""
+    self.launcher_last_error = str(error)
+    self.launcher_tunnel_fallback_commands = getattr(error, 'manual_fallback_commands', None) or ''
+
   def parseLaunchPayload(self, msg):
     """Parses a sim/launch_simulator-family String message into
     (target_key, robot_config). The RUI encodes both as one JSON object,
@@ -1574,13 +1596,13 @@ class NepiSimConnectorApp:
       self.launcher.kill_all_gazebo()
     except LauncherError as e:
       self.launcher_state = 'failed'
-      self.launcher_last_error = str(e)
+      self.setLauncherError(e)
       self.publishLauncherStatus()
       return
     # Not tied to any one target's launch/stop bookkeeping -- back to idle
     # unconditionally, since kill_all_gazebo just cleared everything.
     self.launcher_state = 'idle'
-    self.launcher_last_error = ''
+    self.setLauncherError('')
     self.selected_launch_target = ''
     self.active_launch_target = ''
     self.publishLauncherStatus()
@@ -1619,14 +1641,14 @@ class NepiSimConnectorApp:
       self.selected_launch_target = target_key
       self.active_launch_target = actual_target
       self.launcher_state = 'launching'
-      self.launcher_last_error = ''
+      self.setLauncherError('')
       self.publishLauncherStatus()
       try:
         self.launcher.launch(actual_target, attach=True)
         ready = self.launcher.wait_until_ready(actual_target)
       except LauncherError as e:
         self.launcher_state = 'failed'
-        self.launcher_last_error = str(e)
+        self.setLauncherError(e)
         self.publishLauncherStatus()
         return
       if not ready:
@@ -1695,7 +1717,7 @@ class NepiSimConnectorApp:
     self.selected_launch_target = target_key
     self.active_launch_target = actual_target
     self.launcher_state = 'launching'
-    self.launcher_last_error = ''
+    self.setLauncherError('')
     self.launcher_failed_target = ''
     self.publishLauncherStatus()
 
@@ -1724,7 +1746,7 @@ class NepiSimConnectorApp:
         self.launcher.install(actual_target)
       except LauncherError as e:
         self.launcher_state = 'failed'
-        self.launcher_last_error = str(e)
+        self.setLauncherError(e)
         self.launcher_failed_target = actual_target
         self.checkInstalledOne(actual_target)
         self.publishLauncherStatus()
@@ -1749,7 +1771,7 @@ class NepiSimConnectorApp:
       # past it (Launch New / sim/force_launch_simulator) rather than just
       # reporting a dead end. Every other LauncherError stays plain 'failed'.
       self.launcher_state = 'gazebo_conflict' if isGazeboConflictError(str(e)) else 'failed'
-      self.launcher_last_error = str(e)
+      self.setLauncherError(e)
       self.publishLauncherStatus()
       return
     if not ready:
@@ -1833,7 +1855,7 @@ class NepiSimConnectorApp:
 
   def runInstall(self, target_key):
     self.launcher_state = 'installing'
-    self.launcher_last_error = ''
+    self.setLauncherError('')
     self.launcher_failed_target = ''
     self.launch_target_installed_check_state[target_key] = 'checking'
     self.publishLauncherStatus()
@@ -1841,7 +1863,7 @@ class NepiSimConnectorApp:
       self.launcher.install(target_key)
     except LauncherError as e:
       self.launcher_state = 'failed'
-      self.launcher_last_error = str(e)
+      self.setLauncherError(e)
       self.launcher_failed_target = target_key
       # Not marked 'not_installed' here -- the install command failing
       # doesn't necessarily mean the dependency is confirmed absent (could
@@ -1918,16 +1940,28 @@ class NepiSimConnectorApp:
         status.active_launch_target_name = self.active_launch_target
     status.launcher_state = self.launcher_state
     status.last_error = self.launcher_last_error
-    # Derived, not stored -- computed fresh from state this app already
-    # tracks (launcher_failed_target, launch_target_installed) rather than
-    # threaded through every individual failure site that sets
-    # launcher_last_error. Keyed off launcher_failed_target, NOT
-    # active_launch_target -- runInstall can fail for a target that was
-    # never the one actively running/attempted. Only shown once a failure is
-    # confirmed dependency-related (the target is known NOT installed), so a
-    # timeout/conflict/network failure with a perfectly good install doesn't
-    # get an irrelevant wall of install commands attached to it.
-    if (self.launcher_state == 'failed' and self.launcher_failed_target
+    # launcher_tunnel_fallback_commands (set by setLauncherError whenever the
+    # LauncherError behind the current failure carries its own
+    # manual_fallback_commands -- currently just the reverse-tunnel
+    # connectivity diagnosis, see simulator_launcher's
+    # _classify_connection_failure) takes priority over the per-target
+    # install fallback below: a dead tunnel isn't fixed by that target's own
+    # install_command, and showing both would bury the one that's actually
+    # relevant under a wall of unrelated apt/pip commands.
+    #
+    # The install fallback itself is derived, not stored -- computed fresh
+    # from state this app already tracks (launcher_failed_target,
+    # launch_target_installed) rather than threaded through every individual
+    # failure site that sets launcher_last_error. Keyed off
+    # launcher_failed_target, NOT active_launch_target -- runInstall can
+    # fail for a target that was never the one actively running/attempted.
+    # Only shown once a failure is confirmed dependency-related (the target
+    # is known NOT installed), so a timeout/conflict/network failure with a
+    # perfectly good install doesn't get an irrelevant wall of install
+    # commands attached to it.
+    if self.launcher_state == 'failed' and self.launcher_tunnel_fallback_commands:
+      status.manual_fallback_commands = self.launcher_tunnel_fallback_commands
+    elif (self.launcher_state == 'failed' and self.launcher_failed_target
         and self.launch_target_installed.get(self.launcher_failed_target, True) is False):
       status.manual_fallback_commands = self.launcher.get_manual_fallback_commands(
           self.launcher_failed_target)

@@ -136,6 +136,18 @@ or restart the container) so it picks up the new environment. See
 what these three variables do -- they're applied once at config-load time,
 so every target picks them up with no yaml edits.
 
+## If you skip this entirely: what you'll see
+
+If the reverse tunnel (Step 2) isn't running, `simulator_launcher.py`
+recognizes the specific failure signature -- a connection-level SSH failure
+against the loopback host every default target uses -- and the RUI's
+`last_error`/`manual_fallback_commands` fields surface exactly the two
+command blocks from Step 2 above (VirtualBox vs. WSL/WSL2), instead of a
+bare `ssh: connect to host 127.0.0.1 port 12222: Connection refused` with no
+indication a tunnel was ever supposed to be there. A `Permission denied
+(publickey)` failure gets a different message pointing at Step 1 instead,
+since that means the tunnel IS up but the keys aren't authorized.
+
 ## Step 4 — verify end to end
 
 1. In the RUI, open the Sim Connector app. The Simulator dropdown's
