@@ -292,6 +292,7 @@ class NepiIFSim extends Component {
     this.renderDimensionsEditor = this.renderDimensionsEditor.bind(this)
     this.renderRobotDimensionsDiagram = this.renderRobotDimensionsDiagram.bind(this)
     this.renderEnvironmentDimensionsDiagram = this.renderEnvironmentDimensionsDiagram.bind(this)
+    this.renderDimensionsDiagramSafe = this.renderDimensionsDiagramSafe.bind(this)
   }
 
   // Resolve the sim device namespace from the namespace prop
@@ -874,7 +875,13 @@ class NepiIFSim extends Component {
   // stays true to what actually gets built on the VM. Chassis height has
   // no top-down representation -- called out in the caption text instead.
   renderRobotDimensionsDiagram(fields) {
-    const get = (name) => numericDimensionField(fields, ROBOT_DIMENSION_FIELDS, name)
+    // Clamped to non-negative here, at the one place every dimension is
+    // read, rather than at each derived width/height below -- a negative
+    // physical dimension (typed by accident, or while testing) is
+    // nonsensical regardless of which shape it would have fed, and letting
+    // one through would make scale negative, which makes every SVG
+    // width/height in this diagram negative too.
+    const get = (name) => Math.max(0, numericDimensionField(fields, ROBOT_DIMENSION_FIELDS, name))
     const wheelRadius = get('wheel_radius_m')
     const wheelWidth = get('wheel_width_m')
     const trackWidth = get('track_width_m')
@@ -944,7 +951,12 @@ class NepiIFSim extends Component {
   // footprint here (a shaded zone); its rise isn't a top-down-representable
   // quantity, so it's called out in the caption text instead.
   renderEnvironmentDimensionsDiagram(fields) {
-    const get = (name) => numericDimensionField(fields, ENVIRONMENT_DIMENSION_FIELDS, name)
+    // Clamped to non-negative here, at the one place every dimension is
+    // read, rather than at each derived width/height below -- see
+    // renderRobotDimensionsDiagram's own comment for why (same reasoning,
+    // negative scale from one negative input making every shape's
+    // width/height negative too).
+    const get = (name) => Math.max(0, numericDimensionField(fields, ENVIRONMENT_DIMENSION_FIELDS, name))
     const courseStartX = get('course_start_x_m')
     const corridorWidth = get('corridor_width_m')
     const wallLength = get('wall_length_m')
@@ -955,7 +967,11 @@ class NepiIFSim extends Component {
     const baffleThickness = get('baffle_thickness_m')
     const rampStartX = get('ramp_start_x_m')
     const rampRise = get('ramp_rise_m')
-    const rampAngleDeg = get('ramp_angle_deg')
+    // Also capped below 90 -- tan() approaches infinity as the angle
+    // approaches a vertical ramp, which would make `run` (and everything
+    // derived from it) blow up rather than just draw a very steep ramp.
+    const rampAngleDeg = Math.min(get('ramp_angle_deg'), 89.9)
+
     const plateauLength = get('ramp_plateau_length_m')
 
     const halfCorridor = corridorWidth / 2
@@ -1022,6 +1038,26 @@ class NepiIFSim extends Component {
   // note gated on the *_dirty status (Gazebo only reads model.sdf at spawn
   // time, never live), and the raw-SDF-upload/download escape hatch for
   // geometry the curated fields don't cover.
+  // Wraps whichever diagram renderer in a try/catch -- a bad or
+  // still-in-progress numeric value should degrade to a plain message, never
+  // take the WHOLE page down. There is no error boundary anywhere in this
+  // app (or, as far as this pass found, in nepi_rui generally), so an
+  // uncaught exception during render unmounts all of React, not just this
+  // one panel -- reported live (2026-08-31) as "the whole thing goes black"
+  // right after this preview feature shipped.
+  renderDimensionsDiagramSafe(role, previewFields) {
+    try {
+      return (role === 'robot') ? this.renderRobotDimensionsDiagram(previewFields)
+                                 : this.renderEnvironmentDimensionsDiagram(previewFields)
+    } catch (e) {
+      return (
+        <div style={{ fontSize: 11, color: Styles.vars.colors.red, marginTop: Styles.vars.spacing.xs }}>
+          {"Preview unavailable for the current values (" + e.message + ")"}
+        </div>
+      )
+    }
+  }
+
   renderDimensionsEditor(role, title, fieldDefs, uploadInputRef) {
     const dirty = this.state[role + '_dimensions_dirty']
     const previewFields = this.state[role + '_dimensions_preview_fields']
@@ -1030,8 +1066,7 @@ class NepiIFSim extends Component {
         <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
         <Section title={title}>
           {this.renderDimensionFields(role, fieldDefs)}
-          {(role === 'robot') ? this.renderRobotDimensionsDiagram(previewFields)
-                               : this.renderEnvironmentDimensionsDiagram(previewFields)}
+          {this.renderDimensionsDiagramSafe(role, previewFields)}
           {(dirty === true) ?
             <div style={{
               fontStyle: "italic",
