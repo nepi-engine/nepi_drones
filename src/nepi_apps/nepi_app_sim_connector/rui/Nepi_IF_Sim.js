@@ -1066,7 +1066,15 @@ class NepiIFSim extends Component {
         <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
         <Section title={title}>
           {this.renderDimensionFields(role, fieldDefs)}
-          {this.renderDimensionsDiagramSafe(role, previewFields)}
+          {/* renderDimensionsDiagramSafe(role, previewFields) disabled
+              (2026-08-31): reported live to crash the whole RUI on the
+              very first keystroke in ANY dimensions field (both roles),
+              well before any value could reach an edge case -- clamping
+              and a try/catch (see that method's own comment) did not
+              resolve it, and it could not be root-caused further without
+              browser devtools access this session. Left in place,
+              disabled, rather than deleted, until it can be debugged with
+              an actual console error in hand. */}
           {(dirty === true) ?
             <div style={{
               fontStyle: "italic",
