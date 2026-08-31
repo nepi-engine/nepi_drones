@@ -840,9 +840,21 @@ class NepiIFSim extends Component {
               if (el) {
                 setElementStyleModified(el)
               }
+              // Read event.target.value into a plain variable BEFORE the
+              // setState updater below, not inside it -- React's synthetic
+              // event is pooled and its fields (including .target) get
+              // nulled out once this handler returns, and the updater
+              // function form (needed here to spread the PREVIOUS nested
+              // fields object rather than replace it) runs on React's own
+              // schedule, not necessarily before that happens. Reading
+              // event.target.value lazily inside the updater crashed with
+              // "Cannot read properties of null (reading 'value')" on
+              // every keystroke -- reported live (2026-08-31) as the whole
+              // RUI going black, since nothing here has an error boundary.
+              const value = event.target.value
               const fieldsKey = role + '_dimensions_fields'
               this.setState((prevState) => ({
-                [fieldsKey]: { ...prevState[fieldsKey], [f.name]: event.target.value }
+                [fieldsKey]: { ...prevState[fieldsKey], [f.name]: value }
               }))
             }}
             onKeyDown={(event) => {
@@ -1066,15 +1078,7 @@ class NepiIFSim extends Component {
         <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
         <Section title={title}>
           {this.renderDimensionFields(role, fieldDefs)}
-          {/* renderDimensionsDiagramSafe(role, previewFields) disabled
-              (2026-08-31): reported live to crash the whole RUI on the
-              very first keystroke in ANY dimensions field (both roles),
-              well before any value could reach an edge case -- clamping
-              and a try/catch (see that method's own comment) did not
-              resolve it, and it could not be root-caused further without
-              browser devtools access this session. Left in place,
-              disabled, rather than deleted, until it can be debugged with
-              an actual console error in hand. */}
+          {this.renderDimensionsDiagramSafe(role, previewFields)}
           {(dirty === true) ?
             <div style={{
               fontStyle: "italic",
