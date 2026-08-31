@@ -199,14 +199,6 @@ class NepiIFSim extends Component {
       // taking up space on the page.
       show_robot_config_viewer: false,
 
-      // Save-As-Named-Config for robot configs -- see onSaveRobotConfigClicked.
-      // last_uploaded_config_yaml is captured alongside the existing upload
-      // send (onUploadConfigFileChange) so "Save As Named Config" has
-      // something to persist without a second file picker or a round trip
-      // back through the device to re-fetch what was just uploaded.
-      robot_config_save_as_name: '',
-      last_uploaded_config_yaml: '',
-
       // Lifted up from NepiIFSimLauncher: two separate instances are mounted
       // below (selector up top, deploy controls at the bottom -- see their
       // `only` props), and this dropdown selection has to be shared between
@@ -281,6 +273,12 @@ class NepiIFSim extends Component {
       environment_dimensions_config_names: ['Default'],
       robot_dimensions_selected_config: 'Default',
       environment_dimensions_selected_config: 'Default',
+      // Raw YAML text of whichever config was selected/saved most
+      // recently -- see applyDimensionsYaml's own comment. Shown read-only
+      // by renderDimensionsConfigButtons, the same "click a config, see its
+      // YAML" pattern the capability robot-config buttons already use.
+      robot_dimensions_config_yaml_text: '',
+      environment_dimensions_config_yaml_text: '',
       robot_dimensions_save_as_name: '',
       environment_dimensions_save_as_name: '',
       robotDimensionsConfigNamesListener: null,
@@ -309,7 +307,6 @@ class NepiIFSim extends Component {
     this.onUploadConfigClicked = this.onUploadConfigClicked.bind(this)
     this.onUploadConfigFileChange = this.onUploadConfigFileChange.bind(this)
     this.onDownloadSampleConfigClicked = this.onDownloadSampleConfigClicked.bind(this)
-    this.onSaveRobotConfigClicked = this.onSaveRobotConfigClicked.bind(this)
     this.onDeleteRobotConfigClicked = this.onDeleteRobotConfigClicked.bind(this)
     this.updateRobotConfigYamlListener = this.updateRobotConfigYamlListener.bind(this)
     this.robotConfigYamlListener = this.robotConfigYamlListener.bind(this)
@@ -325,7 +322,8 @@ class NepiIFSim extends Component {
     this.updateDimensionsListeners = this.updateDimensionsListeners.bind(this)
     this.applyDimensionConfigNames = this.applyDimensionConfigNames.bind(this)
     this.onSaveDimensionsClicked = this.onSaveDimensionsClicked.bind(this)
-    this.onSelectDimensionConfigChanged = this.onSelectDimensionConfigChanged.bind(this)
+    this.onSelectDimensionConfig = this.onSelectDimensionConfig.bind(this)
+    this.renderDimensionsConfigButtons = this.renderDimensionsConfigButtons.bind(this)
     this.onSaveDimensionConfigAsClicked = this.onSaveDimensionConfigAsClicked.bind(this)
     this.onDeleteDimensionConfigClicked = this.onDeleteDimensionConfigClicked.bind(this)
     this.onDownloadDimensionsClicked = this.onDownloadDimensionsClicked.bind(this)
@@ -534,6 +532,15 @@ class NepiIFSim extends Component {
   // stored dimensions yet" placeholder text isn't valid YAML on purpose, so
   // this simply keeps the JS-side defaults in that case rather than erroring.
   applyDimensionsYaml(role, yamlText) {
+    // Also captured raw, unparsed, into *_dimensions_config_yaml_text --
+    // renderDimensionsConfigButtons' own read-only viewer shows exactly
+    // this text for whichever named config is currently selected, the same
+    // "click a config, see its YAML" behavior the capability robot-config
+    // buttons already have (getRobotConfigCb/robot_config_yaml). This topic
+    // is what select_<role>_dimensions_config's own backend handler
+    // (applyDimensionConfigByName) re-publishes to, so selecting a named
+    // config populates this viewer with no separate request/topic needed.
+    this.setState({ [role + '_dimensions_config_yaml_text']: yamlText })
     var parsed = null
     try {
       parsed = yaml.load(yamlText)
@@ -697,40 +704,14 @@ class NepiIFSim extends Component {
     }
     const reader = new FileReader()
     reader.onload = () => {
-      const yamlText = String(reader.result)
-      this.props.ros.sendStringMsg(namespace + '/upload_robot_config', yamlText)
-      // Captured so "Save As Named Config" (onSaveRobotConfigClicked) has
-      // something to persist without a second file picker or a round trip
-      // back through the device to re-fetch what was just uploaded.
-      this.setState({ last_uploaded_config_yaml: yamlText })
+      this.props.ros.sendStringMsg(namespace + '/upload_robot_config', String(reader.result))
     }
     reader.readAsText(file)
   }
 
-  // Persists the most recently uploaded robot config (see
-  // last_uploaded_config_yaml's own comment) under an operator-chosen name --
-  // sim_connector_app_node.py's saveRobotConfigCb validates it exactly like
-  // an upload, writes it to disk so it survives a restart, and it appears in
-  // the same available_robot_configs list every checked-in config does
-  // (renderRobotConfigSelector reads that list, not a separate one -- no
-  // new dropdown wiring needed here). No-ops if nothing has been uploaded
-  // yet or the name field is empty, same "reject clearly" instinct as the
-  // upload path itself.
-  onSaveRobotConfigClicked() {
-    const namespace = this.getSimNamespace()
-    const name = this.state.robot_config_save_as_name.trim()
-    if (namespace == null || namespace === 'None' || name === ''
-        || this.state.last_uploaded_config_yaml === '') {
-      return
-    }
-    this.props.ros.sendStringMsg(namespace + '/save_robot_config',
-      JSON.stringify({ name: name, yaml: this.state.last_uploaded_config_yaml }))
-    this.setState({ robot_config_save_as_name: '' })
-  }
-
   // Deletes whichever robot config is currently selected -- the button
   // itself is only ever rendered enabled for a non-built-in selection (see
-  // renderRobotConfigSettings), but deleteRobotConfigCb on the device side
+  // renderRobotConfigSelector), but deleteRobotConfigCb on the device side
   // enforces the same PROTECTED_ROBOT_CONFIG_KEYS check independently, so a
   // stale/racing click can't delete a built-in either way.
   onDeleteRobotConfigClicked() {
@@ -780,11 +761,13 @@ class NepiIFSim extends Component {
   // device side loads it, makes it the active one (same effect Save
   // Dimensions already has), and echoes it back over the existing
   // *_dimensions_yaml topic, so applyDimensionsYaml refreshes the editable
-  // fields and preview diagram without this handler touching them directly.
-  onSelectDimensionConfigChanged(role, event) {
+  // fields, preview diagram, AND renderDimensionsConfigButtons' own YAML
+  // viewer without this handler touching any of them directly. Takes the
+  // name directly (not an event) -- driven by a button click, the same
+  // shape onViewConfigClicked already uses for capability robot configs.
+  onSelectDimensionConfig(role, name) {
     const namespace = this.getSimNamespace()
-    const name = event.target.value
-    if (namespace == null || namespace === 'None' || name === '') {
+    if (namespace == null || namespace === 'None' || !name) {
       return
     }
     this.props.ros.sendStringMsg(namespace + '/select_' + role + '_dimensions_config', name)
@@ -896,14 +879,76 @@ class NepiIFSim extends Component {
     }
 
     return (
-      <Label title={"Robot Config"}>
-        <Select
-          onChange={this.onRobotConfigSelected}
-          value={selected}
-        >
-          {items}
-        </Select>
-      </Label>
+      <React.Fragment>
+        <Label title={"Robot Config"}>
+          <Select
+            onChange={this.onRobotConfigSelected}
+            value={selected}
+          >
+            {items}
+          </Select>
+        </Label>
+        {/* Kept at the top, right by the selector it acts on, rather than
+            buried in the collapsed Config Settings panel below -- deleting
+            is a decision about WHICH config is currently picked, same
+            level as the selector itself, not a settings/management detail. */}
+        <ButtonMenu>
+          <Button
+            disabled={PROTECTED_ROBOT_CONFIG_KEYS.includes(selected)}
+            onClick={this.onDeleteRobotConfigClicked}
+          >
+            {"Delete Selected Config"}
+          </Button>
+        </ButtonMenu>
+      </React.Fragment>
+    )
+  }
+
+  // One row of buttons per saved dimensions config (robot or environment) --
+  // same "buttons you click to select AND view the YAML" pattern the
+  // capability robot-config buttons above already use, not a <Select>
+  // dropdown -- requested live (2026-08-31) so both axes read the same way.
+  // Kept at the TOP of the page, right by the Robot Config selector, rather
+  // than down inside the field-editing sections (renderDimensionsEditor):
+  // picking/deleting a saved config is a top-level decision like picking
+  // the robot config itself, not a per-field editing detail. "Save As New
+  // Config" stays down in renderDimensionsEditor instead, since that is
+  // where the fields actually being saved are edited.
+  renderDimensionsConfigButtons(role, label) {
+    const names = this.state[role + '_dimensions_config_names']
+    const selected = this.state[role + '_dimensions_selected_config']
+    const yamlText = this.state[role + '_dimensions_config_yaml_text']
+    return (
+      <React.Fragment>
+        <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
+        <Label title={label} labelStyle={{ fontWeight: 'bold' }} />
+        <ButtonMenu>
+          {names.map((name) => (
+            <Button
+              key={name}
+              style={(name === selected) ? { backgroundColor: Styles.vars.colors.blue } : undefined}
+              onClick={() => this.onSelectDimensionConfig(role, name)}
+            >
+              {name}
+            </Button>
+          ))}
+          <Button
+            disabled={selected === DEFAULT_DIMENSION_CONFIG_NAME}
+            onClick={() => this.onDeleteDimensionConfigClicked(role)}
+          >
+            {"Delete Selected Config"}
+          </Button>
+        </ButtonMenu>
+        {(yamlText !== '') ?
+          <textarea
+            readOnly
+            value={yamlText}
+            rows={6}
+            style={{ width: "60%", maxWidth: "40em", fontFamily: "monospace",
+                    whiteSpace: "pre", overflow: "auto", display: "block" }}
+          />
+        : null}
+      </React.Fragment>
     )
   }
 
@@ -955,34 +1000,6 @@ class NepiIFSim extends Component {
             <ButtonMenu>
               <Button onClick={this.onUploadConfigClicked}>{"Upload Robot Config"}</Button>
               <Button onClick={this.onDownloadSampleConfigClicked}>{"Download Sample Config"}</Button>
-            </ButtonMenu>
-            {/* Persists the config just uploaded above (last_uploaded_config_yaml)
-                under a name of the operator's choosing -- appears in the same
-                selector every checked-in config does, and survives a restart.
-                Disabled until something has actually been uploaded this
-                session; nothing to save otherwise. */}
-            <Label title={"Save Uploaded Config As"}>
-              <Input
-                id={"RobotConfigSaveAsName"}
-                value={this.state.robot_config_save_as_name}
-                onChange={(event) => this.setState({ robot_config_save_as_name: event.target.value })}
-                onKeyDown={(event) => { if (event.key === 'Enter') { this.onSaveRobotConfigClicked() } }}
-              />
-            </Label>
-            <ButtonMenu>
-              <Button
-                disabled={this.state.robot_config_save_as_name.trim() === ''
-                          || this.state.last_uploaded_config_yaml === ''}
-                onClick={this.onSaveRobotConfigClicked}
-              >
-                {"Save As Named Config"}
-              </Button>
-              <Button
-                disabled={PROTECTED_ROBOT_CONFIG_KEYS.includes(this.getSelectedRobotConfig())}
-                onClick={this.onDeleteRobotConfigClicked}
-              >
-                {"Delete Selected Config"}
-              </Button>
             </ButtonMenu>
             {(available.length > 0) ?
               <React.Fragment>
@@ -1279,24 +1296,10 @@ class NepiIFSim extends Component {
   renderDimensionsEditor(role, title, fieldDefs, uploadInputRef) {
     const dirty = this.state[role + '_dimensions_dirty']
     const previewFields = this.state[role + '_dimensions_preview_fields']
-    const configNames = this.state[role + '_dimensions_config_names']
-    const selectedConfig = this.state[role + '_dimensions_selected_config']
     return (
       <React.Fragment>
         <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
         <Section title={title}>
-          {/* Named-config selector -- Default is always present and never
-              deletable (see sim_connector_app_node.py's DEFAULT_DIMENSION_
-              CONFIG_NAME/PROTECTED comments); anything an operator has saved
-              alongside it appears here too, via *_dimensions_config_names. */}
-          <Label title={"Saved Config"}>
-            <Select
-              onChange={(event) => this.onSelectDimensionConfigChanged(role, event)}
-              value={selectedConfig}
-            >
-              {configNames.map((name) => <Option key={name} value={name}>{name}</Option>)}
-            </Select>
-          </Label>
           {this.renderDimensionFields(role, fieldDefs)}
           {this.renderDimensionsDiagramSafe(role, previewFields)}
           {(dirty === true) ?
@@ -1321,12 +1324,14 @@ class NepiIFSim extends Component {
             <Button onClick={() => this.onDownloadDimensionsClicked(role)}>{"Download Dimensions (YAML)"}</Button>
             <Button onClick={() => this.onUploadModelSdfClicked(role)}>{"Upload Raw model.sdf"}</Button>
           </ButtonMenu>
-          {/* Save As New Config: names and persists the CURRENTLY EDITED
-              fields (not just whichever config was last loaded), and makes
-              the new name the active one -- same "save also means use"
-              behavior as Save Dimensions above, just under a new name
-              instead of overwriting the active config in place. */}
-          <Label title={"Save As New Config"}>
+          {/* Names and persists the CURRENTLY EDITED fields (not just
+              whichever config was last loaded), and makes the new name the
+              active one -- same "save also means use" behavior as Save
+              Dimensions above, just under a new name instead of overwriting
+              the active config in place. Deleting a saved config lives at
+              the top of the page instead (renderDimensionsConfigButtons),
+              next to the buttons that pick one -- not duplicated here. */}
+          <Label title={"Name New Config"}>
             <Input
               id={"DimensionsSaveAsName_" + role}
               value={this.state[role + '_dimensions_save_as_name']}
@@ -1340,12 +1345,6 @@ class NepiIFSim extends Component {
               onClick={() => this.onSaveDimensionConfigAsClicked(role)}
             >
               {"Save As New Config"}
-            </Button>
-            <Button
-              disabled={selectedConfig === DEFAULT_DIMENSION_CONFIG_NAME}
-              onClick={() => this.onDeleteDimensionConfigClicked(role)}
-            >
-              {"Delete Selected Config"}
             </Button>
           </ButtonMenu>
         </Section>
@@ -1505,6 +1504,19 @@ class NepiIFSim extends Component {
               onTargetSelected={this.onLaunchTargetSelected}
             />
             {this.renderRobotConfigSelector()}
+            {/* Both kept visible here at the top, right by the Robot Config
+                selector -- not hidden behind Config Settings' Show/Hide
+                toggle below, since picking or deleting a saved dimensions
+                config is a top-level decision like the selector itself.
+                Environment's stays enabled even with a simulator running
+                (never gated on launcher_state here) -- selecting a new one
+                still only takes effect at the next Launch (the existing
+                dirty indicator down in Environment Dimensions says so),
+                Gazebo has no way to hot-reload a course layout into a
+                running world, but there is no reason to make the operator
+                wait for a stop/relaunch just to LOOK AT or PICK a config. */}
+            {this.renderDimensionsConfigButtons('robot', 'Robot Dimensions Configs')}
+            {this.renderDimensionsConfigButtons('environment', 'Environment Dimensions Configs')}
 
             {/* Deploy/Kill/Install controls -- right after picking WHAT to
                 run (simulator) and WHICH robot config, before Robot Config
