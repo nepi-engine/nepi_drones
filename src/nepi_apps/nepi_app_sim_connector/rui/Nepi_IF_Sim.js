@@ -125,6 +125,22 @@ function defaultDimensionFields(fieldDefs) {
   return fields
 }
 
+// Coerces one dimension field to a finite number for the diagrams below,
+// falling back to that field's own factory default -- fields can hold a
+// string mid-edit (including a momentarily invalid one like "" or "-"
+// while typing a negative number), so this never lets a diagram draw NaN
+// geometry.
+function numericDimensionField(fields, fieldDefs, name) {
+  const num = Number(fields[name])
+  if (isFinite(num)) {
+    return num
+  }
+  const def = fieldDefs.find((f) => f.name === name)
+  return def ? def.default : 0
+}
+
+const DIAGRAM_BG = "#1c1e21"
+
 @inject("ros")
 @observer
 
@@ -216,6 +232,20 @@ class NepiIFSim extends Component {
       environment_dimensions_fields: defaultDimensionFields(ENVIRONMENT_DIMENSION_FIELDS),
       robot_dimensions_dirty: false,
       environment_dimensions_dirty: false,
+
+      // Snapshot the diagram (renderRobotDimensionsDiagram/
+      // renderEnvironmentDimensionsDiagram below) actually draws from --
+      // deliberately NOT the same object as *_dimensions_fields above, which
+      // updates on every keystroke while editing. Requested live (2026-08-31)
+      // as a preview that "updates every time they click Save Dimensions",
+      // not one that redraws mid-edit before a value is even a real number
+      // (a field can be a lone "-" or "" while typing). Set in two places:
+      // applyDimensionsYaml (so the diagram shows the device's actual current
+      // dimensions immediately on load, before any local edit) and
+      // onSaveDimensionsClicked (so it then tracks exactly what "Save
+      // Dimensions" last committed).
+      robot_dimensions_preview_fields: defaultDimensionFields(ROBOT_DIMENSION_FIELDS),
+      environment_dimensions_preview_fields: defaultDimensionFields(ENVIRONMENT_DIMENSION_FIELDS),
       robotDimensionsYamlListener: null,
       environmentDimensionsYamlListener: null,
       robotDimensionsDirtyListener: null,
@@ -260,6 +290,8 @@ class NepiIFSim extends Component {
     this.onUploadModelSdfFileChange = this.onUploadModelSdfFileChange.bind(this)
     this.renderDimensionFields = this.renderDimensionFields.bind(this)
     this.renderDimensionsEditor = this.renderDimensionsEditor.bind(this)
+    this.renderRobotDimensionsDiagram = this.renderRobotDimensionsDiagram.bind(this)
+    this.renderEnvironmentDimensionsDiagram = this.renderEnvironmentDimensionsDiagram.bind(this)
   }
 
   // Resolve the sim device namespace from the namespace prop
@@ -417,7 +449,11 @@ class NepiIFSim extends Component {
       return
     }
     const fieldsKey = role + '_dimensions_fields'
-    this.setState((prevState) => ({ [fieldsKey]: { ...prevState[fieldsKey], ...parsed } }))
+    const previewKey = role + '_dimensions_preview_fields'
+    this.setState((prevState) => ({
+      [fieldsKey]: { ...prevState[fieldsKey], ...parsed },
+      [previewKey]: { ...prevState[previewKey], ...parsed },
+    }))
   }
 
   // Function for configuring and subscribing to sim/robot_config_yaml --
@@ -599,6 +635,10 @@ class NepiIFSim extends Component {
     const fields = this.state[role + '_dimensions_fields']
     const yamlText = yaml.dump(fields)
     this.props.ros.sendStringMsg(namespace + '/set_' + role + '_dimensions', yamlText)
+    // Snapshot for the diagram -- see robot_dimensions_preview_fields'
+    // own comment for why this is a separate copy from the live-editing
+    // fields above.
+    this.setState({ [role + '_dimensions_preview_fields']: { ...fields } })
   }
 
   // Client-side only, downloads the CURRENTLY EDITED fields (not a fresh
@@ -826,22 +866,181 @@ class NepiIFSim extends Component {
     return rows
   }
 
+  // Top-down schematic of the rover from robot_dimensions_preview_fields
+  // (see that state field's own comment for why it's a separate snapshot,
+  // not the live-editing fields). Wheel positions match
+  // generate_model_sdf.py's own WHEEL_POSITIONS exactly (front is +x,
+  // left is +y) rather than guessing at the layout independently, so this
+  // stays true to what actually gets built on the VM. Chassis height has
+  // no top-down representation -- called out in the caption text instead.
+  renderRobotDimensionsDiagram(fields) {
+    const get = (name) => numericDimensionField(fields, ROBOT_DIMENSION_FIELDS, name)
+    const wheelRadius = get('wheel_radius_m')
+    const wheelWidth = get('wheel_width_m')
+    const trackWidth = get('track_width_m')
+    const wheelbase = get('wheelbase_m')
+    const chassisLength = get('chassis_length_m')
+    const chassisWidth = get('chassis_width_m')
+    const chassisHeight = get('chassis_height_m')
+
+    const boundW = Math.max(chassisLength, wheelbase + 2 * wheelRadius, 0.05)
+    const boundH = Math.max(chassisWidth, trackWidth + wheelWidth, 0.05)
+    const viewW = 280
+    const viewH = 170
+    const pad = 30
+    const scale = Math.min((viewW - 2 * pad) / boundW, (viewH - 2 * pad) / boundH)
+    const cx = viewW / 2
+    const cy = viewH / 2
+
+    // sy=+1 (left, REP103 convention) drawn upward -- smaller SVG y --
+    // same up-is-positive mapping renderEnvironmentDimensionsDiagram uses,
+    // so the two panels read consistently if seen side by side.
+    const wheelPositions = [
+      { key: 'FL', sx: 1, sy: 1 }, { key: 'FR', sx: 1, sy: -1 },
+      { key: 'RL', sx: -1, sy: 1 }, { key: 'RR', sx: -1, sy: -1 },
+    ]
+    const wheelBoxW = 2 * wheelRadius * scale
+    const wheelBoxH = wheelWidth * scale
+
+    return (
+      <React.Fragment>
+        <svg viewBox={`0 0 ${viewW} ${viewH}`} width="100%" height={viewH}
+             style={{ background: DIAGRAM_BG, borderRadius: 4 }}>
+          <rect x={cx - (chassisLength * scale) / 2} y={cy - (chassisWidth * scale) / 2}
+                width={chassisLength * scale} height={chassisWidth * scale}
+                fill="none" stroke={Styles.vars.colors.blue} strokeWidth="2" />
+          {wheelPositions.map((p) => (
+            <rect key={p.key}
+                  x={cx + p.sx * (wheelbase / 2) * scale - wheelBoxW / 2}
+                  y={cy - p.sy * (trackWidth / 2) * scale - wheelBoxH / 2}
+                  width={wheelBoxW} height={wheelBoxH}
+                  fill={Styles.vars.colors.grey1} />
+          ))}
+          <polygon fill={Styles.vars.colors.orange} points={
+            (cx + (chassisLength / 2) * scale + 7) + "," + cy + " " +
+            (cx + (chassisLength / 2) * scale - 3) + "," + (cy - 6) + " " +
+            (cx + (chassisLength / 2) * scale - 3) + "," + (cy + 6)
+          } />
+        </svg>
+        <div style={{ fontSize: 11, color: Styles.vars.colors.grey1, marginTop: Styles.vars.spacing.xs }}>
+          {"Wheelbase " + wheelbase.toFixed(2) + "m · Track " + trackWidth.toFixed(2) +
+           "m · Chassis " + chassisLength.toFixed(2) + "×" + chassisWidth.toFixed(2) +
+           "×" + chassisHeight.toFixed(2) + "m (L×W×H)"}
+        </div>
+      </React.Fragment>
+    )
+  }
+
+  // Top-down schematic of the obstacle course from
+  // environment_dimensions_preview_fields. Baffle and ramp placement match
+  // generate_model_sdf.py's buildObstacleCourseSdf exactly: each baffle
+  // attaches to one side wall and reaches to within baffle_gap_m of the
+  // centerline (so a robot driving straight down the middle clears both by
+  // that margin), and the ramp's horizontal run is derived from
+  // rise/tan(angle) the same way that function derives it -- this is
+  // computed independently in JS rather than asking the device for it,
+  // so the diagram matches what "Save Dimensions" is ABOUT to build, not
+  // what was last actually loaded there. The ramp only has a top-down
+  // footprint here (a shaded zone); its rise isn't a top-down-representable
+  // quantity, so it's called out in the caption text instead.
+  renderEnvironmentDimensionsDiagram(fields) {
+    const get = (name) => numericDimensionField(fields, ENVIRONMENT_DIMENSION_FIELDS, name)
+    const courseStartX = get('course_start_x_m')
+    const corridorWidth = get('corridor_width_m')
+    const wallLength = get('wall_length_m')
+    const wallThickness = get('wall_thickness_m')
+    const baffleAX = get('baffle_a_x_m')
+    const baffleBX = get('baffle_b_x_m')
+    const baffleGap = get('baffle_gap_m')
+    const baffleThickness = get('baffle_thickness_m')
+    const rampStartX = get('ramp_start_x_m')
+    const rampRise = get('ramp_rise_m')
+    const rampAngleDeg = get('ramp_angle_deg')
+    const plateauLength = get('ramp_plateau_length_m')
+
+    const halfCorridor = corridorWidth / 2
+    const angleRad = (rampAngleDeg * Math.PI) / 180
+    const run = angleRad > 0 ? rampRise / Math.tan(angleRad) : 0
+    const rampEndX = rampStartX + 2 * run + plateauLength
+
+    const boundW = Math.max(wallLength, rampEndX, 0.5)
+    const boundH = corridorWidth + 2 * wallThickness
+    const viewW = 560
+    const viewH = 190
+    const padX = 20
+    const padY = 24
+    const scale = Math.min((viewW - 2 * padX) / boundW, (viewH - 2 * padY) / boundH)
+    const midY = viewH / 2
+    const toX = (worldX) => padX + worldX * scale
+    // world +y (toward the wall baffle_a attaches to) drawn upward, same
+    // up-is-positive convention as renderRobotDimensionsDiagram.
+    const toY = (worldY) => midY - worldY * scale
+
+    const baffleReach = Math.max(halfCorridor - baffleGap, 0)
+
+    return (
+      <React.Fragment>
+        <svg viewBox={`0 0 ${viewW} ${viewH}`} width="100%" height={viewH}
+             style={{ background: DIAGRAM_BG, borderRadius: 4 }}>
+          <rect x={toX(0)} y={toY(halfCorridor)} width={wallLength * scale} height={corridorWidth * scale}
+                fill="#26292d" />
+          {(rampEndX > rampStartX) ?
+            <rect x={toX(rampStartX)} y={toY(halfCorridor)} width={(rampEndX - rampStartX) * scale}
+                  height={corridorWidth * scale} fill={Styles.vars.colors.blue} opacity="0.18" />
+          : null}
+          <rect x={toX(0)} y={toY(halfCorridor + wallThickness)} width={wallLength * scale}
+                height={wallThickness * scale} fill={Styles.vars.colors.grey1} />
+          <rect x={toX(0)} y={toY(-halfCorridor)} width={wallLength * scale}
+                height={wallThickness * scale} fill={Styles.vars.colors.grey1} />
+          <rect x={toX(baffleAX - baffleThickness / 2)} y={toY(halfCorridor)}
+                width={baffleThickness * scale} height={baffleReach * scale}
+                fill={Styles.vars.colors.orange} />
+          <rect x={toX(baffleBX - baffleThickness / 2)} y={toY(-baffleGap)}
+                width={baffleThickness * scale} height={baffleReach * scale}
+                fill={Styles.vars.colors.orange} />
+          <circle cx={toX(courseStartX)} cy={toY(0)} r="4" fill={Styles.vars.colors.green} />
+          <text x={toX(courseStartX)} y={toY(halfCorridor + wallThickness) - 4} textAnchor="middle"
+                fill={Styles.vars.colors.green} fontSize="9">{"START"}</text>
+          {(rampEndX > rampStartX) ?
+            <text x={toX((rampStartX + rampEndX) / 2)} y={toY(0) + 3} textAnchor="middle"
+                  fill={Styles.vars.colors.blue} fontSize="10">{"RAMP"}</text>
+          : null}
+        </svg>
+        <div style={{ fontSize: 11, color: Styles.vars.colors.grey1, marginTop: Styles.vars.spacing.xs }}>
+          {"Corridor " + corridorWidth.toFixed(2) + "m × " + wallLength.toFixed(2) +
+           "m · Ramp rises " + rampRise.toFixed(2) + "m over " + run.toFixed(2) +
+           "m at " + rampAngleDeg.toFixed(1) + "°, then a " + plateauLength.toFixed(2) +
+           "m plateau"}
+        </div>
+      </React.Fragment>
+    )
+  }
+
   // Full sub-section for one role: curated fields (renderDimensionFields
-  // above), a "changes apply on next Launch" note gated on the *_dirty
-  // status (Gazebo only reads model.sdf at spawn time, never live), and the
-  // raw-SDF-upload/download escape hatch for geometry the curated fields
-  // don't cover.
+  // above), the schematic preview (renderRobotDimensionsDiagram/
+  // renderEnvironmentDimensionsDiagram), a "changes apply on next Launch"
+  // note gated on the *_dirty status (Gazebo only reads model.sdf at spawn
+  // time, never live), and the raw-SDF-upload/download escape hatch for
+  // geometry the curated fields don't cover.
   renderDimensionsEditor(role, title, fieldDefs, uploadInputRef) {
     const dirty = this.state[role + '_dimensions_dirty']
+    const previewFields = this.state[role + '_dimensions_preview_fields']
     return (
       <React.Fragment>
         <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
         <Section title={title}>
           {this.renderDimensionFields(role, fieldDefs)}
+          {(role === 'robot') ? this.renderRobotDimensionsDiagram(previewFields)
+                               : this.renderEnvironmentDimensionsDiagram(previewFields)}
           {(dirty === true) ?
-            <Label title={" "}>
-              <Input disabled value={"Edited -- applies on the next Launch"} />
-            </Label>
+            <div style={{
+              fontStyle: "italic",
+              color: Styles.vars.colors.grey1,
+              marginTop: Styles.vars.spacing.small,
+              marginBottom: Styles.vars.spacing.small,
+            }}>
+              {"Edited -- applies on the next Launch"}
+            </div>
           : null}
           <input
             type="file"
