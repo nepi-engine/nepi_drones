@@ -867,18 +867,22 @@ class ArdupilotNode:
   def sendGotoCommandLoop(self,timer):
     if self.rbx_if.status_msg.ready == False:
       if self.attitude_target != None:
-        self.att_sp_seq += self.att_sp_seq
+        # += self.att_sp_seq (previously) starting from 0 (line 317) is
+        # always 0 -- header.seq never actually incremented. Harmless to
+        # MAVROS/ArduCopter (they don't gate on it), but not what a
+        # monotonic sequence counter is for; += 1 is the fix.
+        self.att_sp_seq += 1
         self.attitude_target.header.stamp = nepi_sdk.get_msg_stamp()
         self.attitude_target.header.seq = self.att_sp_seq
         self.setpoint_attitude_pub.publish(self.attitude_target) # Publish Setpoint
       elif self.position_target != None:
         self.msg_if.pub_info("got position target valid")
-        self.pos_sp_seq += self.pos_sp_seq
+        self.pos_sp_seq += 1
         self.position_target.header.stamp = nepi_sdk.get_msg_stamp()
         self.position_target.header.seq = self.pos_sp_seq
         self.setpoint_position_local_pub.publish(self.position_target) # Publish Setpoint
       elif self.location_target != None:
-        self.loc_sp_seq += self.loc_sp_seq
+        self.loc_sp_seq += 1
         self.location_target.header.stamp = nepi_sdk.get_msg_stamp()
         self.location_target.header.seq = self.loc_sp_seq
         self.setpoint_location_global_pub.publish(self.location_target) # Publish Setpoint
@@ -903,13 +907,48 @@ class ArdupilotNode:
     body_rate.x = 0
     body_rate.y = 0
     body_rate.z = 0
+    # MAVLink SET_ATTITUDE_TARGET type_mask bits 1/2/4 ignore body roll/
+    # pitch/yaw RATE (Copter derives the rates itself from the orientation
+    # target below, which is what every use of this command actually
+    # wants -- an attitude to reach, not a rate to hold).
+    #
+    # Bit 64 (ignore throttle) is deliberately NOT set here, even though it
+    # looks like the obvious fix for the bug below -- confirmed against
+    # ArduCopter's own current source
+    # (ArduCopter/GCS_MAVLink_Copter.cpp, handle_message_set_attitude_target):
+    #   if (throttle_ignore) {
+    #     // The throttle input is not defined
+    #     copter.mode_guided.hold_position();
+    #     return;
+    #   }
+    # Setting it makes Copter discard the ENTIRE message -- orientation
+    # included -- and hold its current position instead. Confirmed live:
+    # with bit 64 set, a 180-degree goto_pose held altitude perfectly but
+    # never actually rotated; the command was a total no-op, not a safe
+    # version of itself.
     type_mask = 1|2|4
-    thrust_ratio = 0
     attitude_target_msg = AttitudeTarget()
     attitude_target_msg.orientation = orientation_enu_quat
     attitude_target_msg.body_rate = body_rate
     attitude_target_msg.type_mask = type_mask
-    attitude_target_msg.thrust = thrust_ratio
+    # thrust=0 (previously) is NOT "zero motor thrust" -- with bit 64 above
+    # unset, Copter treats thrust as a CLIMB RATE command (same source as
+    # above, the use_thrust=false branch): 0.5 means "hold altitude" (zero
+    # climb rate, its own Z controller picks whatever throttle that takes),
+    # 0.0 means "descend at the full WPNAV_SPEED_DN rate" for as long as
+    # this setpoint keeps streaming, and 1.0 means "climb at WPNAV_SPEED_UP".
+    # thrust=0 therefore commanded a continuous forced descent on every
+    # single goto_pose call, including a pure yaw change with roll/pitch
+    # left at 0 -- a small attitude change could look survivable if the
+    # setpoint stream stopped (target reached) before the descent became
+    # visible; a large one (confirmed live: 180 degrees of yaw, which takes
+    # longer to converge) kept streaming that forced descent long enough to
+    # reach the ground. 0.5 is the fix: zero commanded climb rate, altitude
+    # held by Copter's own controller, while the attitude controller drives
+    # toward the requested orientation independently. This is standard
+    # ArduCopter GUIDED-mode behavior (identical on SITL and real hardware),
+    # not a simulator-specific workaround.
+    attitude_target_msg.thrust = 0.5
     ## Send Setpoint Message
     self.attitude_target = attitude_target_msg
     
