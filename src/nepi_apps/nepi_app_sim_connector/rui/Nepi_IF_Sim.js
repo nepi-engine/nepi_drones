@@ -88,14 +88,6 @@ available_camera_view_modes:
 has_environment_controls: true
 `
 
-// The three checked-in robot config keys (sim_connector_app_params.yaml's
-// own robot_configs section) -- mirrors sim_connector_app_node.py's own
-// PROTECTED_ROBOT_CONFIG_KEYS so the Delete button can disable itself for
-// these client-side, without a round trip; the device enforces the same
-// rule independently regardless (deleteRobotConfigCb), so this is purely a
-// UI convenience, not the actual safety check.
-const PROTECTED_ROBOT_CONFIG_KEYS = ['default', 'ground_robot_4_wheel', 'flight_robot_4_motor']
-
 // Mirrors sim_connector_app_node.py's own DEFAULT_DIMENSION_CONFIG_NAME --
 // the one dimensions config name that always exists and can never be
 // deleted (see that constant's own comment for the full design).
@@ -307,7 +299,6 @@ class NepiIFSim extends Component {
     this.onUploadConfigClicked = this.onUploadConfigClicked.bind(this)
     this.onUploadConfigFileChange = this.onUploadConfigFileChange.bind(this)
     this.onDownloadSampleConfigClicked = this.onDownloadSampleConfigClicked.bind(this)
-    this.onDeleteRobotConfigClicked = this.onDeleteRobotConfigClicked.bind(this)
     this.updateRobotConfigYamlListener = this.updateRobotConfigYamlListener.bind(this)
     this.robotConfigYamlListener = this.robotConfigYamlListener.bind(this)
     this.onViewConfigClicked = this.onViewConfigClicked.bind(this)
@@ -315,6 +306,7 @@ class NepiIFSim extends Component {
     this.onLaunchTargetSelected = this.onLaunchTargetSelected.bind(this)
 
     this.renderRobotConfigSelector = this.renderRobotConfigSelector.bind(this)
+    this.renderEnvironmentConfigSelector = this.renderEnvironmentConfigSelector.bind(this)
     this.renderRobotConfigSettings = this.renderRobotConfigSettings.bind(this)
     this.renderFieldPair = this.renderFieldPair.bind(this)
     this.renderData = this.renderData.bind(this)
@@ -709,20 +701,6 @@ class NepiIFSim extends Component {
     reader.readAsText(file)
   }
 
-  // Deletes whichever robot config is currently selected -- the button
-  // itself is only ever rendered enabled for a non-built-in selection (see
-  // renderRobotConfigSelector), but deleteRobotConfigCb on the device side
-  // enforces the same PROTECTED_ROBOT_CONFIG_KEYS check independently, so a
-  // stale/racing click can't delete a built-in either way.
-  onDeleteRobotConfigClicked() {
-    const namespace = this.getSimNamespace()
-    const selected = this.getSelectedRobotConfig()
-    if (namespace == null || namespace === 'None' || selected === 'None') {
-      return
-    }
-    this.props.ros.sendStringMsg(namespace + '/delete_robot_config', selected)
-  }
-
   // Client-side only -- SAMPLE_ROBOT_CONFIG_YAML is a static reference file,
   // not device state, so there is nothing to fetch over ROS for this.
   onDownloadSampleConfigClicked() {
@@ -879,28 +857,40 @@ class NepiIFSim extends Component {
     }
 
     return (
-      <React.Fragment>
-        <Label title={"Robot Config"}>
-          <Select
-            onChange={this.onRobotConfigSelected}
-            value={selected}
-          >
-            {items}
-          </Select>
-        </Label>
-        {/* Kept at the top, right by the selector it acts on, rather than
-            buried in the collapsed Config Settings panel below -- deleting
-            is a decision about WHICH config is currently picked, same
-            level as the selector itself, not a settings/management detail. */}
-        <ButtonMenu>
-          <Button
-            disabled={PROTECTED_ROBOT_CONFIG_KEYS.includes(selected)}
-            onClick={this.onDeleteRobotConfigClicked}
-          >
-            {"Delete Selected Config"}
-          </Button>
-        </ButtonMenu>
-      </React.Fragment>
+      <Label title={"Robot Config"}>
+        <Select
+          onChange={this.onRobotConfigSelected}
+          value={selected}
+        >
+          {items}
+        </Select>
+      </Label>
+    )
+  }
+
+  // Quick-access counterpart to renderRobotConfigSelector above -- same
+  // Label-left/Select-right shape, right underneath it, for picking WHICH
+  // saved environment dimensions config is active. Deliberately not gated
+  // on launcher_state: picking a different one still only takes effect at
+  // the next Launch (Gazebo has no way to hot-reload a course layout into
+  // a running world), but there is no reason to block the SELECTION itself
+  // while a sim happens to be running, the same way the Flat Ground/
+  // Obstacle Course Setting toggle (Nepi_IF_Sim-Controls.js) is never
+  // disabled either. Management (save/delete/view YAML) lives in Config
+  // Settings instead (renderDimensionsConfigButtons) -- this is only ever
+  // meant to be a fast switch, not where a new config gets created.
+  renderEnvironmentConfigSelector() {
+    const names = this.state.environment_dimensions_config_names
+    const selected = this.state.environment_dimensions_selected_config
+    return (
+      <Label title={"Environment Config"}>
+        <Select
+          onChange={(event) => this.onSelectDimensionConfig('environment', event.target.value)}
+          value={selected}
+        >
+          {names.map((name) => <Option key={name} value={name}>{name}</Option>)}
+        </Select>
+      </Label>
     )
   }
 
@@ -945,7 +935,8 @@ class NepiIFSim extends Component {
             value={yamlText}
             rows={6}
             style={{ width: "60%", maxWidth: "40em", fontFamily: "monospace",
-                    whiteSpace: "pre", overflow: "auto", display: "block" }}
+                    whiteSpace: "pre", overflow: "auto", display: "block",
+                    backgroundColor: DIAGRAM_BG, color: Styles.vars.colors.grey0 }}
           />
         : null}
       </React.Fragment>
@@ -1022,7 +1013,8 @@ class NepiIFSim extends Component {
                       value={this.state.robot_config_yaml}
                       rows={8}
                       style={{ width: "60%", maxWidth: "40em", fontFamily: "monospace",
-                              whiteSpace: "pre", overflow: "auto", display: "block" }}
+                              whiteSpace: "pre", overflow: "auto", display: "block",
+                              backgroundColor: DIAGRAM_BG, color: Styles.vars.colors.grey0 }}
                     />
                     <ButtonMenu>
                       <Button onClick={this.onDownloadConfigClicked}>{"Download " + this.state.viewing_config_name + ".yaml"}</Button>
@@ -1031,8 +1023,10 @@ class NepiIFSim extends Component {
                 : null}
               </React.Fragment>
             : null}
+            {this.renderDimensionsConfigButtons('robot', 'Robot Dimensions Configs')}
             {this.renderDimensionsEditor('robot', 'Robot Dimensions', ROBOT_DIMENSION_FIELDS,
                                           this.uploadRobotSdfInputRef)}
+            {this.renderDimensionsConfigButtons('environment', 'Environment Dimensions Configs')}
             {this.renderDimensionsEditor('environment', 'Environment Dimensions', ENVIRONMENT_DIMENSION_FIELDS,
                                           this.uploadEnvironmentSdfInputRef)}
           </Section>
@@ -1504,23 +1498,12 @@ class NepiIFSim extends Component {
               onTargetSelected={this.onLaunchTargetSelected}
             />
             {this.renderRobotConfigSelector()}
-            {/* Both kept visible here at the top, right by the Robot Config
-                selector -- not hidden behind Config Settings' Show/Hide
-                toggle below, since picking or deleting a saved dimensions
-                config is a top-level decision like the selector itself.
-                Environment's stays enabled even with a simulator running
-                (never gated on launcher_state here) -- selecting a new one
-                still only takes effect at the next Launch (the existing
-                dirty indicator down in Environment Dimensions says so),
-                Gazebo has no way to hot-reload a course layout into a
-                running world, but there is no reason to make the operator
-                wait for a stop/relaunch just to LOOK AT or PICK a config. */}
-            {this.renderDimensionsConfigButtons('robot', 'Robot Dimensions Configs')}
-            {this.renderDimensionsConfigButtons('environment', 'Environment Dimensions Configs')}
+            {this.renderEnvironmentConfigSelector()}
 
             {/* Deploy/Kill/Install controls -- right after picking WHAT to
-                run (simulator) and WHICH robot config, before Robot Config
-                Settings and the capability-configuration controls below.
+                run (simulator), WHICH robot config, and WHICH environment
+                config, before Robot Config Settings and the capability-
+                configuration controls below.
                 Those only shape what a robot exposes once running (or, for
                 Robot Config Settings, manage config presets), not the
                 pick-and-go deploy decision -- keeping Deploy right under the
