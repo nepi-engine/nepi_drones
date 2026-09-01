@@ -76,6 +76,7 @@ class NepiIFSimLauncher extends Component {
     this.statusListener = this.statusListener.bind(this)
 
     this.onTargetSelected = this.onTargetSelected.bind(this)
+    this.confirmUnsavedDimensionsOrPrompt = this.confirmUnsavedDimensionsOrPrompt.bind(this)
     this.onDeployClicked = this.onDeployClicked.bind(this)
     this.onNewSimClicked = this.onNewSimClicked.bind(this)
     this.onKillClicked = this.onKillClicked.bind(this)
@@ -222,10 +223,57 @@ class NepiIFSimLauncher extends Component {
   // short-circuits to just applying the new model to the already-connected
   // bridge rather than touching the VM again, so this button never needs to
   // know which case it's in.
+  // Shared by every action below that actually launches/redeploys the
+  // simulator (Deploy, New Sim, Launch New, Use Existing) -- a launch
+  // pushes whatever's CURRENTLY active in each dimensions role to the VM
+  // regardless of whether it was ever saved as a named preset, so this
+  // catches the case where that active state has unsaved edits (see
+  // Nepi_IF_Sim.js's robot_dimensions_selected_config/
+  // environment_dimensions_selected_config -- '' means unsaved) BEFORE
+  // launching, and prompts to name+save each one as a new preset.
+  // Requested live (2026-09-01): an operator's own unsaved test edit had
+  // been mistaken for having permanently replaced a built-in preset (it
+  // hadn't -- only the reported selection was wrong, already fixed
+  // separately); prompting up front removes the ambiguity that raised the
+  // question in the first place, and keeps the built-in presets from ever
+  // being what an un-saved edit quietly rides along on. Returns false if
+  // the operator cancels the naming prompt -- the caller must not proceed
+  // with the launch in that case.
+  confirmUnsavedDimensionsOrPrompt() {
+    const axes = [
+      { role: 'robot', unsaved: this.props.unsaved_robot_dimensions, label: 'Robot' },
+      { role: 'environment', unsaved: this.props.unsaved_environment_dimensions, label: 'Environment' },
+    ]
+    for (var i = 0; i < axes.length; i++) {
+      const { role, unsaved, label } = axes[i]
+      if (!unsaved) {
+        continue
+      }
+      const name = window.prompt(
+        label + " dimensions have been edited but not saved as a preset. Name a new preset " +
+        "to save them as before deploying (Cancel to stop without deploying):"
+      )
+      if (name == null) {
+        return false
+      }
+      if (name.trim() === '') {
+        window.alert("Please enter a name.")
+        return false
+      }
+      if (this.props.onSaveUnsavedDimensionsAs != null) {
+        this.props.onSaveUnsavedDimensionsAs(role, name.trim())
+      }
+    }
+    return true
+  }
+
   onDeployClicked() {
     const namespace = this.getSimNamespace()
     const target = this.getSelectedTarget()
     if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
+      if (!this.confirmUnsavedDimensionsOrPrompt()) {
+        return
+      }
       this.resendRobotConfigIfKnown(namespace)
       this.props.ros.sendStringMsg(namespace + '/launch_simulator', this.buildLaunchPayload(target))
     }
@@ -240,6 +288,9 @@ class NepiIFSimLauncher extends Component {
     const namespace = this.getSimNamespace()
     const target = this.getSelectedTarget()
     if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
+      if (!this.confirmUnsavedDimensionsOrPrompt()) {
+        return
+      }
       this.resendRobotConfigIfKnown(namespace)
       this.props.ros.sendStringMsg(namespace + '/redeploy_simulator', this.buildLaunchPayload(target))
     }
@@ -273,6 +324,9 @@ class NepiIFSimLauncher extends Component {
     const namespace = this.getSimNamespace()
     const target = this.getSelectedTarget()
     if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
+      if (!this.confirmUnsavedDimensionsOrPrompt()) {
+        return
+      }
       this.resendRobotConfigIfKnown(namespace)
       this.props.ros.sendStringMsg(namespace + '/force_launch_simulator', this.buildLaunchPayload(target))
     }
@@ -289,6 +343,9 @@ class NepiIFSimLauncher extends Component {
     const namespace = this.getSimNamespace()
     const target = this.getSelectedTarget()
     if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
+      if (!this.confirmUnsavedDimensionsOrPrompt()) {
+        return
+      }
       this.resendRobotConfigIfKnown(namespace)
       this.props.ros.sendStringMsg(namespace + '/attach_simulator', this.buildLaunchPayload(target))
     }

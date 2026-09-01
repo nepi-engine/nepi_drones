@@ -352,15 +352,35 @@ class SimNode:
     self.msg_if.pub_info("Starting Node Initialization Processes")
 
     ##############################
-    # Gather Driver Settings from param server drv_dict
-    self.drv_dict = nepi_sdk.get_param('~drv_dict', dict())
-    try:
+    # Gather Driver Settings from param server drv_dict -- rbx_sim_discovery.py
+    # sets this param on the SAME master an instant before launching this
+    # node, but right after a fresh reboot (cold rosmaster, cold DNS/hostname
+    # resolution for this container's own hostname) that set can still be in
+    # flight when this process's own get_param call lands, reading back the
+    # empty default and self-shutting-down over what is really just a
+    # startup race, not a genuinely missing/invalid dict (confirmed live,
+    # 2026-09-01: reproduced a full-node restart loop this way immediately
+    # after a device+VM reboot; the SAME launch succeeded instantly once the
+    # system had been up a few minutes). Retries a few times with a short
+    # backoff before giving up for real.
+    DRV_DICT_READ_RETRIES = 5
+    DRV_DICT_READ_RETRY_SEC = 0.5
+    self.drv_dict = dict()
+    last_error = None
+    for attempt in range(DRV_DICT_READ_RETRIES):
+      self.drv_dict = nepi_sdk.get_param('~drv_dict', dict())
+      try:
         self.device_name = self.drv_dict['DEVICE_DICT']['device_name']
         self.device_path = self.drv_dict['DEVICE_DICT']['device_path']
         self.sim_host = self.drv_dict['DEVICE_DICT']['sim_host']
         self.bridge_port = self.drv_dict['DEVICE_DICT']['bridge_port']
-    except Exception as e:
-        self.msg_if.pub_warn("Failed to load Device Dict " + str(e))
+        last_error = None
+        break
+      except Exception as e:
+        last_error = e
+        nepi_sdk.sleep(DRV_DICT_READ_RETRY_SEC)
+    if last_error is not None:
+        self.msg_if.pub_warn("Failed to load Device Dict " + str(last_error))
         nepi_sdk.signal_shutdown(self.node_name + ": Shutting down because no valid Device Dict")
         return
 

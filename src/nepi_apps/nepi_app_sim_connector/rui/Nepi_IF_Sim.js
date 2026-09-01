@@ -408,6 +408,7 @@ class NepiIFSim extends Component {
     this.onSaveDimensionsClicked = this.onSaveDimensionsClicked.bind(this)
     this.onSelectDimensionConfig = this.onSelectDimensionConfig.bind(this)
     this.renderDimensionsConfigButtons = this.renderDimensionsConfigButtons.bind(this)
+    this.saveDimensionsAsNamed = this.saveDimensionsAsNamed.bind(this)
     this.onSaveDimensionConfigAsClicked = this.onSaveDimensionConfigAsClicked.bind(this)
     this.onDeleteDimensionConfigClicked = this.onDeleteDimensionConfigClicked.bind(this)
     this.onDeleteMergedRobotConfigClicked = this.onDeleteMergedRobotConfigClicked.bind(this)
@@ -891,9 +892,14 @@ class NepiIFSim extends Component {
   // happened) -- requested live (2026-08-31). Saving over a built-in name is
   // rejected the same way (deleteDimensionConfigCb-side protection has an
   // exact save-side counterpart, saveDimensionConfigCb).
-  onSaveDimensionConfigAsClicked(role) {
+  // Shared by the "Save As New Config" button below and by the deploy-time
+  // unsaved-edits prompt (see NepiIFSimLauncher's confirmUnsavedDimensionsOrPrompt,
+  // wired via the onSaveUnsavedDimensionsAs prop) -- both mean the exact
+  // same thing, "save the CURRENTLY EDITED fields under this name and make
+  // it the active one" (see saveDimensionConfigCb's own comment for why
+  // "save" always also means "use").
+  saveDimensionsAsNamed(role, name) {
     const namespace = this.getSimNamespace()
-    const name = this.state[role + '_dimensions_save_as_name'].trim()
     if (name === '') {
       window.alert('Please name the config before saving.')
       return
@@ -908,6 +914,14 @@ class NepiIFSim extends Component {
     const yamlText = yaml.dump(this.state[role + '_dimensions_fields'])
     this.props.ros.sendStringMsg(namespace + '/save_' + role + '_dimensions_config',
       JSON.stringify({ name: name, yaml: yamlText }))
+  }
+
+  // An empty name pops an alert instead of quietly no-oping (or disabling
+  // the button, which gave no feedback at all about WHY nothing happened)
+  // -- requested live (2026-08-31).
+  onSaveDimensionConfigAsClicked(role) {
+    const name = this.state[role + '_dimensions_save_as_name'].trim()
+    this.saveDimensionsAsNamed(role, name)
     this.setState({ [role + '_dimensions_save_as_name']: '' })
   }
 
@@ -2300,6 +2314,9 @@ class NepiIFSim extends Component {
               selected_target={this.state.selected_launch_target}
               onTargetSelected={this.onLaunchTargetSelected}
               selected_robot_config={this.getSelectedRobotConfig()}
+              unsaved_robot_dimensions={this.state.robot_dimensions_selected_config === ''}
+              unsaved_environment_dimensions={this.state.environment_dimensions_selected_config === ''}
+              onSaveUnsavedDimensionsAs={this.saveDimensionsAsNamed}
             />
 
             {this.renderRobotConfigSettings()}
