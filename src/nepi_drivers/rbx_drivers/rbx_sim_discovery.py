@@ -231,10 +231,17 @@ class SimDiscovery:
   def checkForSimDevice(self, ip_addr_str, ip_port_str):
     # Probe the sim heartbeat listener's TCP port (through the reverse tunnel)
     # and require its ALIVE reply -- a bare connect succeeds against sshd even
-    # when the far-end listener is down (see class comment above)
+    # when the far-end listener is down (see class comment above).
+    #
+    # Raised from 2s to 6s (2026-09-01): even with HEARTBEAT_MISS_THRESHOLD
+    # raised to 6, a live rover was still purged mid-session -- the reverse
+    # tunnel carrying real traffic (Gazebo's own topics, image streams) adds
+    # real round-trip latency on top of the connect+ALIVE-reply exchange, and
+    # a 2s socket timeout was tight enough to misread that latency as "not
+    # answering" under normal running load, not just at startup.
     found_device = False
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(2)
+    sock.settimeout(6)
     try:
       result = sock.connect_ex((ip_addr_str, int(ip_port_str)))
       if result == 0:

@@ -7,22 +7,22 @@
          using the raw-SDF-upload escape hatch. -->
     <static>true</static>
 
-    <!-- Course runs along +x inside a 4.00m-wide corridor
-         (y = +/-2.00): two boundary walls, a two-baffle
-         chicane forcing a weave (gap = 0.7m), then a ramp-up/
+    <!-- Course runs along +x inside a 6.00m-wide corridor
+         (y = +/-3.00): two boundary walls, a two-baffle
+         chicane forcing a weave (gap = 0.4m), then a ramp-up/
          plateau/ramp-down bump (rise = 0.35m over 1.991m run,
          9.97deg) to climb over. -->
 
     <link name="left_wall">
-      <pose>13.500000 2.000000 0.500000 0 0 0</pose>
+      <pose>13.000000 3.000000 0.500000 0 0 0</pose>
       <collision name="collision">
         <geometry>
-          <box><size>23.000000 0.300000 1.000000</size></box>
+          <box><size>22.000000 0.200000 1.000000</size></box>
         </geometry>
       </collision>
       <visual name="visual">
         <geometry>
-          <box><size>23.000000 0.300000 1.000000</size></box>
+          <box><size>22.000000 0.200000 1.000000</size></box>
         </geometry>
         <material>
           <script>
@@ -34,15 +34,15 @@
     </link>
 
     <link name="right_wall">
-      <pose>13.500000 -2.000000 0.500000 0 0 0</pose>
+      <pose>13.000000 -3.000000 0.500000 0 0 0</pose>
       <collision name="collision">
         <geometry>
-          <box><size>23.000000 0.300000 1.000000</size></box>
+          <box><size>22.000000 0.200000 1.000000</size></box>
         </geometry>
       </collision>
       <visual name="visual">
         <geometry>
-          <box><size>23.000000 0.300000 1.000000</size></box>
+          <box><size>22.000000 0.200000 1.000000</size></box>
         </geometry>
         <material>
           <script>
@@ -54,15 +54,15 @@
     </link>
 
     <link name="baffle_a">
-      <pose>6.000000 1.350000 0.500000 0 0 0</pose>
+      <pose>8.000000 1.700000 0.500000 0 0 0</pose>
       <collision name="collision">
         <geometry>
-          <box><size>0.200000 1.300000 1.000000</size></box>
+          <box><size>0.200000 2.600000 1.000000</size></box>
         </geometry>
       </collision>
       <visual name="visual">
         <geometry>
-          <box><size>0.200000 1.300000 1.000000</size></box>
+          <box><size>0.200000 2.600000 1.000000</size></box>
         </geometry>
         <material>
           <script>
@@ -74,15 +74,15 @@
     </link>
 
     <link name="baffle_b">
-      <pose>14.000000 -1.350000 0.500000 0 0 0</pose>
+      <pose>14.000000 -1.700000 0.500000 0 0 0</pose>
       <collision name="collision">
         <geometry>
-          <box><size>0.200000 1.300000 1.000000</size></box>
+          <box><size>0.200000 2.600000 1.000000</size></box>
         </geometry>
       </collision>
       <visual name="visual">
         <geometry>
-          <box><size>0.200000 1.300000 1.000000</size></box>
+          <box><size>0.200000 2.600000 1.000000</size></box>
         </geometry>
         <material>
           <script>
@@ -97,12 +97,12 @@
       <pose>18.995522 0 0.175000 0 -0.174009 0</pose>
       <collision name="collision">
         <geometry>
-          <box><size>2.021573 4.000000 0.12</size></box>
+          <box><size>2.021573 6.000000 0.12</size></box>
         </geometry>
       </collision>
       <visual name="visual">
         <geometry>
-          <box><size>2.021573 4.000000 0.12</size></box>
+          <box><size>2.021573 6.000000 0.12</size></box>
         </geometry>
         <material>
           <script>
@@ -117,12 +117,12 @@
       <pose>20.491044 0 0.350000 0 0 0</pose>
       <collision name="collision">
         <geometry>
-          <box><size>1.000000 4.000000 0.12</size></box>
+          <box><size>1.000000 6.000000 0.12</size></box>
         </geometry>
       </collision>
       <visual name="visual">
         <geometry>
-          <box><size>1.000000 4.000000 0.12</size></box>
+          <box><size>1.000000 6.000000 0.12</size></box>
         </geometry>
         <material>
           <script>
@@ -137,12 +137,12 @@
       <pose>21.986566 0 0.175000 0 0.174009 0</pose>
       <collision name="collision">
         <geometry>
-          <box><size>2.021573 4.000000 0.12</size></box>
+          <box><size>2.021573 6.000000 0.12</size></box>
         </geometry>
       </collision>
       <visual name="visual">
         <geometry>
-          <box><size>2.021573 4.000000 0.12</size></box>
+          <box><size>2.021573 6.000000 0.12</size></box>
         </geometry>
         <material>
           <script>
