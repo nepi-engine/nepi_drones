@@ -810,6 +810,21 @@ class SimNode:
     # existing sim_bridge TCP connection (this driver has no direct route to
     # the VM's Gazebo/gz_reset_listener otherwise).
     self.clearGotoTarget()
+    # Clearing motor_ratios (not just sending one zero velocity command) is
+    # required, not cosmetic -- reported live (2026-09-02): "if the rover is
+    # a little discombobulated... it doesn't stabilize it, it continues to
+    # glitch around". gotoControlCb runs continuously at CONTROLLER_RATE_HZ
+    # and falls back to `elif any(self.motor_ratios): ... motorControlToVelocity()`
+    # whenever there's no active goto -- if an operator had left manual motor
+    # sliders non-zero, the very NEXT control tick after this method's own
+    # sendVelocityCmd(0.0, 0.0) would see motor_ratios still non-zero and
+    # immediately resend that stale non-zero command, undoing the reset
+    # within a single tick (this method's own zero-send would look like it
+    # "didn't work" even though it ran correctly). RUI motor sliders read
+    # getMotorControlRatios() (via rbx/status's current_motor_control_settings),
+    # so clearing the array here is also what makes them visibly snap back
+    # to 0 the moment Reset Sim is hit, not just internally stop driving.
+    self.motor_ratios = [0.0] * len(self.motor_ratios)
     self.sendVelocityCmd(0.0, 0.0)
     with self.sock_lock:
       connected = self.sock is not None

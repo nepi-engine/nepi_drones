@@ -102,6 +102,7 @@ import time
 import rospy
 
 from std_msgs.msg import Header
+from std_srvs.srv import Empty
 from geometry_msgs.msg import Twist, Pose
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CompressedImage
@@ -156,6 +157,16 @@ ROVER_MODEL_NAME_CUSTOM = 'generic_rover_demo_custom'
 SPAWN_MODEL_SERVICE = '/gazebo/spawn_sdf_model'
 DELETE_MODEL_SERVICE = '/gazebo/delete_model'
 GET_WORLD_PROPERTIES_SERVICE = '/gazebo/get_world_properties'
+# Resets every model in the world (poses, linear/angular velocities, AND
+# each joint's own position/velocity) back to its spawn state -- see
+# resetRover's own comment for why this replaced a pose-only teleport.
+# Deliberately reset_world, not reset_simulation: the latter also zeroes
+# sim time, which is fine for this static-environment rover world but is
+# the exact hazard gz_reset_listener.py's own docstring documents for the
+# ArduPilot quadcopter target (a time discontinuity crashes SITL's FDM
+# link) -- reset_world avoids that class of problem entirely by leaving
+# sim time alone, and this bridge is rover-only regardless.
+RESET_WORLD_SERVICE = '/gazebo/reset_world'
 # Poll budget for confirming a DeleteModel has actually taken effect before
 # respawning under the same name -- see respawnRoverWithCameraOffsets' own
 # comment for why a fixed sleep wasn't reliable.
@@ -485,9 +496,35 @@ class SimBridgeNode:
           pass
 
   def resetRover(self):
-    # Stop first so the teleported pose isn't immediately fought by the
+    # Stop first so the reset pose/velocity isn't immediately fought by the
     # diff-drive plugin still applying the last commanded velocity.
     self.gazebo_cmd_pub.publish(Twist())
+    # ModelState only ever covered the rover's own TOP-LEVEL pose+twist --
+    # it never touched each wheel joint's own velocity, which the
+    # diff-drive plugin's per-wheel PID drives independently. Reported live
+    # (2026-09-02): "if the rover is a little discombobulated... it doesn't
+    # stabilize it, it continues to glitch around" -- a rover that had been
+    # tumbling/spinning kept its wheels' own residual angular velocities
+    # through a ModelState-only reset, so they kept driving the
+    # freshly-repositioned body for the next several physics steps instead
+    # of actually being at rest. /gazebo/reset_world resets EVERY model to
+    # its spawn state -- pose, linear/angular velocity, AND every joint's
+    # own position/velocity (Gazebo's own Model::Reset()/Joint::Reset(),
+    # not something this bridge has to reconstruct field-by-field) -- so
+    # this is a genuine full reset, not a best-effort approximation of one.
+    # Best-effort or not, the call itself is guarded: a missing/slow
+    # service must not crash the bridge's own command-handling thread.
+    try:
+      rospy.wait_for_service(RESET_WORLD_SERVICE, timeout=GAZEBO_SERVICE_WAIT_SEC)
+      rospy.ServiceProxy(RESET_WORLD_SERVICE, Empty)()
+    except Exception as e:
+      rospy.logwarn(PKG_NAME + ": /gazebo/reset_world failed (falling back to "
+                    "pose-only reset): " + str(e))
+    # Also explicitly re-publish the target pose via ModelState -- reset_world
+    # already lands the rover at its spawn pose, but this stays as the
+    # fallback path if that service call above failed, and as a defensive
+    # belt-and-suspenders re-assertion either way (matches the exact target
+    # held_pose is set to just below).
     state = ModelState()
     state.model_name = self.rover_model_name
     state.pose.orientation.w = 1.0

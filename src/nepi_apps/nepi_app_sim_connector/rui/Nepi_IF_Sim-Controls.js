@@ -803,7 +803,26 @@ class NepiIFSimControls extends Component {
             {setup_actions.map((action, i) => (
               <Button
                 key={action}
-                onClick={() => sendIntMsg(namespace + "/setup_action", String(i))}
+                onClick={() => {
+                  sendIntMsg(namespace + "/setup_action", String(i))
+                  // RESET_SIM now clears the driver's own motor_ratios (see
+                  // rbx_sim_node.py's resetSimAction), so the NEXT status
+                  // publish correctly reports all-zero motor speeds -- but
+                  // the sliders below are deliberately NOT continuously
+                  // re-synced from status (see the seeding effect above,
+                  // gated on the motor COUNT changing, not every update, so
+                  // a live server echo can't fight an operator's own drag
+                  // in progress). Reset Sim is exactly the one case that
+                  // SHOULD override local slider state outright, requested
+                  // live (2026-09-02): "this change should happen in the
+                  // RUI too if they are set to something and reset sim is
+                  // hit" -- reuse turnOffAllMotors (same "snap sliders to 0
+                  // and publish it" the All-Off button already does) rather
+                  // than a near-duplicate method.
+                  if (action === 'RESET') {
+                    this.turnOffAllMotors()
+                  }
+                }}
               >{action}</Button>
             ))}
           </ButtonMenu>
