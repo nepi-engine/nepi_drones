@@ -41,11 +41,12 @@ import time
 
 DEFAULT_PORT = 9022
 
-# Matches gazebo_rover's own ready_check_command in
-# simulator_launch_targets.yaml -- scoped to this specific world, not a bare
+# World-file substring gazserver_is_alive() requires in a candidate
+# process's OWN argv -- scoped to this specific world, not a bare
 # "gzserver", so an unrelated Gazebo instance (a different launch target)
-# can't produce a false ALIVE here.
-GZSERVER_PGREP_PATTERN = 'gzserver.*generic_rover.world'
+# can't produce a false ALIVE here. Matches gazebo_rover's own
+# ready_check_command in simulator_launch_targets.yaml.
+GZSERVER_WORLD_FILE_MARKER = 'generic_rover.world'
 
 # How often the background thread below re-checks gzserver's liveness --
 # fast enough that a genuine gzserver death is reflected within about a
@@ -60,11 +61,41 @@ _alive = False
 
 
 def gzserver_is_alive():
+    # `pgrep -f 'gzserver.*generic_rover.world'` (the original approach here)
+    # matches the FULL COMMAND LINE of every process as one regex -- and the
+    # launch_command wrapper script that starts gzserver in the first place
+    # matches its OWN pattern: its own text contains "gzserver" (from its own
+    # `pgrep -x gzserver` guard) followed somewhere later by
+    # "generic_rover.world" (from the actual launch command), so the whole
+    # multi-hundred-character wrapper script counts as a match. Since that
+    # wrapper stays alive (blocked in its own `wait`) for as long as ANY of
+    # gzserver/this listener/camera_rig_controller/sim_bridge_node are still
+    # running, this made a real gzserver crash or an operator closing just
+    # the Gazebo window invisible to this check for as long as those
+    # siblings kept running -- confirmed live (2026-09-01): "closed the
+    # gazebo app but it still shows... on robots" while gzserver was
+    # genuinely gone and only the wrapper + this process + its two siblings
+    # were still up. `pgrep -x gzserver` (matching the bare process NAME,
+    # not a full-cmdline regex -- the same check the wrapper script's own
+    # guard already uses) can never match a bash process, so this reads each
+    # exact-name candidate's own argv directly instead of trusting pgrep's
+    # own substring search across the whole command line.
     try:
-        return subprocess.run(
-            ['pgrep', '-f', GZSERVER_PGREP_PATTERN],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        ).returncode == 0
+        result = subprocess.run(
+            ['pgrep', '-x', 'gzserver'],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+        )
+        if result.returncode != 0:
+            return False
+        for pid in result.stdout.split():
+            try:
+                with open('/proc/' + pid + '/cmdline', 'rb') as f:
+                    cmdline = f.read().decode('utf-8', errors='replace')
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+            if GZSERVER_WORLD_FILE_MARKER in cmdline:
+                return True
+        return False
     except Exception:
         return False
 
