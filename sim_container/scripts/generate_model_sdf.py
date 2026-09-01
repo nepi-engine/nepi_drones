@@ -18,7 +18,8 @@ over the same ssh channel already used for launch/stop commands.
 Usage:
     python3 generate_model_sdf.py <model_name> [--models-dir DIR]
 
-<model_name> is one of: generic_rover, obstacle_course. Reads
+<model_name> is one of: generic_rover, obstacle_course,
+aerial_obstacle_course, custom_obstacles. Reads
 <models_dir>/<model_name>/dimensions.yaml and writes
 <models_dir>/<model_name>/model.sdf.
 """
@@ -40,6 +41,14 @@ ROVER_DEFAULT_DIMENSIONS = {
     "chassis_length_m": 0.4,
     "chassis_width_m": 0.3,
     "chassis_height_m": 0.1,
+    # Shared by both camera sensors below (onboard + chase) -- matches
+    # sim_connector_app_node.py's own CAMERA_HORIZONTAL_FOV_DEG default, the
+    # value it reports to the RUI/targeting math for pixel-to-degree
+    # conversion. Editing this field (same curated-fields path as every
+    # other rover dimension) changes what Gazebo actually renders AND what
+    # gets reported, so the two can never drift out of sync with each
+    # other.
+    "camera_horizontal_fov_deg": 80.0,
 }
 
 OBSTACLE_COURSE_DEFAULT_DIMENSIONS = {
@@ -58,6 +67,22 @@ OBSTACLE_COURSE_DEFAULT_DIMENSIONS = {
     "ramp_plateau_length_m": 1.0,
 }
 
+# A sequence of square gate frames a drone flies up-and-through in order --
+# independent params only, same convention as the two courses above: each
+# gate's exact frame geometry (four box segments forming a hollow square) is
+# derived in buildAerialObstacleCourseSdf, not hand-placed per gate, so
+# gate_count alone controls how long the course is.
+AERIAL_OBSTACLE_COURSE_DEFAULT_DIMENSIONS = {
+    "course_start_x_m": 3.0,
+    "gate_count": 4,
+    "gate_spacing_m": 6.0,
+    "gate_opening_width_m": 2.0,
+    "gate_opening_height_m": 2.0,
+    "gate_frame_thickness_m": 0.15,
+    "gate_base_height_m": 2.0,
+    "gate_height_step_m": 1.0,
+}
+
 
 def loadDimensions(model_name, models_dir, defaults):
     path = os.path.join(models_dir, model_name, "dimensions.yaml")
@@ -66,6 +91,22 @@ def loadDimensions(model_name, models_dir, defaults):
         with open(path, "r") as f:
             loaded = yaml.safe_load(f) or {}
         dims.update(loaded)
+    # A value the operator typed through the RUI round-trips as plain YAML
+    # text, which is not type-preserving -- a field can land here as the
+    # STRING '0.1' instead of the float 0.1 (confirmed live: a string-typed
+    # wheel_radius_m crashed buildRoverSdf's own
+    # wheel_radius + chassis_h/2.0 with "can only concatenate str to str").
+    # Coerce every field back to a real number here, once, rather than
+    # requiring every builder function to defensively re-coerce everything
+    # it reads -- only for keys this model's OWN defaults declare numeric,
+    # so a non-numeric field (custom_obstacles' own 'obstacles' list, or the
+    # reserved '_environment_model' string) passes through untouched.
+    for key, default_value in defaults.items():
+        if isinstance(default_value, (int, float)) and key in dims:
+            try:
+                dims[key] = float(dims[key])
+            except (TypeError, ValueError):
+                pass
     return dims
 
 
@@ -89,6 +130,7 @@ def buildRoverSdf(dims):
     chassis_l = dims["chassis_length_m"]
     chassis_w = dims["chassis_width_m"]
     chassis_h = dims["chassis_height_m"]
+    camera_horizontal_fov_rad = math.radians(dims["camera_horizontal_fov_deg"])
 
     # base_link sits at wheel-axle height so the wheels touch the ground
     # plane when the model spawns at z = 0 -- see generic_rover/model.sdf's
@@ -236,7 +278,7 @@ def buildRoverSdf(dims):
         <always_on>true</always_on>
         <visualize>false</visualize>
         <camera name="rover_camera">
-          <horizontal_fov>1.3962634</horizontal_fov>
+          <horizontal_fov>{camera_horizontal_fov_rad:.7f}</horizontal_fov>
           <image>
             <width>640</width>
             <height>480</height>
@@ -314,7 +356,7 @@ def buildRoverSdf(dims):
         <always_on>true</always_on>
         <visualize>false</visualize>
         <camera name="rover_camera_chase">
-          <horizontal_fov>1.3962634</horizontal_fov>
+          <horizontal_fov>{camera_horizontal_fov_rad:.7f}</horizontal_fov>
           <image>
             <width>640</width>
             <height>480</height>
@@ -608,9 +650,227 @@ def buildObstacleCourseSdf(dims):
 """
 
 
+# ---------------------------------------------------------------------------
+# aerial_obstacle_course
+# ---------------------------------------------------------------------------
+
+def _boxLink(name, x, y, z, size_x, size_y, size_z, color):
+    return f"""    <link name="{name}">
+      <pose>{x:.6f} {y:.6f} {z:.6f} 0 0 0</pose>
+      <collision name="collision">
+        <geometry>
+          <box><size>{size_x:.6f} {size_y:.6f} {size_z:.6f}</size></box>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <box><size>{size_x:.6f} {size_y:.6f} {size_z:.6f}</size></box>
+        </geometry>
+        <material>
+          <script>
+            <uri>file://media/materials/scripts/gazebo.material</uri>
+            <name>{color}</name>
+          </script>
+        </material>
+      </visual>
+    </link>
+
+"""
+
+
+def _gateFrameLinks(index, center_x, center_z, opening_width, opening_height, thickness, color):
+    # Hollow square frame in the y-z plane (thin along x, the flight-through
+    # direction) -- top/bottom bars span the full outer width so the four
+    # bars' corners overlap cleanly, left/right bars fill exactly the
+    # opening_height gap between them.
+    outer_width = opening_width + 2.0 * thickness
+    prefix = f"gate_{index}"
+    links = _boxLink(f"{prefix}_top", center_x, 0.0, center_z + opening_height / 2.0 + thickness / 2.0,
+                      thickness, outer_width, thickness, color)
+    links += _boxLink(f"{prefix}_bottom", center_x, 0.0, center_z - opening_height / 2.0 - thickness / 2.0,
+                       thickness, outer_width, thickness, color)
+    links += _boxLink(f"{prefix}_left", center_x, opening_width / 2.0 + thickness / 2.0, center_z,
+                       thickness, thickness, opening_height, color)
+    links += _boxLink(f"{prefix}_right", center_x, -(opening_width / 2.0 + thickness / 2.0), center_z,
+                       thickness, thickness, opening_height, color)
+    return links
+
+
+def buildAerialObstacleCourseSdf(dims):
+    course_start_x = dims["course_start_x_m"]
+    gate_count = int(dims["gate_count"])
+    gate_spacing = dims["gate_spacing_m"]
+    opening_width = dims["gate_opening_width_m"]
+    opening_height = dims["gate_opening_height_m"]
+    thickness = dims["gate_frame_thickness_m"]
+    base_height = dims["gate_base_height_m"]
+    height_step = dims["gate_height_step_m"]
+
+    gates = ""
+    for i in range(gate_count):
+        center_x = course_start_x + i * gate_spacing
+        center_z = base_height + i * height_step
+        gates += _gateFrameLinks(i, center_x, center_z, opening_width, opening_height, thickness, "Gazebo/Red")
+
+    final_height = base_height + max(gate_count - 1, 0) * height_step
+
+    return f"""<?xml version="1.0" ?>
+<sdf version="1.6">
+  <model name="aerial_obstacle_course">
+    <!-- Static: pure world geometry, no dynamics needed. Generated by
+         generate_model_sdf.py from dimensions.yaml -- edit that file (or the
+         curated-fields UI in Sim Connector), not this one directly, unless
+         using the raw-SDF-upload escape hatch. -->
+    <static>true</static>
+
+    <!-- {gate_count} square gate frames along +x starting at
+         course_start_x_m={course_start_x}m, spaced {gate_spacing}m apart,
+         each opening {opening_width}m x {opening_height}m, climbing from
+         {base_height}m up to {final_height}m in {height_step}m steps -- a
+         drone flies up-and-through each gate in order. -->
+
+{gates}  </model>
+</sdf>
+"""
+
+
+# ---------------------------------------------------------------------------
+# custom_obstacles -- unlike every model above, this one has no fixed set of
+# curated fields. dimensions.yaml holds a single 'obstacles' list, and each
+# entry is one independently add/remove/edit-able obstacle (the RUI's
+# "Custom Obstacles" environment config builds this list interactively).
+# Each obstacle needs only a 'type' key naming which OBSTACLE_BUILDERS
+# function renders it; every other field is that type's own, with a sane
+# fallback via dict.get() if the RUI ever posts a partial entry.
+# ---------------------------------------------------------------------------
+
+CUSTOM_OBSTACLES_DEFAULT_DIMENSIONS = {
+    "obstacles": [],
+}
+
+
+def _obstacleWallLink(name, obstacle):
+    x = float(obstacle.get("x", 0.0))
+    y = float(obstacle.get("y", 0.0))
+    yaw_deg = float(obstacle.get("yaw_deg", 0.0))
+    length = max(float(obstacle.get("length_m", 2.0)), 0.01)
+    thickness = max(float(obstacle.get("thickness_m", 0.2)), 0.01)
+    height = max(float(obstacle.get("height_m", 1.0)), 0.01)
+    yaw_rad = math.radians(yaw_deg)
+    return f"""    <link name="{name}">
+      <pose>{x:.6f} {y:.6f} {height / 2.0:.6f} 0 0 {yaw_rad:.6f}</pose>
+      <collision name="collision">
+        <geometry><box><size>{length:.6f} {thickness:.6f} {height:.6f}</size></box></geometry>
+      </collision>
+      <visual name="visual">
+        <geometry><box><size>{length:.6f} {thickness:.6f} {height:.6f}</size></box></geometry>
+        <material>
+          <script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Orange</name></script>
+        </material>
+      </visual>
+    </link>
+
+"""
+
+
+def _obstacleCircleLink(name, obstacle):
+    x = float(obstacle.get("x", 0.0))
+    y = float(obstacle.get("y", 0.0))
+    radius = max(float(obstacle.get("radius_m", 0.5)), 0.01)
+    height = max(float(obstacle.get("height_m", 1.0)), 0.01)
+    return f"""    <link name="{name}">
+      <pose>{x:.6f} {y:.6f} {height / 2.0:.6f} 0 0 0</pose>
+      <collision name="collision">
+        <geometry><cylinder><radius>{radius:.6f}</radius><length>{height:.6f}</length></cylinder></geometry>
+      </collision>
+      <visual name="visual">
+        <geometry><cylinder><radius>{radius:.6f}</radius><length>{height:.6f}</length></cylinder></geometry>
+        <material>
+          <script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Red</name></script>
+        </material>
+      </visual>
+    </link>
+
+"""
+
+
+def _obstacleTriangleLink(name, obstacle):
+    # A wedge: local vertices (0, depth/2), (0, -depth/2), (base, 0) --
+    # pointing in local +x -- extruded from z=0 to height via SDF's
+    # <polyline> geometry (Gazebo Classic 9+ / SDF 1.6; no native <triangle>
+    # primitive exists, so this is the correct, real way to build one,
+    # not an approximation).
+    x = float(obstacle.get("x", 0.0))
+    y = float(obstacle.get("y", 0.0))
+    yaw_deg = float(obstacle.get("yaw_deg", 0.0))
+    base = max(float(obstacle.get("base_m", 1.0)), 0.01)
+    depth = max(float(obstacle.get("depth_m", 1.0)), 0.01)
+    height = max(float(obstacle.get("height_m", 1.0)), 0.01)
+    yaw_rad = math.radians(yaw_deg)
+    points = (
+        f"<point>0 {depth / 2.0:.6f}</point>"
+        f"<point>0 {-depth / 2.0:.6f}</point>"
+        f"<point>{base:.6f} 0</point>"
+    )
+    geometry = f"<polyline>{points}<height>{height:.6f}</height></polyline>"
+    return f"""    <link name="{name}">
+      <pose>{x:.6f} {y:.6f} 0 0 0 {yaw_rad:.6f}</pose>
+      <collision name="collision">
+        <geometry>{geometry}</geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>{geometry}</geometry>
+        <material>
+          <script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Blue</name></script>
+        </material>
+      </visual>
+    </link>
+
+"""
+
+
+OBSTACLE_TYPE_BUILDERS = {
+    "wall": _obstacleWallLink,
+    "circle": _obstacleCircleLink,
+    "triangle": _obstacleTriangleLink,
+}
+
+
+def buildCustomObstaclesSdf(dims):
+    obstacles = dims.get("obstacles", [])
+    if not isinstance(obstacles, list):
+        obstacles = []
+    links = ""
+    for i, obstacle in enumerate(obstacles):
+        if not isinstance(obstacle, dict):
+            continue
+        obstacle_type = str(obstacle.get("type", ""))
+        builder = OBSTACLE_TYPE_BUILDERS.get(obstacle_type)
+        if builder is None:
+            continue
+        links += builder(f"obstacle_{i}_{obstacle_type}", obstacle)
+
+    return f"""<?xml version="1.0" ?>
+<sdf version="1.6">
+  <model name="custom_obstacles">
+    <!-- Static: pure world geometry, no dynamics needed. Generated by
+         generate_model_sdf.py from dimensions.yaml's own 'obstacles' list --
+         unlike every other model here, this one has no fixed curated field
+         set; edit the list via the "Custom Obstacles" environment config in
+         Sim Connector (or hand-edit dimensions.yaml), not this file
+         directly, unless using the raw-SDF-upload escape hatch.
+
+         {len(obstacles)} obstacle(s) in this course. -->
+{links}  </model>
+</sdf>
+"""
+
+
 BUILDERS = {
     "generic_rover": (buildRoverSdf, ROVER_DEFAULT_DIMENSIONS),
     "obstacle_course": (buildObstacleCourseSdf, OBSTACLE_COURSE_DEFAULT_DIMENSIONS),
+    "aerial_obstacle_course": (buildAerialObstacleCourseSdf, AERIAL_OBSTACLE_COURSE_DEFAULT_DIMENSIONS),
+    "custom_obstacles": (buildCustomObstaclesSdf, CUSTOM_OBSTACLES_DEFAULT_DIMENSIONS),
 }
 
 

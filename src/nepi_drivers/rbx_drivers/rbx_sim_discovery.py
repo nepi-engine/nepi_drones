@@ -89,11 +89,28 @@ class SimDiscovery:
   SIM_ALIVE_REPLY = b'ALIVE'
 
   ################################################
+  # A single missed heartbeat probe killed and relaunched a healthy rbx
+  # node outright (confirmed live, 2026-08-31: a busy dev VM occasionally
+  # drops or delays one TCP probe through the reverse tunnel to
+  # sim_heartbeat_listener.py -- not a real "the sim died" signal, just
+  # transient contention) -- this put the node in an endless restart loop,
+  # since each relaunch takes several seconds to reach steady state and the
+  # very next discovery cycle's probe could just as easily hit another
+  # transient blip before it gets there. Requiring this many CONSECUTIVE
+  # heartbeat misses before purging absorbs that without meaningfully
+  # slowing down detection of a genuinely dead simulator (discovery runs
+  # every 1-3s per nepi_drivers' own polling interval, so this is still a
+  # few-second worst case). Doesn't apply to the OTHER purge condition in
+  # checkOnDevice (the rbx node subprocess itself having actually exited) --
+  # that's an unambiguous, instantaneous signal with nothing to debounce.
+  HEARTBEAT_MISS_THRESHOLD = 3
+
   def __init__(self):
     ############
     # Create Message Logger
     self.log_name = PKG_NAME.lower() + "_discovery"
     self.logger = nepi_sdk.logger(log_name = self.log_name)
+    self.heartbeat_miss_counts = dict()
     time.sleep(1)
     self.logger.log_info("Starting Initialization")
     self.logger.log_info("Initialization Complete")
@@ -163,18 +180,32 @@ class SimDiscovery:
     sim_subproc = device_entry["sim_subproc"]
 
     purge_node = False
-    # Check that the rbx node process is still running
+    # Check that the rbx node process is still running -- unambiguous and
+    # instantaneous, nothing to debounce here.
     if sim_subproc is None or sim_subproc.poll() is not None:
       self.logger.log_warn("Sim rbx node process for " + path_str + " is no longer running... purging from managed list")
       purge_node = True
     else:
-      # Check that the simulator's heartbeat listener still answers
+      # Check that the simulator's heartbeat listener still answers -- see
+      # HEARTBEAT_MISS_THRESHOLD's own comment for why a single miss isn't
+      # purged on the spot.
       [con_type, ip_addr_str, ip_port_str] = path_str.split("_")
       if self.checkForSimDevice(ip_addr_str, ip_port_str) == False:
-        self.logger.log_warn("Sim heartbeat no longer answering for " + path_str + "... purging from managed list")
-        purge_node = True
+        miss_count = self.heartbeat_miss_counts.get(path_str, 0) + 1
+        self.heartbeat_miss_counts[path_str] = miss_count
+        if miss_count >= self.HEARTBEAT_MISS_THRESHOLD:
+          self.logger.log_warn("Sim heartbeat missed " + str(miss_count) +
+                               " times in a row for " + path_str + "... purging from managed list")
+          purge_node = True
+        else:
+          self.logger.log_warn("Sim heartbeat miss " + str(miss_count) + "/" +
+                               str(self.HEARTBEAT_MISS_THRESHOLD) + " for " + path_str +
+                               " -- not purging yet")
+      else:
+        self.heartbeat_miss_counts[path_str] = 0
 
     if purge_node:
+      self.heartbeat_miss_counts.pop(path_str, None)
       self.killDeviceProcesses(device_entry)
       if path_str in self.active_paths_list:
         self.active_paths_list.remove(path_str)

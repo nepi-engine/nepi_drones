@@ -184,21 +184,85 @@ ROBOT_CONFIGS_STORAGE_DIR = '/mnt/nepi_storage/databases/nepi_app_sim_connector/
 # Physical-dimension editing (robot chassis/wheel geometry, environment
 # corridor/ramp geometry) -- distinct from robot_configs' driver-capability
 # profiles above, which never touch Gazebo geometry at all. Two roles for
-# v1, each backed by one in-repo Gazebo model: 'robot' -> generic_rover (the
-# quadcopter's airframe geometry is a vendored third-party Gazebo/ArduPilot
-# model living outside this repo, nothing here to point a role at), and
-# 'environment' -> obstacle_course. See generate_model_sdf.py for how
-# curated dimensions.yaml fields become model.sdf, and
-# SimulatorLauncher.push_dimensions for how they reach the VM.
+# v1: 'robot' -> generic_rover, always (the quadcopter's airframe geometry
+# is a vendored third-party Gazebo/ArduPilot model living outside this repo,
+# nothing here to point a role at), and 'environment' -> whichever model the
+# CURRENTLY SELECTED environment config names via its own reserved
+# '_environment_model' field (see ENVIRONMENT_BUILTIN_DIMENSION_CONFIGS)
+# rather than one fixed model, since an operator switches between Flat/
+# Obstacle Course/Aerial Obstacle Course by switching configs. See
+# generate_model_sdf.py for how curated dimensions.yaml fields become
+# model.sdf, and SimulatorLauncher.push_dimensions for how they reach the VM.
 ROBOT_DIMENSIONS_MODEL = 'generic_rover'
-ENVIRONMENT_DIMENSIONS_MODEL = 'obstacle_course'
 DIMENSION_ROLES = ('robot', 'environment')
-DIMENSION_ROLE_MODEL = {'robot': ROBOT_DIMENSIONS_MODEL, 'environment': ENVIRONMENT_DIMENSIONS_MODEL}
+DIMENSION_ROLE_MODEL = {'robot': ROBOT_DIMENSIONS_MODEL}
 
-# Named dimensions configs -- see the constructor's own comment (search
-# "Named dimensions configs") for the full design. This is the one name
-# neither role's config can ever delete.
-DEFAULT_DIMENSION_CONFIG_NAME = 'Default'
+# Reserved dimensions.yaml key naming which Gazebo model an environment
+# config's fields apply to -- generate_model_sdf.py's own loadDimensions
+# tolerates unknown keys harmlessly, so pushing this key along with the rest
+# of a config's fields is safe. ENVIRONMENT_MODEL_NONE ('none') is a real,
+# valid value (the Flat built-in): it means "no model to generate or push,"
+# not a missing/unset field.
+ENVIRONMENT_MODEL_FIELD_KEY = '_environment_model'
+ENVIRONMENT_MODEL_NONE = 'none'
+# Used only to resolve a config saved before this key existed (an upgrading
+# deployment's migrated legacy config, see ensureBuiltinDimensionConfigs) --
+# matches the one fixed model 'environment' always meant previously.
+ENVIRONMENT_LEGACY_MODEL_FALLBACK = 'obstacle_course'
+
+# Built-in (undeletable) named dimensions configs per role -- see the
+# constructor's own "Named dimensions configs" comment for the full design,
+# and ensureBuiltinDimensionConfigs for how these get seeded on disk. No
+# config is ever named "Default": each role's built-ins are named for what
+# they actually are, and are exactly the configs an operator can never
+# delete (see PROTECTED_DIMENSION_CONFIG_NAMES). Robot's one built-in name
+# ('4-Wheel Rover') is deliberately the same display name
+# ground_robot_4_wheel already uses in robot_configs above -- the RUI merges
+# the two axes (capability profile + chassis/wheel geometry) into one button
+# list per robot kind, and a matching name is what makes that merge line up.
+ROBOT_BUILTIN_DIMENSION_CONFIG_NAME = '4-Wheel Rover'
+ENVIRONMENT_BUILTIN_DIMENSION_CONFIGS = {
+    # Genuinely no model spawned -- EnvironmentModelSpawner's own "nothing
+    # active" state (see sim_container/scripts/environment_models.py) is
+    # already a first-class option; this just gives it dimensions-config
+    # standing alongside the real models below.
+    'Flat': {ENVIRONMENT_MODEL_FIELD_KEY: ENVIRONMENT_MODEL_NONE},
+    'Obstacle Course': {ENVIRONMENT_MODEL_FIELD_KEY: 'obstacle_course'},
+    'Aerial Obstacle Course': {ENVIRONMENT_MODEL_FIELD_KEY: 'aerial_obstacle_course'},
+    # No fixed curated fields of its own -- its 'obstacles' list (an
+    # operator-built sequence of walls/circles/triangles, see
+    # generate_model_sdf.py's buildCustomObstaclesSdf) starts empty and is
+    # built up entirely through the RUI's add/drag/resize obstacle editor.
+    # Requires no other backend support: a dimensions config is already
+    # "any YAML mapping of fields" (setDimensionsCb never restricted this to
+    # scalars), so a nested list travels the exact same save/select/push
+    # path every other config already uses.
+    'Custom Obstacles': {ENVIRONMENT_MODEL_FIELD_KEY: 'custom_obstacles', 'obstacles': []},
+}
+PROTECTED_DIMENSION_CONFIG_NAMES = {
+    'robot': {ROBOT_BUILTIN_DIMENSION_CONFIG_NAME},
+    'environment': set(ENVIRONMENT_BUILTIN_DIMENSION_CONFIGS.keys()),
+}
+# Built-ins always list first, in this order; everything else (custom saved
+# configs) sorts alphabetically after them -- see listDimensionConfigs.
+DIMENSION_CONFIG_BUILTIN_ORDER = {
+    'robot': [ROBOT_BUILTIN_DIMENSION_CONFIG_NAME],
+    'environment': ['Flat', 'Obstacle Course', 'Aerial Obstacle Course', 'Custom Obstacles'],
+}
+# Landed on after a delete removes whatever config was active -- always one
+# of the protected/undeletable names above, so there is always something
+# valid to fall back to. Environment's is 'Obstacle Course', not 'Flat',
+# matching what the old single-file store always held before this
+# per-role-builtins design existed.
+FALLBACK_DIMENSION_CONFIG_NAME = {
+    'robot': ROBOT_BUILTIN_DIMENSION_CONFIG_NAME,
+    'environment': 'Obstacle Course',
+}
+# Pre-2026-08-31 seed name -- ensureBuiltinDimensionConfigs migrates any
+# leftover Default.yaml on disk into FALLBACK_DIMENSION_CONFIG_NAME[role]
+# once, then removes it, so "no such thing as Default anywhere" holds for a
+# deployment upgrading from that earlier design too.
+LEGACY_DEFAULT_DIMENSION_CONFIG_NAME = 'Default'
 
 # Device-side authoritative store for the above -- survives a Docker
 # container restart (unlike the container's own writable layer), the same
@@ -425,20 +489,23 @@ class NepiSimConnectorApp:
     ##############################
     # FOV data -- published as plain, latched Float32 topics rather than
     # extending any .msg (avoids a catkin message-regeneration rebuild for
-    # this). horizontal_fov is the SDF's static camera sensor value, shared
-    # identically by every camera_rig/camera_rig_chase model in this sim;
-    # vertical_fov is derived from it via the standard pinhole relation for
-    # the sensor's fixed 640x480 resolution. Read once here (mount time)
-    # since neither ever changes at runtime.
-    self.CAMERA_HORIZONTAL_FOV_DEG = 80.0
-    self.CAMERA_VERTICAL_FOV_DEG = 2.0 * np.degrees(np.arctan(
-        np.tan(np.radians(self.CAMERA_HORIZONTAL_FOV_DEG) / 2.0) * (480.0 / 640.0)))
+    # this). horizontal_fov is now an editable ROBOT dimension field
+    # (camera_horizontal_fov_deg, see generate_model_sdf.py's
+    # ROVER_DEFAULT_DIMENSIONS and buildRoverSdf) rather than a fixed
+    # constant -- requested live (2026-09-01). Editing it through the
+    # existing robot-dimensions curated-fields path (same save/select flow
+    # as wheel_radius_m etc.) changes what Gazebo actually renders AND
+    # updates these two reported values together via
+    # updateCameraFovFromRobotDimensions, called here once at startup and
+    # again from setDimensionsCb/applyDimensionConfigByName whenever the
+    # robot role's fields change, so the two can never drift out of sync.
+    # vertical_fov is derived from horizontal via the standard pinhole
+    # relation for the sensor's fixed 640x480 resolution.
     self.camera_horizontal_fov_pub = nepi_sdk.create_publisher(
         self.node_name + "/sim/camera_horizontal_fov_deg", Float32, queue_size = 1, latch = True)
     self.camera_vertical_fov_pub = nepi_sdk.create_publisher(
         self.node_name + "/sim/camera_vertical_fov_deg", Float32, queue_size = 1, latch = True)
-    self.camera_horizontal_fov_pub.publish(Float32(data = self.CAMERA_HORIZONTAL_FOV_DEG))
-    self.camera_vertical_fov_pub.publish(Float32(data = self.CAMERA_VERTICAL_FOV_DEG))
+    self.updateCameraFovFromRobotDimensions()
 
     ##############################
     # Home position state -- reused GeoPoint plumbing with its three floats
@@ -680,14 +747,23 @@ class NepiSimConnectorApp:
     # that file stays "whatever is currently active" exactly as before (what
     # pushDirtyDimensions/generate_model_sdf.py read), and a named config is
     # just a separate saved snapshot a client can select to become the new
-    # "currently active" one. DEFAULT_DIMENSION_CONFIG_NAME is seeded once
-    # from whatever the single file already had (see
-    # ensureDefaultDimensionConfig) so "Default" always means "the one that
-    # was already working," never a blank slate -- and is the one name this
-    # can't delete, so there is always at least one config to fall back to.
+    # "currently active" one. Each role's built-in names (see
+    # ENSURE_BUILTIN... / ensureBuiltinDimensionConfigs) are seeded once from
+    # whatever the single file already had (for the one matching
+    # FALLBACK_DIMENSION_CONFIG_NAME[role]) so upgrading a deployment never
+    # means "the one that was already working" silently resets to a blank
+    # slate -- and none of them can ever be deleted, so there is always at
+    # least one config to fall back to. environment_dimensions_model_pub
+    # lets the RUI know which model (and therefore which field set) the
+    # currently-selected ENVIRONMENT config actually targets, since that
+    # varies per config for this role only -- see dimension_config_model.
     self.selected_dimension_config = dict()
+    self.dimension_config_model = dict()
     self.dimension_config_names_pubs = dict()
     self.dimension_config_selected_pubs = dict()
+    self.environment_dimensions_model_pub = nepi_sdk.create_publisher(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/environment_dimensions_selected_model'),
+        String, queue_size = 1, latch = True)
     for role in DIMENSION_ROLES:
       self.dimension_config_names_pubs[role] = nepi_sdk.create_publisher(
           nepi_sdk.create_namespace(self.node_namespace, 'sim/' + role + '_dimensions_config_names'),
@@ -695,7 +771,19 @@ class NepiSimConnectorApp:
       self.dimension_config_selected_pubs[role] = nepi_sdk.create_publisher(
           nepi_sdk.create_namespace(self.node_namespace, 'sim/' + role + '_dimensions_selected_config'),
           String, queue_size = 1, latch = True)
-      self.selected_dimension_config[role] = DEFAULT_DIMENSION_CONFIG_NAME
+      # Resolved from the active file's ACTUAL content, not just assumed to
+      # be the fallback -- see resolveMatchingDimensionConfigName's own
+      # comment for why (reported live, 2026-09-01: after some unsaved
+      # editing, a restart kept showing "4-Wheel Rover"/"Obstacle Course" as
+      # selected even though the active values no longer matched what
+      # either file actually holds, reading as "editing changed the
+      # default" even though the named files themselves were never
+      # touched).
+      self.selected_dimension_config[role] = (
+          self.resolveMatchingDimensionConfigName(role) or FALLBACK_DIMENSION_CONFIG_NAME[role])
+      if role == 'environment':
+        self.dimension_config_model[role] = self.resolveEnvironmentModelFromYaml(
+            self.readStoredDimensionsYaml(role))
       self.publishAvailableDimensionConfigs(role)
       self.publishSelectedDimensionConfig(role)
     nepi_sdk.create_subscriber(
@@ -1135,6 +1223,38 @@ class NepiSimConnectorApp:
   # corridor/ramp geometry) -- see DIMENSION_ROLES's own comment for the
   # role -> model mapping and the device-store-is-authoritative design.
 
+  # Default matches generate_model_sdf.py's own ROVER_DEFAULT_DIMENSIONS
+  # entry -- used here only as the fallback when the robot dimensions store
+  # doesn't (yet) have the field, e.g. a fresh install or a config saved
+  # before this field existed.
+  CAMERA_HORIZONTAL_FOV_DEFAULT_DEG = 80.0
+
+  def updateCameraFovFromRobotDimensions(self):
+    # Reads camera_horizontal_fov_deg out of the robot dimensions store
+    # (an editable curated field, same as wheel_radius_m etc. -- see
+    # generate_model_sdf.py's ROVER_DEFAULT_DIMENSIONS/buildRoverSdf) and
+    # republishes both reported FOV topics from it. Called once at startup
+    # and again from setDimensionsCb/applyDimensionConfigByName whenever
+    # the robot role's fields change, so a live edit's effect on the
+    # rendered camera and on what this app REPORTS about that camera never
+    # drift apart. vertical_fov is derived from horizontal via the
+    # standard pinhole relation for the sensor's fixed 640x480 resolution.
+    try:
+      fields = yaml.safe_load(self.readStoredDimensionsYaml('robot') or '')
+    except yaml.YAMLError:
+      fields = None
+    horizontal_deg = self.CAMERA_HORIZONTAL_FOV_DEFAULT_DEG
+    if isinstance(fields, dict) and 'camera_horizontal_fov_deg' in fields:
+      try:
+        horizontal_deg = float(fields['camera_horizontal_fov_deg'])
+      except (TypeError, ValueError):
+        pass
+    self.CAMERA_HORIZONTAL_FOV_DEG = horizontal_deg
+    self.CAMERA_VERTICAL_FOV_DEG = 2.0 * np.degrees(np.arctan(
+        np.tan(np.radians(horizontal_deg) / 2.0) * (480.0 / 640.0)))
+    self.camera_horizontal_fov_pub.publish(Float32(data = self.CAMERA_HORIZONTAL_FOV_DEG))
+    self.camera_vertical_fov_pub.publish(Float32(data = self.CAMERA_VERTICAL_FOV_DEG))
+
   def dimensionsYamlStoragePath(self, role):
     return os.path.join(DIMENSIONS_STORAGE_DIR, role + '.yaml')
 
@@ -1214,7 +1334,20 @@ class NepiSimConnectorApp:
     for role in DIMENSION_ROLES:
       if not self.dimensions_dirty.get(role, False):
         continue
-      model_name = DIMENSION_ROLE_MODEL[role]
+      if role == 'environment':
+        model_name = self.dimension_config_model.get(role, ENVIRONMENT_LEGACY_MODEL_FALLBACK)
+        if model_name == ENVIRONMENT_MODEL_NONE:
+          # Flat: no model, nothing to generate or push. The live spawn/
+          # delete toggle (EnvironmentModelSpawner -- a separate, pre-
+          # existing mechanism, see sim_container/scripts/
+          # environment_models.py) is what actually controls what's in a
+          # running Gazebo world; this dimensions-config axis only edits a
+          # model's own geometry fields.
+          self.dimensions_dirty[role] = False
+          self.publishDimensionsDirty(role)
+          continue
+      else:
+        model_name = DIMENSION_ROLE_MODEL[role]
       try:
         self.launcher.push_dimensions(target, model_name,
             self.readStoredDimensionsYaml(role), self.readStoredSdfOverride(role))
@@ -1249,28 +1382,96 @@ class NepiSimConnectorApp:
   def dimensionConfigPath(self, role, name):
     return os.path.join(self.dimensionConfigsDir(role), self.sanitizeDimensionConfigName(name) + '.yaml')
 
-  def ensureDefaultDimensionConfig(self, role):
-    # Seeds Default.yaml ONCE, from whatever the existing single-file store
-    # already has -- so "Default" always means "the one that was already
-    # working" for an operator upgrading into this feature, never a blank
-    # slate that would silently reset their current setup. An empty '{}' is
-    # a genuinely valid config (setDimensionsCb's own comment: generate_
-    # model_sdf.py fills in its own defaults for anything a config doesn't
-    # set), so a fresh install with nothing customized yet still gets a
-    # real, working Default rather than this being skipped.
-    path = self.dimensionConfigPath(role, DEFAULT_DIMENSION_CONFIG_NAME)
-    if os.path.exists(path):
-      return
+  def resolveEnvironmentModelFromYaml(self, yaml_text):
+    # Reads ENVIRONMENT_MODEL_FIELD_KEY out of a config's own fields --
+    # falls back to the one fixed model 'environment' always meant before
+    # per-config model routing existed, for a config saved before that key
+    # existed at all (a migrated legacy config, or a hand-edited file).
     try:
-      os.makedirs(self.dimensionConfigsDir(role), exist_ok = True)
-      current_yaml = self.readStoredDimensionsYaml(role) or '{}\n'
-      with open(path, 'w') as f:
-        f.write(current_yaml)
-    except Exception as e:
-      self.msg_if.pub_warn("Failed to seed Default " + role + " dimensions config: " + str(e))
+      fields = yaml.safe_load(yaml_text) if yaml_text else None
+    except yaml.YAMLError:
+      fields = None
+    if isinstance(fields, dict) and ENVIRONMENT_MODEL_FIELD_KEY in fields:
+      return str(fields[ENVIRONMENT_MODEL_FIELD_KEY])
+    return ENVIRONMENT_LEGACY_MODEL_FALLBACK
+
+  def resolveMatchingDimensionConfigName(self, role):
+    # Finds which named config (if any) currently has EXACTLY the same
+    # fields as the "active" single-file store -- used at startup (and
+    # after an edit invalidates whatever was selected before it) so
+    # self.selected_dimension_config never just ASSUMES the fallback name,
+    # which would be wrong wherever the active file was left mid-edit, or
+    # was last set by selecting some OTHER config. Returns '' when nothing
+    # matches (an unsaved edit) -- callers decide their own fallback.
+    try:
+      active_fields = yaml.safe_load(self.readStoredDimensionsYaml(role) or '')
+    except yaml.YAMLError:
+      active_fields = None
+    if not isinstance(active_fields, dict):
+      return ''
+    for name in self.listDimensionConfigs(role):
+      try:
+        with open(self.dimensionConfigPath(role, name), 'r') as f:
+          named_fields = yaml.safe_load(f.read())
+      except Exception:
+        continue
+      if named_fields == active_fields:
+        return name
+    return ''
+
+  def ensureBuiltinDimensionConfigs(self, role):
+    # Seeds every built-in name in PROTECTED_DIMENSION_CONFIG_NAMES[role]
+    # that doesn't already exist on disk. The one matching
+    # FALLBACK_DIMENSION_CONFIG_NAME[role] seeds from whatever the existing
+    # single-file store (or a legacy Default.yaml, migrated and removed
+    # here) already has, so upgrading an existing deployment never silently
+    # resets an operator's current setup to a blank slate; every other
+    # built-in seeds fresh -- a genuinely valid, if unfilled, config
+    # (generate_model_sdf.py fills in its own defaults for anything a
+    # config doesn't set).
+    os.makedirs(self.dimensionConfigsDir(role), exist_ok = True)
+    legacy_path = self.dimensionConfigPath(role, LEGACY_DEFAULT_DIMENSION_CONFIG_NAME)
+    legacy_fields = None
+    if os.path.exists(legacy_path):
+      try:
+        with open(legacy_path, 'r') as f:
+          legacy_fields = yaml.safe_load(f.read())
+      except Exception as e:
+        self.msg_if.pub_warn("Failed to read legacy Default " + role + " dimensions config: " + str(e))
+      try:
+        os.remove(legacy_path)
+      except Exception as e:
+        self.msg_if.pub_warn("Failed to remove legacy Default " + role + " dimensions config: " + str(e))
+
+    if role == 'robot':
+      builtins = {ROBOT_BUILTIN_DIMENSION_CONFIG_NAME: {}}
+    else:
+      builtins = ENVIRONMENT_BUILTIN_DIMENSION_CONFIGS
+    fallback_name = FALLBACK_DIMENSION_CONFIG_NAME[role]
+    for name, extra_fields in builtins.items():
+      path = self.dimensionConfigPath(role, name)
+      if os.path.exists(path):
+        continue
+      if name == fallback_name:
+        if isinstance(legacy_fields, dict):
+          base = dict(legacy_fields)
+        else:
+          try:
+            base = yaml.safe_load(self.readStoredDimensionsYaml(role) or '')
+          except yaml.YAMLError:
+            base = None
+          base = dict(base) if isinstance(base, dict) else {}
+      else:
+        base = {}
+      base.update(extra_fields)
+      try:
+        with open(path, 'w') as f:
+          yaml.safe_dump(base, f, default_flow_style = False, sort_keys = False)
+      except Exception as e:
+        self.msg_if.pub_warn("Failed to seed " + role + " dimensions config '" + name + "': " + str(e))
 
   def listDimensionConfigs(self, role):
-    self.ensureDefaultDimensionConfig(role)
+    self.ensureBuiltinDimensionConfigs(role)
     names = []
     try:
       for filename in os.listdir(self.dimensionConfigsDir(role)):
@@ -1278,9 +1479,12 @@ class NepiSimConnectorApp:
           names.append(filename[:-len('.yaml')])
     except Exception as e:
       self.msg_if.pub_warn("Failed to list " + role + " dimensions configs: " + str(e))
-    # Default always first, everything else alphabetical -- matches
-    # available_robot_configs's own sorted() convention for the rest.
-    names.sort(key = lambda n: (n != DEFAULT_DIMENSION_CONFIG_NAME, n.lower()))
+    # Built-ins always first, in DIMENSION_CONFIG_BUILTIN_ORDER's order;
+    # everything else (custom saved configs) sorts alphabetically after.
+    builtin_order = DIMENSION_CONFIG_BUILTIN_ORDER.get(role, [])
+    def sortKey(n):
+      return (0, builtin_order.index(n)) if n in builtin_order else (1, n.lower())
+    names.sort(key = sortKey)
     return names
 
   def publishAvailableDimensionConfigs(self, role):
@@ -1291,14 +1495,17 @@ class NepiSimConnectorApp:
   def publishSelectedDimensionConfig(self, role):
     pub = self.dimension_config_selected_pubs.get(role)
     if pub is not None:
-      pub.publish(String(data = self.selected_dimension_config.get(role, DEFAULT_DIMENSION_CONFIG_NAME)))
+      pub.publish(String(data = self.selected_dimension_config.get(role, FALLBACK_DIMENSION_CONFIG_NAME.get(role, ''))))
+    if role == 'environment' and self.environment_dimensions_model_pub is not None:
+      self.environment_dimensions_model_pub.publish(String(data =
+          self.dimension_config_model.get(role, ENVIRONMENT_LEGACY_MODEL_FALLBACK)))
 
   def applyDimensionConfigByName(self, role, name):
     # Shared by selectDimensionConfigCb (an explicit operator pick) and
-    # deleteDimensionConfigCb (falling back to Default after removing
-    # whatever was selected) -- both mean "make this saved config the
-    # active one," which is exactly writeStoredDimensionsYaml's own job,
-    # the same file pushDirtyDimensions/generate_model_sdf.py read.
+    # deleteDimensionConfigCb (falling back to FALLBACK_DIMENSION_CONFIG_NAME
+    # after removing whatever was selected) -- both mean "make this saved
+    # config the active one," which is exactly writeStoredDimensionsYaml's
+    # own job, the same file pushDirtyDimensions/generate_model_sdf.py read.
     path = self.dimensionConfigPath(role, name)
     if not os.path.exists(path):
       self.msg_if.pub_warn(role + " dimensions config '" + name + "' not found, ignoring")
@@ -1309,9 +1516,13 @@ class NepiSimConnectorApp:
     except Exception as e:
       self.msg_if.pub_warn("Failed to read " + role + " dimensions config '" + name + "': " + str(e))
       return False
+    if role == 'environment':
+      self.dimension_config_model[role] = self.resolveEnvironmentModelFromYaml(yaml_text)
     self.writeStoredDimensionsYaml(role, yaml_text)
     self.clearStoredSdfOverride(role)
     self.markDimensionsDirty(role)
+    if role == 'robot':
+      self.updateCameraFovFromRobotDimensions()
     self.selected_dimension_config[role] = self.sanitizeDimensionConfigName(name)
     self.publishSelectedDimensionConfig(role)
     # Echoes to the same latched topic applyDimensionsYaml already listens
@@ -1362,6 +1573,9 @@ class NepiSimConnectorApp:
     if not name:
       self.msg_if.pub_warn("Cannot save a " + role + " dimensions config with an empty name")
       return
+    if self.sanitizeDimensionConfigName(name) in PROTECTED_DIMENSION_CONFIG_NAMES.get(role, set()):
+      self.msg_if.pub_warn("Cannot save over the built-in " + role + " dimensions config '" + name + "'")
+      return
     try:
       fields = yaml.safe_load(str(payload.get('yaml', '')))
     except yaml.YAMLError as e:
@@ -1370,6 +1584,14 @@ class NepiSimConnectorApp:
     if not isinstance(fields, dict):
       self.msg_if.pub_warn("Cannot save " + role + " dimensions config '" + name + "': must be a YAML mapping")
       return
+    if role == 'environment':
+      # A save always carries forward whichever model was active for the
+      # config being edited -- the editable fields never include this
+      # reserved key themselves (see ENVIRONMENT_MODEL_FIELD_KEY's own
+      # comment), so without this a "Save As" derived from Obstacle Course
+      # would silently save a config with no model to push at all.
+      fields[ENVIRONMENT_MODEL_FIELD_KEY] = self.dimension_config_model.get(
+          role, ENVIRONMENT_LEGACY_MODEL_FALLBACK)
     try:
       clean_yaml = yaml.safe_dump(fields, default_flow_style = False, sort_keys = False)
       os.makedirs(self.dimensionConfigsDir(role), exist_ok = True)
@@ -1392,8 +1614,8 @@ class NepiSimConnectorApp:
     name = str(msg.data).strip()
     if not name:
       return
-    if self.sanitizeDimensionConfigName(name) == DEFAULT_DIMENSION_CONFIG_NAME:
-      self.msg_if.pub_warn("Cannot delete the Default " + role + " dimensions config")
+    if self.sanitizeDimensionConfigName(name) in PROTECTED_DIMENSION_CONFIG_NAMES.get(role, set()):
+      self.msg_if.pub_warn("Cannot delete the built-in " + role + " dimensions config '" + name + "'")
       return
     path = self.dimensionConfigPath(role, name)
     if not os.path.exists(path):
@@ -1406,7 +1628,7 @@ class NepiSimConnectorApp:
       return
     self.publishAvailableDimensionConfigs(role)
     if self.selected_dimension_config.get(role) == self.sanitizeDimensionConfigName(name):
-      self.applyDimensionConfigByName(role, DEFAULT_DIMENSION_CONFIG_NAME)
+      self.applyDimensionConfigByName(role, FALLBACK_DIMENSION_CONFIG_NAME[role])
     self.msg_if.pub_info("Deleted " + role + " dimensions config: " + name)
 
   def setRobotDimensionsCb(self, msg):
@@ -1443,6 +1665,24 @@ class NepiSimConnectorApp:
     # silently never take effect.
     self.clearStoredSdfOverride(role)
     self.markDimensionsDirty(role)
+    # Re-resolves rather than just clearing to "unsaved" outright -- an edit
+    # that happens to reproduce a saved config's fields exactly (e.g.
+    # editing a value and back) should still show that config as selected.
+    # This is the fix for a real report (2026-09-01): editing while a
+    # BUILT-IN like "4-Wheel Rover"/"Obstacle Course" was selected kept
+    # showing that name as selected even after the values no longer
+    # matched what its own file holds, reading as "editing changed the
+    # default" -- it never did (setDimensionsCb only ever writes the
+    # ACTIVE single-file store, see this method's own docstring, never a
+    # named config's own file); only the SELECTED-NAME INDICATOR was wrong.
+    # Now it correctly drops to '' (nothing selected -- shown in the RUI as
+    # unsaved edits) the moment the active content no longer matches
+    # anything on disk, exactly the "only applies if saved and selected"
+    # behavior reported missing.
+    self.selected_dimension_config[role] = self.resolveMatchingDimensionConfigName(role)
+    self.publishSelectedDimensionConfig(role)
+    if role == 'robot':
+      self.updateCameraFovFromRobotDimensions()
     self.msg_if.pub_info("Updated " + role + " dimensions: " + yaml_text.replace(chr(10), ' '))
 
   def uploadRobotModelSdfCb(self, msg):

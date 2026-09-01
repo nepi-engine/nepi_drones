@@ -1,6 +1,6 @@
-wheel_radius_m: 0.1
-wheel_width_m: 0.05
-track_width_m: 0.34
+wheel_radius_m: '0.1'
+wheel_width_m: '0.02'
+track_width_m: '0.34'
 wheelbase_m: 0.3
 chassis_length_m: 0.4
 chassis_width_m: 0.3
