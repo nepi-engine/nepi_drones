@@ -96,14 +96,16 @@ class SimDiscovery:
   # transient contention) -- this put the node in an endless restart loop,
   # since each relaunch takes several seconds to reach steady state and the
   # very next discovery cycle's probe could just as easily hit another
-  # transient blip before it gets there. Requiring this many CONSECUTIVE
-  # heartbeat misses before purging absorbs that without meaningfully
-  # slowing down detection of a genuinely dead simulator (discovery runs
-  # every 1-3s per nepi_drivers' own polling interval, so this is still a
+  # transient blip before it gets there. Raised from an initial 3 to 6
+  # (2026-09-01) after a fresh device+VM reboot showed the reverse tunnel
+  # can still throw brief BURSTS of 2-3 consecutive misses while it settles,
+  # not just isolated singles -- 6 comfortably absorbs that without
+  # meaningfully slowing down detection of a genuinely dead simulator
+  # (discovery runs every 1-3s per nepi_drivers' own polling interval, so this is still a
   # few-second worst case). Doesn't apply to the OTHER purge condition in
   # checkOnDevice (the rbx node subprocess itself having actually exited) --
   # that's an unambiguous, instantaneous signal with nothing to debounce.
-  HEARTBEAT_MISS_THRESHOLD = 3
+  HEARTBEAT_MISS_THRESHOLD = 6
 
   def __init__(self):
     ############
