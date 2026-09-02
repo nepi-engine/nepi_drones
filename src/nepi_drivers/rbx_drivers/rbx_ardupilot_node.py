@@ -300,6 +300,13 @@ class ArdupilotNode:
   msg_list = ["","","","","",""]
 
   takeoff_complete = False
+  # Set alongside takeoff_complete's timeout-path False below, never cleared
+  # on success -- lets autonomousControlsReady()/teleopControlsReady() keep
+  # checking real altitude against the actual goal even after the one-shot
+  # completion wait in takeoff_action() has already given up (see the live
+  # recheck there for why this matters).
+  takeoff_goal_alt = None
+  takeoff_error_bound_m = None
   takeoff_reset_modes = ["LAND","RTL"]
 
   home_loc = GeoPoint()
@@ -1031,6 +1038,34 @@ class ArdupilotNode:
     # check is needed on top of it.
     return True
 
+  def isAirborne(self):
+    # takeoff_complete is set once, by takeoff_action()'s own bounded wait
+    # loop -- if that loop times out while the vehicle is still genuinely
+    # climbing (confirmed live 2026-09-01: a loaded VM can leave the vehicle
+    # several meters short at the timeout, then keep climbing under its own
+    # MAVLink TAKEOFF command and reach goal_alt a couple minutes later),
+    # takeoff_complete stays False for the rest of the flight -- exactly the
+    # "false timeout PERMANENTLY disabled every goto command" failure this
+    # class of check already exists to avoid, just via a path the 2026-08-12
+    # fix didn't cover (that one only handled converging AT the timeout
+    # boundary, not well after it). Rather than widen the wait loop's own
+    # timeout further (already raised once, still not always enough under
+    # load), recheck the actual current altitude against the recorded goal
+    # here on every readiness query -- cheap, and self-correcting the moment
+    # the vehicle actually gets there, instead of trusting a flag that can
+    # never become true again once it's False.
+    if self.takeoff_complete:
+      return True
+    if self.takeoff_goal_alt is None or self.takeoff_error_bound_m is None:
+      return False
+    if self.rbx_if is None:
+      return False
+    alt_error = self.takeoff_goal_alt - self.rbx_if.current_location_wgs84_geo[2]
+    if abs(alt_error) <= self.takeoff_error_bound_m:
+      self.takeoff_complete = True
+      return True
+    return False
+
   def autonomousControlsReady(self):
     # Also requires autonomous_movement_enabled -- the Sim Connector's own
     # per-robot-config "automated movement" toggle, same as
@@ -1040,7 +1075,7 @@ class ArdupilotNode:
     if self.settings_dict['autonomous_movement_enabled']['value'] != 'TRUE':
       return False
     ready = False
-    if self.RBX_STATES[self.state_ind] == "ARM" and self.RBX_MODES[self.mode_ind] == "GUIDED" and self.takeoff_complete:
+    if self.RBX_STATES[self.state_ind] == "ARM" and self.RBX_MODES[self.mode_ind] == "GUIDED" and self.isAirborne():
       ready = True
     return ready
 
@@ -1055,7 +1090,7 @@ class ArdupilotNode:
       return False
     return (self.RBX_STATES[self.state_ind] == "ARM"
             and self.RBX_MODES[self.mode_ind] == "GUIDED"
-            and self.takeoff_complete)
+            and self.isAirborne())
 
   def setTeleopVelocity(self, linear_x, linear_y, linear_z, angular_z):
     # Inputs are body-frame ratios in [-1,1] (forward/right/up, yaw-rate) --
@@ -1604,6 +1639,7 @@ class ArdupilotNode:
       # ellipsoid climb at a fixed lat/lon. See fakeGpsGoPosCb in the fake_gps app.
       start_alt = self.rbx_if.current_location_wgs84_geo[2]
       goal_alt = start_alt + takeoff_height_m
+      self.takeoff_goal_alt = goal_alt
       climb_point = Point()
       climb_point.x = 0.0
       climb_point.y = 0.0
@@ -1611,6 +1647,7 @@ class ArdupilotNode:
       self.fake_gps_goto_position_pub.publish(climb_point)
 
       error_bound_m = self.rbx_if.rbx_info.error_bounds.max_distance_error_m
+      self.takeoff_error_bound_m = error_bound_m
       timeout_sec = self.rbx_if.rbx_info.cmd_timeout
       check_interval_s = float(timeout_sec) / 100
       check_timer = 0

@@ -94,10 +94,7 @@ PROCESS_NAME = "sim_ai_targeting_bridge"
 
 def find_image_topic(candidates, timeout = 20):
   # Polls nepi_ros.find_topic() across all candidates each tick, so total
-  # worst-case wait is timeout, not timeout * len(candidates). Short 20s
-  # default -- the image relay is a nice-to-have for this bridge, not its
-  # actual job (that's the target_localizations feed below), so this
-  # shouldn't hold up startup for long if no camera is found.
+  # worst-case wait is timeout, not timeout * len(candidates).
   start_time = time.time()
   while (time.time() - start_time) < timeout and not nepi_ros.is_shutdown():
     for candidate in candidates:
@@ -106,6 +103,10 @@ def find_image_topic(candidates, timeout = 20):
         return found
     time.sleep(0.1)
   return ""
+
+# How often imageRelayThread rechecks for the camera topic once the initial
+# find_image_topic() window (below) comes up empty.
+IMAGE_TOPIC_RETRY_INTERVAL_SEC = 10.0
 
 
 LAUNCH_TRIGGER_RETRY_ATTEMPTS = 8
@@ -183,17 +184,21 @@ class sim_ai_targeting_bridge(object):
     self.msg_if.pub_info("Attempting to trigger the full sim stack on the dev VM (harmless no-op if already running)")
     trigger_remote_sim_launch(self.msg_if)
 
-    self.msg_if.pub_info("Checking for image topic: " + str(ROBOT_IMAGE_TOPIC_CANDIDATES))
-    source_image_topic = find_image_topic(ROBOT_IMAGE_TOPIC_CANDIDATES)
-    if source_image_topic == "":
-      # Non-fatal: the image relay is a bonus (targeting_image), not this
-      # script's actual job. The target_localizations feed below is what
-      # drone_follow_object_mission_script.py and the RUI's Peripheral Status
-      # check both actually depend on -- that must still start regardless.
-      self.msg_if.pub_warn("No camera image topic found -- continuing without image relay")
-    else:
-      self.msg_if.pub_info("Relaying image topic: " + source_image_topic)
-      rospy.Subscriber(source_image_topic, Image, self.imageRelayCb, queue_size = 1)
+    # Confirmed live 2026-08-28: a single 20s window at startup is not
+    # enough -- this script's own process outlives many VM/device restart
+    # cycles (it just keeps reconnecting bridgeLoop() below), but the RBX
+    # driver's color_2d_image topic can easily still be initializing (or
+    # mid-reload) at whatever moment THIS script happened to start, weeks
+    # or hours ago. That one check failing once meant targeting_image never
+    # got wired up for the rest of this script's lifetime, even after the
+    # driver's camera topic came up fine later -- drone_follow_object_
+    # mission_script.py's wait_for_topic(targeting_image) would then always
+    # time out at 60s and get "" back, exactly like the same one-shot race
+    # already fixed for trigger_remote_sim_launch above. Same fix here:
+    # keep retrying in the background instead of giving up permanently.
+    self.image_relay_thread = threading.Thread(target = self.imageRelayThread)
+    self.image_relay_thread.daemon = True
+    self.image_relay_thread.start()
 
     self.bridge_thread = threading.Thread(target = self.bridgeLoop)
     self.bridge_thread.daemon = True
@@ -204,6 +209,23 @@ class sim_ai_targeting_bridge(object):
 
   def imageRelayCb(self, msg):
     self.image_pub.publish(msg)
+
+  def imageRelayThread(self):
+    # Non-fatal either way: the image relay is a bonus (targeting_image),
+    # not this script's actual job. The target_localizations feed handled
+    # by bridgeLoop() is what drone_follow_object_mission_script.py and the
+    # RUI's Peripheral Status check both actually depend on, and that
+    # starts regardless of whether this ever finds a camera.
+    self.msg_if.pub_info("Checking for image topic: " + str(ROBOT_IMAGE_TOPIC_CANDIDATES))
+    while not nepi_ros.is_shutdown():
+      source_image_topic = find_image_topic(ROBOT_IMAGE_TOPIC_CANDIDATES)
+      if source_image_topic != "":
+        self.msg_if.pub_info("Relaying image topic: " + source_image_topic)
+        rospy.Subscriber(source_image_topic, Image, self.imageRelayCb, queue_size = 1)
+        return
+      self.msg_if.pub_warn("No camera image topic found yet -- rechecking in " +
+                           str(IMAGE_TOPIC_RETRY_INTERVAL_SEC) + "s")
+      time.sleep(IMAGE_TOPIC_RETRY_INTERVAL_SEC)
 
   def bridgeLoop(self):
     buf = b''

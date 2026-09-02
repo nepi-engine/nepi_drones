@@ -654,17 +654,36 @@ class TestDroneFollowObjectMissionScript(unittest.TestCase):
     # ------------------------------------------------------------
     def test_move_to_object_callback_drives_goto_on_matching_target(self):
         instance = self._build_instance()
-        target = _Target(name="chair", range_m=2.0, azimuth_deg=0.0, elevation_deg=0.0)
+        target = _Target(name="chair", range_m=10.0, azimuth_deg=0.0, elevation_deg=0.0)
         targets_msg = _Targets(targets=[target])
 
         instance.move_to_object_callback(targets_msg)
 
         goto_msg = instance.rbx_goto_position_pub.published[-1]
-        # azimuth/elevation 0 -> straight ahead, offset 0.1m subtracted from range.
-        self.assertAlmostEqual(goto_msg.x_meters, 1.9, places=5)
+        # azimuth/elevation 0 -> straight ahead, standoff radius subtracted from range.
+        expected_x = 10.0 - self.module.TARGET_OFFSET_GOAL_M
+        self.assertAlmostEqual(goto_msg.x_meters, expected_x, places=5)
         self.assertAlmostEqual(goto_msg.y_meters, 0.0, places=5)
         # IGNORE_YAW_CONTROL is True in this script's USER SETTINGS -> -999 sentinel.
         self.assertEqual(goto_msg.yaw_deg, -999)
+
+    def test_move_to_object_callback_backs_away_inside_standoff_radius(self):
+        # If the chair closes to within the standoff radius, setpoint_range_m
+        # goes negative -- the goto target lands behind the drone along the
+        # same bearing, so ArduPilot backs it away rather than holding
+        # position or advancing further. This is the "fly backward to
+        # maintain the safe distance" requirement, achieved by the plain
+        # linear range subtraction with no extra clamping/branching needed.
+        instance = self._build_instance()
+        target = _Target(name="chair", range_m=1.0, azimuth_deg=0.0, elevation_deg=0.0)
+        targets_msg = _Targets(targets=[target])
+
+        instance.move_to_object_callback(targets_msg)
+
+        goto_msg = instance.rbx_goto_position_pub.published[-1]
+        expected_x = 1.0 - self.module.TARGET_OFFSET_GOAL_M
+        self.assertLess(expected_x, 0.0, "test target must be inside the standoff radius")
+        self.assertAlmostEqual(goto_msg.x_meters, expected_x, places=5)
 
     def test_move_to_object_callback_converts_sensor_frame_to_driver_frame(self):
         # Regression test for the 2026-08-26 sign-inversion bug: the

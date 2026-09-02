@@ -88,7 +88,18 @@ IGNORE_YAW_CONTROL = True
 
 ###!!!!!!!! Set Automation action parameters !!!!!!!!
 TARGET_TO_FOLLOW = "chair" # Either a target class name (will follow first found of that class) or specific target_id
-TARGET_OFFSET_GOAL_M = 0.1 # How close to set setpoint to target
+# This is the standoff radius: setpoint_range_m below is target_range_m minus
+# this value, so the drone's goto target sits this far short of the chair
+# along the line to it (the same "fly to a point on the safe-boundary
+# perimeter" idea as a proportional standoff controller -- just expressed as
+# a range subtraction in the sensor's own polar range/azimuth/elevation frame
+# rather than a Cartesian map-frame vector, since that's the frame this
+# target data is already in). 0.1m put the goto setpoint essentially AT the
+# chair, i.e. no collision buffer at all. If the chair moves closer than this
+# radius, setpoint_range_m goes negative and the goto target lands behind the
+# drone -- ArduPilot backs it away to hold the boundary, which is exactly the
+# desired "back off if it gets too close" behavior with no extra logic needed.
+TARGET_OFFSET_GOAL_M = 2.5 # Standoff radius (m) -- how close the drone is allowed to get to the target
 TRIGGER_RESET_DELAY_S = 5 # Time between detect/move checks
 
 # Set Home Poistion
