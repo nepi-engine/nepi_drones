@@ -28,6 +28,11 @@ import Button, { ButtonMenu } from "./Button"
 import Styles from "./Styles"
 import { Columns, Column } from "./Columns"
 
+// Sentinel value for the "+ Add New OS Instance" selector entry -- never a
+// real instance_id (those are all 'os_'-prefixed, see
+// os_instance_registry.py's _instance_id_from_name), so it can't collide.
+const ADD_NEW_VALUE = '__add_new_os_instance__'
+
 @inject("ros")
 @observer
 
@@ -47,12 +52,6 @@ import { Columns, Column } from "./Columns"
 // machine (see os_instance_registry.py's select()); Nepi_IF_SimLauncher below
 // this component keeps working completely unchanged, since it only ever
 // reflects whatever SimLauncherStatus reports.
-//
-// Sentinel value for the "+ Add New OS Instance" selector entry -- never a
-// real instance_id (those are all 'os_'-prefixed, see
-// os_instance_registry.py's _instance_id_from_name), so it can't collide.
-const ADD_NEW_VALUE = '__add_new_os_instance__'
-
 class NepiIFSimOsInstances extends Component {
   constructor(props) {
     super(props)
@@ -213,6 +212,15 @@ class NepiIFSimOsInstances extends Component {
   // here (selecting one would silently point every launch target at a
   // machine that was never confirmed reachable) but are still listed,
   // removable, further down in renderInstanceList.
+  //
+  // Never a generic "Default"/"None" placeholder -- reported live: the
+  // picker should "name the name of the one it's currently connected to."
+  // The backend always registers a real, named, already-verified 'baseline'
+  // entry (see os_instance_registry.py's ensure_baseline) representing
+  // whatever connection simulator_launch_targets.yaml itself hardcodes, so
+  // selected_instance_id is never actually empty once status_msg exists --
+  // it shows up in this same loop like any other instance, just first and
+  // never removable (see renderInstanceList).
   renderOsSelector() {
     const status_msg = this.state.status_msg
     if (status_msg == null) {
@@ -224,9 +232,6 @@ class NepiIFSimOsInstances extends Component {
     const selected = status_msg.selected_instance_id || ''
 
     var items = []
-    if (selected === '') {
-      items.push(<Option key={'None'} value={'None'}>{'Default (this app\'s own config)'}</Option>)
-    }
     for (var i = 0; i < ids.length; i++) {
       if (statuses[i] !== 'verified') {
         continue
@@ -239,7 +244,7 @@ class NepiIFSimOsInstances extends Component {
       <Label title={"OS"}>
         <Select
           onChange={this.onOsSelected}
-          value={(selected !== '') ? selected : 'None'}
+          value={selected}
         >
           {items}
         </Select>
@@ -301,7 +306,7 @@ class NepiIFSimOsInstances extends Component {
     return (
       <React.Fragment>
 
-        <Label title={"Run These Commands On Your New Machine"}>
+        <Label title={"Setup Commands -- Run On The New Machine, In Order"}>
           <pre style={{
             textAlign: "left",
             whiteSpace: "pre-wrap",
@@ -312,14 +317,14 @@ class NepiIFSimOsInstances extends Component {
           </pre>
         </Label>
 
-        <Label title={"SSH Username On That Machine"}>
+        <Label title={"Then: The Username You Log Into That Machine As"}>
           <Input
             value={this.state.verify_ssh_user}
             onChange={(e) => this.setState({ verify_ssh_user: e.target.value })}
           />
         </Label>
 
-        <Label title={"Host (leave blank if using the reverse tunnel above)"}>
+        <Label title={"Host Address (only if NOT using the reverse tunnel above -- leave blank otherwise)"}>
           <Input
             value={this.state.verify_host}
             onChange={(e) => this.setState({ verify_host: e.target.value })}
@@ -357,11 +362,18 @@ class NepiIFSimOsInstances extends Component {
       <React.Fragment>
         {ids.map((id, i) => {
           const label = names[i] + " (" + statuses[i] + ")" + ((id === selected) ? " -- selected" : "")
+          // 'baseline' (the always-present entry for whatever
+          // simulator_launch_targets.yaml itself hardcodes) is never
+          // removable -- there's nothing to fall back to if it were gone,
+          // see os_instance_registry.py's remove().
+          const removable = (id !== 'baseline')
           return (
             <Columns key={id}>
               <Column>
                 <Label title={label}>
-                  <Button onClick={() => this.onRemoveInstance(id)}>{"Remove"}</Button>
+                  {removable
+                    ? <Button onClick={() => this.onRemoveInstance(id)}>{"Remove"}</Button>
+                    : null}
                 </Label>
               </Column>
             </Columns>

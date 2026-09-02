@@ -62,6 +62,15 @@ OS_INSTANCES_STORAGE_DIR = '/mnt/nepi_storage/databases/nepi_app_sim_connector/o
 # collide with that pre-existing default.
 FIRST_ALLOCATED_SSH_PORT = 12223
 
+# Id of the pseudo-instance representing whatever connection
+# simulator_launch_targets.yaml itself hardcodes -- see ensure_baseline's own
+# docstring. Never operator-created or removable, always present whenever a
+# launcher config is loaded at all, so the RUI's picker always has a real,
+# named, already-verified entry to show instead of a generic "default"
+# placeholder -- reported live: the picker should "name the name of the one
+# it's currently connected to," never say "Default."
+BASELINE_INSTANCE_ID = 'baseline'
+
 SSH_CONNECT_TIMEOUT_SEC = 8
 
 DEFAULT_SSH_KEY = os.path.expanduser("~/.ssh/nepi_default_ssh_key")
@@ -202,40 +211,66 @@ class OsInstanceRegistry(object):
     paths (systemd, and the plain-autossh fallback needed on a machine like
     this dev VM's own WSL environment, per that doc's own WSL callout), with
     the real allocated port substituted in rather than a human hand-editing
-    port numbers out of a markdown file."""
+    port numbers out of a markdown file.
+
+    Restructured (reported live: "the commands are kind of hard to
+    understand ... give the right places to go properly") as a plain,
+    numbered walkthrough with an explicit WHERE line on every step, rather
+    than a wall of shell-comment-prefixed lines -- the earlier shape read as
+    one long script when it's actually two machines and two alternative
+    paths interleaved."""
     port = instance['ssh_port']
     iid = instance['instance_id']
     return (
-        "# 1) SSH key -- reuse ~/.ssh/nepi_default_ssh_key if you already set one up\n"
-        "#    for an earlier instance; skip straight to step 2 if so.\n"
-        "ssh-keygen -t ed25519 -f ~/.ssh/nepi_default_ssh_key -N \"\"\n"
-        "# Copy the PUBLIC half (nepi_default_ssh_key.pub) into THIS machine's own\n"
-        "# ~/.ssh/authorized_keys -- the NEPI device already trusts this key.\n"
+        "STEP 1 of 3 -- Create an SSH key\n"
+        "Where: on the NEW machine (" + instance['display_name'] + ")\n"
         "\n"
-        "# 2) Reverse tunnel back to the NEPI device, forwarding port " + str(port) + "\n"
-        "#    to this machine's own sshd -- pick ONE of the two options below.\n"
+        "Skip this step if you already did it once before for a different\n"
+        "machine -- every machine reuses the same key.\n"
         "\n"
-        "# Option A -- systemd (recommended, survives reboots):\n"
-        "mkdir -p ~/.config/systemd/user ~/.config\n"
-        "cp sim_container/systemd/nepi-tunnel.service "
+        "    ssh-keygen -t ed25519 -f ~/.ssh/nepi_default_ssh_key -N \"\"\n"
+        "    cat ~/.ssh/nepi_default_ssh_key.pub >> ~/.ssh/authorized_keys\n"
+        "\n"
+        "(The second line authorizes this same key on this machine -- the NEPI\n"
+        "device already trusts it, so nothing needs to change on the device side.)\n"
+        "\n"
+        "\n"
+        "STEP 2 of 3 -- Open a reverse tunnel back to the NEPI device\n"
+        "Where: on the NEW machine (" + instance['display_name'] + ")\n"
+        "\n"
+        "This is what lets the NEPI device reach this machine to deploy a\n"
+        "simulator later. Pick ONE of the two options below -- not both.\n"
+        "\n"
+        "  Option A -- recommended: restarts itself automatically on reboot.\n"
+        "\n"
+        "    mkdir -p ~/.config/systemd/user ~/.config\n"
+        "    cp sim_container/systemd/nepi-tunnel.service "
         "~/.config/systemd/user/nepi-tunnel-" + iid + ".service\n"
-        "cat > ~/.config/nepi-tunnel-" + iid + ".env <<'EOF'\n"
-        "DEVICE_SSH_HOST=<your NEPI device's real IP or hostname>\n"
-        "DEVICE_SSH_USER=nepi\n"
-        "DEVICE_SSH_PORT=22\n"
-        "TUNNEL_SSH_PORT=" + str(port) + "\n"
-        "EOF\n"
-        "systemctl --user daemon-reload\n"
-        "systemctl --user enable --now nepi-tunnel-" + iid + ".service\n"
-        "loginctl enable-linger $(id -un)\n"
+        "    cat > ~/.config/nepi-tunnel-" + iid + ".env <<'EOF'\n"
+        "    DEVICE_SSH_HOST=<REPLACE with your NEPI device's IP or hostname>\n"
+        "    DEVICE_SSH_USER=nepi\n"
+        "    DEVICE_SSH_PORT=22\n"
+        "    TUNNEL_SSH_PORT=" + str(port) + "\n"
+        "    EOF\n"
+        "    systemctl --user daemon-reload\n"
+        "    systemctl --user enable --now nepi-tunnel-" + iid + ".service\n"
+        "    loginctl enable-linger $(id -un)\n"
         "\n"
-        "# Option B -- plain autossh, no systemd needed (e.g. WSL without\n"
-        "#    systemd=true in /etc/wsl.conf):\n"
-        "autossh -M 0 -f -N -R " + str(port) + ":127.0.0.1:22 -p 22 \\\n"
-        "  -i ~/.ssh/nepi_default_ssh_key <your NEPI device user>@<your NEPI device host>\n"
+        "  Option B -- one-off command, no systemd required (use this on WSL\n"
+        "  unless you've already turned systemd on in /etc/wsl.conf):\n"
         "\n"
-        "# 3) Verify, then click \"Test Connection\" in the RUI:\n"
-        "ssh -p " + str(port) + " <your username>@localhost echo ok"
+        "    autossh -M 0 -f -N -R " + str(port) + ":127.0.0.1:22 -p 22 \\\n"
+        "      -i ~/.ssh/nepi_default_ssh_key \\\n"
+        "      <REPLACE with your NEPI device's user>@<REPLACE with its IP or hostname>\n"
+        "\n"
+        "\n"
+        "STEP 3 of 3 -- Verify it worked\n"
+        "Where: on the NEW machine (" + instance['display_name'] + ")\n"
+        "\n"
+        "    ssh -p " + str(port) + " <REPLACE with your username on this machine>@localhost echo ok\n"
+        "\n"
+        "If that prints \"ok\", go back to the RUI and click \"Test Connection\" --\n"
+        "no need to run anything else by hand."
     )
 
   #**********************
@@ -290,7 +325,42 @@ class OsInstanceRegistry(object):
       raise LauncherError("Connection test failed for '" + instance['display_name'] + "': " + error)
     return instance
 
+  def ensure_baseline(self, display_name, host, ssh_user, ssh_port):
+    """Registers (or refreshes) the pseudo-instance representing whatever
+    connection simulator_launch_targets.yaml itself hardcodes -- called once
+    at startup with the values the launcher's own config just loaded (its
+    first target's host/ssh_user/ssh_port; all targets share the same
+    connection by convention). This is what lets the RUI's picker always
+    show a real, named, already-'verified' entry -- reported live: there
+    should be no generic "Default" placeholder, the picker should "name the
+    name of the one it's currently connected to."
+
+    host/ssh_user/ssh_port/display_name are refreshed every call (every app
+    startup) since they're derived from the yaml, not operator-set -- an
+    edit to simulator_launch_targets.yaml followed by a restart is reflected
+    here too. selected_instance_id is left alone if the operator already
+    chose a real, different instance on a previous run; only defaults to
+    this baseline when nothing has ever been selected (a genuinely first
+    boot, or after a fresh install)."""
+    instance = self.instances.get(BASELINE_INSTANCE_ID, {})
+    instance.update({
+        'instance_id': BASELINE_INSTANCE_ID,
+        'display_name': display_name,
+        'host': host,
+        'ssh_user': ssh_user,
+        'ssh_port': ssh_port,
+        'status': 'verified',
+    })
+    self.instances[BASELINE_INSTANCE_ID] = instance
+    self._persist(BASELINE_INSTANCE_ID)
+    if not self.selected_instance_id:
+      instance['selected'] = True
+      self._persist(BASELINE_INSTANCE_ID)
+      self.selected_instance_id = BASELINE_INSTANCE_ID
+
   def remove(self, instance_id):
+    if instance_id == BASELINE_INSTANCE_ID:
+      raise LauncherError("Cannot remove the default NEPI-device connection")
     if instance_id not in self.instances:
       return
     try:

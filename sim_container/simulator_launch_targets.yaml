@@ -48,6 +48,14 @@
 # set (e.g. running the launcher standalone as a normal user).
 ssh_key_path: "/home/nepi/.ssh/nepi_default_ssh_key"
 
+# Optional. A human-friendly name for the connection every target below
+# hardcodes (host/ssh_user/ssh_port) -- shown as-is in the RUI's "OS"
+# picker as the always-present, already-verified entry representing THIS
+# yaml's own hardcoded machine (see os_instance_registry.py's
+# ensure_baseline). If omitted, falls back to "ssh_user@host:port" -- still
+# a real, identifying name, never a generic "Default" label.
+# connection_display_name: "suraj-vm"
+
 # How the VM-side bridge script reaches this NEPI device (leg 1 above).
 # "nepi" here relies on the same /etc/hosts-style alias already used for SSH
 # access to the device from the VM -- substitute your device's real

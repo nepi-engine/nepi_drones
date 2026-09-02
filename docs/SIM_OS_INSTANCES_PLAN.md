@@ -103,6 +103,46 @@ is no per-instance port math needed for those.
    default VM. Explicitly deferred by request -- this VM is meant to be
    registered as that second machine by hand afterward, not by this pass.
 
+## 3a. Follow-up fixes from live feedback (2026-09-02)
+
+Two real gaps reported after the first deploy, both fixed in place -- not a
+redesign:
+
+- **The picker showed a generic "Default (this app's own config)" entry
+  whenever nothing had ever been explicitly selected.** Reported live: "there
+  shouldn't be any 'default' -- it should name the name of the one it's
+  currently connected to." Fixed by having `ensure_baseline()` register a
+  real, always-present, already-`verified` pseudo-instance (id `baseline`)
+  representing whatever connection `simulator_launch_targets.yaml` itself
+  hardcodes -- named from a new optional `connection_display_name` yaml key,
+  falling back to `"{ssh_user}@{host}:{port}"` (a real identity, never a
+  placeholder) when that key is absent. Called once at startup from
+  `sim_connector_app_node.py`, right after the launcher loads its config, so
+  a genuinely first boot (or any boot where nothing was ever explicitly
+  selected) defaults `selected_instance_id` to `baseline` instead of leaving
+  it empty. `baseline` is otherwise a completely ordinary instance record --
+  `select('baseline', launcher)` needs no special-casing (it just re-applies
+  its own captured host/ssh_user/ssh_port, which is a no-op the first time
+  and a genuine "go back to the hardcoded default" the next time a real
+  instance was previously selected) -- only `remove()` special-cases it, by
+  refusing (nothing to fall back to if it were gone). The RUI drops its old
+  empty-selection branch entirely and just relies on `baseline` showing up
+  in the normal instance loop; `renderInstanceList` hides the Remove button
+  for it specifically.
+- **The generated setup commands were hard to follow.** Reported live:
+  "make it easier to follow and give the right places to go properly." The
+  original shape read as one continuous shell script with `#`-comments
+  explaining each line, when it's actually two machines (the new one and
+  the NEPI device) and two alternative tunnel paths (systemd vs plain
+  `autossh`) interleaved. `build_setup_commands()` now renders three
+  explicitly numbered steps, each with its own `Where: on the NEW machine
+  (<name>)` line, blank-line-separated command blocks (not comment-prefixed
+  shell), and every value the operator must fill in marked
+  `<REPLACE with ...>` rather than a bare angle-bracket placeholder that
+  could be mistaken for a literal token. The RUI's own field labels next to
+  the block were reworded to match (`"Setup Commands -- Run On The New
+  Machine, In Order"`, etc.).
+
 ## 4. Explicitly not doing
 
 - ArduPilot SITL auto-install -- unchanged, still manual-fallback-only (no

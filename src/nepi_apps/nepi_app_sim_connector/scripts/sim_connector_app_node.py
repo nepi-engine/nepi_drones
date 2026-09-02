@@ -644,6 +644,26 @@ class NepiSimConnectorApp:
     self.os_instance_pending_id = ''
     self.os_instance_last_error = ''
     self.os_instance_pending_setup_commands = ''
+    # Registers the always-present, always-named "this is what's currently
+    # connected" entry -- reported live: the OS picker should never show a
+    # generic "Default" placeholder, it should show the real name of
+    # whatever it's actually pointed at. Derived from whichever connection
+    # simulator_launch_targets.yaml itself hardcodes (every target shares
+    # the same host/ssh_user/ssh_port by convention, so the first one
+    # stands in for all of them). connection_display_name is an optional
+    # top-level key in that yaml for a human-friendly override; falls back
+    # to "user@host:port" (still a real identity, never a placeholder) when
+    # absent. See OsInstanceRegistry.ensure_baseline's own docstring.
+    if self.launcher is not None:
+      first_target = next((t for t in self.launcher.config.get('launch_targets', {}).values() if t), None)
+      if first_target is not None:
+        baseline_host = first_target.get('host', '')
+        baseline_user = first_target.get('ssh_user', '')
+        baseline_port = first_target.get('ssh_port', 22)
+        baseline_name = self.launcher.config.get('connection_display_name') or (
+            baseline_user + '@' + baseline_host + ':' + str(baseline_port))
+        self.os_instance_registry.ensure_baseline(baseline_name, baseline_host,
+                                                  baseline_user, baseline_port)
     # A previously-selected instance survives a node restart via the
     # registry's own persisted 'selected' flag, but self.launcher above was
     # just freshly loaded from simulator_launch_targets.yaml (host/ssh_user/
