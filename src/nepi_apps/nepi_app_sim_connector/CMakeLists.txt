@@ -23,6 +23,7 @@ add_message_files(FILES
 	SensorTopicInfo.msg
 	SimInfo.msg
 	SimLauncherStatus.msg
+	SimOsInstancesStatus.msg
 	SimStatus.msg
 )
 

@@ -7,6 +7,15 @@ convenience, skip all of this and see `SIM_CONNECTOR_TESTING_GUIDE.md`
 instead -- running a simulator yourself and pointing it at the device's
 already-open TCP listener needs no SSH setup at all.
 
+**Registering more than one machine?** See `SIM_OS_INSTANCES_PLAN.md` and the
+Sim Connector RUI panel's own "OS" picker ("+ Add New OS Instance") instead
+of hand-editing anything below -- it generates the same SSH-key and
+reverse-tunnel commands this doc walks through by hand, with the right port
+already filled in for each machine you register. This doc remains the
+reference for what those generated commands actually do and why, and for the
+very first (default, port-12222) machine `simulator_launch_targets.yaml`
+itself hardcodes.
+
 ## Why this exists
 
 Two machines, no shared ROS master, connected only by SSH:

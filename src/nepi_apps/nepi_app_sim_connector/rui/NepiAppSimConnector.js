@@ -24,6 +24,7 @@ import { observer, inject } from "mobx-react"
 import { Columns, Column } from "./Columns"
 
 import NepiIFSim from "./Nepi_IF_Sim"
+import NepiIFSimOsInstances from "./Nepi_IF_SimOsInstances"
 
 @inject("ros")
 @observer
@@ -86,6 +87,17 @@ class NepiAppSimConnector extends Component {
 
       <Columns>
         <Column>
+
+          {/* Additive "OS selected" picker (see docs/SIM_OS_INSTANCES_PLAN.md) --
+              mounted above NepiIFSim so it reads as the top control of this
+              section. Selecting a registered instance here re-points every
+              simulator_launch_targets.yaml target's host/ssh_user/ssh_port at
+              that machine; NepiIFSim/NepiIFSimLauncher below are unmodified and
+              keep working exactly as before regardless of which instance (if
+              any) is selected. */}
+          <NepiIFSimOsInstances
+            namespace={simNamespace}
+          />
 
           {/* show_controls is deliberately false, not a bug -- this panel's job is
               standing up the right sim/robot config, not direct control. Manual

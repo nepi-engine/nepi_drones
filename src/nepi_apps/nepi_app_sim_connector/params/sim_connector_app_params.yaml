@@ -14,6 +14,7 @@ RUI_DICT:
   - Nepi_IF_Sim.js
   - Nepi_IF_Sim-Controls.js
   - Nepi_IF_SimLauncher.js
+  - Nepi_IF_SimOsInstances.js
   rui_main_file: NepiAppSimConnector.js
   rui_main_class: NepiAppSimConnector
 

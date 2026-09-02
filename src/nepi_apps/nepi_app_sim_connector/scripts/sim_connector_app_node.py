@@ -137,6 +137,18 @@ from nepi_api.simulator_launcher import (SimulatorLauncher, LauncherError,
                                          find_config_path)
 from nepi_app_sim_connector.msg import SimLauncherStatus
 
+# Additive multi-OS-instance deploy-target registry (see
+# docs/SIM_OS_INSTANCES_PLAN.md in nepi_drones) -- generalizes
+# simulator_launch_targets.yaml's single hardcoded VM into a small,
+# separately-persisted list of registered machines. Same "installed
+# alongside device_if_sim.py/optional at runtime" shape as the launcher
+# import above; self.os_instance_registry is constructed unconditionally
+# below (it has its own empty-by-default persistence, independent of whether
+# self.launcher itself is configured) so the OS picker is always available
+# even on a deployment with no simulator_launch_targets.yaml at all.
+from nepi_api.os_instance_registry import OsInstanceRegistry
+from nepi_app_sim_connector.msg import SimOsInstancesStatus
+
 PKG_NAME = 'SIM_CONNECTOR'
 
 # This app's own ROS package name, used to find its installed params file by
@@ -620,6 +632,47 @@ class NepiSimConnectorApp:
       except LauncherError as e:
         self.msg_if.pub_warn("Simulator auto-launch disabled (config at " +
                              launcher_config_path + " unusable): " + str(e))
+
+    ##############################
+    # Multi-OS-instance deploy-target registry (see
+    # docs/SIM_OS_INSTANCES_PLAN.md) -- additive over simulator_launch_targets.yaml's
+    # single hardcoded VM. Constructed unconditionally (its own persistence
+    # defaults to empty, independent of self.launcher above) so the OS picker
+    # is always available, even with no launch-targets config at all.
+    self.os_instance_registry = OsInstanceRegistry()
+    self.os_instance_setup_state = 'idle'
+    self.os_instance_pending_id = ''
+    self.os_instance_last_error = ''
+    self.os_instance_pending_setup_commands = ''
+    # A previously-selected instance survives a node restart via the
+    # registry's own persisted 'selected' flag, but self.launcher above was
+    # just freshly loaded from simulator_launch_targets.yaml (host/ssh_user/
+    # ssh_port back to that file's own hardcoded values) -- re-apply here so
+    # the two stay in sync across a restart exactly as they were before it.
+    if self.os_instance_registry.selected_instance_id and self.launcher is not None:
+      try:
+        self.os_instance_registry.select(self.os_instance_registry.selected_instance_id,
+                                         self.launcher)
+      except LauncherError as e:
+        self.msg_if.pub_warn("Failed to re-apply previously-selected OS instance on "
+                             "startup: " + str(e))
+
+    self.os_instances_status_pub = nepi_sdk.create_publisher(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/os_instances/status'),
+        SimOsInstancesStatus, queue_size = 1, latch = True)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/os_instances/register'),
+        String, self.registerOsInstanceCb, queue_size = 1)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/os_instances/verify'),
+        String, self.verifyOsInstanceCb, queue_size = 1)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/os_instances/select'),
+        String, self.selectOsInstanceCb, queue_size = 1)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/os_instances/remove'),
+        String, self.removeOsInstanceCb, queue_size = 1)
+    self.publishOsInstancesStatus()
 
     self.launcher_status_pub = nepi_sdk.create_publisher(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/launcher_status'),
@@ -2602,6 +2655,118 @@ class NepiSimConnectorApp:
     else:
       status.manual_fallback_commands = ''
     self.launcher_status_pub.publish(status)
+
+  #**********************
+  # Multi-OS-instance deploy-target registry -- see
+  # docs/SIM_OS_INSTANCES_PLAN.md. Register/verify/select/remove all run
+  # synchronously on the subscriber's own callback thread (unlike
+  # launch/stop/install above): every one of these is a single short-timeout
+  # SSH probe or a plain file write, none of the long-running
+  # "hold an ssh session open for the sim's own lifetime" concern that makes
+  # runLaunch/runInstall need a dedicated background thread.
+
+  def publishOsInstancesStatus(self):
+    status = SimOsInstancesStatus()
+    instances = self.os_instance_registry.list_instances()
+    # Stable order (sorted by id) rather than dict iteration order, so the
+    # RUI's picker doesn't visibly reshuffle entries between two status
+    # messages that happen to load the same instances in a different order.
+    ids = sorted(instances.keys())
+    status.instance_ids = ids
+    status.instance_display_names = [instances[i].get('display_name', i) for i in ids]
+    status.instance_hosts = [instances[i].get('host', '') for i in ids]
+    status.instance_ssh_users = [instances[i].get('ssh_user', '') for i in ids]
+    status.instance_ssh_ports = [int(instances[i].get('ssh_port', 0)) for i in ids]
+    status.instance_statuses = [instances[i].get('status', 'pending') for i in ids]
+    status.selected_instance_id = self.os_instance_registry.selected_instance_id
+    status.setup_state = self.os_instance_setup_state
+    status.pending_instance_id = self.os_instance_pending_id
+    status.last_error = self.os_instance_last_error
+    status.pending_setup_commands = self.os_instance_pending_setup_commands
+    self.os_instances_status_pub.publish(status)
+
+  def registerOsInstanceCb(self, msg):
+    display_name = str(msg.data).strip()
+    if not display_name:
+      self.msg_if.pub_warn("Cannot register an OS instance with an empty name")
+      return
+    try:
+      instance_id, setup_commands = self.os_instance_registry.register(display_name)
+    except LauncherError as e:
+      self.os_instance_setup_state = 'failed'
+      self.os_instance_last_error = str(e)
+      self.publishOsInstancesStatus()
+      return
+    self.os_instance_setup_state = 'registering'
+    self.os_instance_pending_id = instance_id
+    self.os_instance_last_error = ''
+    self.os_instance_pending_setup_commands = setup_commands
+    self.msg_if.pub_info("Registered OS instance '" + display_name + "' (" + instance_id + ")")
+    self.publishOsInstancesStatus()
+
+  def verifyOsInstanceCb(self, msg):
+    # Payload is JSON {"instance_id": ..., "ssh_user": ..., "host": ...} --
+    # host is optional (defaults to the reverse-tunnel convention, see
+    # OsInstanceRegistry.verify's own docstring), ssh_user is required the
+    # first time an instance is verified.
+    raw = str(msg.data).strip()
+    try:
+      payload = json.loads(raw)
+    except ValueError:
+      payload = {'instance_id': raw}
+    if not isinstance(payload, dict) or not payload.get('instance_id'):
+      self.msg_if.pub_warn("Verify OS instance payload must include an instance_id")
+      return
+    instance_id = str(payload['instance_id']).strip()
+    ssh_user = payload.get('ssh_user')
+    host = payload.get('host')
+    self.os_instance_setup_state = 'verifying'
+    self.os_instance_pending_id = instance_id
+    self.publishOsInstancesStatus()
+    try:
+      self.os_instance_registry.verify(instance_id, host=host, ssh_user=ssh_user)
+    except LauncherError as e:
+      self.os_instance_setup_state = 'failed'
+      self.os_instance_last_error = str(e)
+      self.publishOsInstancesStatus()
+      return
+    self.os_instance_setup_state = 'idle'
+    self.os_instance_last_error = ''
+    self.os_instance_pending_setup_commands = ''
+    self.msg_if.pub_info("OS instance '" + instance_id + "' verified")
+    self.publishOsInstancesStatus()
+
+  def selectOsInstanceCb(self, msg):
+    instance_id = str(msg.data).strip()
+    if not instance_id:
+      return
+    try:
+      self.os_instance_registry.select(instance_id, self.launcher)
+    except LauncherError as e:
+      self.os_instance_setup_state = 'failed'
+      self.os_instance_last_error = str(e)
+      self.publishOsInstancesStatus()
+      return
+    self.os_instance_setup_state = 'idle'
+    self.os_instance_last_error = ''
+    self.msg_if.pub_info("Selected OS instance '" + instance_id +
+                         "' as the sim-connector deploy target")
+    # The selected instance's host/ssh_user/ssh_port now apply to every
+    # launch target -- republish SimLauncherStatus too so the existing
+    # Simulator dropdown's install-check state naturally re-evaluates
+    # against the newly-selected machine (checkInstalledAllCb's own
+    # background sweep will pick this up on its next tick regardless; this
+    # just avoids waiting for that tick before the RUI reflects the change).
+    self.publishOsInstancesStatus()
+    self.publishLauncherStatus()
+
+  def removeOsInstanceCb(self, msg):
+    instance_id = str(msg.data).strip()
+    if not instance_id:
+      return
+    self.os_instance_registry.remove(instance_id)
+    self.msg_if.pub_info("Removed OS instance '" + instance_id + "'")
+    self.publishOsInstancesStatus()
 
   #**********************
   # Connection health
