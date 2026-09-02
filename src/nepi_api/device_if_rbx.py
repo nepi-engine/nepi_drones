@@ -1948,9 +1948,21 @@ class RBXRobotIF:
         # Calculate setpoint position and yaw errors
         geopoint_errors_geo = np.array(self.current_location_wgs84_geo) - np.array(new_geopoint_wgs84)
         geopoint_errors_m = [geopoint_errors_geo[0]*111139,geopoint_errors_geo[1]*111139,geopoint_errors_geo[2]]
-        for ind in range(3):  # Ignore error check if set to current
-          if input_geopoint_wgs84[ind] == -999.0:
-            geopoint_errors_m[ind] = 0
+        # NOTE: a -999 input axis is resolved to a concrete snapshotted target
+        # (new_geopoint_wgs84[ind], captured at call start) above, not left
+        # unconstrained -- so its error is real drift away from that hold
+        # point, not a meaningless comparison. Previously this loop zeroed
+        # out any -999 axis's error unconditionally, which meant a "hold
+        # current altitude" goto (e.g. GOTO_LOCATION's -999 altitude) could
+        # never be blocked from reporting "reached" by altitude divergence,
+        # even while the vehicle visibly climbed away from where it started.
+        # Confirmed live 2026-08-27: after a TAKEOFF->GUIDED handoff, the
+        # ArduPilot SITL vehicle sometimes climbs ~15-20m past a correctly
+        # and continuously re-sent altitude setpoint (verified via direct
+        # capture of the actual setpoint_position/global messages staying
+        # perfectly constant while ground-truth altitude diverged) -- with
+        # the axis unmasked, that drift is now detected and the goto keeps
+        # retrying/timing out honestly instead of silently declaring success.
         max_geopoint_error_m = np.max(np.abs(geopoint_errors_m))
         if input_yaw_ned_deg == -999: # Ignore error check if set to current
           setpoint_location_global_yaw_reached = True

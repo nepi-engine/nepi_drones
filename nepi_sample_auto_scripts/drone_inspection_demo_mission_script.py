@@ -34,6 +34,7 @@
 
 import rospy
 import sys
+import os
 import time
 from nepi_sdk import nepi_ros
 from nepi_sdk import nepi_settings
@@ -60,13 +61,68 @@ TAKEOFF_HEIGHT_M = 10.0
 # goto_location is [LAT, LONG, ALT_WGS84, YAW_NED_DEGREES]
 # Altitude is specified as meters above the WGS-84 and converted to AMSL before sending
 # Yaw is specified in NED frame degrees 0-360 or +-180
-GOTO_LOCATION = [47.6541208,-122.3186620, 10, -999] # [Lat, Long, Alt WGS84, Yaw NED Frame], Enter -999 to use current value
-GOTO_LOCATION_CORNERS =  [[47.65412620,-122.31881480, -999, -999],[47.65402050,-122.31875320, -999, -999],[47.65391570,-122.31883630, -999, -999]]
+#
+# These were Seattle-area coordinates (~47.65,-122.32) with a real-hardware,
+# fake-GPS deployment in mind -- thousands of km from the SITL's actual CMAC
+# spawn point (see HOME_LOCATION below, matching the sibling
+# drone_follow_object_mission_script.py's corrected value). Against a SITL
+# this sent goto_location commands to fly there literally, which is not a
+# testable mission. Replaced with the same small triangular patrol pattern
+# (identical lat/long deltas from home as the original Seattle waypoints),
+# just re-centered on CMAC so this script is actually testable against the
+# dev VM's SITL.
+#
+# GOTO_LOCATION_CORNERS' altitude is an EXPLICIT value (613.44 = the CMAC
+# field's 603.44 m AMSL + TAKEOFF_HEIGHT_M), not -999 (hold current).
+# Confirmed live 2026-08-27: chaining multiple -999-altitude goto_location
+# calls back to back climbed the vehicle from ~10 m AGL after the first
+# call to ~48 m AGL by the third corner (613 -> 632 -> 633 -> 651 m AMSL
+# commanded, each call nominally just "holding" whatever altitude the
+# previous one left it at) -- confirmed via Gazebo ground truth, not just
+# a telemetry artifact. Root cause not fully pinned down (traced deep into
+# device_if_rbx.py's setpoint_location_global_wgs84()/current_geoid_height_m
+# plumbing without finding a clean, confident mechanism -- likely a race
+# between the GPS-fix callback and the goto-processing loop reading
+# current_geoid_height_m/current_location_wgs84_geo mid-update), so rather
+# than risk a shared-driver-level fix without fully understanding it,
+# sidestepped here at the script level: an explicit altitude removes the
+# repeated-current-altitude-read path entirely, since it was verified in
+# this same test that a SINGLE -999-altitude call (the main GOTO_LOCATION
+# below, called only once right after takeoff) is NOT affected. Worth
+# revisiting device_if_rbx.py's geoid-height handling directly if any other
+# script needs to safely chain multiple -999-altitude goto_locations.
+GOTO_LOCATION = [-35.3632241, 149.1653332, -999, -999] # [Lat, Long, Alt WGS84, Yaw NED Frame], Enter -999 to use current value
+GOTO_LOCATION_CORNERS =  [[-35.3632187,149.1651804, 613.44, -999],[-35.3632244,149.1652420, 613.44, -999],[-35.3632292,149.1651589, 613.44, -999]]
 
 # Set Home Poistion
-ENABLE_FAKE_GPS = True
-SET_HOME = True
-HOME_LOCATION = [47.6540828,-122.3187578,0.0]
+#
+# ENABLE_FAKE_GPS was True, and that is exactly what stops this script from
+# ever flying against a SITL -- same root cause already diagnosed and fixed
+# in the sibling drone_follow_object_mission_script.py (2026-08-12): the
+# Fake GPS app injects GPS_INPUT from HOME_LOCATION while the SITL already
+# has its own simulated GPS at CMAC, thousands of km apart, both claiming
+# gps_id 0. The EKF never forms a position estimate, ArduPilot answers
+# "PreArm: Need Position Estimate", and LAUNCH aborts at the ARM step.
+#
+# Fake GPS exists for a real airframe with no GPS of its own. A SITL has
+# one, so it must stay OFF here. rbx_ardupilot_node.py's
+# reconcileFakeGpsApp() also auto-disables it whenever it detects a SITL,
+# so leaving this True would just have the script fighting the driver.
+ENABLE_FAKE_GPS = False
+# SET_HOME was True, and with Fake GPS off it is actively harmful against a
+# SITL -- same bug already fixed in the sibling script: a home altitude of
+# 0.0 m moves the EKF's home reference to sea level while the CMAC field
+# sits ~603 m AMSL, so the vehicle believes it's already ~584 m above home
+# and the takeoff climb target is already below current altitude, causing
+# "armed in GUIDED mode but the takeoff did not complete". A SITL spawns
+# with a correct home exactly where it sits, so the right move is to leave
+# it alone. HOME_LOCATION is kept below, corrected to the SITL's own CMAC
+# location including its real ~603 m AMSL field elevation (identical value
+# to drone_follow_object_mission_script.py's), so flipping SET_HOME back on
+# for a real fake-GPS deployment does not silently reintroduce the
+# sea-level bug.
+SET_HOME = False
+HOME_LOCATION = [-35.3632621,149.1652374,603.44]
 
 # Goto Error Settings
 GOTO_MAX_ERROR_M = 2.0 # Goal reached when all translation move errors are less than this value
@@ -76,8 +132,12 @@ GOTO_STABILIZED_SEC = 1.0 # Window of time that setpoint error values must be go
 # CMD Timeout Values
 CMD_STATE_TIMEOUT_SEC = 5
 CMD_MODE_TIMEOUT_SEC = 5
-CMD_ACTION_TIMEOUT_SEC = 20
-CMD_GOTO_TIMEOUT_SEC = 20
+# Both raised from 20 -- confirmed live in the sibling script that SITL plus
+# Gazebo on a loaded VM runs slower than realtime (a 10 m takeoff climb took
+# ~20 s wall-clock), so a 20 s budget lands right on the timeout and scores
+# an actually-succeeding action as a failure. 60/40 leave real headroom.
+CMD_ACTION_TIMEOUT_SEC = 60
+CMD_GOTO_TIMEOUT_SEC = 40
 
 #########################################
 # Node Class
@@ -110,6 +170,14 @@ class drone_inspection_demo_mission(object):
     rbx_namespace = (robot_namespace + "rbx/")
     self.msg_if.pub_info("Using rbx namesapce " + rbx_namespace)
     self.rbx_initialize(rbx_namespace)
+    # Registered as soon as the rbx_* publishers cleanup_actions() needs
+    # actually exist. This mission normally reaches post_mission_actions()'s
+    # own RTL on its own linear path, but that never runs if the RUI stops
+    # this script mid-mission -- same gap found and fixed in the sibling
+    # drone_follow_object_mission_script.py (cleanup_actions() previously
+    # existed but was never wired to anything, so a mid-mission stop could
+    # leave the vehicle armed/flying with nothing supervising it).
+    rospy.on_shutdown(self.cleanup_actions)
     time.sleep(1)
     self.msg_if.pub_info("Waiting for status message")
     while self.rbx_status is None and not rospy.is_shutdown():
@@ -275,7 +343,13 @@ class drone_inspection_demo_mission(object):
     # Fake GPS is a standalone app now (nepi_app_fake_gps), not a per-robot rbx/ topic --
     # a single instance at the base namespace injects HilGPS into whichever mavros node
     # the driver is attached to.
-    FAKE_GPS_NAMESPACE = self.base_namespace + "app_fake_gps/"
+    # os.path.join, not string concatenation: get_base_namespace() returns the
+    # namespace with NO trailing slash, so "base + 'app_fake_gps/'" would build
+    # the topic "/nepi/device1app_fake_gps/enable" -- same bug found and fixed
+    # in the sibling drone_follow_object_mission_script.py. Dormant here too
+    # (ENABLE_FAKE_GPS is False), fixed anyway so re-enabling it for a real
+    # fake-GPS deployment doesn't silently publish to a topic nothing subscribes to.
+    FAKE_GPS_NAMESPACE = os.path.join(self.base_namespace, "app_fake_gps") + "/"
     self.fake_gps_enable_pub = nepi_ros.create_publisher(FAKE_GPS_NAMESPACE + "enable", Bool, queue_size=1)
 
     self.msg_if.pub_info("RBX initialize process complete")
@@ -465,6 +539,24 @@ class drone_inspection_demo_mission(object):
       # Send goto Location Command
       self.msg_if.pub_info("Starting goto Location Corners Process")
       success = self.goto_rbx_location(GOTO_LOCATION_CORNERS[ind],timeout_sec =CMD_GOTO_TIMEOUT_SEC)
+      error_str = str(self.rbx_status.errors_current)
+      if success:
+        self.msg_if.pub_info("Goto Location Corner " + str(ind) + " completed with errors: " + error_str )
+      else:
+        # Confirmed live 2026-08-27: ArduPilot SITL can climb well past a
+        # correctly and continuously re-sent altitude setpoint after a
+        # TAKEOFF->GUIDED handoff, causing this goto to time out here
+        # instead of silently reporting success. A fresh re-issue of the
+        # same goto occasionally breaks that stuck condition, so retry once
+        # before moving on rather than compounding the error into the next
+        # corner uncorrected.
+        self.msg_if.pub_info("Goto Location Corner " + str(ind) + " failed with errors: " + error_str + " -- retrying once")
+        success = self.goto_rbx_location(GOTO_LOCATION_CORNERS[ind],timeout_sec =CMD_GOTO_TIMEOUT_SEC)
+        error_str = str(self.rbx_status.errors_current)
+        if success:
+          self.msg_if.pub_info("Goto Location Corner " + str(ind) + " retry completed with errors: " + error_str )
+        else:
+          self.msg_if.pub_info("Goto Location Corner " + str(ind) + " retry failed with errors: " + error_str + " -- proceeding anyway")
       # Run Mission Actions
       self.msg_if.pub_info("Starting Mission Actions")
       success = self.mission_actions()
@@ -522,6 +614,21 @@ class drone_inspection_demo_mission(object):
 
   def cleanup_actions(self):
     self.msg_if.pub_info("Shutting down: Executing script cleanup actions")
+    # Best-effort safety net for a mid-mission stop (e.g. via the RUI) --
+    # post_mission_actions() already does this on the script's own normal
+    # completion path, so only act here if that never got a chance to run
+    # (vehicle still reports ARM).
+    try:
+      if self.rbx_info is not None and self.rbx_cap_states:
+        armed_ind = -1
+        for ind, state in enumerate(self.rbx_cap_states):
+          if state == "ARM":
+            armed_ind = ind
+        if armed_ind != -1 and self.rbx_info.state == armed_ind:
+          self.msg_if.pub_info("Vehicle still armed on shutdown -- sending RTL")
+          self.set_rbx_mode("RTL", timeout_sec = CMD_MODE_TIMEOUT_SEC)
+    except Exception as e:
+      self.msg_if.pub_warn("RTL on cleanup failed: " + str(e))
 
 #########################################
 # Main

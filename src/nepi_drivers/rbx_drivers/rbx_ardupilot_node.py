@@ -1164,11 +1164,14 @@ class ArdupilotNode:
   def gps_topic_callback(self,navsatfix_msg):
       if navsatfix_msg.latitude != 0:
         self.gps_connected = True
-      #Fix Mavros Altitude Error
-      if self.rbx_if is None:
-        geoid_height_m = 0
-      else:
-        geoid_height_m = self.rbx_if.current_geoid_height_m
+      # geoid_height_m used to be read back from self.rbx_if.current_geoid_height_m,
+      # which is itself only ever set from navpose_dict['geoid_height_meters']
+      # below -- a self-referential loop with no real geoid-separation source
+      # feeding it, permanently pinned at its initial value of 0 (confirmed
+      # live 2026-08-27). No real geoid data is available from this SITL's
+      # NavSatFix, so this is left an explicit, honest 0 instead of a fake
+      # correction that only looked like it was doing something.
+      geoid_height_m = 0
       altitude_wgs84 = navsatfix_msg.altitude - geoid_height_m
       time_ns = nepi_sdk.sec_from_msg_stamp(navsatfix_msg.header.stamp)
       # Location Lat,Long
@@ -1190,7 +1193,17 @@ class ArdupilotNode:
       pos_msg = odom_msg.pose.pose.position
       pos_list = [pos_msg.x, pos_msg.y, pos_msg.z]
       rpy = nepi_nav.convert_quat2rpy(or_list)
-      xyz = nepi_nav.convert_point_body2enu(pos_list,rpy[2])
+      # nav_msgs/Odometry's pose is always in a world-fixed frame (per
+      # header.frame_id), never body-relative -- mavros's global_position/local
+      # already reports an absolute ENU position here. Rotating it through
+      # convert_point_body2enu() (meant for genuinely body-relative offsets)
+      # double-applied the vehicle's own yaw on top of an already-absolute
+      # position, so any x/y offset from the origin got rotated by the
+      # vehicle's heading -- confirmed live 2026-08-27 as the root cause of
+      # horizontal drift/"flew to some random place" during follow-object
+      # missions (a goto to a real target coordinate got silently re-rotated
+      # into the wrong direction as soon as the vehicle's yaw was nonzero).
+      xyz = pos_list
       time_ns = nepi_sdk.sec_from_msg_stamp(odom_msg.header.stamp)
 
       # Orientation Degrees in selected 3d frame (roll,pitch,yaw)

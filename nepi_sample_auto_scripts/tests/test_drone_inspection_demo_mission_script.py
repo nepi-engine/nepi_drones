@@ -403,6 +403,9 @@ def _make_rospy_stub(record):
     def signal_shutdown(reason):
         record["signal_shutdown_calls"].append(reason)
 
+    def on_shutdown(callback):
+        record["on_shutdown_callbacks"].append(callback)
+
     def Publisher(topic, data_class, queue_size=1, **kwargs):
         pub = FakePublisher(topic, data_class, queue_size=queue_size)
         record["rospy_publishers"].append(pub)
@@ -410,6 +413,7 @@ def _make_rospy_stub(record):
 
     rospy.is_shutdown = is_shutdown
     rospy.signal_shutdown = signal_shutdown
+    rospy.on_shutdown = on_shutdown
     rospy.Publisher = Publisher
     return rospy
 
@@ -658,6 +662,7 @@ class TestDroneInspectionDemoMissionScript(unittest.TestCase):
             "pub_error": [],
             "rospy_publishers": [],
             "signal_shutdown_calls": [],
+            "on_shutdown_callbacks": [],
         }
         self.module = _load_target_module(self.record)
 
@@ -712,11 +717,19 @@ class TestDroneInspectionDemoMissionScript(unittest.TestCase):
         self.assertEqual(self.record["signal_shutdown_calls"], ["Mission Complete, Shutting Down"])
 
         # Fake GPS is the standalone app_fake_gps app (Bool on .../enable),
-        # not a per-robot rbx/enable_fake_gps topic.
+        # not a per-robot rbx/enable_fake_gps topic. ENABLE_FAKE_GPS/SET_HOME
+        # are both False against a SITL (see the module's own USER SETTINGS
+        # comments) -- confirmed live 2026-08-27 that leaving either True
+        # fights the SITL's own simulated GPS and blocks PreArm entirely, so
+        # this script must never publish to either topic by default.
         fake_gps_topic, fake_gps_msg_cls, fake_gps_pub = self._publisher_for("app_fake_gps/enable")
         self.assertIs(fake_gps_msg_cls, FakeBool)
         self.assertEqual(fake_gps_topic, "/nepi/device1/app_fake_gps/enable")
-        self.assertTrue(any(getattr(p, "data", p) is True or p is True for p in fake_gps_pub.published))
+        self.assertEqual(fake_gps_pub.published, [])
+
+        set_home_topic, set_home_cls, set_home_pub = self._publisher_for("set_home")
+        self.assertIs(set_home_cls, FakeGeoPoint)
+        self.assertEqual(set_home_pub.published, [])
 
         # Snapshot trigger fired once per mission_actions() call: the main
         # goto + 3 corner gotos = 4 total.
@@ -843,6 +856,39 @@ class TestDroneInspectionDemoMissionScript(unittest.TestCase):
         self.assertNotRegex(code, r"\bRBXStatus\(")
         self.assertNotRegex(code, r"\bRBXGoto\w*\b")
         self.assertNotRegex(code, r"\bRBXErrorBounds\b")
+
+    def test_cleanup_actions_registered_and_sends_rtl_if_still_armed(self):
+        with mock.patch("time.sleep", return_value=None):
+            node = self.module.drone_inspection_demo_mission()
+
+        # rospy.on_shutdown(self.cleanup_actions) must actually be wired --
+        # previously this method existed but nothing called it, so a
+        # mid-mission RUI stop left the vehicle armed/flying unsupervised.
+        self.assertEqual(len(self.record["on_shutdown_callbacks"]), 1)
+        self.assertEqual(self.record["on_shutdown_callbacks"][0], node.cleanup_actions)
+
+        # Simulate the vehicle still being armed (index 1 in the default
+        # ["DISARM", "ARM"] state_options) when the script is stopped.
+        node.rbx_info.state = 1
+        node.cleanup_actions()
+
+        set_mode_topic, set_mode_cls, set_mode_pub = self._publisher_for("set_mode")
+        # RTL is index 2 in the default mode_options list.
+        self.assertIn(2, [getattr(p, "data", p) for p in set_mode_pub.published])
+
+    def test_cleanup_actions_noop_when_already_disarmed(self):
+        with mock.patch("time.sleep", return_value=None):
+            node = self.module.drone_inspection_demo_mission()
+
+        set_mode_topic, set_mode_cls, set_mode_pub = self._publisher_for("set_mode")
+        published_before = list(set_mode_pub.published)
+
+        # Default post-mission state is DISARM (index 0) -- cleanup should
+        # not send an RTL mode change on top of an already-safe vehicle.
+        node.rbx_info.state = 0
+        node.cleanup_actions()
+
+        self.assertEqual(set_mode_pub.published, published_before)
 
 
 if __name__ == "__main__":
