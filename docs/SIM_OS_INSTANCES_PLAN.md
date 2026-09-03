@@ -198,6 +198,16 @@ placeholder). Fixed two ways:
   platform's fixed convention (not a per-deployment placeholder) rather
   than something to "replace."
 
+## 3d. Missing `autossh` install step
+
+Reported live: a fresh WSL machine following the wizard hit
+`Command 'autossh' not found`. Both options need it (Option A's
+`nepi-tunnel.service` execs `autossh` under the hood same as Option B does
+directly), so `build_setup_commands()` and `SIM_VM_CONNECTION_SETUP.md`'s
+own Step 2 now both open with a one-line install-if-missing check
+(`command -v autossh >/dev/null || sudo apt-get install -y autossh`) before
+either option, rather than assuming it's already present.
+
 ## 4. Explicitly not doing
 
 - ArduPilot SITL auto-install -- unchanged, still manual-fallback-only (no

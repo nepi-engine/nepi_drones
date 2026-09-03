@@ -106,6 +106,12 @@ all. Don't change `DEVICE_SSH_PORT` away from 2222 unless your device's
 setup genuinely differs from this platform default. Override without
 editing any tracked file:
 
+Both paths below need `autossh` -- install it first if you don't already
+have it (reported live: a fresh WSL machine didn't):
+```bash
+command -v autossh >/dev/null || sudo apt-get install -y autossh
+```
+
 **Manual/ad-hoc** (source `nepi_sitl_dev_env.sh` from your `~/.bashrc`
 first, per its own header):
 ```bash
