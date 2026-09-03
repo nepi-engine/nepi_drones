@@ -9,6 +9,7 @@
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023a/projects/objects/backgrounds/protos/TexturedBackground.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023a/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023a/projects/objects/floors/protos/Floor.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023a/projects/appearances/protos/Grass.proto"
 
 WorldInfo {
   basicTimeStep 16
@@ -22,8 +23,13 @@ TexturedBackground {
 }
 TexturedBackgroundLight {
 }
+# Grass appearance (default is a grey checkered Parquetry) -- reported live:
+# the ground should look the same across every sim, grassy like the Gazebo
+# worlds' own Gazebo/Grass ground plane, not grey.
 Floor {
   size 6 6
+  appearance Grass {
+  }
 }
 Robot {
   translation 0 0 0.05

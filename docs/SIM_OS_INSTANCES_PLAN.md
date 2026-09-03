@@ -495,6 +495,60 @@ real `ALIVE` reply through the tunnel, and confirmed `rbx_sim_discovery`
 found and launched `sim_rover1` within one polling cycle (~5s) with no
 operator action beyond the normal Deploy click.
 
+## 3k. Second-instance testing found a real bug, plus a requested simplification (2026-09-03)
+
+Registered a genuinely separate second instance to verify the multi-VM
+mechanics for real (a second local Linux user account, its own login, its
+own `authorized_keys`/sudoers -- the closest proxy to real second hardware
+available in this session) while the first instance's tunnel was still up,
+per the plan's own "multiple instances can be registered/reachable
+simultaneously" design goal.
+
+**Found a real bug this way, not by code reading**: the second instance's
+tunnel crash-looped forever ("remote port forwarding failed for listen
+port 5760"). 3j's own fix (forward `SIM_UTILITY_TUNNEL_PORTS` from every
+instance's tunnel) is correct for exactly one active tunnel, but these
+ports are identical across every instance on purpose (only one simulator
+ever runs at a time) -- a second tunnel's `-R` requests for them are always
+rejected once a first tunnel already holds them, and `-o
+ExitOnForwardFailure=yes` (needed on the control-leg port so a genuinely
+dead connection is detected -- see 3i) turned that one rejected shared port
+into a dead whole session, killing the control-leg port too even though it
+had no conflict of its own. Fixed by splitting into TWO tunnels per
+instance: one for the control-leg port (strict, `ExitOnForwardFailure=yes`)
+and one for the shared ports (tolerant, no such flag -- a rejected bind
+there now just logs a warning and the tunnel stays up). Confirmed live
+after the fix: both instances' tunnels stayed active simultaneously,
+register/verify/select/remove all worked correctly against the real second
+account, and removing it (validating 3j's baseline-removability fix
+generalizes) left the first instance untouched and still selected.
+
+**Also simplified the wizard text itself**, reported live in the same
+message: "way too many steps and too complex... simplify this and combine
+it into smaller commands." The 3-step, 2-lettered-sub-step, 2-parallel-
+option shape (see 3f-3j) had grown one careful fix at a time without ever
+being reconsidered as a whole. Collapsed into one paste-once block (every
+fix from 3f-3k's own commands is still there, just without the surrounding
+numbered-step/lettered-sub-step prose) plus a two-line WSL-without-systemd
+fallback, cutting the generated text from over 100 lines to under 60.
+`docs/SIM_VM_CONNECTION_SETUP.md` remains the fuller reference for anyone
+who wants the design explained end to end; the wizard itself no longer
+tries to also be that document.
+
+**Unrelated to the OS-instance registry, reported in the same message**:
+the Sim Connector panel had two ways to pick the active Environment
+Dimensions config (a dropdown near the top, a button row down in the
+collapsed Config Settings panel) -- both drove the exact same
+`select_environment_dimensions_config` call, entirely redundant. Removed
+the button row, folded its YAML-viewer and Delete-button into the top
+dropdown instead of leaving that capability lost. Also added a `Grass`
+appearance to all three Webots `.wbt` worlds (rover, quadcopter, and the
+sim_connector bridge's own rover world), which had been using Webots'
+default grey checkered floor since they were first written -- reported
+live: "even for the drone sim, the ground should look the same, being the
+grassy one, not just the grey ones" (the Gazebo worlds already used
+`Gazebo/Grass`; only the Webots ones didn't).
+
 ## 4. Explicitly not doing
 
 - Running more than one simulator across instances at once -- matches the

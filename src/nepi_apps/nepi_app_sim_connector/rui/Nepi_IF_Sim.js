@@ -359,8 +359,9 @@ class NepiIFSim extends Component {
       robot_merged_selected_name: null,
       // Raw YAML text of whichever config was selected/saved most
       // recently -- see applyDimensionsYaml's own comment. Shown read-only
-      // by renderDimensionsConfigButtons, the same "click a config, see its
-      // YAML" pattern the capability robot-config buttons already use.
+      // by renderRobotConfigAndDimensionsButtons (robot) /
+      // renderEnvironmentConfigSelector (environment), the same "click a
+      // config, see its YAML" pattern both axes share.
       robot_dimensions_config_yaml_text: '',
       environment_dimensions_config_yaml_text: '',
       robot_dimensions_save_as_name: '',
@@ -407,7 +408,6 @@ class NepiIFSim extends Component {
     this.applyDimensionConfigNames = this.applyDimensionConfigNames.bind(this)
     this.onSaveDimensionsClicked = this.onSaveDimensionsClicked.bind(this)
     this.onSelectDimensionConfig = this.onSelectDimensionConfig.bind(this)
-    this.renderDimensionsConfigButtons = this.renderDimensionsConfigButtons.bind(this)
     this.saveDimensionsAsNamed = this.saveDimensionsAsNamed.bind(this)
     this.onSaveDimensionConfigAsClicked = this.onSaveDimensionConfigAsClicked.bind(this)
     this.onDeleteDimensionConfigClicked = this.onDeleteDimensionConfigClicked.bind(this)
@@ -658,10 +658,11 @@ class NepiIFSim extends Component {
   // this simply keeps the JS-side defaults in that case rather than erroring.
   applyDimensionsYaml(role, yamlText) {
     // Also captured raw, unparsed, into *_dimensions_config_yaml_text --
-    // renderDimensionsConfigButtons' own read-only viewer shows exactly
-    // this text for whichever named config is currently selected, the same
-    // "click a config, see its YAML" behavior the capability robot-config
-    // buttons already have (getRobotConfigCb/robot_config_yaml). This topic
+    // renderRobotConfigAndDimensionsButtons/renderEnvironmentConfigSelector's
+    // own read-only viewers show exactly this text for whichever named
+    // config is currently selected, the same "click a config, see its YAML"
+    // behavior the capability robot-config buttons already have
+    // (getRobotConfigCb/robot_config_yaml). This topic
     // is what select_<role>_dimensions_config's own backend handler
     // (applyDimensionConfigByName) re-publishes to, so selecting a named
     // config populates this viewer with no separate request/topic needed.
@@ -872,8 +873,9 @@ class NepiIFSim extends Component {
   // device side loads it, makes it the active one (same effect Save
   // Dimensions already has), and echoes it back over the existing
   // *_dimensions_yaml topic, so applyDimensionsYaml refreshes the editable
-  // fields, preview diagram, AND renderDimensionsConfigButtons' own YAML
-  // viewer without this handler touching any of them directly. Takes the
+  // fields, preview diagram, AND the relevant YAML viewer (see
+  // applyDimensionsYaml's own comment) without this handler touching any of
+  // them directly. Takes the
   // name directly (not an event) -- driven by a button click, the same
   // shape onViewConfigClicked already uses for capability robot configs.
   onSelectDimensionConfig(role, name) {
@@ -1059,68 +1061,50 @@ class NepiIFSim extends Component {
 
   // Quick-access counterpart to renderRobotConfigSelector above -- same
   // Label-left/Select-right shape, right underneath it, for picking WHICH
-  // saved environment dimensions config is active. Deliberately not gated
-  // on launcher_state: picking a different one still only takes effect at
-  // the next Launch (Gazebo has no way to hot-reload a course layout into
-  // a running world), but there is no reason to block the SELECTION itself
-  // while a sim happens to be running, the same way the Flat Ground/
-  // Obstacle Course Setting toggle (Nepi_IF_Sim-Controls.js) is never
-  // disabled either. Management (save/delete/view YAML) lives in Config
-  // Settings instead (renderDimensionsConfigButtons) -- this is only ever
-  // meant to be a fast switch, not where a new config gets created.
+  // saved environment dimensions config is active (Flat/Obstacle Course/
+  // Aerial Obstacle Course/Custom Obstacles/anything saved). Deliberately
+  // not gated on launcher_state: picking a different one still only takes
+  // effect at the next Launch (Gazebo has no way to hot-reload a course
+  // layout into a running world), but there is no reason to block the
+  // SELECTION itself while a sim happens to be running, the same way the
+  // Flat Ground/Obstacle Course Setting toggle (Nepi_IF_Sim-Controls.js) is
+  // never disabled either.
+  // Also renders the YAML viewer and a Delete button, absorbing what used
+  // to be a second, separate "Environment Dimensions Configs" button row
+  // down in the collapsed Config Settings panel (renderDimensionsConfigButtons)
+  // -- reported live (2026-09-03): that row picked from the exact same list
+  // via the exact same onSelectDimensionConfig call, just as a row of
+  // buttons instead of a dropdown, entirely redundant with this one. Removed
+  // there, folded in here instead of duplicated, so there is exactly one
+  // place to pick AND inspect the active environment config. "Save As New
+  // Config" stays down in renderDimensionsEditor -- that's where the fields
+  // actually being saved are edited, this is only ever a fast switch, not
+  // where a new config gets created.
   // selected === '' means the active values no longer match ANY saved
   // config (an in-progress, unsaved edit -- see setDimensionsCb's own
   // comment on the device) -- shown as its own explicit placeholder option
   // rather than letting the browser fall back to silently highlighting
   // whichever option happens to be first, which would misleadingly look
-  // like that config is what's actually active.
+  // like that config is what's actually active. Delete is disabled (not
+  // hidden -- keeps the row from jumping around) in that same case, since
+  // there's no saved config selected to delete.
   renderEnvironmentConfigSelector() {
     const names = this.state.environment_dimensions_config_names
     const selected = this.state.environment_dimensions_selected_config
-    return (
-      <Label title={"Environment Config"}>
-        <Select
-          onChange={(event) => this.onSelectDimensionConfig('environment', event.target.value)}
-          value={selected}
-        >
-          {(selected === '') ? <Option key={''} value={''}>{'(Unsaved Edits)'}</Option> : null}
-          {names.map((name) => <Option key={name} value={name}>{name}</Option>)}
-        </Select>
-      </Label>
-    )
-  }
-
-  // One row of buttons per saved dimensions config (robot or environment) --
-  // same "buttons you click to select AND view the YAML" pattern the
-  // capability robot-config buttons above already use, not a <Select>
-  // dropdown -- requested live (2026-08-31) so both axes read the same way.
-  // Kept at the TOP of the page, right by the Robot Config selector, rather
-  // than down inside the field-editing sections (renderDimensionsEditor):
-  // picking/deleting a saved config is a top-level decision like picking
-  // the robot config itself, not a per-field editing detail. "Save As New
-  // Config" stays down in renderDimensionsEditor instead, since that is
-  // where the fields actually being saved are edited.
-  renderDimensionsConfigButtons(role, label) {
-    const names = this.state[role + '_dimensions_config_names']
-    const selected = this.state[role + '_dimensions_selected_config']
-    const yamlText = this.state[role + '_dimensions_config_yaml_text']
+    const yamlText = this.state.environment_dimensions_config_yaml_text
     return (
       <React.Fragment>
-        <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
-        <Label title={label} labelStyle={{ fontWeight: 'bold' }} />
-        <ButtonMenu>
-          {names.map((name) => (
-            <Button
-              key={name}
-              style={(name === selected) ? { backgroundColor: Styles.vars.colors.blue } : undefined}
-              onClick={() => this.onSelectDimensionConfig(role, name)}
-            >
-              {name}
-            </Button>
-          ))}
-          <Button
-            onClick={() => this.onDeleteDimensionConfigClicked(role)}
+        <Label title={"Environment Config"}>
+          <Select
+            onChange={(event) => this.onSelectDimensionConfig('environment', event.target.value)}
+            value={selected}
           >
+            {(selected === '') ? <Option key={''} value={''}>{'(Unsaved Edits)'}</Option> : null}
+            {names.map((name) => <Option key={name} value={name}>{name}</Option>)}
+          </Select>
+        </Label>
+        <ButtonMenu>
+          <Button disabled={!selected} onClick={() => this.onDeleteDimensionConfigClicked('environment')}>
             {"Delete Selected Config"}
           </Button>
         </ButtonMenu>
@@ -1137,6 +1121,7 @@ class NepiIFSim extends Component {
       </React.Fragment>
     )
   }
+
 
   // Merged button row for BOTH axes of "robot config" -- the capability
   // profile (Quadcopter/4-Wheel Rover/any custom saved profile,
@@ -1291,7 +1276,6 @@ class NepiIFSim extends Component {
             {this.renderRobotConfigAndDimensionsButtons()}
             {this.renderDimensionsEditor('robot', 'Robot Dimensions', ROBOT_DIMENSION_FIELDS,
                                           this.uploadRobotSdfInputRef)}
-            {this.renderDimensionsConfigButtons('environment', 'Environment Dimensions Configs')}
             {(this.state.environment_dimensions_model === CUSTOM_OBSTACLES_MODEL) ?
               this.renderCustomObstaclesEditor()
             :
@@ -2125,8 +2109,9 @@ class NepiIFSim extends Component {
               active one -- same "save also means use" behavior as Save
               Dimensions above, just under a new name instead of overwriting
               the active config in place. Deleting a saved config lives at
-              the top of the page instead (renderDimensionsConfigButtons),
-              next to the buttons that pick one -- not duplicated here. */}
+              the top of the page instead (renderRobotConfigAndDimensionsButtons/
+              renderEnvironmentConfigSelector), next to the controls that
+              pick one -- not duplicated here. */}
           <Label title={"Name New Config"}>
             <Input
               id={"DimensionsSaveAsName_" + role}

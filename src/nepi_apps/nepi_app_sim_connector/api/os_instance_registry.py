@@ -99,6 +99,28 @@ BASELINE_INSTANCE_ID = 'baseline'
 # instance's own tunnel too, automatically, with no additional operator step
 # -- reported requirement: "this should automatically happen for any
 # connected vm without me prompting."
+#
+# Registering and tunneling a SECOND instance while the first's tunnel is
+# still up (explicitly supported -- see SIM_OS_INSTANCES_PLAN.md: "multiple
+# instances can be registered/reachable simultaneously") surfaced a second
+# bug the same day: these ports are identical across every instance's
+# tunnel on purpose (only one simulator ever runs at a time, so there's
+# only ever one real listener to reach), so the SECOND tunnel's `-R`
+# requests for them are always rejected by sshd -- the first tunnel already
+# holds them. With `-o ExitOnForwardFailure=yes` (needed on the SSH
+# control-leg port so a genuinely dead connection is detected -- see that
+# same flag's own history above), a single rejected forward killed the
+# WHOLE ssh session, including the control-leg port that instance actually
+# owns -- confirmed live: a second registered+tunneled instance crash-
+# looped forever ("remote port forwarding failed for listen port 5760"),
+# unreachable even for its own install/verify/launch despite never being
+# selected. Fixed in build_setup_commands by putting these shared ports on
+# their own ssh invocation, separate from the control-leg port, WITHOUT
+# ExitOnForwardFailure -- a rejected shared-port bind now just logs a
+# harmless warning and the session stays up, while the control-leg port
+# (which has no such conflict, unique per instance) keeps its own strict
+# connection, in its own ssh invocation, where ExitOnForwardFailure still
+# means what it says.
 SIM_UTILITY_TUNNEL_PORTS = [
     5760, 5771,
     9021, 9022, 9023, 9024, 9025, 9026, 9027, 9028, 9029,
@@ -342,127 +364,51 @@ class OsInstanceRegistry(object):
 
   def build_setup_commands(self, instance):
     """The exact copy-paste block the RUI shows for a freshly-registered
-    instance -- mirrors docs/SIM_VM_CONNECTION_SETUP.md's own two documented
-    tunnel paths (systemd, and the plain-autossh fallback needed on a
-    machine like this dev VM's own WSL environment, per that doc's own WSL
-    callout), with the real allocated port substituted in rather than a
-    human hand-editing port numbers out of a markdown file.
+    instance. History: went through three earlier shapes this same week
+    (a numbered STEP 1/2/3 walkthrough with lettered sub-steps and two
+    parallel "Option A/B" tunnel paths each with several paragraphs of
+    prose) as each individually-reported gap got fixed -- see
+    docs/SIM_OS_INSTANCES_PLAN.md's own dated entries for the full history
+    of what each of those fixed and why (missing SSH server, missing
+    device-pubkey trust, missing passwordless sudo, a broken `cp` assuming
+    nepi_drones was checked out on the target, missing SSH keepalives,
+    invalid heredoc indentation, a second-instance port-forwarding
+    collision). Collapsed here (2026-09-03) into ONE paste-once block --
+    reported live: "way too many steps and too complex... simplify this and
+    combine it into smaller commands." Every fix above is still present in
+    the commands themselves; only the surrounding prose walkthrough (three
+    numbered steps, two lettered sub-steps, two fully-spelled-out parallel
+    options) was cut. The systemd path is the only one shown by default now
+    (WSL-without-systemd gets a two-line fallback instead of an equally
+    prose-heavy parallel "Option B") since it is the one that survives a
+    reboot and self-heals, which is what most people want; docs/
+    SIM_VM_CONNECTION_SETUP.md remains the fuller reference doc for anyone
+    who wants the two-tunnel design explained end to end.
 
-    Restructured (reported live: "the commands are kind of hard to
-    understand ... give the right places to go properly") as a plain,
-    numbered walkthrough with an explicit WHERE line on every step, rather
-    than a wall of shell-comment-prefixed lines -- the earlier shape read as
-    one long script when it's actually two machines and two alternative
-    paths interleaved.
+    No SSH-key-generation step, ever (see the git history for why one used
+    to exist and why it was removed -- it once overwrote a machine's own
+    already-working key). Assumes NEPI Remote Setup already ran here, which
+    is the overwhelmingly common case; a machine that has genuinely never
+    done that needs Remote Setup first, not a key generated in isolation.
 
-    No SSH-key-generation step -- reported live: "most people will already
-    have the normal OS-to-NEPI connection working, so there's no reason to
-    have the ssh pub/priv thing there." The overwhelming common case is a
-    machine that's already been through NEPI's own Remote Setup, which
-    already created ~/.ssh/nepi_default_ssh_key and already got its public
-    half trusted by the device -- generating a SECOND keypair here would be
-    redundant at best, and once (see docs/SIM_OS_INSTANCES_PLAN.md's
-    incident writeup) actually destructive: running it against a machine
-    that already had a WORKING nepi_default_ssh_key overwrote that working
-    key, breaking the very connection the device already trusted. The
-    tunnel commands below reuse whatever key is already there; a machine
-    that has genuinely never done Remote Setup at all needs that setup
-    first (see NEPI_REMOTE_SETUP.md), not a key generated in isolation
-    here.
+    device_host is this device's own real, currently-detected IP (see
+    _guess_device_ip), not a placeholder. user (nepi) and port (2222) are
+    this platform's fixed convention (confirmed against a real device: the
+    host-level 'nepi' account can't log in at all, only the container's
+    port 2222 can), not placeholders either -- only device_host and the
+    operator's own username (entered in the RUI at verify time) actually
+    vary per deployment.
 
-    device_host below is filled in with this device's own real, currently-
-    detected IP (see _guess_device_ip) rather than a bare placeholder --
-    reported live: "give the example and also put that as the example in
-    the RUI." user/port are NOT placeholders needing a real value filled
-    in -- 'nepi'/2222 is the actual, tested default this whole mechanism
-    (`nepi_tunnel()`/`nepi-tunnel.service`, see SIM_VM_CONNECTION_SETUP.md's
-    own Step 2) already uses, confirmed directly against the real device
-    this session: the host-level 'nepi' account exists but has a
-    /sbin/nologin shell (cannot SSH in at all), so port 2222 (the
-    container's own sshd, where 'nepi' has a real shell) is the only
-    combination that actually works -- not a placeholder value to replace,
-    unlike device_host which genuinely differs per deployment.
-
-    STEP 1 (new prerequisites) added after a real, live end-to-end test
-    this session (register through select, not just code reading) hit TWO
-    genuine gaps neither the original single-VM doc's Step 2 nor the
-    earlier 2-step wizard covered for a truly fresh machine:
-    - No SSH *server* running on the new machine at all. The reverse
-      tunnel's whole point is forwarding port 22 on the new machine back
-      through the device -- if nothing is listening there, the tunnel
-      still "succeeds" (ssh -R doesn't validate the forward target at
-      connect time), and the failure only surfaces later, confusingly, at
-      Test Connection. A genuinely fresh dev VM (this one, confirmed) can
-      easily have only an SSH *client* installed, never a server.
-    - The device's own public key was never actually shown anywhere for
-      the operator to trust. A working tunnel is not sufficient by
-      itself -- the device still needs to complete a real SSH login
-      through it, which needs a key the new machine trusts.
-      SIM_VM_CONNECTION_SETUP.md's original Step 1 already required this
-      exact second direction ("On the device... whose PUBLIC half is in
-      the VM user's authorized_keys"); the 2-step wizard dropped it when
-      the keygen step was removed, since it read (wrongly) like the same
-      concern the keygen step was cutting. _device_public_key() reads the
-      real value so there's an exact line to copy, not a vague
-      instruction.
-
-    STEP 2's Option A/B rewritten (2026-09-02) after a real live failure on
-    this session's own dev VM found two more genuine bugs:
-    - Option A's `cp sim_container/systemd/nepi-tunnel.service ...` assumed
-      nepi_drones was already checked out (and cwd'd into) on the new
-      machine -- never stated as a prerequisite anywhere. On a machine that
-      never cloned it (confirmed: this is not required to register an OS
-      instance at all, by design -- see SIM_OS_INSTANCES_PLAN.md's own
-      "any Ubuntu machine" framing), the cp silently failed and
-      `systemctl --user enable` then correctly, but confusingly, reported
-      "Unit file ... does not exist". Fixed by generating the unit file
-      inline via heredoc instead -- no nepi_drones checkout needed on the
-      target machine at all, matching this feature's own design intent.
-      (The copied unit also would have used the WRONG port even if the cp
-      had succeeded: the reference nepi-tunnel.service hardcodes port 12222
-      for one specific developer's own setup and has no
-      TUNNEL_SSH_PORT-style override wired into its ExecStart at all --
-      the old Option A's env-file step was setting a variable nothing
-      read.)
-    - Both this heredoc and the old Option B one-liner were missing
-      `-o ServerAliveInterval`/`-o ServerAliveCountMax`/
-      `-o ExitOnForwardFailure` -- confirmed live: after this session's own
-      device container was restarted (via nepicommit/nepistart, for
-      unrelated work), the existing autossh process never noticed its
-      connection had died and never reconnected, since autossh's own
-      monitoring is disabled (-M 0) in favor of exactly these SSH-level
-      keepalives -- without them, autossh has no way to detect a silently
-      dead connection at all. This is the same reason
-      docs/SIM_VM_CONNECTION_SETUP.md's own reference nepi_tunnel()/
-      nepi-tunnel.service already carried these flags; the wizard's
-      simplified one-liner had dropped them. Deploy then fails with
-      "Could not reach your sim VM -- the reverse SSH tunnel... does not
-      appear to be running" until the tunnel is restarted by hand -- now
-      it self-heals within ~45s instead.
-    - Also found while fixing the above: every heredoc terminator line in
-      this method was itself indented (matching the block's overall
-      4-space "copy-paste" visual style), which is invalid for a plain
-      `<<'EOF'` -- the terminator must be flush-left, or the shell keeps
-      reading everything after it as file content instead of executing it.
-      Confirmed by reproducing the exact failure locally. Fixed by keeping
-      the terminator (and the whole heredoc body, which is file content,
-      not a shell command) flush-left; only the surrounding shell commands
-      keep the visual indent.
-
-    STEP 2's tunnel widened (2026-09-03) to also forward
-    SIM_UTILITY_TUNNEL_PORTS, not just the SSH control-leg port -- see that
-    constant's own comment for the full "robot controls don't work, TCP
-    isn't getting detected" root cause this fixes. Automatic for every
-    instance's own generated tunnel, no separate operator step -- reported
-    requirement: "this should automatically happen for any connected vm
-    without me prompting.\""""
+    Still forwards SIM_UTILITY_TUNNEL_PORTS as a SEPARATE tunnel from the
+    per-instance SSH control-leg port -- see that constant's own comment
+    for why (a second registered instance's copy would otherwise crash-loop
+    fighting the first for the same shared ports)."""
     port = instance['ssh_port']
     iid = instance['instance_id']
     # One -R flag per fixed sim-utility port, same numbers for every
-    # instance (see SIM_UTILITY_TUNNEL_PORTS) plus this instance's own
-    # allocated SSH control-leg port -- built once, used in both Option A's
-    # ExecStart and Option B's one-liner below so the two can't drift apart.
-    port_forward_args = " ".join(
+    # instance (see SIM_UTILITY_TUNNEL_PORTS) -- built once, shared by the
+    # systemd unit and its WSL-fallback one-liner below.
+    shared_port_args = " ".join(
         "-R " + str(p) + ":127.0.0.1:" + str(p) for p in SIM_UTILITY_TUNNEL_PORTS)
     # No angle brackets in this fallback placeholder (rare -- only when
     # _guess_device_ip finds neither a config file nor a route) -- reported
@@ -476,71 +422,28 @@ class OsInstanceRegistry(object):
         "PASTE_THIS_DEVICE'S_OWN_PUBLIC_KEY_HERE  # could not read it automatically"
     )
     return (
-        "STEP 1 of 3 -- One-time prerequisites\n"
-        "Where: on the NEW machine (" + instance['display_name'] + ")\n"
-        "\n"
-        "a) Make sure an SSH SERVER (not just the SSH client you already use\n"
-        "   to reach the device) is installed and running here -- the tunnel\n"
-        "   forwards connections TO this machine's own sshd, so without one\n"
-        "   listening the tunnel will look like it worked but Test Connection\n"
-        "   will fail later:\n"
+        "Run this whole block on the NEW machine (" + instance['display_name'] + ").\n"
+        "Assumes NEPI Remote Setup already ran here (so ~/.ssh/nepi_default_ssh_key\n"
+        "already exists and the device already trusts it) -- if not, do that\n"
+        "first: NEPI_REMOTE_SETUP.md.\n"
         "\n"
         "    command -v sshd >/dev/null || sudo apt-get install -y openssh-server\n"
         "    sudo systemctl enable --now ssh\n"
-        "\n"
-        "b) Trust the NEPI device's own key so it can log back in through the\n"
-        "   tunnel (a working tunnel alone doesn't complete the login):\n"
-        "\n"
         "    echo \"" + device_pubkey_line + "\" >> ~/.ssh/authorized_keys\n"
-        "\n"
-        "c) Allow passwordless sudo -- needed for the RUI's Install button to\n"
-        "   work later (it runs apt-get over this same non-interactive SSH\n"
-        "   connection, which has no terminal for sudo to prompt on):\n"
-        "\n"
         "    echo \"$USER ALL=(ALL) NOPASSWD:ALL\" | sudo tee /etc/sudoers.d/nepi-sim-connector\n"
         "    sudo chmod 0440 /etc/sudoers.d/nepi-sim-connector\n"
-        "\n"
-        "\n"
-        "STEP 2 of 3 -- Open a reverse tunnel back to the NEPI device\n"
-        "Where: on the NEW machine (" + instance['display_name'] + ")\n"
-        "\n"
-        "This assumes this machine already has NEPI Remote Setup done (the\n"
-        "normal, already-working OS-to-device connection) -- it already has\n"
-        "~/.ssh/nepi_default_ssh_key, and the device already trusts it. This\n"
-        "step just opens a tunnel with that existing key; it does not create\n"
-        "or change any key. (If this machine has never done Remote Setup at\n"
-        "all, do that first -- see NEPI_REMOTE_SETUP.md -- rather than running\n"
-        "anything below.)\n"
-        "\n"
-        "This NEPI device's own current address is " + device_host + " --\n"
-        "already filled in below. user (nepi) and port (2222) are this\n"
-        "platform's own fixed convention, not placeholders -- leave them as\n"
-        "written.\n"
-        "\n"
-        "Both options below need autossh -- install it first if you don't\n"
-        "already have it (reported live: a fresh WSL machine didn't):\n"
-        "\n"
         "    command -v autossh >/dev/null || sudo apt-get install -y autossh\n"
-        "\n"
-        "Pick ONE of the two options below -- not both.\n"
-        "\n"
-        "  Option A -- recommended: restarts itself automatically on reboot,\n"
-        "  and automatically RECONNECTS if the connection ever silently dies\n"
-        "  (e.g. the device reboots or its software restarts) -- fully\n"
-        "  self-contained below, does NOT need nepi_drones checked out on\n"
-        "  this machine.\n"
-        "\n"
         "    mkdir -p ~/.config/systemd/user\n"
         "    cat > ~/.config/systemd/user/nepi-tunnel-" + iid + ".service <<'EOF'\n"
         "[Unit]\n"
-        "Description=NEPI reverse SSH tunnel to device (OS instance " + iid + ")\n"
+        "Description=NEPI reverse SSH tunnel to device (OS instance " + iid + ", control leg)\n"
         "After=network-online.target\n"
         "Wants=network-online.target\n"
         "StartLimitIntervalSec=0\n"
         "\n"
         "[Service]\n"
         "Type=simple\n"
-        "ExecStart=/usr/bin/autossh -M 0 -N -R " + str(port) + ":127.0.0.1:22 " + port_forward_args + " -p 2222 "
+        "ExecStart=/usr/bin/autossh -M 0 -N -R " + str(port) + ":127.0.0.1:22 -p 2222 "
         "-o ServerAliveInterval=15 -o ServerAliveCountMax=3 "
         "-o ExitOnForwardFailure=yes -o ConnectTimeout=5 "
         "-i %h/.ssh/nepi_default_ssh_key nepi@" + device_host + "\n"
@@ -551,53 +454,39 @@ class OsInstanceRegistry(object):
         "[Install]\n"
         "WantedBy=default.target\n"
         "EOF\n"
+        "    cat > ~/.config/systemd/user/nepi-tunnel-" + iid + "-shared.service <<'EOF'\n"
+        "[Unit]\n"
+        "Description=NEPI reverse SSH tunnel to device (OS instance " + iid + ", shared sim-utility ports)\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n"
+        "StartLimitIntervalSec=0\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "ExecStart=/usr/bin/autossh -M 0 -N " + shared_port_args + " -p 2222 "
+        "-o ServerAliveInterval=15 -o ServerAliveCountMax=3 "
+        "-o ConnectTimeout=5 "
+        "-i %h/.ssh/nepi_default_ssh_key nepi@" + device_host + "\n"
+        "Environment=AUTOSSH_GATETIME=0\n"
+        "Restart=always\n"
+        "RestartSec=10\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+        "EOF\n"
         "    systemctl --user daemon-reload\n"
-        "    systemctl --user enable --now nepi-tunnel-" + iid + ".service\n"
+        "    systemctl --user enable --now nepi-tunnel-" + iid + ".service nepi-tunnel-" + iid + "-shared.service\n"
         "    loginctl enable-linger $(id -un)\n"
         "\n"
-        "  Option B -- one-off command, no systemd required (use this on WSL\n"
-        "  unless you've already turned systemd on in /etc/wsl.conf AND fully\n"
-        "  restarted WSL itself afterward -- `wsl --shutdown` from Windows,\n"
-        "  then reopen your terminal; editing /etc/wsl.conf alone does not\n"
-        "  start systemd in your CURRENT session). The ServerAlive/\n"
-        "  ExitOnForwardFailure flags below matter, not just decoration --\n"
-        "  without them, if this connection ever silently dies (e.g. the\n"
-        "  device reboots or its software restarts), the autossh process\n"
-        "  keeps running but never notices and never reconnects, and Deploy\n"
-        "  fails with \"the reverse SSH tunnel does not appear to be\n"
-        "  running\" until this command is run again by hand -- confirmed\n"
-        "  live, 2026-09-02.\n"
+        "On WSL without systemd enabled: skip the systemd block above and run\n"
+        "these two lines instead (re-run them if the tunnel ever needs\n"
+        "restarting -- they won't survive a reboot on their own):\n"
         "\n"
-        "    autossh -M 0 -f -N -R " + str(port) + ":127.0.0.1:22 \\\n"
-        "      " + port_forward_args + " \\\n"
-        "      -p 2222 \\\n"
-        "      -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \\\n"
-        "      -o ExitOnForwardFailure=yes -o ConnectTimeout=5 \\\n"
-        "      -i ~/.ssh/nepi_default_ssh_key nepi@" + device_host + "\n"
+        "    autossh -M 0 -f -N -R " + str(port) + ":127.0.0.1:22 -p 2222 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o ConnectTimeout=5 -i ~/.ssh/nepi_default_ssh_key nepi@" + device_host + "\n"
+        "    autossh -M 0 -f -N " + shared_port_args + " -p 2222 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ConnectTimeout=5 -i ~/.ssh/nepi_default_ssh_key nepi@" + device_host + "\n"
         "\n"
-        "\n"
-        "STEP 3 of 3 -- Verify it worked\n"
-        "Where: back in the RUI (NOT the new machine, and NOT a command\n"
-        "you need to run at all in the normal case)\n"
-        "\n"
-        "Enter your username on the NEW machine in the field below, then\n"
-        "click \"Test Connection\". That button runs the real check from the\n"
-        "NEPI DEVICE's own side -- which is the only place it means anything,\n"
-        "since the tunnel makes the DEVICE listen on port " + str(port) + " and\n"
-        "forward back to THIS machine's own sshd.\n"
-        "\n"
-        "(Only if that fails and you want to double-check by hand: the\n"
-        "equivalent manual command has to run ON THE NEPI DEVICE ITSELF --\n"
-        "e.g. over `sshnh`/`sshn` if you have direct access to it -- never on\n"
-        "the new machine. Fill in a real username before running it (don't\n"
-        "paste the placeholder text below verbatim -- the < character is\n"
-        "shell redirection syntax and will error):\n"
-        "\n"
-        "    ssh -p " + str(port) + " YOUR_USERNAME_ON_THE_NEW_MACHINE@localhost echo ok\n"
-        "\n"
-        "Running this ON THE NEW MACHINE INSTEAD will always fail with\n"
-        "\"Connection refused\" -- there's nothing listening on that port\n"
-        "there; the forwarded listener only exists on the device side.)"
+        "Then back here in the RUI: enter your username on this machine below\n"
+        "and click \"Test Connection.\""
     )
 
   #**********************
