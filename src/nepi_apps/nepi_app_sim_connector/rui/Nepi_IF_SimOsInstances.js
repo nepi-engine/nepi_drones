@@ -317,15 +317,24 @@ class NepiIFSimOsInstances extends Component {
           </pre>
         </Label>
 
-        <Label title={"Then: The Username You Log Into That Machine As"}>
+        {/* Reported live: an operator typed "nepi" here (the DEVICE's own
+            container username) instead of their own login on the NEW
+            machine, and separately put their own username in the Host
+            field below. Both labels now name the two machines explicitly,
+            and this field gets a live placeholder showing this VM's own
+            actual username as a concrete example, not an abstract one. */}
+        <Label title={"YOUR OWN login username, on the NEW machine (not the device's 'nepi' user)"}>
           <Input
+            placeholder={"e.g. " + (status_msg.instance_ssh_users && status_msg.instance_ssh_users[0]
+              ? status_msg.instance_ssh_users[0] : "your-username")}
             value={this.state.verify_ssh_user}
             onChange={(e) => this.setState({ verify_ssh_user: e.target.value })}
           />
         </Label>
 
-        <Label title={"Host Address (only if NOT using the reverse tunnel above -- leave blank otherwise)"}>
+        <Label title={"Leave this BLANK -- only fill in if you skipped the reverse tunnel entirely"}>
           <Input
+            placeholder={"(leave blank -- using the tunnel above)"}
             value={this.state.verify_host}
             onChange={(e) => this.setState({ verify_host: e.target.value })}
           />

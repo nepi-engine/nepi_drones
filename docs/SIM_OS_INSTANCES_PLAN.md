@@ -235,6 +235,61 @@ in `SIM_VM_CONNECTION_SETUP.md`'s own manual doc now avoids angle brackets
 entirely, so pasting one literally produces an obvious "no such user"/"no
 such host" failure instead of a cryptic shell parse error.
 
+## 3f. First real end-to-end test (2026-09-02) -- two genuine gaps found and fixed
+
+Ran the actual flow against the real device for the first time this
+session (register → tunnel → verify → select → remove), using this repo's
+own dev VM as the "new machine," rather than just reading code. Found two
+real, previously-undocumented gaps -- neither was a bug in existing code,
+both were missing prerequisites the wizard never mentioned:
+
+- **No SSH server on the new machine.** This VM had an SSH *client* only
+  (used all session to reach the device) -- no `sshd`, no
+  `openssh-server` package. The reverse tunnel's whole point is forwarding
+  the device's port back to *this* machine's own sshd; without one
+  listening, `autossh` still reports success (an `-R` forward isn't
+  validated against its target at connect time), and the failure only
+  surfaces later, confusingly, at Test Connection. Installed
+  `openssh-server` and started it to complete the test.
+- **The device's own public key was never trusted on the new machine.**
+  A working tunnel only gets the device's SSH client TO the new machine's
+  sshd -- it still needs a key that machine trusts to actually log in.
+  Confirmed directly: the tunnel itself worked immediately (`ssh -p 12223
+  -i /home/nepi/.ssh/nepi_default_ssh_key suraj@localhost` succeeded) once
+  the device's own public key (`nepi@numurus`, read from
+  `/home/nepi/.ssh/nepi_default_ssh_key.pub` inside the container) was
+  appended to the new machine's `authorized_keys`. This is exactly the
+  second direction `SIM_VM_CONNECTION_SETUP.md`'s original Step 1 already
+  required ("On the device... whose PUBLIC half is in the VM user's
+  authorized_keys") -- the 2-step wizard dropped it when the keygen step
+  was removed, since it read like the same concern.
+
+Both fixed by adding a new **STEP 1 of 3** ("One-time prerequisites") ahead
+of the tunnel step: an install-if-missing check for `openssh-server` (same
+pattern as the existing `autossh` check), and a real, auto-read line to
+append to `authorized_keys` -- `_device_public_key()` (new, mirrors
+`_ssh_key_candidates()`'s own priority order, reading the `.pub` half of
+whatever `_ssh_key()` would use) fills in the actual key content, not a
+vague instruction. Steps renumbered 1-3; verify moved to Step 3, unchanged
+otherwise.
+
+**Also found (RUI, not the wizard text) while diagnosing the earlier
+`suraj`/`nepi` mix-up**: the verify form's two fields were genuinely
+ambiguous about *whose* username/host each one wants -- an operator (this
+session) put the device's own `nepi` account in the username field and
+their own `suraj` in the host field, exactly backwards. Both labels now
+name the two machines explicitly ("YOUR OWN login username, on the NEW
+machine (not the device's 'nepi' user)" / "Leave this BLANK -- only fill in
+if you skipped the reverse tunnel entirely"), and the username field shows
+a live placeholder example (the existing `baseline` instance's own real
+ssh_user) rather than an abstract one.
+
+Confirmed working end to end after these fixes: register → both new
+Step-1 prerequisites → tunnel (autossh) → verify (real `ssh_user`,
+`host` left blank) → `verified` → select → `simulator_launch_targets.yaml`
+targets correctly repointed at the new instance → reselect `baseline` →
+remove test instance, leaving a clean slate.
+
 ## 4. Explicitly not doing
 
 - ArduPilot SITL auto-install -- unchanged, still manual-fallback-only (no

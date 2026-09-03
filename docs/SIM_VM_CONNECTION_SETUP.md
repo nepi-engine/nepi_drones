@@ -64,6 +64,18 @@ on the VM side, no editing of any tracked file required.
 Both directions need their own SSH key and their own username, and both
 are currently hardcoded to one developer's own setup. Fixing both:
 
+**Prerequisite, easy to miss on a genuinely fresh VM** (confirmed live,
+2026-09-02): the VM needs an SSH *server* actually installed and running,
+not just the SSH client you use to reach the device. The reverse tunnel
+forwards connections back to the VM's own sshd -- without one listening,
+the tunnel still reports success (`ssh -R` doesn't validate its forward
+target at connect time) and the failure only surfaces later, confusingly,
+at the final verify step. Check/install before continuing:
+```bash
+command -v sshd >/dev/null || sudo apt-get install -y openssh-server
+sudo systemctl enable --now ssh
+```
+
 ## Step 1 — SSH keys
 
 You need two separate keypairs (despite sharing a filename convention,

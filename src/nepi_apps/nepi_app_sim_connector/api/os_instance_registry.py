@@ -231,6 +231,32 @@ class OsInstanceRegistry(object):
         return candidate
     raise LauncherError("No usable SSH key found. Tried: " + ", ".join(candidates))
 
+  def _device_public_key(self):
+    """Reads this device's own SSH PUBLIC key -- the .pub half of whatever
+    _ssh_key() would use as the private key -- so the wizard can show the
+    exact line to append to the new machine's authorized_keys, instead of a
+    vague "make sure it's trusted" instruction with nothing to copy.
+
+    Confirmed live this session (a real end-to-end test, register through
+    select): a working reverse tunnel is NOT enough on its own. The tunnel
+    only lets the device dial back into the new machine's sshd -- it still
+    needs a key the new machine actually trusts to complete that login,
+    same as this app's own pre-existing single-VM feature already requires
+    (see SIM_VM_CONNECTION_SETUP.md's original Step 1, "On the device...
+    whose PUBLIC half is in the VM user's authorized_keys" -- a requirement
+    that doc got right and the 2-step wizard lost when the keygen step was
+    removed). Returns None if no candidate's matching .pub file is
+    readable, in which case callers fall back to a plain instruction."""
+    for candidate in self._ssh_key_candidates():
+      try:
+        with open(candidate + '.pub', 'r') as f:
+          content = f.read().strip()
+        if content:
+          return content
+      except OSError:
+        continue
+    return None
+
   def _probe_connection(self, host, ssh_user, ssh_port):
     ssh_key = self._ssh_key()
     ssh_cmd = [
@@ -295,7 +321,30 @@ class OsInstanceRegistry(object):
     /sbin/nologin shell (cannot SSH in at all), so port 2222 (the
     container's own sshd, where 'nepi' has a real shell) is the only
     combination that actually works -- not a placeholder value to replace,
-    unlike device_host which genuinely differs per deployment."""
+    unlike device_host which genuinely differs per deployment.
+
+    STEP 1 (new prerequisites) added after a real, live end-to-end test
+    this session (register through select, not just code reading) hit TWO
+    genuine gaps neither the original single-VM doc's Step 2 nor the
+    earlier 2-step wizard covered for a truly fresh machine:
+    - No SSH *server* running on the new machine at all. The reverse
+      tunnel's whole point is forwarding port 22 on the new machine back
+      through the device -- if nothing is listening there, the tunnel
+      still "succeeds" (ssh -R doesn't validate the forward target at
+      connect time), and the failure only surfaces later, confusingly, at
+      Test Connection. A genuinely fresh dev VM (this one, confirmed) can
+      easily have only an SSH *client* installed, never a server.
+    - The device's own public key was never actually shown anywhere for
+      the operator to trust. A working tunnel is not sufficient by
+      itself -- the device still needs to complete a real SSH login
+      through it, which needs a key the new machine trusts.
+      SIM_VM_CONNECTION_SETUP.md's original Step 1 already required this
+      exact second direction ("On the device... whose PUBLIC half is in
+      the VM user's authorized_keys"); the 2-step wizard dropped it when
+      the keygen step was removed, since it read (wrongly) like the same
+      concern the keygen step was cutting. _device_public_key() reads the
+      real value so there's an exact line to copy, not a vague
+      instruction."""
     port = instance['ssh_port']
     iid = instance['instance_id']
     # No angle brackets in this fallback placeholder (rare -- only when
@@ -304,8 +353,31 @@ class OsInstanceRegistry(object):
     # command breaks it outright, since '<' is redirection syntax, rather
     # than failing obviously (e.g. "no such host").
     device_host = _guess_device_ip() or "YOUR_NEPI_DEVICE_IP_OR_HOSTNAME"
+    device_pubkey = self._device_public_key()
+    device_pubkey_line = (
+        device_pubkey if device_pubkey else
+        "PASTE_THIS_DEVICE'S_OWN_PUBLIC_KEY_HERE  # could not read it automatically"
+    )
     return (
-        "STEP 1 of 2 -- Open a reverse tunnel back to the NEPI device\n"
+        "STEP 1 of 3 -- One-time prerequisites\n"
+        "Where: on the NEW machine (" + instance['display_name'] + ")\n"
+        "\n"
+        "a) Make sure an SSH SERVER (not just the SSH client you already use\n"
+        "   to reach the device) is installed and running here -- the tunnel\n"
+        "   forwards connections TO this machine's own sshd, so without one\n"
+        "   listening the tunnel will look like it worked but Test Connection\n"
+        "   will fail later:\n"
+        "\n"
+        "    command -v sshd >/dev/null || sudo apt-get install -y openssh-server\n"
+        "    sudo systemctl enable --now ssh\n"
+        "\n"
+        "b) Trust the NEPI device's own key so it can log back in through the\n"
+        "   tunnel (a working tunnel alone doesn't complete the login):\n"
+        "\n"
+        "    echo \"" + device_pubkey_line + "\" >> ~/.ssh/authorized_keys\n"
+        "\n"
+        "\n"
+        "STEP 2 of 3 -- Open a reverse tunnel back to the NEPI device\n"
         "Where: on the NEW machine (" + instance['display_name'] + ")\n"
         "\n"
         "This assumes this machine already has NEPI Remote Setup done (the\n"
@@ -350,7 +422,7 @@ class OsInstanceRegistry(object):
         "      -i ~/.ssh/nepi_default_ssh_key nepi@" + device_host + "\n"
         "\n"
         "\n"
-        "STEP 2 of 2 -- Verify it worked\n"
+        "STEP 3 of 3 -- Verify it worked\n"
         "Where: back in the RUI (NOT the new machine, and NOT a command\n"
         "you need to run at all in the normal case)\n"
         "\n"
