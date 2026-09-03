@@ -43,6 +43,7 @@
 
 import os
 import re
+import socket
 import subprocess
 
 import yaml
@@ -74,6 +75,27 @@ BASELINE_INSTANCE_ID = 'baseline'
 SSH_CONNECT_TIMEOUT_SEC = 8
 
 DEFAULT_SSH_KEY = os.path.expanduser("~/.ssh/nepi_default_ssh_key")
+
+
+def _guess_device_ip():
+  """Best-effort discovery of THIS device's own LAN-reachable IP, so the
+  generated setup commands can show a real, working example instead of an
+  abstract placeholder -- reported live: "give the example and also put
+  that as the example in the RUI." Pure local-socket routing trick (no
+  packet is actually sent to 8.8.8.8 -- UDP connect() just asks the kernel
+  to pick the outbound route/interface), so this stays zero-ROS-dependency
+  like the rest of this module (no network_mgr/ip_addr_query service call).
+  Returns None if it genuinely can't determine one (e.g. no network at
+  all), in which case callers fall back to a plain placeholder."""
+  try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+      s.connect(('8.8.8.8', 80))
+      return s.getsockname()[0]
+    finally:
+      s.close()
+  except OSError:
+    return None
 
 
 def _sanitize_display_name(name):
@@ -233,9 +255,23 @@ class OsInstanceRegistry(object):
     tunnel commands below reuse whatever key is already there; a machine
     that has genuinely never done Remote Setup at all needs that setup
     first (see NEPI_REMOTE_SETUP.md), not a key generated in isolation
-    here."""
+    here.
+
+    device_host below is filled in with this device's own real, currently-
+    detected IP (see _guess_device_ip) rather than a bare placeholder --
+    reported live: "give the example and also put that as the example in
+    the RUI." user/port are NOT placeholders needing a real value filled
+    in -- 'nepi'/2222 is the actual, tested default this whole mechanism
+    (`nepi_tunnel()`/`nepi-tunnel.service`, see SIM_VM_CONNECTION_SETUP.md's
+    own Step 2) already uses, confirmed directly against the real device
+    this session: the host-level 'nepi' account exists but has a
+    /sbin/nologin shell (cannot SSH in at all), so port 2222 (the
+    container's own sshd, where 'nepi' has a real shell) is the only
+    combination that actually works -- not a placeholder value to replace,
+    unlike device_host which genuinely differs per deployment."""
     port = instance['ssh_port']
     iid = instance['instance_id']
+    device_host = _guess_device_ip() or "<REPLACE with your NEPI device's IP or hostname>"
     return (
         "STEP 1 of 2 -- Open a reverse tunnel back to the NEPI device\n"
         "Where: on the NEW machine (" + instance['display_name'] + ")\n"
@@ -248,6 +284,11 @@ class OsInstanceRegistry(object):
         "all, do that first -- see NEPI_REMOTE_SETUP.md -- rather than running\n"
         "anything below.)\n"
         "\n"
+        "This NEPI device's own current address is " + device_host + " --\n"
+        "already filled in below. user (nepi) and port (2222) are this\n"
+        "platform's own fixed convention, not placeholders -- leave them as\n"
+        "written.\n"
+        "\n"
         "Pick ONE of the two options below -- not both.\n"
         "\n"
         "  Option A -- recommended: restarts itself automatically on reboot.\n"
@@ -256,9 +297,9 @@ class OsInstanceRegistry(object):
         "    cp sim_container/systemd/nepi-tunnel.service "
         "~/.config/systemd/user/nepi-tunnel-" + iid + ".service\n"
         "    cat > ~/.config/nepi-tunnel-" + iid + ".env <<'EOF'\n"
-        "    DEVICE_SSH_HOST=<REPLACE with your NEPI device's IP or hostname>\n"
+        "    DEVICE_SSH_HOST=" + device_host + "\n"
         "    DEVICE_SSH_USER=nepi\n"
-        "    DEVICE_SSH_PORT=22\n"
+        "    DEVICE_SSH_PORT=2222\n"
         "    TUNNEL_SSH_PORT=" + str(port) + "\n"
         "    EOF\n"
         "    systemctl --user daemon-reload\n"
@@ -268,9 +309,8 @@ class OsInstanceRegistry(object):
         "  Option B -- one-off command, no systemd required (use this on WSL\n"
         "  unless you've already turned systemd on in /etc/wsl.conf):\n"
         "\n"
-        "    autossh -M 0 -f -N -R " + str(port) + ":127.0.0.1:22 -p 22 \\\n"
-        "      -i ~/.ssh/nepi_default_ssh_key \\\n"
-        "      <REPLACE with your NEPI device's user>@<REPLACE with its IP or hostname>\n"
+        "    autossh -M 0 -f -N -R " + str(port) + ":127.0.0.1:22 -p 2222 \\\n"
+        "      -i ~/.ssh/nepi_default_ssh_key nepi@" + device_host + "\n"
         "\n"
         "\n"
         "STEP 2 of 2 -- Verify it worked\n"

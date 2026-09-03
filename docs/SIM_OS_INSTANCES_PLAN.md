@@ -168,6 +168,29 @@ Setup done, and points at `NEPI_REMOTE_SETUP.md` for the rare case where it
 genuinely doesn't. No code elsewhere needed to change: `verify()`/`select()`
 never cared how the tunnel got set up, only that it eventually works.
 
+## 3c. Concrete example instead of a bare placeholder, and a real port bug fix
+
+Reported live: "what would this be in my case? give the example and also
+put that as the example in the RUI" (about the leftover
+`<REPLACE with your NEPI device's user>@<REPLACE with its IP or hostname>`
+placeholder). Fixed two ways:
+
+- `_guess_device_ip()` (new, zero-ROS-dependency -- a local UDP-socket
+  routing trick, no packet actually sent) fills `DEVICE_SSH_HOST`/the
+  `autossh` target with this device's own real, currently-detected IP,
+  falling back to a placeholder only if that genuinely can't be determined.
+- **Found and fixed a real bug while verifying this against the actual
+  device**: the generated commands (and `SIM_VM_CONNECTION_SETUP.md`'s own
+  manual Step 2 examples, copied from the same source) used
+  `DEVICE_SSH_PORT=22`, but the device's host-level `nepi` OS account has a
+  `/sbin/nologin` shell and can't SSH in at all -- confirmed directly.
+  Port 2222 (the container's own sshd, where `nepi` has a real shell) is
+  the only combination that actually works, matching what
+  `nepi_tunnel()`/`nepi-tunnel.service` already default to when unset. Both
+  the wizard and the manual doc now hardcode 2222, documented as this
+  platform's fixed convention (not a per-deployment placeholder) rather
+  than something to "replace."
+
 ## 4. Explicitly not doing
 
 - ArduPilot SITL auto-install -- unchanged, still manual-fallback-only (no

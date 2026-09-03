@@ -97,14 +97,21 @@ ssh-keygen -t ed25519 -f ~/.ssh/nepi_default_ssh_key -N ""
 `nepi_tunnel()` and `nepi-tunnel.service` both default to `nepi@nepi:2222`
 (the platform's own default device username and dev-VM-facing sshd port --
 not a value unique to any one setup, but still worth overriding if your
-device's sshd differs). Override without editing any tracked file:
+device's sshd differs). **2222 is the actual, tested-working port** for
+this leg (confirmed directly against a real device, 2026-09-02) -- the
+device's host-level `nepi` OS account exists but has a `/sbin/nologin`
+shell, so the container's own sshd (port 2222, where `nepi` has a real
+login shell) is the only combination of that username that can log in at
+all. Don't change `DEVICE_SSH_PORT` away from 2222 unless your device's
+setup genuinely differs from this platform default. Override without
+editing any tracked file:
 
 **Manual/ad-hoc** (source `nepi_sitl_dev_env.sh` from your `~/.bashrc`
 first, per its own header):
 ```bash
 export NEPI_DEVICE_SSH_HOST=192.168.1.50   # your device's real IP or hostname
 export NEPI_DEVICE_SSH_USER=nepi           # only if your device's user differs
-export NEPI_DEVICE_SSH_PORT=22             # only if your device's sshd differs
+export NEPI_DEVICE_SSH_PORT=2222           # only if your device's sshd differs
 nepi_tunnel
 ```
 
@@ -115,7 +122,7 @@ cp sim_container/systemd/nepi-tunnel.service ~/.config/systemd/user/
 cat > ~/.config/nepi-tunnel.env <<'EOF'
 DEVICE_SSH_HOST=192.168.1.50
 DEVICE_SSH_USER=nepi
-DEVICE_SSH_PORT=22
+DEVICE_SSH_PORT=2222
 EOF
 systemctl --user daemon-reload
 systemctl --user enable --now nepi-tunnel.service
