@@ -435,6 +435,16 @@ launch_targets:
     # in simulator_launcher.py alongside this -- a full ArduPilot build plus
     # ros-noetic-desktop-full plus the bridge's cmake build can easily run
     # past 10 minutes on modest hardware.
+    #
+    # ArduPilot clone made shallow + single-branch (2026-09-03) -- confirmed
+    # live: a plain `git clone --recurse-submodules` (full history, every
+    # branch) took well over half an hour and was still only partway through
+    # on a real network connection, since ArduPilot's own repo history plus
+    # its full submodule set is large. `--branch Copter-4.5 --depth 1
+    # --shallow-submodules` clones only the one commit this target actually
+    # builds (and only its submodules at that same depth), which is all
+    # `./waf` needs -- dramatically smaller and faster, no loss of
+    # functionality (nothing here ever needs this repo's git history).
     install_command: >-
       bash -lc '
       set -e;
@@ -460,7 +470,7 @@ launch_targets:
       fi;
       sudo apt-get install -y gazebo11 libgazebo11-dev;
       if [ ! -d $HOME/ardupilot ]; then
-      git clone --recurse-submodules https://github.com/ArduPilot/ardupilot $HOME/ardupilot;
+      git clone --branch Copter-4.5 --depth 1 --recurse-submodules --shallow-submodules https://github.com/ArduPilot/ardupilot $HOME/ardupilot;
       fi;
       cd $HOME/ardupilot;
       git checkout Copter-4.5;
@@ -487,7 +497,7 @@ launch_targets:
     # fails -- same convention as gazebo_rover's own manual_fallback_commands.
     manual_fallback_commands: |-
       git clone git@github.com:nepi-engine/nepi_drones.git ~/nepi_engine_ws/nepi_drones
-      git clone --recurse-submodules https://github.com/ArduPilot/ardupilot
+      git clone --branch Copter-4.5 --depth 1 --recurse-submodules --shallow-submodules https://github.com/ArduPilot/ardupilot
       cd ardupilot
       git checkout Copter-4.5
       git submodule update --init --recursive
