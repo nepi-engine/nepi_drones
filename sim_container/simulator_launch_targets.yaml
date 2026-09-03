@@ -445,6 +445,22 @@ launch_targets:
     # builds (and only its submodules at that same depth), which is all
     # `./waf` needs -- dramatically smaller and faster, no loss of
     # functionality (nothing here ever needs this repo's git history).
+    #
+    # PIP_CONSTRAINT added (2026-09-03) -- confirmed live: with the clone
+    # fix above actually working, install-prereqs-ubuntu.sh itself then
+    # failed (exit 2) inside its own `pip3 install --user -U pip setuptools
+    # wheel` step's LATER pip invocation, with `packaging.version.
+    # InvalidVersion: Invalid version: '1.0.3.linux-x86_64'` -- a legacy,
+    # non-PEP440 version string somewhere in a dependency's PyPI release
+    # history that newer setuptools' own VENDORED `packaging` (22+, which
+    # dropped the old lenient LegacyVersion fallback in favor of raising)
+    # can no longer parse. Confirmed live: pinning `pip<24`/`setuptools<66`
+    # via PIP_CONSTRAINT before running install-prereqs-ubuntu.sh (whose
+    # own unconditional `-U` would otherwise install the newest, broken
+    # combination) lets the exact same prereqs install succeed cleanly --
+    # setuptools<66 still vendors the pre-strict packaging that falls back
+    # instead of raising. Nothing this script installs afterward needs a
+    # newer pip/setuptools than this.
     install_command: >-
       bash -lc '
       set -e;
@@ -476,6 +492,9 @@ launch_targets:
       git checkout Copter-4.5;
       git submodule update --init --recursive;
       if [ ! -x $HOME/ardupilot/build/sitl/bin/arducopter ]; then
+      echo "pip<24" > /tmp/nepi_pip_constraints.txt;
+      echo "setuptools<66" >> /tmp/nepi_pip_constraints.txt;
+      export PIP_CONSTRAINT=/tmp/nepi_pip_constraints.txt;
       Tools/environment_install/install-prereqs-ubuntu.sh -y;
       . $HOME/.profile;
       ./waf configure --board sitl;
@@ -501,6 +520,9 @@ launch_targets:
       cd ardupilot
       git checkout Copter-4.5
       git submodule update --init --recursive
+      echo "pip<24" > /tmp/nepi_pip_constraints.txt
+      echo "setuptools<66" >> /tmp/nepi_pip_constraints.txt
+      export PIP_CONSTRAINT=/tmp/nepi_pip_constraints.txt
       Tools/environment_install/install-prereqs-ubuntu.sh -y
       . ~/.profile
       ./waf configure --board sitl
