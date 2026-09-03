@@ -148,6 +148,78 @@ equivalent. Picking either dropdown now keeps both in sync; "Aerial
 Obstacle Course"/"Custom Obstacles"/any other saved name has no Setting
 equivalent to guess at and is left alone on purpose.
 
+## Camera yaw/tilt, lock-to-robot, and FOV editing (2026-09-03)
+
+Reported live: "for the camera offsets as well, yaw and tilt should also be
+editable. right now its just x y and z" and "camera horizontal and vertical
+fov dont seem to be editable yet."
+
+Added `camera_offset_yaw`/`camera_offset_tilt`/`scene_offset_yaw`/
+`scene_offset_tilt` as new RBX Settings (`rbx_sim_node.py`'s
+`CAMERA_SETTING_NAMES`/`CAP_SETTINGS`/`FACTORY_SETTINGS`), both in degrees
+matching this app's existing angle convention. `sim_bridge_node.py`'s
+`applyCameraSettings`/`respawnRoverWithCameraOffsets` now rewrite all six
+pose components (x y z roll pitch yaw, roll always 0) instead of only the
+position triple -- `CAMERA_LINK_POSE_RE` widened to match/replace the whole
+existing rotation too, not just preserve it. `renderCameraOffsetControls`
+(`Nepi_IF_Sim-Controls.js`) grew two more Input fields per camera.
+
+"Lock Scene Camera To Robot" toggle (scene/chase camera only -- there's no
+"face the robot" concept for a camera mounted ON the robot): when checked,
+`computeLockedSceneYawTilt()` derives yaw/tilt purely from the scene
+camera's own x/y/z offset (`atan2` back toward the origin), applied both to
+local state and the live Setting every time position changes while locked.
+Yaw/Tilt inputs are `disabled` (not hidden) while locked -- they still show
+the computed values, just aren't hand-editable, per report.
+
+Camera Horizontal FOV got a direct edit box (`Nepi_IF_Sim.js`, right under
+its existing read-only reading) that reuses the EXISTING Robot Dimensions
+save path (`onSaveDimensionsClicked('robot')`) rather than inventing a
+second Setting-based mechanism -- `camera_horizontal_fov_deg` was already
+one of `ROBOT_DIMENSION_FIELDS`, just only reachable via Robot Config
+Settings before. Vertical FOV has no edit box: it's derived from horizontal
+FOV plus the camera's aspect ratio in `generate_model_sdf.py`'s
+`buildRoverSdf`, not an independent physical parameter.
+
+## Rover physics stability and a weight parameter (2026-09-03)
+
+Reported live: "if you change motor controls too rapidly, ex: putting to
+100% and then -100% after 5 seconds, it starts going crazy and randomly
+glitching out. the reset button seems to help." Root cause (confirmed by
+investigation, not guessed): `generate_model_sdf.py`'s `buildRoverSdf`
+configured the `libgazebo_ros_diff_drive` plugin with
+`<wheelAcceleration>0.0</wheelAcceleration>`, which is that plugin's own
+documented meaning for UNLIMITED, not zero -- a 100% to -100% command was a
+literal step-function velocity-target reversal with the full 25 N*m of
+`wheelTorque` applied instantly to chase it, exactly the kind of single-
+timestep delta that diverges Gazebo's ODE constraint solver. `RESET_SIM`
+(`rbx_sim_node.py`'s `resetSimAction`) only ever teleported the model back
+to its spawn pose, clearing the diverged state rather than fixing the
+cause -- which is why it "helped" without actually solving anything. Capped
+to `3.0` (rad/s^2).
+
+Also added an editable `weight_kg` dimension field (`ROBOT_DIMENSION_FIELDS`
+in `Nepi_IF_Sim.js`, default 5.0 kg matching the previous hardcoded mass
+exactly) -- requested live: "add a weight parameter... should work in lbs
+and kgs." Renders a companion lbs-converted Input next to the kg one (new
+generic `altUnit` field-descriptor support in `renderDimensionFields`,
+converting bidirectionally, editing the same single stored kg value so the
+two inputs can never disagree). `buildRoverSdf` now recomputes base_link's
+`ixx`/`iyy`/`izz` from `weight_kg` via the standard rectangular-prism
+inertia formula instead of the old hardcoded literals (0.0417/0.0708/
+0.1042) -- those were only ever correct for the factory 5.0 kg / 0.4x0.3x0.1
+m chassis, so this also fixes a pre-existing latent bug where inertia went
+stale if chassis dimensions were edited without a matching mass change.
+
+Verified live: relaunched `gazebo_rover`, confirmed the regenerated
+`model.sdf` shows the recomputed inertia and the capped
+`wheelAcceleration`, and sent repeated 100%/-100% teleop-velocity reversals
+without any NaN/divergence in the reported navpose position. Could not
+fully re-confirm the ORIGINAL visual "glitching" is gone from the command
+line alone (sustained wheel motion needs the RUI's own teleop path, not
+`rostopic pub`) -- code-reviewed and physics-verified, visual confirmation
+still open.
+
 ## Explicitly not doing
 
 - Not building pre-deploy preset-editing UI (editing `robot_configs` entries themselves) --
