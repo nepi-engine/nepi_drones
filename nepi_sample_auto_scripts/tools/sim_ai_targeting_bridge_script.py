@@ -245,13 +245,39 @@ class sim_ai_targeting_bridge(object):
       time.sleep(IMAGE_TOPIC_RETRY_INTERVAL_SEC)
 
   def wireUpTargetOverlay(self, source_image_topic):
-    # source_image_topic is "<device_ns>/color_2d_image" (or ".../idx/color_image")
-    # -- the generic per-device image-overlay topics (add_target_degree_offsets,
-    # targets_enable, ...; same family as add_target_pixel/overlay_target_pixels
-    # seen elsewhere in this app's own image utils) live as siblings under
-    # "<device_ns>/image/", not under the specific image topic's own name, so
-    # this strips exactly one path component and appends "image/...".
-    device_ns = source_image_topic.rsplit('/', 1)[0]
+    # source_image_topic is NOT usable here -- confirmed live 2026-09-03:
+    # nepi_sdk.find_topic()'s non-exact branch (what find_image_topic above
+    # calls) has a real bug, returning the SEARCH STRING it was given
+    # ("color_2d_image") rather than the actual matched topic path it found
+    # in the graph. rospy.Subscriber() a few lines up tolerates that by
+    # accident (a bare relative name still resolves to *something*, just
+    # not reliably the intended device's own topic), but there is no
+    # namespace left in that string for this method to derive anything
+    # from, and reusing the same rsplit trick on it (an earlier version of
+    # this method did) silently produced a nonexistent overlay topic and
+    # never published anything.
+    #
+    # Independently re-resolves the real path via rospy.get_published_topics()
+    # directly instead. The generic per-device image-overlay topics
+    # (add_target_degree_offsets, targets_enable, ...; same family as
+    # add_target_pixel/overlay_target_pixels seen elsewhere in this app's
+    # own image utils) live as siblings of "color_2d_image" under
+    # "<device_ns>/image/", e.g. ".../ardupilot_sitl/image/
+    # add_target_degree_offsets" next to ".../ardupilot_sitl/color_2d_image"
+    # -- so splitting a REAL match on the literal "/color_2d_image"
+    # component gives the right device namespace.
+    device_ns = None
+    try:
+      for topic_name, _msg_type in rospy.get_published_topics():
+        if '/color_2d_image' in topic_name:
+          device_ns = topic_name.split('/color_2d_image')[0]
+          break
+    except Exception as e:
+      self.msg_if.pub_warn("Could not resolve device namespace for target overlay: " + str(e))
+    if device_ns is None:
+      self.msg_if.pub_warn("No real color_2d_image topic found in the graph -- target "
+                           "overlay marker will not be available this run")
+      return
     self.image_add_target_pub = nepi_ros.create_publisher(
         device_ns + "/image/add_target_degree_offsets", ImageTarget, queue_size = 1)
     self.image_targets_enable_pub = nepi_ros.create_publisher(

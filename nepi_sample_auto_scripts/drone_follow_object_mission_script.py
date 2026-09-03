@@ -162,10 +162,21 @@ CMD_MODE_TIMEOUT_SEC = 5
 # the timeout and was scored a failure. 60 s leaves real headroom without
 # masking an actually-stuck takeoff.
 CMD_ACTION_TIMEOUT_SEC = 60
-# Raised from 20 for the same slower-than-realtime reason, and because the follow
-# target is a MOVING one -- see the call site in move_to_object_callback, which
-# also had to be fixed to actually pass this value.
-CMD_GOTO_TIMEOUT_SEC = 30
+# Lowered from 30 for continuous tracking (2026-09-03: "constantly follow
+# it" -- see move_to_object_callback's own comment). This isn't just a
+# do-or-give-up budget for one move any more -- it's also, indirectly, how
+# often the driver can accept a NEW setpoint at all: gotoPositionCb
+# (nepi_api's device_if_rbx.py) drops any incoming GotoPosition message
+# outright ("Ignoring GoTo Position Request, Another GoTo Command Process
+# is Active") for as long as the PREVIOUS one is still inside its own
+# blocking convergence wait, which runs for up to this many seconds
+# whenever it doesn't converge sooner. 30s meant most detections streaming
+# in during that window were silently discarded, not queued -- the
+# opposite of "constantly follow, as it keeps updating". A short budget
+# means a call either converges quickly (already close) or times out
+# quickly and returns to ready, so a fresh detection's setpoint actually
+# gets through far more often.
+CMD_GOTO_TIMEOUT_SEC = 3
 
 # Sim target teardown (added 2026-08-26) -- best-effort signal to the dev
 # VM's ai_targeting_controller_ardupilot.py (see its TEARDOWN_PORT) to
@@ -678,7 +689,33 @@ class drone_follow_object_mission(object):
         sp_z_m = setpoint_range_m * math.sin(math.radians(target_pitch_d)) # sensor Z is Down -> driver Z is Up
         sp_yaw_d = target_yaw_d
         if IGNORE_YAW_CONTROL:
-          sp_yaw_d = -999
+          # NOT -999. Confirmed live 2026-09-03 ("the drone just fell over
+          # and is upside down" / "it's just flying in a random place"):
+          # nepi_api's setpoint_position_local_body() only honors -999 as
+          # a "hold current yaw" sentinel for its OWN convergence check
+          # (skips waiting on yaw error) -- the actual command value is
+          # computed unconditionally as new_yaw_enu_deg = start_yaw_enu_deg
+          # + input_yaw_body_deg regardless, and its +-180 wraparound is a
+          # single if/elif, not a real modulo, so passing -999 there sends
+          # a wildly wrong ABSOLUTE yaw target (e.g. current 234.6 degrees
+          # becomes -764.4, "wrapped" once to -404.4 -- still nowhere near
+          # a real heading). With the old, long-blocking single-shot goto
+          # this got sent once per ~30s+ cycle and had time to settle
+          # before mattering much; continuously re-firing a setpoint on
+          # every detection (see this method's own comment above) means
+          # it's now re-corrupting the actual commanded yaw every cycle,
+          # and since setpoint_position_local_body() rotates the NEXT
+          # body-frame position offset by whatever yaw the vehicle is
+          # ACTUALLY at when that next call starts, a vehicle spun to a
+          # garbage heading also sends the FOLLOWING position setpoint in
+          # a garbage direction -- compounding into the vehicle apparently
+          # flying to a random place. setpoint_position_local_body()'s own
+          # semantics are new_yaw = current_yaw + input_yaw_body_deg, so 0
+          # (not -999) is the correct "no yaw change" delta -- this is a
+          # workaround kept entirely on this script's side rather than
+          # touching nepi_api (shared platform code used well beyond this
+          # app) for what is ultimately that function's own bug.
+          sp_yaw_d = 0
         setpoint_position_body_m = [sp_x_m,sp_y_m,sp_z_m,sp_yaw_d]
         rospy.logwarn(setpoint_position_body_m)
         # Send poisition update
