@@ -204,26 +204,34 @@ ROVER_MODEL_SDF_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), '..', 'models',
     'generic_rover', 'model.sdf')
 # Matches generic_rover/model.sdf's own hard-coded camera_link/camera_link_chase
-# poses exactly, and rbx_sim_node.py's own FACTORY_SETTINGS for the same six
+# poses exactly, and rbx_sim_node.py's own FACTORY_SETTINGS for the same ten
 # values -- see applied_camera_offsets' own comment for why this matters.
-FACTORY_CAMERA_OFFSETS = (0.2, 0.0, 0.65, -2.5, 0.0, 1.65)
+# Widened (2026-09-03) from 6 values (position only) to 10 (position + yaw +
+# tilt/pitch per camera) -- reported live: "yaw and tilt should also be
+# editable." Roll is not one of the ten: it stays fixed at 0 for both
+# cameras, matching generic_rover/model.sdf's own convention, where neither
+# camera has ever had roll. camera_link_chase's own factory tilt reproduces
+# its hard-coded 0.5404195 rad downward-look pitch (see
+# rbx_sim_node.py's FACTORY_SCENE_TILT_DEG, the single source of truth for
+# that value in degrees -- duplicated here as a literal only because this
+# file cannot import that class); camera_link's factory tilt is 0 (no
+# rotation in the stock model at all).
+FACTORY_CAMERA_OFFSETS = (0.2, 0.0, 0.65, 0.0, 0.0, -2.5, 0.0, 1.65, 0.0, math.degrees(0.5404195))
 # Matches a <link name="LINKNAME"> immediately followed by its own <pose>
-# element. Group 1 is everything up to and including "<pose>"; group 2 is the
-# existing rotation triple plus "</pose>" -- substituting keeps group 1 and
-# group 2 and replaces only what sits between them (the position triple), so
-# the existing roll/pitch/yaw survives untouched. (camera_link_chase carries a
-# pitch for its downward look; camera_link does not offer rotation as a
-# setting at all, so preserving whatever is already there is correct for
-# both.)
+# element, capturing everything up to (group 1) and including "</pose>"
+# (implicitly, via the non-capturing replacement below) -- unlike the
+# previous 6-value version, this no longer preserves any existing rotation:
+# ALL SIX pose components (x y z roll pitch yaw) are now supplied by
+# respawnRoverWithCameraOffsets, roll always 0.0.
 CAMERA_LINK_POSE_RE = {
   'camera_link': re.compile(
       r'(<link name="camera_link">\s*<pose>)\s*'
-      r'[-0-9.eE]+\s+[-0-9.eE]+\s+[-0-9.eE]+\s*'
-      r'([-0-9.eE]+\s+[-0-9.eE]+\s+[-0-9.eE]+\s*</pose>)'),
+      r'[-0-9.eE]+\s+[-0-9.eE]+\s+[-0-9.eE]+\s+'
+      r'[-0-9.eE]+\s+[-0-9.eE]+\s+[-0-9.eE]+\s*(</pose>)'),
   'camera_link_chase': re.compile(
       r'(<link name="camera_link_chase">\s*<pose>)\s*'
-      r'[-0-9.eE]+\s+[-0-9.eE]+\s+[-0-9.eE]+\s*'
-      r'([-0-9.eE]+\s+[-0-9.eE]+\s+[-0-9.eE]+\s*</pose>)'),
+      r'[-0-9.eE]+\s+[-0-9.eE]+\s+[-0-9.eE]+\s+'
+      r'[-0-9.eE]+\s+[-0-9.eE]+\s+[-0-9.eE]+\s*(</pose>)'),
 }
 GAZEBO_SERVICE_WAIT_SEC = 5.0
 
@@ -587,14 +595,16 @@ class SimBridgeNode:
     self.model_state_pub.publish(state)
 
   def applyCameraSettings(self, cmd):
-    # offset_x/y/z (robot view) and scene_offset_x/y/z (scene/chase view) are
-    # optional in this wire message: absent on any deployment still running
-    # an older rbx_sim_node.py. get() with None sentinels, then bail without
-    # touching anything already applied, rather than defaulting to 0.0 and
-    # silently snapping both cameras to the origin the first time an old
+    # offset_x/y/z/yaw/tilt (robot view) and scene_offset_x/y/z/yaw/tilt
+    # (scene/chase view) are optional in this wire message: absent on any
+    # deployment still running an older rbx_sim_node.py that predates
+    # yaw/tilt. get() with None sentinels, then bail without touching
+    # anything already applied, rather than defaulting to 0.0 and silently
+    # snapping both cameras to the origin/no-rotation the first time an old
     # sender's message arrives.
-    keys = ('offset_x', 'offset_y', 'offset_z',
-            'scene_offset_x', 'scene_offset_y', 'scene_offset_z')
+    keys = ('offset_x', 'offset_y', 'offset_z', 'offset_yaw', 'offset_tilt',
+            'scene_offset_x', 'scene_offset_y', 'scene_offset_z',
+            'scene_offset_yaw', 'scene_offset_tilt')
     if any(cmd.get(k) is None for k in keys):
       return
     try:
@@ -610,13 +620,16 @@ class SimBridgeNode:
     if self.rover_sdf_template is None:
       rospy.logwarn(PKG_NAME + ": No rover SDF loaded, cannot apply camera offsets")
       return
-    (off_x, off_y, off_z, scene_x, scene_y, scene_z) = offsets
+    (off_x, off_y, off_z, off_yaw_deg, off_tilt_deg,
+     scene_x, scene_y, scene_z, scene_yaw_deg, scene_tilt_deg) = offsets
 
     sdf = self.rover_sdf_template
     sdf, n1 = CAMERA_LINK_POSE_RE['camera_link'].subn(
-        lambda m: m.group(1) + ("%.6f %.6f %.6f " % (off_x, off_y, off_z)) + m.group(2), sdf)
+        lambda m: m.group(1) + ("%.6f %.6f %.6f 0 %.6f %.6f " %
+            (off_x, off_y, off_z, math.radians(off_tilt_deg), math.radians(off_yaw_deg))) + m.group(2), sdf)
     sdf, n2 = CAMERA_LINK_POSE_RE['camera_link_chase'].subn(
-        lambda m: m.group(1) + ("%.6f %.6f %.6f " % (scene_x, scene_y, scene_z)) + m.group(2), sdf)
+        lambda m: m.group(1) + ("%.6f %.6f %.6f 0 %.6f %.6f " %
+            (scene_x, scene_y, scene_z, math.radians(scene_tilt_deg), math.radians(scene_yaw_deg))) + m.group(2), sdf)
     if n1 != 1 or n2 != 1:
       # A structural change to generic_rover/model.sdf (renamed link, reordered
       # pose) could make this regex stop matching -- fail loudly rather than
@@ -687,7 +700,8 @@ class SimBridgeNode:
     self.rover_model_name = new_name
     self.applied_camera_offsets = offsets
     self.held_pose = None  # Stale anchor from before the respawn -- see resetRover.
-    rospy.loginfo(PKG_NAME + ": Applied camera offsets, robot=(%.2f,%.2f,%.2f) scene=(%.2f,%.2f,%.2f), model now '%s'"
+    rospy.loginfo(PKG_NAME + ": Applied camera offsets, robot=(%.2f,%.2f,%.2f,yaw=%.1f,tilt=%.1f) "
+                  "scene=(%.2f,%.2f,%.2f,yaw=%.1f,tilt=%.1f), model now '%s'"
                   % (offsets + (new_name,)))
 
   def bridgeServerLoop(self):

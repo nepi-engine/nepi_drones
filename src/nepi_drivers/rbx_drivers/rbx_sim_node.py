@@ -104,8 +104,24 @@ class SimNode:
   # scene/chase view. Factory values reproduce generic_rover/model.sdf's
   # hard-coded camera_link (0.2, 0, 0.65) and camera_link_chase
   # (-2.5, 0, 1.65) poses exactly, so the default view is unchanged.
+  #
+  # *_yaw/*_tilt added (2026-09-03) -- reported live: "for the camera offsets
+  # as well, yaw and tilt should also be editable. right now its just x y and
+  # z." Both in DEGREES, matching this app's own existing angle convention
+  # (camera_horizontal_fov_deg, max_angular_rate_dps) -- sim_bridge_node.py
+  # converts to radians only when building the SDF <pose> string. "tilt"
+  # (the RUI-facing name the operator used) maps internally to SDF pitch;
+  # roll stays fixed at 0 for both cameras, unchanged, not exposed as a
+  # setting -- matches generic_rover/model.sdf's own pose convention, where
+  # neither camera has ever had roll. Factory values reproduce
+  # generic_rover/model.sdf's hard-coded rotations exactly: camera_link has
+  # none (0, 0, 0) -- FACTORY_CAMERA_LINK_TILT_DEG stays 0.0 -- and
+  # camera_link_chase's own hard-coded downward-look pitch (0.5404195 rad)
+  # is what FACTORY_SCENE_TILT_DEG below reproduces in degrees.
   CAMERA_SETTING_NAMES = ("camera_offset_x", "camera_offset_y", "camera_offset_z",
-                          "scene_offset_x", "scene_offset_y", "scene_offset_z")
+                          "camera_offset_yaw", "camera_offset_tilt",
+                          "scene_offset_x", "scene_offset_y", "scene_offset_z",
+                          "scene_offset_yaw", "scene_offset_tilt")
 
   # Suffixes for the six always-live ROS topics published off
   # self.image_topic_name -- see processImageLine's routing by the bridge
@@ -163,6 +179,13 @@ class SimNode:
   CAPABILITY_SETTING_NAMES = ("autonomous_movement_enabled",
                               "camera_controls_enabled", "enabled_image_sources")
 
+  # generic_rover/model.sdf's own hard-coded camera_link_chase pitch, in
+  # degrees -- FACTORY_SETTINGS' scene_offset_tilt reproduces this exactly so
+  # an unconfigured robot config's default view is unchanged. camera_link
+  # itself has no rotation at all (0 rad), so no equivalent constant is
+  # needed for camera_offset_tilt's own factory value (just "0.0" below).
+  FACTORY_SCENE_TILT_DEG = math.degrees(0.5404195)
+
   CAP_SETTINGS = dict(
     max_linear_speed_mps = {"type":"Float","name":"max_linear_speed_mps","options":["0.05","5.0"]},
     max_angular_rate_dps = {"type":"Float","name":"max_angular_rate_dps","options":["5.0","180.0"]},
@@ -170,9 +193,13 @@ class SimNode:
     camera_offset_x = {"type":"Float","name":"camera_offset_x","options":["-10.0","10.0"]},
     camera_offset_y = {"type":"Float","name":"camera_offset_y","options":["-10.0","10.0"]},
     camera_offset_z = {"type":"Float","name":"camera_offset_z","options":["-10.0","10.0"]},
+    camera_offset_yaw = {"type":"Float","name":"camera_offset_yaw","options":["-180.0","180.0"]},
+    camera_offset_tilt = {"type":"Float","name":"camera_offset_tilt","options":["-90.0","90.0"]},
     scene_offset_x = {"type":"Float","name":"scene_offset_x","options":["-10.0","10.0"]},
     scene_offset_y = {"type":"Float","name":"scene_offset_y","options":["-10.0","10.0"]},
     scene_offset_z = {"type":"Float","name":"scene_offset_z","options":["-10.0","10.0"]},
+    scene_offset_yaw = {"type":"Float","name":"scene_offset_yaw","options":["-180.0","180.0"]},
+    scene_offset_tilt = {"type":"Float","name":"scene_offset_tilt","options":["-90.0","90.0"]},
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]},
     # No fixed options -- the candidate topic set is per-deployment.
@@ -187,10 +214,14 @@ class SimNode:
     camera_offset_x = {"type":"Float","name":"camera_offset_x","value":"0.2"},
     camera_offset_y = {"type":"Float","name":"camera_offset_y","value":"0.0"},
     camera_offset_z = {"type":"Float","name":"camera_offset_z","value":"0.65"},
+    camera_offset_yaw = {"type":"Float","name":"camera_offset_yaw","value":"0.0"},
+    camera_offset_tilt = {"type":"Float","name":"camera_offset_tilt","value":"0.0"},
     # Reproduces generic_rover/model.sdf's hard-coded camera_link_chase pose.
     scene_offset_x = {"type":"Float","name":"scene_offset_x","value":"-2.5"},
     scene_offset_y = {"type":"Float","name":"scene_offset_y","value":"0.0"},
     scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"1.65"},
+    scene_offset_yaw = {"type":"Float","name":"scene_offset_yaw","value":"0.0"},
+    scene_offset_tilt = {"type":"Float","name":"scene_offset_tilt","value":str(FACTORY_SCENE_TILT_DEG)},
     # Both default to enabled: a robot config that never touches these
     # settings behaves exactly as every robot config did before this feature
     # existed.
@@ -1150,14 +1181,21 @@ class SimNode:
   def sendCameraSettings(self):
     # No view_mode -- both views are always-live, separate ROS topics now
     # (see CAMERA_SETTING_NAMES's own comment), nothing left to switch.
+    # offset_yaw/offset_tilt/scene_offset_yaw/scene_offset_tilt are in
+    # degrees, same convention as every other angle this app sends over the
+    # bridge -- sim_bridge_node.py converts to radians itself.
     cmd = {
       'type': 'camera_settings',
       'offset_x': float(self.settings_dict['camera_offset_x']['value']),
       'offset_y': float(self.settings_dict['camera_offset_y']['value']),
       'offset_z': float(self.settings_dict['camera_offset_z']['value']),
+      'offset_yaw': float(self.settings_dict['camera_offset_yaw']['value']),
+      'offset_tilt': float(self.settings_dict['camera_offset_tilt']['value']),
       'scene_offset_x': float(self.settings_dict['scene_offset_x']['value']),
       'scene_offset_y': float(self.settings_dict['scene_offset_y']['value']),
       'scene_offset_z': float(self.settings_dict['scene_offset_z']['value']),
+      'scene_offset_yaw': float(self.settings_dict['scene_offset_yaw']['value']),
+      'scene_offset_tilt': float(self.settings_dict['scene_offset_tilt']['value']),
     }
     self.sendLineToBridge(cmd, "Camera settings")
 

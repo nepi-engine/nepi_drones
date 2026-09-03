@@ -170,29 +170,43 @@ class NepiIFSimControls extends Component {
       // buffers -- resynced from the device's own value in
       // rbxSettingsListener below only when it actually changes, never on
       // every status tick, so an in-progress edit is never clobbered.
+      // yaw/tilt added (2026-09-03) alongside x/y/z -- see
+      // renderCameraOffsetControls's own comment.
       camera_offset_x: '', camera_offset_y: '', camera_offset_z: '',
+      camera_offset_yaw: '', camera_offset_tilt: '',
       scene_offset_x: '', scene_offset_y: '', scene_offset_z: '',
+      scene_offset_yaw: '', scene_offset_tilt: '',
+
+      // "Lock Scene Camera To Robot" toggle state -- see
+      // computeLockedSceneYawTilt's own comment. Off by default: an
+      // unconfigured robot config's scene camera keeps behaving exactly as
+      // it always did (whatever yaw/tilt the Settings already carry),
+      // rather than silently overriding it the first time this component
+      // mounts.
+      lock_scene_to_robot: false,
 
       // Environment dropdown display value -- "Flat Ground"/"Obstacle
       // Course" labels for FLAT_GROUND/OBSTACLE_COURSE, matching
       // NepiDeviceRBX.js's own onSelectEnvironment convention exactly.
       selected_environment_setting: 'Flat Ground',
 
-      // Set to the operator's own dropdown pick whenever it was made while
-      // !isRbxLive() (renderEnvironmentSetting's onChange can't send
-      // updateSetting yet -- no driver namespace exists to send it to), and
-      // cleared once it has actually been sent. Without this, a pre-launch
-      // pick was silently dropped: the freshly-launched device comes up with
-      // whatever "environment" its own Settings persistence carried over
-      // from a PREVIOUS session (independent of anything the RUI showed),
-      // rbxSettingsListener below then resyncs the dropdown to match that
-      // stale value once live, and since the dropdown already read the
-      // operator's intended value the whole time, reselecting the same
-      // option fires no onChange -- confirmed live (2026-08-28) that only
-      // toggling away and back (two genuine onChange events) actually sent
-      // anything. Tracking the pending pick here lets rbxSettingsListener
-      // send it the moment the device goes live, instead of the operator
-      // having to notice and manually force a change.
+      // Set to the operator's own dropdown pick (or the environment
+      // dimensions-config selector's own pick, see setEnvironmentSetting's
+      // own comment) whenever it was made while !isRbxLive() (nothing to
+      // send updateSetting to yet -- no driver namespace exists to send it
+      // to), and cleared once it has actually been sent. Without this, a
+      // pre-launch pick was silently dropped: the freshly-launched device
+      // comes up with whatever "environment" its own Settings persistence
+      // carried over from a PREVIOUS session (independent of anything the
+      // RUI showed), rbxSettingsListener below then resyncs the dropdown to
+      // match that stale value once live, and since the dropdown already
+      // read the operator's intended value the whole time, reselecting the
+      // same option fires no onChange -- confirmed live (2026-08-28) that
+      // only toggling away and back (two genuine onChange events) actually
+      // sent anything. Tracking the pending pick here lets
+      // rbxSettingsListener send it the moment the device goes live,
+      // instead of the operator having to notice and manually force a
+      // change.
       environment_setting_pending: null,
 
     }
@@ -224,7 +238,6 @@ class NepiIFSimControls extends Component {
     this.onEnterSetRbxFloatSetting = this.onEnterSetRbxFloatSetting.bind(this)
     this.renderCameraOffsetControls = this.renderCameraOffsetControls.bind(this)
     this.renderDepthMapToggle = this.renderDepthMapToggle.bind(this)
-    this.renderEnvironmentSetting = this.renderEnvironmentSetting.bind(this)
     this.setEnvironmentSetting = this.setEnvironmentSetting.bind(this)
 
     this.renderLiveControls = this.renderLiveControls.bind(this)
@@ -402,7 +415,9 @@ class NepiIFSimControls extends Component {
     // message overwrites whatever is being typed. Same pattern as
     // NepiDeviceRBX.js's own offsetNames sync.
     const floatSettingNames = ["camera_offset_x", "camera_offset_y", "camera_offset_z",
-                               "scene_offset_x", "scene_offset_y", "scene_offset_z"]
+                               "camera_offset_yaw", "camera_offset_tilt",
+                               "scene_offset_x", "scene_offset_y", "scene_offset_z",
+                               "scene_offset_yaw", "scene_offset_tilt"]
     var updates = {}
     for (let i = 0; i < floatSettingNames.length; i++) {
       const name = floatSettingNames[i]
@@ -414,11 +429,11 @@ class NepiIFSimControls extends Component {
     if (valuesDict["environment"] !== undefined
         && valuesDict["environment"] !== this.state.rbxSettingsValuesDict["environment"]) {
       if (this.state.environment_setting_pending !== null) {
-        // The operator picked this before the device existed to send it to
-        // (renderEnvironmentSetting's onChange couldn't reach updateSetting
-        // yet). Now that a real SettingsStatus has arrived, the driver
-        // namespace exists -- send the pending pick for real instead of
-        // letting this status resync the dropdown back to whatever
+        // The operator (or the environment dimensions-config selector, via
+        // setEnvironmentSetting) picked this before the device existed to
+        // send it to. Now that a real SettingsStatus has arrived, the
+        // driver namespace exists -- send the pending pick for real instead
+        // of letting this status resync the dropdown back to whatever
         // "environment" this fresh device happened to carry over from a
         // previous session. Clearing the pending flag here, not in the
         // onChange handler, is what makes this a one-shot catch-up rather
@@ -1175,17 +1190,87 @@ class NepiIFSimControls extends Component {
   }
 
 
-  // Editable X/Y/Z Float inputs for a camera_offset_*/scene_offset_* triple.
-  // This is now the ONLY place these Settings are editable -- removed from
-  // NepiDeviceRBX.js per request: camera positioning is a sim-only concept
-  // (nothing to "offset" on a real camera the same way), so it belongs
-  // exclusively here rather than duplicated on the generic RBX device panel.
-  // Gated on that triple's own presence plus camera_controls_enabled. In
-  // preview mode (not live, Show Settings clicked) both triples are assumed
-  // present -- every current Gazebo-based driver (rbx_sim_node.py,
-  // rbx_ardupilot_node.py) declares both; the Webots drivers only declare
-  // camera_offset (one real camera, no scene view) and correctly narrow
-  // down to just that once a live connection reports the real list.
+  // Recomputes scene_offset_yaw/scene_offset_tilt from the CURRENT
+  // scene_offset_x/y/z so the scene (chase) camera keeps facing the robot's
+  // origin regardless of where its position is edited to -- requested
+  // live: "for the scene camera (3rd person), there should be a lock to
+  // robot option, where if the scene camera's position is changed, it
+  // still faces it towards the robot's center." Aims at the robot's own
+  // origin point (x=0, y=0, z=0), not its true geometric/chassis center --
+  // a deliberate simplification: the real center sits a little above
+  // ground (wheel_radius_m + chassis_height_m/2, see generate_model_sdf.py's
+  // buildRoverSdf), but that dimensions data lives in a different component
+  // (Nepi_IF_Sim.js) with no existing plumbing into this one, and aiming at
+  // the origin is close enough for a chase-cam angle (a few degrees off at
+  // the factory offsets) without adding a cross-component dependency.
+  // yaw = angle from the camera's position back toward the origin, in the
+  // XY plane (0 deg = facing +X, matching camera_link_chase's own
+  // unrotated-frame convention, confirmed by generic_rover/model.sdf's own
+  // factory pose: positioned at -2.5 on X, yaw 0, and that faces the robot
+  // correctly). tilt = angle down from horizontal needed to look from the
+  // camera's height to ground level -- positive tilts the camera downward,
+  // matching camera_link_chase's own factory tilt (positive, "downward
+  // look" per that pose's own long-standing comment).
+  computeLockedSceneYawTilt() {
+    const x = parseFloat(this.state.scene_offset_x)
+    const y = parseFloat(this.state.scene_offset_y)
+    const z = parseFloat(this.state.scene_offset_z)
+    if (isNaN(x) || isNaN(y) || isNaN(z)) {
+      return null
+    }
+    const yawRad = Math.atan2(-y, -x)
+    const horizontalDist = Math.sqrt(x * x + y * y)
+    const tiltRad = Math.atan2(z, horizontalDist)
+    return {
+      scene_offset_yaw: yawRad * 180 / Math.PI,
+      scene_offset_tilt: tiltRad * 180 / Math.PI,
+    }
+  }
+
+  // Applies computeLockedSceneYawTilt's result to both local state (so the
+  // now-disabled Yaw/Tilt inputs immediately show the new values) and the
+  // live device (so the actual camera really moves, not just the RUI's own
+  // display of it) -- called on every scene-position edit while locked, and
+  // once immediately when the lock is first turned on.
+  applyLockedSceneYawTilt() {
+    const computed = this.computeLockedSceneYawTilt()
+    if (computed == null) {
+      return
+    }
+    this.setState(computed)
+    if (this.isRbxLive()) {
+      const { updateSetting } = this.props.ros
+      updateSetting(this.state.rbx_namespace + "/settings", "scene_offset_yaw", "Float", String(computed.scene_offset_yaw))
+      updateSetting(this.state.rbx_namespace + "/settings", "scene_offset_tilt", "Float", String(computed.scene_offset_tilt))
+    }
+  }
+
+  onToggleLockSceneToRobot(checked) {
+    this.setState({ lock_scene_to_robot: checked })
+    if (checked) {
+      this.applyLockedSceneYawTilt()
+    }
+  }
+
+  // Editable X/Y/Z/Yaw/Tilt Float inputs for a camera_offset_*/scene_offset_*
+  // set. This is now the ONLY place these Settings are editable -- removed
+  // from NepiDeviceRBX.js per request: camera positioning is a sim-only
+  // concept (nothing to "offset" on a real camera the same way), so it
+  // belongs exclusively here rather than duplicated on the generic RBX
+  // device panel. Gated on the X field's own presence plus
+  // camera_controls_enabled. In preview mode (not live, Show Settings
+  // clicked) both triples are assumed present -- every current
+  // Gazebo-based driver (rbx_sim_node.py, rbx_ardupilot_node.py) declares
+  // both; the Webots drivers only declare camera_offset (one real camera,
+  // no scene view) and correctly narrow down to just that once a live
+  // connection reports the real list.
+  // Yaw/Tilt added (2026-09-03) -- reported live: "for the camera offsets
+  // as well, yaw and tilt should also be editable. right now its just x y
+  // and z." "Lock Scene Camera To Robot" toggle shown only for the scene
+  // (chase) camera -- reported live, see computeLockedSceneYawTilt's own
+  // comment for the geometry and why this doesn't apply to the robot
+  // (first-person) camera at all (there is no "face the robot" concept for
+  // a camera mounted ON the robot).
   renderCameraOffsetControls(namePrefix, titlePrefix) {
     const live = this.isRbxLive()
     if (!this.state.show_settings) {
@@ -1198,32 +1283,53 @@ class NepiIFSimControls extends Component {
     if ((live && !settings.includes(namePrefix + "_x")) || !camera_controls_enabled) {
       return null
     }
+    const isScene = (namePrefix === "scene_offset")
+    const locked = isScene && this.state.lock_scene_to_robot
 
     const offsets = [
       { name: namePrefix + "_x", title: titlePrefix + " Offset X (m)" },
       { name: namePrefix + "_y", title: titlePrefix + " Offset Y (m)" },
       { name: namePrefix + "_z", title: titlePrefix + " Offset Z (m)" },
+      { name: namePrefix + "_yaw", title: titlePrefix + " Yaw (deg)", is_angle: true },
+      { name: namePrefix + "_tilt", title: titlePrefix + " Tilt (deg)", is_angle: true },
     ]
     return (
       <React.Fragment>
-        {offsets.map((offset) => (
-          <Label key={offset.name} title={offset.title}>
-            <Input
-              id={"SimRbx_" + offset.name}
-              value={this.state[offset.name]}
-              onChange={(event) => {
-                const el = document.getElementById("SimRbx_" + offset.name)
-                if (el) {
-                  setElementStyleModified(el)
-                }
-                var obj = {}
-                obj[offset.name] = event.target.value
-                this.setState(obj)
-              }}
-              onKeyDown={(event) => this.onEnterSetRbxFloatSetting(event, offset.name)}
+        {isScene ?
+          <Label title={"Lock Scene Camera To Robot"}>
+            <Toggle
+              checked={locked}
+              onChange={(event) => this.onToggleLockSceneToRobot(event.target.checked)}
             />
           </Label>
-        ))}
+        : null}
+        {offsets.map((offset) => {
+          const isDisabled = locked && offset.is_angle
+          return (
+            <Label key={offset.name} title={offset.title}>
+              <Input
+                id={"SimRbx_" + offset.name}
+                disabled={isDisabled}
+                value={this.state[offset.name]}
+                onChange={(event) => {
+                  const el = document.getElementById("SimRbx_" + offset.name)
+                  if (el) {
+                    setElementStyleModified(el)
+                  }
+                  var obj = {}
+                  obj[offset.name] = event.target.value
+                  this.setState(obj)
+                }}
+                onKeyDown={(event) => {
+                  this.onEnterSetRbxFloatSetting(event, offset.name)
+                  if (event.key === 'Enter' && isScene && locked && !offset.is_angle) {
+                    this.applyLockedSceneYawTilt()
+                  }
+                }}
+              />
+            </Label>
+          )
+        })}
       </React.Fragment>
     )
   }

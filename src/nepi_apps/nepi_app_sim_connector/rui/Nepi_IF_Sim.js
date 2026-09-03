@@ -130,6 +130,16 @@ const ROBOT_DIMENSION_FIELDS = [
   { name: "chassis_length_m", title: "Chassis Length (m)", default: 0.4 },
   { name: "chassis_width_m", title: "Chassis Width (m)", default: 0.3 },
   { name: "chassis_height_m", title: "Chassis Height (m)", default: 0.1 },
+  // altUnit renders a second, companion Input right next to the main one,
+  // showing/editing the SAME underlying field (weight_kg) converted to a
+  // different unit -- both inputs always agree since there is only ever one
+  // stored value (kg); the lbs box is purely a display/edit convenience.
+  // Requested live: "add a weight parameter... should work in lbs and kgs."
+  // Also drives base_link's mass AND its recomputed-from-mass inertia in
+  // generate_model_sdf.py's buildRoverSdf -- see that function's own
+  // comment for why inertia can't be left hardcoded once mass is editable.
+  { name: "weight_kg", title: "Weight (kg)", default: 5.0,
+    altUnit: { title: "Weight (lbs)", toAlt: (kg) => kg * 2.20462, fromAlt: (lbs) => lbs / 2.20462 } },
   { name: "camera_horizontal_fov_deg", title: "Camera Horizontal FOV (deg)", default: 80.0 },
 ]
 
@@ -1825,9 +1835,49 @@ class NepiIFSim extends Component {
           />
         </Label>
       )
+      // Companion unit-converted Input (see weight_kg's own altUnit
+      // comment) -- edits the SAME fields[f.name] (always stored in the
+      // field's own base unit), just converted on the way in/out, so the
+      // two inputs can never disagree.
+      const renderOnePair = (f) => (f.altUnit == null) ? renderOne(f) : (
+        <React.Fragment key={f.name}>
+          {renderOne(f)}
+          <Label title={f.altUnit.title}>
+            <Input
+              id={"SimDim_" + role + "_" + f.name + "_alt"}
+              value={(fields[f.name] !== '' && !isNaN(parseFloat(fields[f.name])))
+                ? round(f.altUnit.toAlt(parseFloat(fields[f.name])), 3) : fields[f.name]}
+              onChange={(event) => {
+                const el = document.getElementById("SimDim_" + role + "_" + f.name + "_alt")
+                if (el) {
+                  setElementStyleModified(el)
+                }
+                const altValue = parseFloat(event.target.value)
+                if (isNaN(altValue)) {
+                  return
+                }
+                const fieldsKey = role + '_dimensions_fields'
+                this.setState((prevState) => ({
+                  [fieldsKey]: { ...prevState[fieldsKey], [f.name]: String(f.altUnit.fromAlt(altValue)) }
+                }))
+              }}
+              onKeyDown={(event) => {
+                if (event.key !== 'Enter') {
+                  return
+                }
+                const el = document.getElementById("SimDim_" + role + "_" + f.name + "_alt")
+                if (el) {
+                  clearElementStyleModified(el)
+                }
+                this.onSaveDimensionsClicked(role)
+              }}
+            />
+          </Label>
+        </React.Fragment>
+      )
       rows.push(
         <React.Fragment key={a.name}>
-          {(b != null) ? this.renderFieldPair(renderOne(a), renderOne(b)) : renderOne(a)}
+          {(b != null) ? this.renderFieldPair(renderOnePair(a), renderOnePair(b)) : renderOnePair(a)}
         </React.Fragment>
       )
     }
