@@ -398,35 +398,116 @@ launch_targets:
     # Checks for ArduCopter SITL + pymavlink + the ardupilot_gazebo world
     # file, IN ADDITION to the plain gzserver/roscore check gazebo_rover's
     # own command uses -- this target needs all of it, not just Gazebo
-    # itself. No install_command: unlike every other target's dependency
-    # (a package-manager or pip one-liner), ArduPilot SITL setup is a
-    # multi-step build from source with no honest single command to offer --
-    # see ardupilot's own install docs. Still checkable/status-tracked in
-    # the background like every hidden_from_selector entry; just not
-    # offered a matching Install button (there is no visible selector row
-    # for this target to show one on regardless).
-    # nepi_drones existence checked first, same as gazebo_rover -- see that
-    # target's own check_installed_command comment for the full "nepi_drones
-    # deleted and re-cloned nepi_engine_ws only" scenario this catches.
+    # itself. nepi_drones existence checked first, same as gazebo_rover --
+    # see that target's own check_installed_command comment for the full
+    # "nepi_drones deleted and re-cloned nepi_engine_ws only" scenario this
+    # catches.
     check_installed_command: "bash -lc \"test -d $HOME/nepi_engine_ws/nepi_drones/sim_container && source /opt/ros/noetic/setup.bash && command -v gzserver > /dev/null && command -v roscore > /dev/null && command -v sim_vehicle.py > /dev/null && python3 -c 'import pymavlink' > /dev/null 2>&1 && test -f $HOME/ardupilot_gazebo/worlds/iris_arducopter_cmac.world\""
-    # No install_command (see the comment above), so this is the ONLY
-    # fallback the RUI has for this target -- shown as copy-paste text when a
-    # Deploy attempt fails because ArduPilot SITL isn't set up. Steps are
-    # ArduPilot's own documented from-source build (already used as this
-    # project's own reference -- see docs/DISCOVERY_EXPLAINED.md's "Standing
-    # up ArduPilot SITL" appendix), quoted here rather than re-derived so the
-    # two copies can't drift silently. nepi_drones clone prepended (2026-08-28)
-    # since this target has no install_command at all to attempt it
-    # automatically -- this is the only place a missing nepi_drones checkout
-    # for THIS target ever gets a fix shown.
+    # Added (2026-09-02) -- until now this target had no install_command at
+    # all (unlike every other target) because ArduPilot SITL setup is a
+    # multi-step build from source with no honest single package-manager
+    # command. Reported live: the RUI's Install button hit "Install command
+    # exited 1: sudo: a terminal is required to read the password" on every
+    # target (a foundational bug, fixed separately -- see simulator_launcher.py's
+    # SUDO_NOPASSWD_FALLBACK_COMMANDS), and separately this target's own
+    # manual_fallback_commands below was missing Gazebo11, the
+    # ardupilot_gazebo bridge plugin, and the world file entirely, and built
+    # ArduPilot off `master` -- which doesn't build against Ubuntu 20.04's
+    # stock Python 3.8.10. Reported live: "these gazebo comamnds are also
+    # missing making it useable with pyhon 3.8.10, since thats the max
+    # ubuntu 20.04 can go to." Fixed by pinning `Copter-4.5` (the last
+    # release branch confirmed Python-3.8-compatible) and adding the missing
+    # Gazebo11 + bridge-plugin + world-file steps below, using the same
+    # validated command sequence the user's own manual recipe confirmed
+    # works. Every stage is skip-if-already-done, same convention as
+    # gazebo_rover's own install_command, so re-running this on a
+    # partially-set-up box (e.g. ArduPilot built but the bridge plugin
+    # missing) is harmless and fast rather than redundantly rebuilding
+    # everything. The world-file copy at the end is NOT skip-if-already-done
+    # on purpose -- it always overwrites from nepi_drones' own committed copy,
+    # since that repo (not the target machine) is this file's source of
+    # truth. NOT live-tested against real Gazebo/compute hardware as of
+    # 2026-09-02 -- code-reviewed against the user's own validated manual
+    # recipe and the stock khancyr/ardupilot_gazebo world file, ships the
+    # same "VM-side done, on-device confirmation still open" way this
+    # project already documents elsewhere (see SIM_OS_INSTANCES_PLAN.md's
+    # own dated entries). INSTALL_TIMEOUT_SEC was raised from 600s to 3600s
+    # in simulator_launcher.py alongside this -- a full ArduPilot build plus
+    # ros-noetic-desktop-full plus the bridge's cmake build can easily run
+    # past 10 minutes on modest hardware.
+    install_command: >-
+      bash -lc '
+      set -e;
+      if [ ! -d $HOME/nepi_engine_ws/nepi_drones/sim_container ]; then
+      mkdir -p $HOME/nepi_engine_ws;
+      git clone git@github.com:nepi-engine/nepi_drones.git $HOME/nepi_engine_ws/nepi_drones;
+      fi;
+      if [ ! -f /etc/apt/sources.list.d/ros-latest.list ]; then
+      sudo sh -c "echo \"deb http://packages.ros.org/ros/ubuntu $(lsb_release -sc) main\" > /etc/apt/sources.list.d/ros-latest.list";
+      sudo apt-get install -y curl;
+      curl -s https://raw.githubusercontent.com/ros/rosdistro/master/ros.asc | sudo apt-key add -;
+      fi;
+      sudo apt-get update --fix-missing;
+      if ! dpkg -s ros-noetic-desktop-full > /dev/null 2>&1; then
+      sudo apt-get install -y ros-noetic-desktop-full;
+      fi;
+      sudo apt-get install -y ros-noetic-gazebo-ros-pkgs ros-noetic-gazebo-ros-control;
+      if [ ! -f /etc/apt/sources.list.d/gazebo-stable.list ]; then
+      sudo apt-get install -y wget lsb-release gnupg;
+      sudo sh -c "echo \"deb http://packages.osrfoundation.org/gazebo/ubuntu-stable $(lsb_release -sc) main\" > /etc/apt/sources.list.d/gazebo-stable.list";
+      wget -q https://packages.osrfoundation.org/gazebo.key -O - | sudo apt-key add -;
+      sudo apt-get update;
+      fi;
+      sudo apt-get install -y gazebo11 libgazebo11-dev;
+      if [ ! -d $HOME/ardupilot ]; then
+      git clone --recurse-submodules https://github.com/ArduPilot/ardupilot $HOME/ardupilot;
+      fi;
+      cd $HOME/ardupilot;
+      git checkout Copter-4.5;
+      git submodule update --init --recursive;
+      if [ ! -x $HOME/ardupilot/build/sitl/bin/arducopter ]; then
+      Tools/environment_install/install-prereqs-ubuntu.sh -y;
+      . $HOME/.profile;
+      ./waf configure --board sitl;
+      ./waf copter;
+      fi;
+      if [ ! -d $HOME/ardupilot_gazebo ]; then
+      git clone https://github.com/khancyr/ardupilot_gazebo $HOME/ardupilot_gazebo;
+      fi;
+      mkdir -p $HOME/ardupilot_gazebo/build;
+      cd $HOME/ardupilot_gazebo/build;
+      cmake ..;
+      make -j$(nproc);
+      sudo make install;
+      mkdir -p $HOME/ardupilot_gazebo/worlds;
+      cp -f $HOME/nepi_engine_ws/nepi_drones/sim_container/worlds/iris_arducopter_cmac.world $HOME/ardupilot_gazebo/worlds/iris_arducopter_cmac.world
+      '
+    # Copy of install_command's own steps, laid out one command per line for
+    # the RUI to show verbatim as a copy-paste fallback if auto-install ever
+    # fails -- same convention as gazebo_rover's own manual_fallback_commands.
     manual_fallback_commands: |-
       git clone git@github.com:nepi-engine/nepi_drones.git ~/nepi_engine_ws/nepi_drones
       git clone --recurse-submodules https://github.com/ArduPilot/ardupilot
       cd ardupilot
+      git checkout Copter-4.5
+      git submodule update --init --recursive
       Tools/environment_install/install-prereqs-ubuntu.sh -y
       . ~/.profile
       ./waf configure --board sitl
       ./waf copter
+      echo "deb http://packages.osrfoundation.org/gazebo/ubuntu-stable $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/gazebo-stable.list
+      wget -q https://packages.osrfoundation.org/gazebo.key -O - | sudo apt-key add -
+      sudo apt-get update
+      sudo apt-get install -y gazebo11 libgazebo11-dev
+      cd ~
+      git clone https://github.com/khancyr/ardupilot_gazebo
+      mkdir -p ardupilot_gazebo/build
+      cd ardupilot_gazebo/build
+      cmake ..
+      make -j$(nproc)
+      sudo make install
+      mkdir -p ~/ardupilot_gazebo/worlds
+      cp ~/nepi_engine_ws/nepi_drones/sim_container/worlds/iris_arducopter_cmac.world ~/ardupilot_gazebo/worlds/
     # Same fragile-YAML-folding caution as gazebo_rover's own launch_command
     # above applies here verbatim -- every line stays at the SAME
     # indentation on purpose. Verify with

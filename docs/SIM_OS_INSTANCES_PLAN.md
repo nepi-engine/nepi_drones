@@ -290,10 +290,82 @@ Step-1 prerequisites → tunnel (autossh) → verify (real `ssh_user`,
 targets correctly repointed at the new instance → reselect `baseline` →
 remove test instance, leaving a clean slate.
 
+## 3g. Install button failed everywhere: `sudo: a terminal is required` (2026-09-02)
+
+Reported live: `Install command exited 1: sudo: a terminal is required to
+read the password`, on a target that had nothing specifically wrong with
+it -- a foundational bug, not a per-target one. `_ssh_cmd()` never allocates
+a pty (no `-t`), so *any* `install_command` that shells out to `sudo` has no
+terminal for `sudo` to prompt on. This affects every target with an
+`install_command` (`gazebo_rover`, `webots_rover`, `webots_quadcopter`,
+`mujoco_rover`, and now `gazebo_quadcopter` -- see 3h below), not just the
+one that happened to be tried first.
+
+Piping a password over a non-interactive SSH session would mean storing or
+transmitting a sudo password -- against this codebase's own "no
+credentials, ever" design for SSH keys, extended here to sudo. Fixed
+instead by requiring passwordless sudo on the target machine
+(`/etc/sudoers.d/nepi-sim-connector`, `NOPASSWD:ALL`), detected rather than
+assumed: `simulator_launcher.py`'s `install()` now checks `stderr` for the
+telltale "a terminal is required to read the password" / "no tty present"
+strings and raises a `LauncherError` with a new
+`SUDO_NOPASSWD_FALLBACK_COMMANDS` as `manual_fallback_commands` -- which
+surfaces automatically through the existing generic
+`setLauncherError`/`publishLauncherStatus` mechanism, no changes needed to
+`sim_connector_app_node.py` itself. Added as a new wizard prerequisite
+(now **STEP 1c**, alongside the SSH-server and device-pubkey-trust steps
+from 3f) and to `SIM_VM_CONNECTION_SETUP.md`. Deployed, verified
+error-free, committed (`60c2e62`), and persisted via `nepicommit`.
+
+## 3h. ArduPilot + Gazebo auto-install (2026-09-02)
+
+`gazebo_quadcopter` had no `install_command` at all (a deliberate choice
+until now -- ArduPilot SITL setup was judged a from-source build with no
+honest single install command, see §4's own prior wording) -- its
+`manual_fallback_commands`
+was the only path, and it was itself incomplete: it built ArduPilot off
+`master`, which doesn't build against Ubuntu 20.04's stock Python 3.8.10
+(reported live: "these gazebo comamnds are also missing making it useable
+with pyhon 3.8.10, since thats the max ubuntu 20.04 can go to"), and it
+never installed Gazebo11 or built the `ardupilot_gazebo` bridge plugin at
+all -- both are hard requirements of this target's own `launch_command`.
+
+Fixed using the user's own validated manual recipe as the reference
+sequence: pin ArduPilot to the `Copter-4.5` branch (the same
+version-pinning pattern this project has hit before -- WPILib/robotpy
+needed `2022.4.8` for a GCC10/C++20 issue, Webots needed R2023a for a glibc
+issue; ArduPilot's Python-3.8 issue is the same recurring class of problem),
+add the Gazebo11 OSRF apt repo/key/package steps, and clone+cmake-build+
+`sudo make install` the `ardupilot_gazebo` bridge plugin. Every stage is
+skip-if-already-done, matching `gazebo_rover`'s own `install_command`
+convention, so re-running this on a partially-set-up box is harmless.
+
+This also required reconstructing `iris_arducopter_cmac.world`
+(`check_installed_command`/`launch_command`/`ready_check_command` all
+hard-require it, but it existed nowhere in this repo -- a hand-customized
+file that lived only on the original dev machine). Reconstructed as the
+stock `iris_arducopter_runway.world` from `khancyr/ardupilot_gazebo`
+(fetched from GitHub) plus one added `<include>model://camera_rig</include>`
+block, matching the syntax `generic_rover_multi.world` uses for the same
+model -- but as a single, non-inlined instance, since ArduPilot SITL is
+single-vehicle by construction and the multi-rover world's inlined
+duplicates exist specifically to work around a *multi*-instance topic
+collision that doesn't apply here. `GAZEBO_MODEL_PATH` already includes
+this repo's `sim_container/models` (set by this target's existing
+`launch_command`), so `model://camera_rig` resolves with no launch_command
+changes. `INSTALL_TIMEOUT_SEC` raised 600s -> 3600s in
+`simulator_launcher.py` alongside this -- the previous value was sized for
+package-manager one-liners, not a from-source ArduPilot build.
+
+**Not live-tested against real Gazebo/compute hardware** -- no such
+environment is available in this session. Code-reviewed against the user's
+own validated recipe and the stock upstream world file; ships as
+VM-side-done, on-device-confirmation-still-open, the same convention this
+doc's own 3a-3f entries already followed before their own live tests
+happened.
+
 ## 4. Explicitly not doing
 
-- ArduPilot SITL auto-install -- unchanged, still manual-fallback-only (no
-  honest single install command for a from-source build).
 - Running more than one simulator across instances at once -- matches the
   existing, resource-driven "one simulator at a time" constraint. Multiple
   instances can be *registered/reachable* simultaneously; only one is ever

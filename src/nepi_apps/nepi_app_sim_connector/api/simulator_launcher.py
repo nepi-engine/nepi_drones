@@ -60,7 +60,12 @@ READY_CHECK_INTERVAL_SEC = 3
 # An install can mean anything from a pip install to a multi-package apt
 # transaction with a slow mirror -- generous on purpose; this blocks the
 # caller's dedicated install thread, never the main status/launch path.
-INSTALL_TIMEOUT_SEC = 600
+# Raised 600 -> 3600 (2026-09-02) once gazebo_quadcopter got a real
+# install_command: a from-source ArduPilot build plus ros-noetic-desktop-full
+# plus the ardupilot_gazebo bridge's own cmake build can easily run past
+# 10 minutes on modest hardware -- 600s was sized for the package-manager
+# one-liners every other target uses, not a build like this one.
+INSTALL_TIMEOUT_SEC = 3600
 
 
 class LauncherError(Exception):
