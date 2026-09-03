@@ -143,6 +143,31 @@ redesign:
   the block were reworded to match (`"Setup Commands -- Run On The New
   Machine, In Order"`, etc.).
 
+## 3b. SSH-keygen step removed entirely (2026-09-02)
+
+Reported live: "most people will already have the normal os to nepi
+connection working, so theres no reason to have the ssh pubpriv thng
+there. make it so just hte reverse ssh is set up." The original 3-step
+wizard's Step 1 (`ssh-keygen -f ~/.ssh/nepi_default_ssh_key`) assumed the
+machine being registered had never touched that path before -- true for a
+genuinely new machine, but **false and actively destructive** for the
+overwhelming common case: a machine that already completed NEPI's own
+Remote Setup (`NEPI_REMOTE_SETUP.md`) and already has a working,
+device-trusted `nepi_default_ssh_key`. Confirmed the hard way this session:
+running Step 1 against exactly that kind of machine (this project's own dev
+VM) overwrote the working private key with a fresh, never-authorized one,
+locking out both the NEPI device's host and its running container until
+physical console access could restore it (`docker exec` from the host was
+the eventual fix for the container side, once the host was reachable
+again).
+
+`build_setup_commands()` now generates a 2-step wizard (tunnel, then
+verify) that never touches `~/.ssh/nepi_default_ssh_key` at all -- it
+documents up front that the new machine is assumed to already have Remote
+Setup done, and points at `NEPI_REMOTE_SETUP.md` for the rare case where it
+genuinely doesn't. No code elsewhere needed to change: `verify()`/`select()`
+never cared how the tunnel got set up, only that it eventually works.
+
 ## 4. Explicitly not doing
 
 - ArduPilot SITL auto-install -- unchanged, still manual-fallback-only (no

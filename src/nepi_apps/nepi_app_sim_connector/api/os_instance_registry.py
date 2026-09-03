@@ -208,38 +208,47 @@ class OsInstanceRegistry(object):
   def build_setup_commands(self, instance):
     """The exact copy-paste block the RUI shows for a freshly-registered
     instance -- mirrors docs/SIM_VM_CONNECTION_SETUP.md's own two documented
-    paths (systemd, and the plain-autossh fallback needed on a machine like
-    this dev VM's own WSL environment, per that doc's own WSL callout), with
-    the real allocated port substituted in rather than a human hand-editing
-    port numbers out of a markdown file.
+    tunnel paths (systemd, and the plain-autossh fallback needed on a
+    machine like this dev VM's own WSL environment, per that doc's own WSL
+    callout), with the real allocated port substituted in rather than a
+    human hand-editing port numbers out of a markdown file.
 
     Restructured (reported live: "the commands are kind of hard to
     understand ... give the right places to go properly") as a plain,
     numbered walkthrough with an explicit WHERE line on every step, rather
     than a wall of shell-comment-prefixed lines -- the earlier shape read as
     one long script when it's actually two machines and two alternative
-    paths interleaved."""
+    paths interleaved.
+
+    No SSH-key-generation step -- reported live: "most people will already
+    have the normal OS-to-NEPI connection working, so there's no reason to
+    have the ssh pub/priv thing there." The overwhelming common case is a
+    machine that's already been through NEPI's own Remote Setup, which
+    already created ~/.ssh/nepi_default_ssh_key and already got its public
+    half trusted by the device -- generating a SECOND keypair here would be
+    redundant at best, and once (see docs/SIM_OS_INSTANCES_PLAN.md's
+    incident writeup) actually destructive: running it against a machine
+    that already had a WORKING nepi_default_ssh_key overwrote that working
+    key, breaking the very connection the device already trusted. The
+    tunnel commands below reuse whatever key is already there; a machine
+    that has genuinely never done Remote Setup at all needs that setup
+    first (see NEPI_REMOTE_SETUP.md), not a key generated in isolation
+    here."""
     port = instance['ssh_port']
     iid = instance['instance_id']
     return (
-        "STEP 1 of 3 -- Create an SSH key\n"
+        "STEP 1 of 2 -- Open a reverse tunnel back to the NEPI device\n"
         "Where: on the NEW machine (" + instance['display_name'] + ")\n"
         "\n"
-        "Skip this step if you already did it once before for a different\n"
-        "machine -- every machine reuses the same key.\n"
+        "This assumes this machine already has NEPI Remote Setup done (the\n"
+        "normal, already-working OS-to-device connection) -- it already has\n"
+        "~/.ssh/nepi_default_ssh_key, and the device already trusts it. This\n"
+        "step just opens a tunnel with that existing key; it does not create\n"
+        "or change any key. (If this machine has never done Remote Setup at\n"
+        "all, do that first -- see NEPI_REMOTE_SETUP.md -- rather than running\n"
+        "anything below.)\n"
         "\n"
-        "    ssh-keygen -t ed25519 -f ~/.ssh/nepi_default_ssh_key -N \"\"\n"
-        "    cat ~/.ssh/nepi_default_ssh_key.pub >> ~/.ssh/authorized_keys\n"
-        "\n"
-        "(The second line authorizes this same key on this machine -- the NEPI\n"
-        "device already trusts it, so nothing needs to change on the device side.)\n"
-        "\n"
-        "\n"
-        "STEP 2 of 3 -- Open a reverse tunnel back to the NEPI device\n"
-        "Where: on the NEW machine (" + instance['display_name'] + ")\n"
-        "\n"
-        "This is what lets the NEPI device reach this machine to deploy a\n"
-        "simulator later. Pick ONE of the two options below -- not both.\n"
+        "Pick ONE of the two options below -- not both.\n"
         "\n"
         "  Option A -- recommended: restarts itself automatically on reboot.\n"
         "\n"
@@ -264,7 +273,7 @@ class OsInstanceRegistry(object):
         "      <REPLACE with your NEPI device's user>@<REPLACE with its IP or hostname>\n"
         "\n"
         "\n"
-        "STEP 3 of 3 -- Verify it worked\n"
+        "STEP 2 of 2 -- Verify it worked\n"
         "Where: on the NEW machine (" + instance['display_name'] + ")\n"
         "\n"
         "    ssh -p " + str(port) + " <REPLACE with your username on this machine>@localhost echo ok\n"
