@@ -216,6 +216,35 @@ from the outside.
   config in memory. Not yet addressed; the honest options are to re-read the
   file per launch request, or to surface the loaded config's mtime in
   `SimLauncherStatus` so a stale config is at least visible.
+- [x] **Install gave zero feedback for minutes at a time (2026-09-02).**
+  Reported live against a real install (`gazebo_rover`'s `ros-noetic-desktop-
+  full`, which genuinely took long enough to notice): "hit deploy and it
+  doesn't do anything." `install()` runs the whole `install_command` as one
+  opaque blocking remote command (see `simulator_launcher.py`'s own
+  docstring), and `runInstall()` only calls `publishLauncherStatus()` once at
+  the very start and once at the end -- so `launcher_state` sits at
+  `'installing'` with literally nothing else changing for however long the
+  real install takes, and the RUI's only visible reaction was a greyed-out
+  button. Confirmed by finding the actual `apt-get install -y
+  ros-noetic-desktop-full` / `dpkg --unpack` processes still genuinely
+  running on the target machine -- not stuck, just slow and invisible.
+  Fixed entirely client-side, in `Nepi_IF_SimLauncher.js` -- no backend
+  change, since there's no real per-stage progress the backend could report
+  without instrumenting every target's `install_command` to emit stage
+  markers (not done; see below). The component now tracks
+  `install_started_at` (set the moment it observes `launcher_state`
+  transition into `'installing'`) and a 1-second `tick` used only to force a
+  re-render, and renders "Installing '<target>'... (Ns elapsed) -- large
+  installs... can take 10-20+ minutes" next to the disabled button whenever
+  `state === 'installing'`. Deliberately just an elapsed-time reassurance,
+  not a real progress bar -- still a large improvement over nothing, and
+  deployable as a pure RUI rebuild with no risk to an in-flight install
+  (confirmed: didn't touch `sim_connector_app_node.py`, so the live install
+  this was found against was never disturbed by deploying the fix).
+  **Real per-stage progress (e.g. "downloading Gazebo11", "building
+  ArduPilot") is still open** -- would need each `install_command` to write
+  stage markers to a well-known remote file and a poller to read them back,
+  more invasive than this pass's scope.
 
 ## 4. Deferred / explicitly out of scope for this plan
 

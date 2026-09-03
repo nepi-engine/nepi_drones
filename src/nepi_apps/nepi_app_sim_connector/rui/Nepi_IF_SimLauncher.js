@@ -65,7 +65,22 @@ class NepiIFSimLauncher extends Component {
       // Only used when this instance isn't given a selected_target prop --
       // see getSelectedTarget/setSelectedTarget.
       selected_target: 'None',
+
+      // Client-side timestamp (Date.now()) of when launcher_state was last
+      // observed transitioning INTO 'installing' -- reported live: "hit
+      // deploy... it doesn't do anything" when a real install (a large
+      // ros-noetic-desktop-full apt transaction, in that case) was several
+      // minutes in with zero feedback beyond a greyed-out button. The
+      // backend has no per-stage progress to report (install_command runs
+      // as one opaque blocking remote command -- see simulator_launcher.py's
+      // install()), so this is deliberately just an elapsed-time
+      // reassurance, not real progress; still far better than nothing.
+      // null whenever not currently installing. tick forces a re-render
+      // once a second so the elapsed time actually counts up live.
+      install_started_at: null,
+      tick: 0,
     }
+    this.tickIntervalId = null
 
     this.getSimNamespace = this.getSimNamespace.bind(this)
 
@@ -114,6 +129,11 @@ class NepiIFSimLauncher extends Component {
 
   componentDidMount() {
     this.updateStatusListener()
+    // Drives the elapsed-time install indicator -- see install_started_at's
+    // own comment. Runs for this component's whole lifetime rather than
+    // only while installing (negligible cost either way, and avoids a
+    // second layer of start/stop bookkeeping on top of statusListener's own).
+    this.tickIntervalId = setInterval(() => this.setState({ tick: Date.now() }), 1000)
   }
 
   componentDidUpdate(prevProps, prevState, snapshot) {
@@ -128,6 +148,10 @@ class NepiIFSimLauncher extends Component {
       this.state.statusListener.unsubscribe()
     }
     this.setState({ statusListener: null })
+    if (this.tickIntervalId !== null) {
+      clearInterval(this.tickIntervalId)
+      this.tickIntervalId = null
+    }
   }
 
   // Subscribes to <namespace>/launcher_status, message type
@@ -151,6 +175,21 @@ class NepiIFSimLauncher extends Component {
   }
 
   statusListener(message) {
+    // Catches BOTH the edge where install_started_at doesn't exist yet
+    // (e.g. Install was clicked elsewhere, or this component just mounted
+    // mid-install) and a normal transition -- either way, the first status
+    // update this component ever sees while the backend reports
+    // 'installing' is close enough to the real start for an elapsed-time
+    // estimate; it doesn't need to be exact.
+    const was_installing = (this.state.status_msg !== null
+      && this.state.status_msg.launcher_state === 'installing')
+    const now_installing = (message.launcher_state === 'installing')
+    if (now_installing && !was_installing) {
+      this.setState({ install_started_at: Date.now() })
+    } else if (!now_installing && this.state.install_started_at !== null) {
+      this.setState({ install_started_at: null })
+    }
+
     this.setState({ status_msg: message })
     // Keep the dropdown following the device's own reported selection
     // (e.g. after a launch started from elsewhere) unless the operator
@@ -463,6 +502,29 @@ class NepiIFSimLauncher extends Component {
       </Label>
     : null
 
+    // Elapsed-time reassurance while an install is in flight -- reported
+    // live: "hit deploy... it doesn't do anything" partway through a real
+    // install (ros-noetic-desktop-full, several minutes in) with nothing
+    // but a greyed-out button to look at. install_command runs as one
+    // opaque blocking remote command (see simulator_launcher.py's
+    // install()), so there's no real per-stage progress to show here --
+    // this is deliberately just "still going, here's how long," not a
+    // progress bar. this.state.tick (ticked once a second by
+    // componentDidMount's own interval) is read only to force this to
+    // re-render live; its value is never used directly.
+    const installing_row = (state === 'installing' && this.state.install_started_at !== null) ?
+      <Label title={"Installing"}>
+        <div style={{ textAlign: "left", whiteSpace: "normal" }}>
+          {"Installing '" + target + "'... (" +
+            Math.max(0, Math.floor((this.state.tick - this.state.install_started_at) / 1000)) +
+            "s elapsed). Large installs -- ROS/Gazebo package sets, or a "
+            + "from-source ArduPilot build -- can take 10-20+ minutes. This "
+            + "page will update on its own when it finishes; no need to "
+            + "click anything again."}
+        </div>
+      </Label>
+    : null
+
     // Worst-case copy-paste fallback -- populated by the backend
     // (publishLauncherStatus) only once a failure is confirmed
     // dependency-related, for a human to run directly in a terminal when
@@ -497,6 +559,7 @@ class NepiIFSimLauncher extends Component {
         <React.Fragment>
 
           {error_row}
+          {installing_row}
           {manual_fallback_row}
 
           <ButtonMenu>
@@ -544,6 +607,7 @@ class NepiIFSimLauncher extends Component {
           </Label>
 
           {error_row}
+          {installing_row}
           {manual_fallback_row}
 
           <ButtonMenu>
@@ -567,6 +631,7 @@ class NepiIFSimLauncher extends Component {
           </Label>
 
           {error_row}
+          {installing_row}
           {manual_fallback_row}
 
           <ButtonMenu>
@@ -582,6 +647,7 @@ class NepiIFSimLauncher extends Component {
     return (
       <React.Fragment>
         {error_row}
+        {installing_row}
         {manual_fallback_row}
         <ButtonMenu>
           <Button disabled={deploy_disabled} onClick={this.onDeployClicked}>{"Deploy"}</Button>
