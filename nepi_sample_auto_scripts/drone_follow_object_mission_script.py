@@ -108,7 +108,10 @@ TARGET_TO_FOLLOW = "chair" # Either a target class name (will follow first found
 # drone -- ArduPilot backs it away to hold the boundary, which is exactly the
 # desired "back off if it gets too close" behavior with no extra logic needed.
 TARGET_OFFSET_GOAL_M = 2.5 # Standoff radius (m) -- how close the drone is allowed to get to the target
-TRIGGER_RESET_DELAY_S = 5 # Time between detect/move checks
+# TRIGGER_RESET_DELAY_S (a fixed pause between detect/move checks) was
+# removed 2026-09-03 along with the rest of the per-cycle delays in
+# move_to_object_callback -- see that method's own comment on continuous
+# tracking for why.
 
 # Set Home Poistion
 #
@@ -518,25 +521,50 @@ class drone_follow_object_mission(object):
     self.rbx_set_process_name_pub.publish(process_name)
     return True
 
-  def goto_rbx_position(self, goto_data, timeout_sec=10):
+  def goto_rbx_position(self, goto_data, timeout_sec=10, wait_for_completion=True):
+    # wait_for_completion=False (see move_to_object_callback's own comment
+    # on continuous tracking): publishes the setpoint and returns
+    # immediately instead of blocking on busy->ready convergence. Safe to
+    # skip that wait for a moving target -- gotoPosition() on the driver
+    # side (rbx_ardupilot_node.py) re-bases the body-frame offset onto
+    # wherever the vehicle currently is on EVERY publish, it doesn't queue
+    # or require the previous setpoint to finish first, so publishing a
+    # fresh setpoint here always immediately supersedes whatever the
+    # vehicle was flying toward before.
     self.rbx_set_cmd_timeout_pub.publish(timeout_sec)
     time.sleep(0.1)
-    if len(goto_data) == 4:
-      ready = self.wait_for_rbx_status_ready(timeout_sec)
-      if ready:
-        self.msg_if.pub_info("Starting goto Position Body Process")
-        goto_msg = GotoPosition()
-        goto_msg.x_meters = goto_data[0]
-        goto_msg.y_meters = goto_data[1]
-        goto_msg.z_meters = goto_data[2]
-        goto_msg.yaw_deg = goto_data[3]
-        self.rbx_goto_position_pub.publish(goto_msg)
-        busy = self.wait_for_rbx_status_busy(timeout_sec)
-        if busy:
-          self.wait_for_rbx_status_ready(timeout_sec)
-      time.sleep(1)
-      return self.rbx_status.cmd_success
-    return False
+    if len(goto_data) != 4:
+      return False
+    if not wait_for_completion:
+      # Skip the ready-gate too, not just the post-publish wait -- "busy"
+      # here just means "still flying toward the previous setpoint", which
+      # for a continuously-tracked moving target is exactly the state a new
+      # setpoint is meant to interrupt, not wait out. Blocking here on the
+      # SAME condition this call exists to supersede would mean each
+      # tracking update waits out however long the last one takes to
+      # "finish" (which for a moving target may be never), defeating the
+      # whole point of following continuously.
+      goto_msg = GotoPosition()
+      goto_msg.x_meters = goto_data[0]
+      goto_msg.y_meters = goto_data[1]
+      goto_msg.z_meters = goto_data[2]
+      goto_msg.yaw_deg = goto_data[3]
+      self.rbx_goto_position_pub.publish(goto_msg)
+      return True
+    ready = self.wait_for_rbx_status_ready(timeout_sec)
+    if ready:
+      self.msg_if.pub_info("Starting goto Position Body Process")
+      goto_msg = GotoPosition()
+      goto_msg.x_meters = goto_data[0]
+      goto_msg.y_meters = goto_data[1]
+      goto_msg.z_meters = goto_data[2]
+      goto_msg.yaw_deg = goto_data[3]
+      self.rbx_goto_position_pub.publish(goto_msg)
+      busy = self.wait_for_rbx_status_busy(timeout_sec)
+      if busy:
+        self.wait_for_rbx_status_ready(timeout_sec)
+    time.sleep(1)
+    return self.rbx_status.cmd_success
 
   #######################
   ### Node Methods
@@ -664,23 +692,24 @@ class drone_follow_object_mission(object):
         # SITL running slower than realtime: confirmed live 2026-08-12, every
         # goto reported "Setpoint cmd timed out" / "Goto Position failed" while
         # the vehicle was in fact tracking the target correctly.
-        success = self.goto_rbx_position(setpoint_position_body_m, timeout_sec = CMD_GOTO_TIMEOUT_SEC)
-        error_str = str(self.rbx_status.errors_current)
-        if success:
-          self.msg_if.pub_info("Goto Position completed with errors: " + error_str )
-        else:
-          self.msg_if.pub_info("Goto Position failed with errors: " + error_str )
-        nepi_ros.sleep(2,10)
-        #########################################
-        # Run Mission Actions
-        #self.msg_if.pub_info("Starting Mission Actions")
-        #success = self.mission_actions()
-        ##########################################
-  ##        self.msg_if.pub_info("Switching back to original mode")
-  ##        self.set_rbx_mode("RESUME")
-        self.msg_if.pub_info("Delaying next trigger for " + str(TRIGGER_RESET_DELAY_S) + " secs")
-        nepi_ros.sleep(TRIGGER_RESET_DELAY_S,100)
-        self.msg_if.pub_info("Waiting for next " + TARGET_TO_FOLLOW + " detection")
+        # Requested live (2026-09-03): "keep making it an action to go to
+        # that point. as it keeps updating, constantly follow it." -- the
+        # previous version blocked here (goto_rbx_position's default
+        # wait_for_completion=True) for up to CMD_GOTO_TIMEOUT_SEC, then
+        # added a further TRIGGER_RESET_DELAY_S + nepi_ros.sleep(2,10)
+        # pause before the NEXT detection was even looked at -- up to ~37s
+        # of committing to one single, increasingly stale setpoint against
+        # a target that circles with a 50s period. That's "fly to where it
+        # was a while ago, pause, repeat", not tracking. wait_for_completion
+        # =False publishes the updated setpoint and returns immediately
+        # (see that method's own comment for why this is safe to do on
+        # every detection rather than waiting each one out), so this now
+        # re-aims at the target's CURRENT bearing on essentially every
+        # incoming detection (~the AI-targeting stream's own rate) instead
+        # of once per ~37s cycle -- continuous pursuit rather than discrete
+        # hops.
+        self.goto_rbx_position(setpoint_position_body_m, timeout_sec = CMD_GOTO_TIMEOUT_SEC,
+                                wait_for_completion = False)
       else:
         self.msg_if.pub_info("Target range value invalid, skipping actions")
         time.sleep(1)

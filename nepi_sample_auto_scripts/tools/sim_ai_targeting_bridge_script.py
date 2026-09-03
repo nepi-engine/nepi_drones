@@ -62,8 +62,9 @@ import time
 from nepi_sdk import nepi_ros
 from nepi_api.messages_if import MsgIF
 
+from std_msgs.msg import Bool
 from sensor_msgs.msg import Image
-from nepi_interfaces.msg import Target, Targets
+from nepi_interfaces.msg import Target, Targets, ImageTarget
 
 #########################################
 # USER SETTINGS - Edit as Necessary
@@ -90,6 +91,12 @@ LAUNCH_TRIGGER_TIMEOUT_SEC = 3.0
 ROBOT_IMAGE_TOPIC_CANDIDATES = ["color_2d_image", "idx/color_image"]
 
 PROCESS_NAME = "sim_ai_targeting_bridge"
+
+# Requested live (2026-09-03): "put some sort of pointer on the object for
+# detection" -- the marker color for the live target crosshair overlay
+# (see wireUpTargetOverlay/publishTargetOverlay below). Bright red so it
+# reads clearly against grass/ground colors in the sim world.
+TARGET_OVERLAY_COLOR_RGB = (255, 0, 0)
 
 
 def find_image_topic(candidates, timeout = 20):
@@ -174,6 +181,15 @@ class sim_ai_targeting_bridge(object):
     self.targets_pub = nepi_ros.create_publisher(TARGETS_TOPIC, Targets, queue_size = 1)
     self.image_pub = nepi_ros.create_publisher(IMAGE_TOPIC, Image, queue_size = 1)
 
+    # Live crosshair overlay on the robot's OWN image (not targeting_image,
+    # which is just a passthrough relay with no overlay renderer of its
+    # own) -- wired up lazily once imageRelayThread finds the robot's image
+    # topic and can derive its sibling "image/" overlay namespace from it.
+    # None until then; processBridgeLine no-ops the overlay call so it's
+    # safe to receive target lines before this is ready.
+    self.image_add_target_pub = None
+    self.image_targets_enable_pub = None
+
     # Always trigger, unconditionally -- sitl_gazebo_full is idempotent and
     # checks real OS processes on the VM (not a ROS-level proxy), so this is
     # harmless when everything's already up. A "is the RBX driver already
@@ -222,10 +238,56 @@ class sim_ai_targeting_bridge(object):
       if source_image_topic != "":
         self.msg_if.pub_info("Relaying image topic: " + source_image_topic)
         rospy.Subscriber(source_image_topic, Image, self.imageRelayCb, queue_size = 1)
+        self.wireUpTargetOverlay(source_image_topic)
         return
       self.msg_if.pub_warn("No camera image topic found yet -- rechecking in " +
                            str(IMAGE_TOPIC_RETRY_INTERVAL_SEC) + "s")
       time.sleep(IMAGE_TOPIC_RETRY_INTERVAL_SEC)
+
+  def wireUpTargetOverlay(self, source_image_topic):
+    # source_image_topic is "<device_ns>/color_2d_image" (or ".../idx/color_image")
+    # -- the generic per-device image-overlay topics (add_target_degree_offsets,
+    # targets_enable, ...; same family as add_target_pixel/overlay_target_pixels
+    # seen elsewhere in this app's own image utils) live as siblings under
+    # "<device_ns>/image/", not under the specific image topic's own name, so
+    # this strips exactly one path component and appends "image/...".
+    device_ns = source_image_topic.rsplit('/', 1)[0]
+    self.image_add_target_pub = nepi_ros.create_publisher(
+        device_ns + "/image/add_target_degree_offsets", ImageTarget, queue_size = 1)
+    self.image_targets_enable_pub = nepi_ros.create_publisher(
+        device_ns + "/image/targets_enable", Bool, queue_size = 1, latch = True)
+    time.sleep(0.5)  # let the publishers register before the first send
+    self.image_targets_enable_pub.publish(Bool(data = True))
+    self.msg_if.pub_info("Target overlay wired up on " + device_ns + "/image")
+
+  def publishTargetOverlay(self, target):
+    # Requested live (2026-09-03): "put some sort of pointer on the object
+    # for detection ... as it keeps updating, constantly follow it" -- a
+    # live crosshair marker on the robot's own image showing exactly where
+    # the currently-tracked target actually is, updated on every detection
+    # (not just left showing wherever the drone last visited). Named by
+    # target.name, so repeated calls here replace the same marker in place
+    # (see nepi_api's add_target_degs: it keys its targets_dict by name and
+    # only republishes when the entry actually changed) rather than
+    # accumulating a trail of stale ones.
+    #
+    # y_offset_deg is negated: this sensor's own elevation_deg convention is
+    # positive = up (mirrors ai_targeting_controller_ardupilot.py's Z-down
+    # frame, negated -- see move_to_object_callback's own comment on this),
+    # but the image overlay API's y offset follows image-row convention
+    # (increasing = further down the frame, derived from its own
+    # add_target_pixels: y_deg grows with y_ratio, and y_ratio 0 is the top
+    # row) -- so a target above boresight (positive elevation) must map to
+    # a NEGATIVE y offset to appear above center instead of below it.
+    if self.image_add_target_pub is None:
+      return
+    msg = ImageTarget()
+    msg.name = target.name
+    msg.x_offset_deg = target.azimuth_deg
+    msg.y_offset_deg = -target.elevation_deg
+    msg.r, msg.g, msg.b = TARGET_OVERLAY_COLOR_RGB
+    msg.msg_str = target.name + (" %.1fm" % target.range_m)
+    self.image_add_target_pub.publish(msg)
 
   def bridgeLoop(self):
     buf = b''
@@ -299,6 +361,8 @@ class sim_ai_targeting_bridge(object):
     targets_msg.targets = [target]
 
     self.targets_pub.publish(targets_msg)
+    if target.range_m != -999.0:
+      self.publishTargetOverlay(target)
 
 
 #########################################
