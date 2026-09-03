@@ -93,7 +93,7 @@ from nepi_interfaces.msg import DeviceRBXInfo, DeviceRBXStatus, AxisControls, Er
      GotoPose, GotoPosition, GotoLocation, Setting, Settings, SettingsStatus
 from nepi_interfaces.srv import RBXCapabilitiesQuery, RBXCapabilitiesQueryResponse
 from sensor_msgs.msg import NavSatFix, Image
-from nepi_interfaces.msg import Target, Targets
+from nepi_interfaces.msg import Target, Targets, NavPose
 
 #########################################
 # USER SETTINGS - Edit as Necessary
@@ -275,6 +275,23 @@ FOLLOW_MAX_SPEED_RATIO = 0.5
 # the yaw-rate ratio cap (1.0, i.e. TELEOP_MAX_ANGULAR_DPS) is reached at
 # 50 degrees off-center.
 FOLLOW_YAW_GAIN_PER_DEG = 0.02
+# Debugging aid (2026-09-04): even with the -999-yaw-sentinel, coast-
+# forever, close-range-instability, and ~90 degree driver yaw-convention
+# bugs all found and fixed this same session, one more test still showed
+# the vehicle diverging from a NORMAL ~7m tracking distance (not the
+# near-zero-range case FOLLOW_MIN_RANGE_M guards), in a different
+# direction than the earlier bug's own consistent bias -- a distinct,
+# still-unexplained issue. Periodic (every ~10s) position snapshots
+# aren't enough resolution to catch a sub-second control anomaly in the
+# act, so velocityControlLoopCb logs every tick here instead: timestamp,
+# range/azimuth/elevation this tick was computed from, the driver's own
+# CURRENTLY reported yaw/heading (navposeCb, above) for cross-reference,
+# and the resulting speed_ratio/twist actually sent. Written directly to
+# a local file (this script runs ON THE DEVICE, not the VM) rather than
+# through rospy logging, both to avoid flooding /rosout at
+# FOLLOW_CONTROL_RATE_HZ and so the file survives after the fact for
+# analysis pulled off the device separately from this node's own log.
+FOLLOW_DEBUG_LOG_PATH = "/tmp/follow_debug.log"
 
 # Sim target teardown (added 2026-08-26) -- best-effort signal to the dev
 # VM's ai_targeting_controller_ardupilot.py (see its TEARDOWN_PORT) to
@@ -315,6 +332,16 @@ class drone_follow_object_mission(object):
   latest_target_azimuth_deg = 0.0
   latest_target_elevation_deg = 0.0
 
+  # Latest cached navpose reading (see navposeCb) -- debug-log-only, not
+  # used by the control law itself (velocityControlLoopCb sends body-frame
+  # commands and lets the driver do its own yaw rotation, same as before);
+  # this is purely for cross-referencing against azimuth in
+  # FOLLOW_DEBUG_LOG_PATH while chasing the remaining divergence.
+  navpose_lock = threading.Lock()
+  latest_yaw_deg = 0.0
+  latest_heading_deg = 0.0
+  debug_log_file = None
+
   settings_update =  dict(
     takeoff_height_m = {"type":"Float","name":"takeoff_height_m","value":str(TAKEOFF_HEIGHT_M)}
   )
@@ -337,6 +364,19 @@ class drone_follow_object_mission(object):
     rbx_namespace = (robot_namespace + "rbx/")
     self.msg_if.pub_info("Using rbx namesapce " + rbx_namespace)
     self.rbx_initialize(rbx_namespace)
+    # Debugging the remaining follow-controller divergence (2026-09-04,
+    # see velocityControlLoopCb's own FOLLOW_DEBUG_LOG_PATH comment):
+    # subscribed here (not just read off self.rbx_status, which this
+    # script already has) so the debug log can show the DRIVER's own
+    # currently-reported yaw/heading alongside every command this script
+    # sends, cross-referencing against the azimuth that command was based
+    # on -- exactly the pair that exposed the ~90 degree yaw bug fixed
+    # earlier this same session (rbx_ardupilot_node.py), and the
+    # cheapest way to catch whatever is causing the STILL-remaining
+    # divergence in the act.
+    navpose_topic = robot_namespace + "npx/navpose"
+    self.msg_if.pub_info("Subscribing to navpose: " + navpose_topic)
+    rospy.Subscriber(navpose_topic, NavPose, self.navposeCb, queue_size = 1)
     # Registered as soon as the rbx_* publishers cleanup_actions() needs
     # actually exist -- fires on a normal RUI stop (StopScript -> rospy
     # shutdown) as well as any other clean rospy shutdown, covering
@@ -724,6 +764,14 @@ class drone_follow_object_mission(object):
       self.img_height = img_msg.height
       self.img_width = img_msg.width
 
+  # Caches the driver's own currently-reported yaw/heading -- see
+  # FOLLOW_DEBUG_LOG_PATH's own comment for why (debugging the remaining
+  # follow-controller divergence). Not used by the control law itself.
+  def navposeCb(self, navpose_msg):
+    with self.navpose_lock:
+      self.latest_yaw_deg = navpose_msg.yaw_deg
+      self.latest_heading_deg = navpose_msg.heading_deg
+
   # Action upon detection and targeting for object of interest -- just
   # caches the latest reading (thread-safe: this callback and
   # velocityControlLoopCb below run on different threads, rospy's own
@@ -785,12 +833,16 @@ class drone_follow_object_mission(object):
       azimuth_deg = self.latest_target_azimuth_deg
       elevation_deg = self.latest_target_elevation_deg
     if target_time == 0.0 or (time.time() - target_time) > FOLLOW_TARGET_STALE_SEC:
-      self.rbx_set_teleop_velocity_pub.publish(Twist())
+      twist = Twist()
+      self.rbx_set_teleop_velocity_pub.publish(twist)
+      self._logFollowDebug("STALE", range_m, azimuth_deg, elevation_deg, 0.0, twist)
       return
     if range_m < FOLLOW_MIN_RANGE_M:
       # See FOLLOW_MIN_RANGE_M's own comment -- azimuth/elevation are not
       # trustworthy this close in, and there is nothing left to chase.
-      self.rbx_set_teleop_velocity_pub.publish(Twist())
+      twist = Twist()
+      self.rbx_set_teleop_velocity_pub.publish(twist)
+      self._logFollowDebug("CLOSE", range_m, azimuth_deg, elevation_deg, 0.0, twist)
       return
     range_error_m = range_m - TARGET_OFFSET_GOAL_M
     speed_ratio = max(-FOLLOW_MAX_SPEED_RATIO, min(FOLLOW_MAX_SPEED_RATIO,
@@ -816,6 +868,29 @@ class drone_follow_object_mission(object):
     else:
       twist.angular.z = max(-1.0, min(1.0, azimuth_deg * FOLLOW_YAW_GAIN_PER_DEG))
     self.rbx_set_teleop_velocity_pub.publish(twist)
+    self._logFollowDebug("TRACK", range_m, azimuth_deg, elevation_deg, speed_ratio, twist)
+
+  def _logFollowDebug(self, state, range_m, azimuth_deg, elevation_deg, speed_ratio, twist):
+    # See FOLLOW_DEBUG_LOG_PATH's own comment. Lazily opened (not in
+    # __init__) so a script that never reaches the follow loop at all
+    # doesn't leave a stray empty file behind. Errors here are swallowed
+    # deliberately -- a debug log write failing must never take down
+    # actual vehicle control.
+    try:
+      if self.debug_log_file is None:
+        self.debug_log_file = open(FOLLOW_DEBUG_LOG_PATH, "w")
+        self.debug_log_file.write(
+            "time,state,range_m,azimuth_deg,elevation_deg,driver_yaw_deg,"
+            "driver_heading_deg,speed_ratio,twist_x,twist_y,twist_z,twist_angular_z\n")
+      with self.navpose_lock:
+        yaw_deg = self.latest_yaw_deg
+        heading_deg = self.latest_heading_deg
+      self.debug_log_file.write("%.3f,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.4f,%.4f\n" % (
+          time.time(), state, range_m, azimuth_deg, elevation_deg, yaw_deg, heading_deg,
+          speed_ratio, twist.linear.x, twist.linear.y, twist.linear.z, twist.angular.z))
+      self.debug_log_file.flush()
+    except Exception as e:
+      pass
 
 
   #######################
