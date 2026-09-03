@@ -736,17 +736,30 @@ class drone_follow_object_mission(object):
     set_teleop_velocity primitive (body-frame [-1,1] forward/right/up
     ratios + yaw-rate) instead of that project's MAVLink velocity calls.
 
-    Stops (publishes nothing further, letting the driver's own
-    TELEOP_CMD_TIMEOUT_SEC safety cutoff take over) whenever the cached
-    target reading is missing or older than FOLLOW_TARGET_STALE_SEC --
-    "haven't seen it recently" and "never saw it" should both mean "don't
-    move", not extrapolate from a stale bearing."""
+    Publishes an explicit ZERO Twist (not just "stop calling publish") when
+    the cached target reading is missing or older than
+    FOLLOW_TARGET_STALE_SEC. Confirmed live (2026-09-04): merely going
+    silent and trusting rbx_ardupilot_node.py's own TELEOP_CMD_TIMEOUT_SEC
+    cutoff to stop the vehicle does NOT stop it -- that cutoff only stops
+    THIS DRIVER from re-publishing to MAVROS's velocity setpoint topic;
+    ArduPilot itself, once no new velocity setpoint arrives, was observed
+    to keep flying at the LAST commanded velocity indefinitely rather than
+    braking to a hover, so a target that got lost (out of detection range,
+    including right after a close pass/overshoot) left the vehicle coasting
+    away in a straight line, accelerating the very overshoot this
+    controller is meant to correct rather than damping it out. Publishing
+    zero every tick regardless -- not a single one-shot stop message either,
+    for the same "never trust a lone packet" reasoning
+    sendTeleopVelocityLoop's own comment already gives -- means there is
+    always a fresh, explicit command for ArduPilot to act on, tracking or
+    not."""
     with self.follow_lock:
       target_time = self.latest_target_time
       range_m = self.latest_target_range_m
       azimuth_deg = self.latest_target_azimuth_deg
       elevation_deg = self.latest_target_elevation_deg
     if target_time == 0.0 or (time.time() - target_time) > FOLLOW_TARGET_STALE_SEC:
+      self.rbx_set_teleop_velocity_pub.publish(Twist())
       return
     range_error_m = range_m - TARGET_OFFSET_GOAL_M
     speed_ratio = max(-FOLLOW_MAX_SPEED_RATIO, min(FOLLOW_MAX_SPEED_RATIO,
