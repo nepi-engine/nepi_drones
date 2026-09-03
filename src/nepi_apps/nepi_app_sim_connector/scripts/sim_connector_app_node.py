@@ -688,13 +688,10 @@ class NepiSimConnectorApp:
     # just freshly loaded from simulator_launch_targets.yaml (host/ssh_user/
     # ssh_port back to that file's own hardcoded values) -- re-apply here so
     # the two stay in sync across a restart exactly as they were before it.
-    if self.os_instance_registry.selected_instance_id and self.launcher is not None:
-      try:
-        self.os_instance_registry.select(self.os_instance_registry.selected_instance_id,
-                                         self.launcher)
-      except LauncherError as e:
-        self.msg_if.pub_warn("Failed to re-apply previously-selected OS instance on "
-                             "startup: " + str(e))
+    # Shared with refreshLauncherConfigCb's own hot-reload path -- see
+    # reapplySelectedOsInstance's own docstring for why that path needs the
+    # identical re-apply.
+    self.reapplySelectedOsInstance(context = "startup")
 
     self.os_instances_status_pub = nepi_sdk.create_publisher(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/os_instances/status'),
@@ -2881,6 +2878,28 @@ class NepiSimConnectorApp:
     self.publishOsInstancesStatus()
     self.publishLauncherStatus()
 
+  def reapplySelectedOsInstance(self, context):
+    """Re-applies the registry's persisted 'selected' OS instance onto
+    self.launcher's in-memory config. Needed anywhere self.launcher is
+    (re)built from simulator_launch_targets.yaml -- a fresh SimulatorLauncher
+    always starts out with that file's own hardcoded host/ssh_user/ssh_port,
+    which silently discards whichever instance was selected until this runs.
+    Originally only called on node startup; reported live (2026-09-03) that
+    an unrelated mid-session config redeploy (which reload_if_changed() also
+    picks up) reverted the selected instance the same way, with the next
+    launch failing fast against a dead tunnel and no clue why -- factored out
+    so every self.launcher (re)build path gets the same re-apply, not just
+    startup. A no-op if nothing is selected yet (fresh install, or only the
+    baseline instance, which the file's own values already match)."""
+    if not self.os_instance_registry.selected_instance_id or self.launcher is None:
+      return
+    try:
+      self.os_instance_registry.select(self.os_instance_registry.selected_instance_id,
+                                       self.launcher)
+    except LauncherError as e:
+      self.msg_if.pub_warn("Failed to re-apply selected OS instance after " +
+                           context + ": " + str(e))
+
   def removeOsInstanceCb(self, msg):
     instance_id = str(msg.data).strip()
     if not instance_id:
@@ -3239,6 +3258,7 @@ class NepiSimConnectorApp:
           return
         self.launcher = SimulatorLauncher(config_path)
         self.msg_if.pub_info("Simulator auto-launch enabled from " + config_path)
+        self.reapplySelectedOsInstance(context = "config load")
         self.publishLauncherStatus()
         self.startInstalledCheckAll()
       elif self.launcher.reload_if_changed():
@@ -3248,6 +3268,17 @@ class NepiSimConnectorApp:
           available, _names = self.launcher.get_available_targets()
           if self.selected_launch_target not in available:
             self.selected_launch_target = ''
+        # reload_if_changed() just re-read simulator_launch_targets.yaml from
+        # disk, which resets every target's host/ssh_user/ssh_port back to
+        # that file's own hardcoded values -- silently discarding whichever
+        # OS instance was selected (see the identical re-apply on node
+        # startup above/in __init__, and its own comment). Reported live
+        # (2026-09-03): a config redeploy for an unrelated fix mid-session
+        # reverted the selected instance's ssh_port without any error, and
+        # the next launch attempt failed fast against a dead tunnel with no
+        # indication why -- re-apply here so a hot config reload can never
+        # silently do this again.
+        self.reapplySelectedOsInstance(context = "config reload")
         self.publishLauncherStatus()
         # Targets may have been added/edited -- re-check all of them rather
         # than trying to diff what changed.
