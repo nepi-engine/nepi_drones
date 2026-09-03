@@ -208,6 +208,33 @@ own Step 2 now both open with a one-line install-if-missing check
 (`command -v autossh >/dev/null || sudo apt-get install -y autossh`) before
 either option, rather than assuming it's already present.
 
+## 3e. Verify step ran on the wrong machine, and a bracket-placeholder shell bug
+
+Reported live, from an actual attempt: `ssh -p 12223 <REPLACE with your
+username on this machine>@localhost echo ok` pasted verbatim gave
+`-bash: REPLACE: No such file or directory` (`<` is shell redirection
+syntax -- pasting a bracketed placeholder literally doesn't fail
+obviously, it breaks the shell parse), and after fixing that by hand,
+`ssh -p 12223 suraj@localhost` / `nepi@localhost` both got "Connection
+refused" -- because **the command was run on the wrong machine**. The
+`-R 12223:127.0.0.1:22` tunnel makes the *NEPI device* listen on 12223 and
+forward back to *this (new) machine's* own sshd -- so `localhost:12223`
+only means anything from the device's side. `SIM_VM_CONNECTION_SETUP.md`'s
+own original Step 2 said this correctly ("run ON THE DEVICE"); the
+wizard's Step 2 regressed from that when it was restructured for clarity
+earlier this session, losing the WHERE distinction it had needed most.
+
+Fixed by making the RUI's own "Test Connection" button (which already runs
+the equivalent check from the device's own side, correctly) the *only*
+step described in the normal case -- Step 2 now just says "enter your
+username, click Test Connection," with the manual command demoted to an
+explicitly-labeled fallback ("has to run ON THE NEPI DEVICE ITSELF... never
+on the new machine"). Every remaining placeholder in this module
+(`YOUR_USERNAME_ON_THE_NEW_MACHINE`, `YOUR_NEPI_DEVICE_IP_OR_HOSTNAME`) and
+in `SIM_VM_CONNECTION_SETUP.md`'s own manual doc now avoids angle brackets
+entirely, so pasting one literally produces an obvious "no such user"/"no
+such host" failure instead of a cryptic shell parse error.
+
 ## 4. Explicitly not doing
 
 - ArduPilot SITL auto-install -- unchanged, still manual-fallback-only (no

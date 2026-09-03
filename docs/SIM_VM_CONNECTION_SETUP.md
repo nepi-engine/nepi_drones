@@ -136,8 +136,13 @@ loginctl enable-linger $(id -un)   # starts the tunnel at boot, before login
 ```
 
 Verify: `systemctl --user status nepi-tunnel.service` should show it
-active, and `ssh -p 12222 <your-vm-user>@localhost echo ok` run ON THE
-DEVICE should print `ok` once the tunnel is up.
+active, and `ssh -p 12222 YOUR_VM_USERNAME@localhost echo ok` (fill in a
+real username first -- don't paste `YOUR_VM_USERNAME` literally) **run ON
+THE DEVICE ITSELF, not on the VM** should print `ok` once the tunnel is
+up. Running it on the VM instead always fails with "Connection refused":
+the tunnel makes the DEVICE listen on that port and forward back to the
+VM's own sshd, so `localhost:12222` only means anything from the device's
+side.
 
 ## Step 3 — point the device's Deploy path at your VM's username
 

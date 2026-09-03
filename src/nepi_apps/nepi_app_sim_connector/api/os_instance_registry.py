@@ -298,7 +298,12 @@ class OsInstanceRegistry(object):
     unlike device_host which genuinely differs per deployment."""
     port = instance['ssh_port']
     iid = instance['instance_id']
-    device_host = _guess_device_ip() or "<REPLACE with your NEPI device's IP or hostname>"
+    # No angle brackets in this fallback placeholder (rare -- only when
+    # _guess_device_ip finds neither a config file nor a route) -- reported
+    # live: pasting a bracketed placeholder verbatim into a real shell
+    # command breaks it outright, since '<' is redirection syntax, rather
+    # than failing obviously (e.g. "no such host").
+    device_host = _guess_device_ip() or "YOUR_NEPI_DEVICE_IP_OR_HOSTNAME"
     return (
         "STEP 1 of 2 -- Open a reverse tunnel back to the NEPI device\n"
         "Where: on the NEW machine (" + instance['display_name'] + ")\n"
@@ -346,12 +351,27 @@ class OsInstanceRegistry(object):
         "\n"
         "\n"
         "STEP 2 of 2 -- Verify it worked\n"
-        "Where: on the NEW machine (" + instance['display_name'] + ")\n"
+        "Where: back in the RUI (NOT the new machine, and NOT a command\n"
+        "you need to run at all in the normal case)\n"
         "\n"
-        "    ssh -p " + str(port) + " <REPLACE with your username on this machine>@localhost echo ok\n"
+        "Enter your username on the NEW machine in the field below, then\n"
+        "click \"Test Connection\". That button runs the real check from the\n"
+        "NEPI DEVICE's own side -- which is the only place it means anything,\n"
+        "since the tunnel makes the DEVICE listen on port " + str(port) + " and\n"
+        "forward back to THIS machine's own sshd.\n"
         "\n"
-        "If that prints \"ok\", go back to the RUI and click \"Test Connection\" --\n"
-        "no need to run anything else by hand."
+        "(Only if that fails and you want to double-check by hand: the\n"
+        "equivalent manual command has to run ON THE NEPI DEVICE ITSELF --\n"
+        "e.g. over `sshnh`/`sshn` if you have direct access to it -- never on\n"
+        "the new machine. Fill in a real username before running it (don't\n"
+        "paste the placeholder text below verbatim -- the < character is\n"
+        "shell redirection syntax and will error):\n"
+        "\n"
+        "    ssh -p " + str(port) + " YOUR_USERNAME_ON_THE_NEW_MACHINE@localhost echo ok\n"
+        "\n"
+        "Running this ON THE NEW MACHINE INSTEAD will always fail with\n"
+        "\"Connection refused\" -- there's nothing listening on that port\n"
+        "there; the forwarded listener only exists on the device side.)"
     )
 
   #**********************
