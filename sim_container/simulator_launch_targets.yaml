@@ -538,6 +538,23 @@ launch_targets:
     # gzserver's own guard above doesn't have this problem either way:
     # `pgrep -x` matches the process NAME only ("bash", never "gzserver").
     #
+    # ai_targeting_controller_ardupilot.py now launched alongside too
+    # (2026-09-03) -- reported live: "look over the drone autonomous script
+    # pipeline (the simulator object detection) and see if that's working
+    # properly." Investigation found a real integration gap: this target's
+    # own guard already did `pkill -f "[a]i_targeting_controller_ardupilot.py"`
+    # (cleaning up a stray instance from the older nepi_sitl_dev_env.sh dev
+    # workflow) but never started a fresh one -- the chair-following demo's
+    # actual detection source only ever came up through that separate,
+    # older workflow (source nepi_sitl_dev_env.sh && sitl_gazebo_full, or
+    # sim_launch_listener.py's remote trigger, which itself only exists if
+    # sitl_gazebo/sitl_gazebo_full already ran once), never through this
+    # Deploy button. A Deploy alone produced a flying drone with nothing to
+    # detect. Now started here directly, same pattern as camera_rig_
+    # controller_ardupilot.py right above it -- Deploy is self-sufficient
+    # for the whole chair-following demo now, matching gazebo_rover's own
+    # launch_command already bundling its own auxiliary processes together.
+    #
     # camera_rig_controller_ardupilot.py is launched alongside (not by the
     # bridge script itself) -- it already owns positioning/publishing the
     # chase-cam feed for the separate RBX SITL dev flow; reused here as-is
@@ -598,8 +615,9 @@ launch_targets:
       rosrun gazebo_ros gazebo $HOME/ardupilot_gazebo/worlds/iris_arducopter_cmac.world < /dev/null > /tmp/sim_connector_quadcopter_gazebo_launch.log 2>&1 & GZ_PID=$!;
       gz_wait=0; until rostopic list 2>/dev/null | grep -q "^/gazebo/model_states$"; do sleep 1; gz_wait=$((gz_wait+1)); if [ $gz_wait -ge 30 ]; then break; fi; done;
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/camera_rig_controller_ardupilot.py < /dev/null > /tmp/sim_connector_quadcopter_camera_rig_launch.log 2>&1 & CAM_PID=$!;
+      python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/ai_targeting_controller_ardupilot.py < /dev/null > /tmp/sim_connector_quadcopter_ai_targeting_launch.log 2>&1 & AI_TARGET_PID=$!;
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/gazebo/sim_connector_bridge_gazebo_quadcopter.py --host {device_bridge_host} --port {device_bridge_port} --mavlink tcp:127.0.0.1:5772 < /dev/null > /tmp/sim_connector_quadcopter_bridge_launch.log 2>&1 & BRIDGE_PID=$!;
-      wait $SITL_PID $GZ_PID $CAM_PID $BRIDGE_PID
+      wait $SITL_PID $GZ_PID $CAM_PID $AI_TARGET_PID $BRIDGE_PID
       '
     # Same "Use Existing" override as gazebo_rover's own attach_launch_command
     # -- skips ONLY the gzserver refuse-guard and the `rosrun gazebo_ros
@@ -627,9 +645,10 @@ launch_targets:
       rostopic list > /dev/null 2>&1 || {{ nohup roscore < /dev/null > /tmp/sim_connector_quadcopter_roscore_launch.log 2>&1 & until rostopic list > /dev/null 2>&1; do sleep 1; done; }};
       pgrep -f "[g]z_reset_listener.py 9021" > /dev/null || {{ nohup python3 -u $HOME/.local/bin/gz_reset_listener.py 9021 < /dev/null > /tmp/sim_connector_quadcopter_gz_reset_listener_launch.log 2>&1 & disown; }};
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/camera_rig_controller_ardupilot.py < /dev/null > /tmp/sim_connector_quadcopter_camera_rig_launch.log 2>&1 & CAM_PID=$!;
+      python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/ai_targeting_controller_ardupilot.py < /dev/null > /tmp/sim_connector_quadcopter_ai_targeting_launch.log 2>&1 & AI_TARGET_PID=$!;
       sim_vehicle.py -v ArduCopter -f gazebo-iris --out=tcpin:0.0.0.0:5771 --out=tcpin:0.0.0.0:5772 --mavproxy-args="--daemon" < /dev/null > /tmp/sim_connector_quadcopter_sitl_launch.log 2>&1 & SITL_PID=$!;
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/gazebo/sim_connector_bridge_gazebo_quadcopter.py --host {device_bridge_host} --port {device_bridge_port} --mavlink tcp:127.0.0.1:5772 < /dev/null > /tmp/sim_connector_quadcopter_bridge_launch.log 2>&1 & BRIDGE_PID=$!;
-      wait $CAM_PID $SITL_PID $BRIDGE_PID
+      wait $CAM_PID $AI_TARGET_PID $SITL_PID $BRIDGE_PID
       '
     # Belt-and-suspenders like gazebo_rover's own stop_command: the pgid kill
     # is the primary mechanism, but sim_vehicle.py is a much more complex
@@ -657,7 +676,7 @@ launch_targets:
     # which is exactly what made the NEXT launch attempt fail in a way that
     # looked like "launching doesn't launch the SITL" (the fresh
     # sim_vehicle.py's own MAVProxy can't bind those ports).
-    stop_command: "bash -lc 'f=/tmp/sim_connector_quadcopter_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; rm -f /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo; pkill -f \"[s]im_vehicle.py -v ArduCopter\" 2>/dev/null; pkill -9 -f \"[m]avproxy.py\" 2>/dev/null; pkill -f \"[a]rducopter -S\" 2>/dev/null; pkill -f [c]amera_rig_controller_ardupilot.py 2>/dev/null; pkill -f [s]im_connector_bridge_gazebo_quadcopter.py 2>/dev/null; pkill -f [g]z_reset_listener.py 2>/dev/null; sleep 1; if timeout 1 bash -c \"cat < /dev/null > /dev/tcp/127.0.0.1/5771\" 2>/dev/null; then echo \"WARNING: port 5771 still bound after stop -- a MAVProxy/ArduCopter orphan may have survived\" >&2; fi; true'"
+    stop_command: "bash -lc 'f=/tmp/sim_connector_quadcopter_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; rm -f /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo; pkill -f \"[s]im_vehicle.py -v ArduCopter\" 2>/dev/null; pkill -9 -f \"[m]avproxy.py\" 2>/dev/null; pkill -f \"[a]rducopter -S\" 2>/dev/null; pkill -f [c]amera_rig_controller_ardupilot.py 2>/dev/null; pkill -f [a]i_targeting_controller_ardupilot.py 2>/dev/null; pkill -f [s]im_connector_bridge_gazebo_quadcopter.py 2>/dev/null; pkill -f [g]z_reset_listener.py 2>/dev/null; sleep 1; if timeout 1 bash -c \"cat < /dev/null > /dev/tcp/127.0.0.1/5771\" 2>/dev/null; then echo \"WARNING: port 5771 still bound after stop -- a MAVProxy/ArduCopter orphan may have survived\" >&2; fi; true'"
     # Same "prove THIS target's own world is up" bar as gazebo_rover's own
     # ready_check_command -- /camera_rig/camera/image_raw having a real
     # publisher proves camera_rig_controller_ardupilot.py connected to a

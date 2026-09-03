@@ -51,10 +51,20 @@
 #     needed, just one more -R forward in nepi_tunnel() (see
 #     nepi_sitl_dev_env.sh).
 #
-# Not auto-started by sitl_gazebo() -- manual-launch convention matching
+# Not auto-started by sitl_gazebo() (the older manual nepi_sitl_dev_env.sh
+# dev workflow) -- manual-launch convention there matching
 # camera_rig_controller_ardupilot (run in a separate terminal/screen after
 # sitl_gazebo is up); see ai_targeting_controller_ardupilot() in
 # nepi_sitl_dev_env.sh.
+#
+# IS auto-started by the Sim Connector app's own Deploy button, though
+# (added 2026-09-03) -- simulator_launch_targets.yaml's gazebo_quadcopter
+# launch_command now starts this alongside camera_rig_controller_ardupilot.py
+# and the SITL/bridge processes. Found live: clicking Deploy produced a
+# flying drone with nothing to detect at all -- this file's own guard
+# already killed a stray instance from the older dev workflow but nothing
+# ever started a fresh one through Deploy, so the two launch paths
+# (Deploy vs. the manual dev workflow) had silently diverged.
 
 import json
 import math

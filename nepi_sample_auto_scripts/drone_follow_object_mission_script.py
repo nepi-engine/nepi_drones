@@ -41,20 +41,28 @@
 # drone's /gazebo/model_states pose, streams it over its own TCP bridge on port 9027) plus
 # nepi_sample_auto_scripts/tools/sim_ai_targeting_bridge_script.py (device-side: republishes
 # that stream as Targets on the exact topics this script waits for, and relays the RBX
-# driver's own live image topic for targeting_image) stand in for the missing app. Deploy and
-# launch both alongside this script (get_scripts/launch_script) to test the follow logic
-# live. No changes were made to this script itself -- the sim infrastructure satisfies its
-# existing (already-correct) expectations unmodified.
+# driver's own live image topic for targeting_image) stand in for the missing app. No changes
+# were made to this script itself -- the sim infrastructure satisfies its existing
+# (already-correct) expectations unmodified.
 #
-# Live-tested result: with the stand-in running, this script gets past
-# wait_for_topic(AI_TARGETING_TOPIC), detects the simulated "chair" target with a live
-# range_m/azimuth_deg/elevation_deg, and move_to_object_callback correctly computes and issues
-# a body-frame goto_rbx_position command toward it -- proving the follow logic itself is
-# correct. The vehicle doesn't visibly close the distance in Gazebo because LAUNCH's takeoff
-# step times out before reaching altitude (a separate, pre-existing ArduPilot SITL fake-GPS
-# takeoff-climb issue in rbx_ardupilot_node.py, already documented from an earlier session's
-# drone_inspection_demo_mission_script.py test -- confirmed reproducible again here, not
-# something this pass introduced or is in scope to fix).
+# As of 2026-09-03: ai_targeting_controller_ardupilot.py is auto-started by the Sim
+# Connector app's own Deploy button (simulator_launch_targets.yaml's gazebo_quadcopter
+# launch_command) -- only launch sim_ai_targeting_bridge_script.py yourself
+# (get_scripts/launch_script), alongside this script. Before this fix, Deploy alone
+# produced a flying drone with nothing to detect at all; the chair only ever spawned
+# through a separate, older manual dev workflow (nepi_sitl_dev_env.sh's sitl_gazebo_full)
+# that had silently diverged from the Deploy-button path this app's RUI actually exposes.
+#
+# Live-tested result (2026-09-01, see that date's own commit): with the stand-in running,
+# this script gets past wait_for_topic(AI_TARGETING_TOPIC), detects the simulated "chair"
+# target with a live range_m/azimuth_deg/elevation_deg, and move_to_object_callback
+# correctly computes and issues a body-frame goto_rbx_position command toward it -- and,
+# after that same commit's takeoff-completion-latch fix, the vehicle actually closes
+# distance and reports genuine "Goto Position completed" convergence near
+# TARGET_OFFSET_GOAL_M. The earlier-reported "vehicle doesn't visibly close the distance"
+# symptom (LAUNCH's takeoff step timing out before reaching altitude) is fixed -- see
+# rbx_ardupilot_node.py's isAirborne(), which no longer trusts a one-shot latch that could
+# stay stuck False even after the vehicle safely reached altitude a bit later.
 
 import rospy
 import sys
