@@ -360,6 +360,57 @@ class SimulatorLauncher(object):
     if result.returncode != 0:
       raise LauncherError("SSH push to " + remote_path + " failed: " + (result.stderr or "unknown error"))
 
+  # Wrapper text every launch_command/attach_launch_command in
+  # simulator_launch_targets.yaml is authored with -- see
+  # _stage_launch_script's own docstring for why it gets stripped back off
+  # before staging. Kept as a module-level constant, not inlined into that
+  # method, so a future author changing the YAML's own wrapper convention
+  # only has one place to update it in step.
+  _LAUNCH_SCRIPT_WRAPPER_PREFIX = "bash -lc '"
+  _LAUNCH_SCRIPT_WRAPPER_SUFFIX = "'"
+
+  def _stage_launch_script(self, target, target_key, command):
+    """Writes a launch/attach command to a remote temp file and returns its
+    path, so launch() can exec it via `bash -l <path>` instead of passing
+    the whole script as a single inline `bash -lc '...'` SSH remote-command
+    argument. Reported live (2026-09-03): the inline-string form is
+    intermittently unreliable for gazebo_quadcopter's long launch_command --
+    the identical script, byte-for-byte, sometimes had its SSH session exit
+    within the launch startup grace period with an empty stderr and no
+    remote-side log output at all (not even the first line), while running
+    the exact same text as a file via `bash -l <file>` was reliable across
+    many repeated manual trials, over the same (double-hop, reverse-
+    tunneled) connection. Root cause not fully isolated -- suspected some
+    limit or race specific to a single, very long argv element being handed
+    to a remote shell as its `-c` command -- so this sidesteps the failure
+    mode rather than depending on it being understood.
+
+    Every launch_command/attach_launch_command in
+    simulator_launch_targets.yaml is authored as `bash -lc '<script>'` (kept
+    that way so a human can still copy either one out of
+    manual_fallback_commands and run it as-is) -- the wrapper is stripped
+    back off here before writing, or the staged file would itself just
+    contain another `bash -lc '<script>'` invocation and reintroduce the
+    exact inline-string form this is meant to avoid. Falls back to writing
+    `command` unstripped if some future target's launch_command doesn't
+    follow that convention -- still correct (bash -l happily runs a file
+    that starts with `bash -lc '...'` as its one and only statement), just
+    without the reliability fix, and _stage_launch_script has no way to
+    know that ahead of time.
+
+    Reuses _push_file_content's own proven cat> mechanism -- no scp binary
+    or extra credential needed. remote_path is derived from target_key (a
+    fixed identifier from this app's own config, never user-supplied
+    text), so no shell-injection concern from interpolating it directly
+    into the remote command string."""
+    script_body = command
+    if (command.startswith(self._LAUNCH_SCRIPT_WRAPPER_PREFIX) and
+        command.endswith(self._LAUNCH_SCRIPT_WRAPPER_SUFFIX)):
+      script_body = command[len(self._LAUNCH_SCRIPT_WRAPPER_PREFIX):-len(self._LAUNCH_SCRIPT_WRAPPER_SUFFIX)]
+    remote_path = "/tmp/nepi_sim_launch_" + target_key + ".sh"
+    self._push_file_content(target, remote_path, script_body)
+    return remote_path
+
   def push_dimensions(self, target, model_name, dimensions_yaml_text, sdf_override_text):
     """Pushes one model's editable geometry to the VM ahead of a launch --
     see sim_connector_app_node.py's device-side dimensions store for the
@@ -555,7 +606,8 @@ class SimulatorLauncher(object):
     device_port = self.config.get("device_bridge_port", "")
     command = launch_command.format(
         device_bridge_host=device_host, device_bridge_port=device_port)
-    ssh_cmd = self._ssh_cmd(target, command)
+    remote_script_path = self._stage_launch_script(target, target_key, command)
+    ssh_cmd = self._ssh_cmd(target, "bash -l " + remote_script_path)
     proc = subprocess.Popen(ssh_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     time.sleep(LAUNCH_STARTUP_GRACE_SEC)
     if proc.poll() is not None:
