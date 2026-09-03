@@ -344,7 +344,50 @@ class OsInstanceRegistry(object):
       the keygen step was removed, since it read (wrongly) like the same
       concern the keygen step was cutting. _device_public_key() reads the
       real value so there's an exact line to copy, not a vague
-      instruction."""
+      instruction.
+
+    STEP 2's Option A/B rewritten (2026-09-02) after a real live failure on
+    this session's own dev VM found two more genuine bugs:
+    - Option A's `cp sim_container/systemd/nepi-tunnel.service ...` assumed
+      nepi_drones was already checked out (and cwd'd into) on the new
+      machine -- never stated as a prerequisite anywhere. On a machine that
+      never cloned it (confirmed: this is not required to register an OS
+      instance at all, by design -- see SIM_OS_INSTANCES_PLAN.md's own
+      "any Ubuntu machine" framing), the cp silently failed and
+      `systemctl --user enable` then correctly, but confusingly, reported
+      "Unit file ... does not exist". Fixed by generating the unit file
+      inline via heredoc instead -- no nepi_drones checkout needed on the
+      target machine at all, matching this feature's own design intent.
+      (The copied unit also would have used the WRONG port even if the cp
+      had succeeded: the reference nepi-tunnel.service hardcodes port 12222
+      for one specific developer's own setup and has no
+      TUNNEL_SSH_PORT-style override wired into its ExecStart at all --
+      the old Option A's env-file step was setting a variable nothing
+      read.)
+    - Both this heredoc and the old Option B one-liner were missing
+      `-o ServerAliveInterval`/`-o ServerAliveCountMax`/
+      `-o ExitOnForwardFailure` -- confirmed live: after this session's own
+      device container was restarted (via nepicommit/nepistart, for
+      unrelated work), the existing autossh process never noticed its
+      connection had died and never reconnected, since autossh's own
+      monitoring is disabled (-M 0) in favor of exactly these SSH-level
+      keepalives -- without them, autossh has no way to detect a silently
+      dead connection at all. This is the same reason
+      docs/SIM_VM_CONNECTION_SETUP.md's own reference nepi_tunnel()/
+      nepi-tunnel.service already carried these flags; the wizard's
+      simplified one-liner had dropped them. Deploy then fails with
+      "Could not reach your sim VM -- the reverse SSH tunnel... does not
+      appear to be running" until the tunnel is restarted by hand -- now
+      it self-heals within ~45s instead.
+    - Also found while fixing the above: every heredoc terminator line in
+      this method was itself indented (matching the block's overall
+      4-space "copy-paste" visual style), which is invalid for a plain
+      `<<'EOF'` -- the terminator must be flush-left, or the shell keeps
+      reading everything after it as file content instead of executing it.
+      Confirmed by reproducing the exact failure locally. Fixed by keeping
+      the terminator (and the whole heredoc body, which is file content,
+      not a shell command) flush-left; only the surrounding shell commands
+      keep the visual indent."""
     port = instance['ssh_port']
     iid = instance['instance_id']
     # No angle brackets in this fallback placeholder (rare -- only when
@@ -407,25 +450,53 @@ class OsInstanceRegistry(object):
         "\n"
         "Pick ONE of the two options below -- not both.\n"
         "\n"
-        "  Option A -- recommended: restarts itself automatically on reboot.\n"
+        "  Option A -- recommended: restarts itself automatically on reboot,\n"
+        "  and automatically RECONNECTS if the connection ever silently dies\n"
+        "  (e.g. the device reboots or its software restarts) -- fully\n"
+        "  self-contained below, does NOT need nepi_drones checked out on\n"
+        "  this machine.\n"
         "\n"
-        "    mkdir -p ~/.config/systemd/user ~/.config\n"
-        "    cp sim_container/systemd/nepi-tunnel.service "
-        "~/.config/systemd/user/nepi-tunnel-" + iid + ".service\n"
-        "    cat > ~/.config/nepi-tunnel-" + iid + ".env <<'EOF'\n"
-        "    DEVICE_SSH_HOST=" + device_host + "\n"
-        "    DEVICE_SSH_USER=nepi\n"
-        "    DEVICE_SSH_PORT=2222\n"
-        "    TUNNEL_SSH_PORT=" + str(port) + "\n"
-        "    EOF\n"
+        "    mkdir -p ~/.config/systemd/user\n"
+        "    cat > ~/.config/systemd/user/nepi-tunnel-" + iid + ".service <<'EOF'\n"
+        "[Unit]\n"
+        "Description=NEPI reverse SSH tunnel to device (OS instance " + iid + ")\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n"
+        "StartLimitIntervalSec=0\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "ExecStart=/usr/bin/autossh -M 0 -N -R " + str(port) + ":127.0.0.1:22 -p 2222 "
+        "-o ServerAliveInterval=15 -o ServerAliveCountMax=3 "
+        "-o ExitOnForwardFailure=yes -o ConnectTimeout=5 "
+        "-i %h/.ssh/nepi_default_ssh_key nepi@" + device_host + "\n"
+        "Environment=AUTOSSH_GATETIME=0\n"
+        "Restart=always\n"
+        "RestartSec=10\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+        "EOF\n"
         "    systemctl --user daemon-reload\n"
         "    systemctl --user enable --now nepi-tunnel-" + iid + ".service\n"
         "    loginctl enable-linger $(id -un)\n"
         "\n"
         "  Option B -- one-off command, no systemd required (use this on WSL\n"
-        "  unless you've already turned systemd on in /etc/wsl.conf):\n"
+        "  unless you've already turned systemd on in /etc/wsl.conf AND fully\n"
+        "  restarted WSL itself afterward -- `wsl --shutdown` from Windows,\n"
+        "  then reopen your terminal; editing /etc/wsl.conf alone does not\n"
+        "  start systemd in your CURRENT session). The ServerAlive/\n"
+        "  ExitOnForwardFailure flags below matter, not just decoration --\n"
+        "  without them, if this connection ever silently dies (e.g. the\n"
+        "  device reboots or its software restarts), the autossh process\n"
+        "  keeps running but never notices and never reconnects, and Deploy\n"
+        "  fails with \"the reverse SSH tunnel does not appear to be\n"
+        "  running\" until this command is run again by hand -- confirmed\n"
+        "  live, 2026-09-02.\n"
         "\n"
         "    autossh -M 0 -f -N -R " + str(port) + ":127.0.0.1:22 -p 2222 \\\n"
+        "      -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \\\n"
+        "      -o ExitOnForwardFailure=yes -o ConnectTimeout=5 \\\n"
         "      -i ~/.ssh/nepi_default_ssh_key nepi@" + device_host + "\n"
         "\n"
         "\n"

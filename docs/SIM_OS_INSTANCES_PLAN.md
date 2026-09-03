@@ -364,6 +364,63 @@ VM-side-done, on-device-confirmation-still-open, the same convention this
 doc's own 3a-3f entries already followed before their own live tests
 happened.
 
+## 3i. Tunnel silently died and never reconnected, plus a broken Option A (2026-09-02)
+
+Reported live on this session's own dev VM (registered earlier as instance
+`surajwsl`, already `verified`): Deploy started failing with "Could not
+reach your sim VM -- the reverse SSH tunnel between this device and the VM
+does not appear to be running," and the operator's own attempt to follow
+STEP 2's Option A produced `Failed to enable unit: Unit file
+nepi-tunnel.service does not exist.` and a `nepi_tunnel: command not
+found`.
+
+Three real, separate bugs, all confirmed by reproducing on this VM directly
+(this dev VM's own hostname IS `surajwsl`'s registered machine):
+
+- **The tunnel actually was dead, and stayed dead.** This session's own
+  earlier device container restart (`nepicommit`/`nepistart`, for unrelated
+  ArduPilot/Gazebo work -- see 3h) severed the existing SSH connection
+  underneath the running `autossh` process. `-M 0` disables autossh's own
+  monitoring in favor of SSH-level keepalives, but the wizard's Option B
+  one-liner never set `-o ServerAliveInterval`/`-o ServerAliveCountMax` --
+  so nothing ever told the local ssh process the connection was gone, and
+  it sat there indefinitely holding a phantom forward (confirmed: `ss -tln`
+  on the device showed nothing listening on the instance's port at all,
+  while the local ssh/autossh processes looked perfectly healthy). Fixed by
+  adding `-o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o
+  ExitOnForwardFailure=yes -o ConnectTimeout=5` to both Option A and B --
+  matching the flags `docs/SIM_VM_CONNECTION_SETUP.md`'s own reference
+  `nepi_tunnel()`/`nepi-tunnel.service` already carried (that one wasn't
+  affected; the wizard's simplified copy of it had quietly dropped them).
+- **Option A's `cp sim_container/systemd/nepi-tunnel.service ...` assumed
+  nepi_drones was already checked out on the new machine.** Never stated as
+  a prerequisite anywhere -- registering an OS instance is deliberately NOT
+  supposed to require that (see this doc's own "any Ubuntu machine"
+  framing). On a machine that never cloned it, the `cp` fails silently and
+  `systemctl --user enable` then reports the confusing-but-accurate "Unit
+  file does not exist." Separately, even a successful `cp` would have used
+  the WRONG port: the reference unit hardcodes port 12222 (one developer's
+  own original single-VM setup) and has no `TUNNEL_SSH_PORT`-style override
+  wired into its `ExecStart` -- the old Option A's env-file step was
+  setting a variable nothing actually read. Fixed by generating the unit
+  file inline via heredoc instead, with the instance's own real port baked
+  directly into `ExecStart` -- no nepi_drones checkout needed on the target
+  machine at all.
+- **Every heredoc terminator in this method was itself indented**, matching
+  the block's overall 4-space "copy this" visual style -- invalid for a
+  plain `<<'EOF'`, whose terminator must be flush-left or the shell keeps
+  reading everything after it as file content instead of running it as
+  commands. Confirmed by reproducing the exact failure locally with the
+  original text. Fixed by keeping heredoc bodies (file content, not shell
+  commands) and their terminators flush-left; only the surrounding actual
+  shell commands keep the visual indent.
+
+Confirmed working end to end after these fixes: killed the stale/broken
+tunnel, ran the corrected Option A block verbatim on this VM, confirmed the
+resulting systemd unit is well-formed and the service starts clean, and
+confirmed the forward is actually live from the device's own side (`ssh -p
+<port> ... echo ok` through the tunnel succeeds).
+
 ## 4. Explicitly not doing
 
 - Running more than one simulator across instances at once -- matches the
