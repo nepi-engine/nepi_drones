@@ -76,17 +76,44 @@ SSH_CONNECT_TIMEOUT_SEC = 8
 
 DEFAULT_SSH_KEY = os.path.expanduser("~/.ssh/nepi_default_ssh_key")
 
+# The platform's own authoritative device-IP config, already present on
+# every real deployment (nepi_setup's docker_config_setup.sh writes it) --
+# see _guess_device_ip's own docstring for why this, not a network-routing
+# guess, is the right primary source.
+NEPI_SYSTEM_CONFIG_PATH = '/opt/nepi/etc/nepi_system_config.yaml'
+
 
 def _guess_device_ip():
   """Best-effort discovery of THIS device's own LAN-reachable IP, so the
   generated setup commands can show a real, working example instead of an
   abstract placeholder -- reported live: "give the example and also put
-  that as the example in the RUI." Pure local-socket routing trick (no
-  packet is actually sent to 8.8.8.8 -- UDP connect() just asks the kernel
-  to pick the outbound route/interface), so this stays zero-ROS-dependency
-  like the rest of this module (no network_mgr/ip_addr_query service call).
-  Returns None if it genuinely can't determine one (e.g. no network at
-  all), in which case callers fall back to a plain placeholder."""
+  that as the example in the RUI."
+
+  Tries NEPI_SYSTEM_CONFIG_PATH's own NEPI_STATIC_IP first -- the
+  platform's own authoritative, intentionally-configured device address --
+  and only falls back to a local-socket outbound-routing guess if that
+  file is missing/unreadable. This order matters, confirmed the hard way:
+  a real device can be multi-homed (this one has a static `eth0` at
+  192.168.179.103 -- the address every other machine in this whole
+  session actually uses to reach it -- alongside a DHCP `wlan0` used only
+  for the device's own internet uplink), and a naive "connect to 8.8.8.8,
+  see which interface answers" guess picks whichever has the DEFAULT
+  ROUTE, which is commonly the wifi/internet-facing one, not the one other
+  machines should dial in on. The socket fallback (no packet is actually
+  sent -- UDP connect() just asks the kernel to pick a route) stays purely
+  as a safety net for a deployment that genuinely has no system config
+  file to read, not the primary source of truth. Both paths stay zero-ROS-
+  dependency, like the rest of this module (no network_mgr/ip_addr_query
+  service call). Returns None if neither works, in which case callers fall
+  back to a plain placeholder."""
+  try:
+    with open(NEPI_SYSTEM_CONFIG_PATH, 'r') as f:
+      config = yaml.safe_load(f)
+    static_ip = (config or {}).get('NEPI_STATIC_IP', '')
+    if static_ip:
+      return str(static_ip).split('/')[0]
+  except (OSError, yaml.YAMLError):
+    pass
   try:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:

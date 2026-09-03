@@ -175,10 +175,17 @@ put that as the example in the RUI" (about the leftover
 `<REPLACE with your NEPI device's user>@<REPLACE with its IP or hostname>`
 placeholder). Fixed two ways:
 
-- `_guess_device_ip()` (new, zero-ROS-dependency -- a local UDP-socket
-  routing trick, no packet actually sent) fills `DEVICE_SSH_HOST`/the
-  `autossh` target with this device's own real, currently-detected IP,
-  falling back to a placeholder only if that genuinely can't be determined.
+- `_guess_device_ip()` (new, zero-ROS-dependency) fills `DEVICE_SSH_HOST`/
+  the `autossh` target with this device's own real IP, falling back to a
+  placeholder only if that genuinely can't be determined. **Reads
+  `/opt/nepi/etc/nepi_system_config.yaml`'s own `NEPI_STATIC_IP` first, not
+  a network-routing guess** -- found live that this device is multi-homed
+  (a static `eth0` at 192.168.179.103, the address every other machine in
+  this whole session actually used, alongside a DHCP `wlan0` used only for
+  the device's own internet uplink) and a naive "connect to 8.8.8.8, see
+  which interface answers" guess picked the wrong one (`wlan0`, since
+  that's the default route). The socket-routing guess is now only a
+  fallback for a deployment with no system config file to read.
 - **Found and fixed a real bug while verifying this against the actual
   device**: the generated commands (and `SIM_VM_CONNECTION_SETUP.md`'s own
   manual Step 2 examples, copied from the same source) used
