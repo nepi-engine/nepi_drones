@@ -230,6 +230,32 @@ FOLLOW_CONTROL_RATE_HZ = 8.0
 # (a deliberate safety behavior on ITS side, not a bug to work around),
 # which would otherwise look like "it randomly stops following".
 FOLLOW_TARGET_STALE_SEC = 0.5
+# Confirmed live (2026-09-04): even with FOLLOW_TARGET_STALE_SEC correctly
+# stopping the vehicle once it truly loses the target (out past
+# ai_targeting_controller_ardupilot.py's own MAX_DETECTION_RANGE_M -- 20m
+# -- confirmed as the actual reason it went quiet, not a bug: detections
+# were still arriving at a steady 5Hz right up to that point), the vehicle
+# would first overshoot PAST the target by 15-20+ m in a single burst,
+# consistently in the same direction across repeated clean runs (not
+# random each time) -- exactly the signature of ai_targeting_controller_
+# ardupilot.py's own azimuth_deg = atan2(body_right, body_forward)
+# becoming numerically unstable right as the vehicle closes to near-zero
+# range: atan2 of two components that are both shrinking toward zero
+# together is extremely sensitive to sub-centimeter simulation noise, so
+# the reported bearing can swing wildly for a tick or two exactly at the
+# moment this controller needs it least -- multiplied by a still-sizeable
+# speed_ratio (range_error can also swing back positive fast right after
+# a close pass, if the vehicle drifts slightly past the target and range
+# starts growing again on the other side), that's enough of a mis-aimed
+# push to explain a real, sustained excursion in the ~0.2s before the next
+# (correct) reading arrives and tries to correct it back.
+#
+# FOLLOW_MIN_RANGE_M below is the guard: inside this range, don't trust
+# azimuth/elevation for direction at all -- hold (zero velocity) instead,
+# since "already this close to the standoff distance" is close enough to
+# call the approach done, and there is nothing this controller should still
+# be chasing at a range where its own bearing math is least reliable.
+FOLLOW_MIN_RANGE_M = 1.5
 # Ratio-per-meter proportional gain: the speed ratio [-1,1] sent to
 # set_teleop_velocity climbs at this rate per meter of remaining range
 # error (target_range_m - TARGET_OFFSET_GOAL_M), capped by
@@ -759,6 +785,11 @@ class drone_follow_object_mission(object):
       azimuth_deg = self.latest_target_azimuth_deg
       elevation_deg = self.latest_target_elevation_deg
     if target_time == 0.0 or (time.time() - target_time) > FOLLOW_TARGET_STALE_SEC:
+      self.rbx_set_teleop_velocity_pub.publish(Twist())
+      return
+    if range_m < FOLLOW_MIN_RANGE_M:
+      # See FOLLOW_MIN_RANGE_M's own comment -- azimuth/elevation are not
+      # trustworthy this close in, and there is nothing left to chase.
       self.rbx_set_teleop_velocity_pub.publish(Twist())
       return
     range_error_m = range_m - TARGET_OFFSET_GOAL_M
