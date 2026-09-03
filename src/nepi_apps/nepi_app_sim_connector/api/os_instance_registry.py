@@ -65,12 +65,45 @@ FIRST_ALLOCATED_SSH_PORT = 12223
 
 # Id of the pseudo-instance representing whatever connection
 # simulator_launch_targets.yaml itself hardcodes -- see ensure_baseline's own
-# docstring. Never operator-created or removable, always present whenever a
-# launcher config is loaded at all, so the RUI's picker always has a real,
-# named, already-verified entry to show instead of a generic "default"
+# docstring. Never operator-created, but removable like any other instance
+# (see remove()/ensure_baseline()) -- always present on a genuinely fresh
+# install (nothing else registered yet) so the RUI's picker always has a
+# real, named, already-verified entry to show instead of a generic "default"
 # placeholder -- reported live: the picker should "name the name of the one
 # it's currently connected to," never say "Default."
 BASELINE_INSTANCE_ID = 'baseline'
+
+# The fixed sim-utility ports every launch target's own launch_command
+# hardcodes (heartbeat/bridge/camera listeners, MAVLink) -- forwarded back to
+# the device by BOTH the original single-VM nepi_tunnel()/nepi-tunnel.service
+# (docs/SIM_VM_CONNECTION_SETUP.md) and every OS instance's own generated
+# tunnel below. Only the SSH control-leg port varies per instance (see
+# build_setup_commands) -- these stay the same numbers regardless of which
+# instance is selected, since only one simulator ever runs at a time (see
+# SIM_OS_INSTANCES_PLAN.md's own "explicitly not doing" section).
+#
+# Reported live (2026-09-03): "it doesn't seem like any of the robot controls
+# work for the robot -- i don't think that tcp is getting detected." Root
+# cause: rbx_sim_discovery.py runs ON THE DEVICE and probes these ports on
+# its OWN 127.0.0.1 (confirmed by reading it -- sim_addr_list = ['127.0.0.1'])
+# -- it only ever finds anything because nepi_tunnel()'s reverse tunnel
+# forwards them there. This module's own generated tunnel (STEP 2 of
+# build_setup_commands) originally forwarded ONLY the SSH control-leg port
+# (needed for simulator_launcher.py's _ssh_cmd to reach the target machine at
+# all) -- once a launch actually started on a newly-registered instance, its
+# heartbeat/bridge processes had nothing forwarding them back to the device,
+# so discovery never saw them, silently, with no error anywhere (the launch
+# itself reports "running" -- ready_check_command runs "on" the target
+# machine and doesn't need the tunnel at all -- only cross-machine discovery
+# was broken). Fixed by forwarding this same fixed list from every OS
+# instance's own tunnel too, automatically, with no additional operator step
+# -- reported requirement: "this should automatically happen for any
+# connected vm without me prompting."
+SIM_UTILITY_TUNNEL_PORTS = [
+    5760, 5771,
+    9021, 9022, 9023, 9024, 9025, 9026, 9027, 9028, 9029,
+    9041, 9042, 9046, 9047,
+]
 
 SSH_CONNECT_TIMEOUT_SEC = 8
 
@@ -163,10 +196,27 @@ class OsInstanceRegistry(object):
     return os.path.join(self.storage_dir, instance_id + '.yaml')
 
   def _load_all(self):
+    """Reported live (2026-09-03): "robot controls don't work... TCP isn't
+    getting detected" traced back to selected_instance_id silently reverting
+    to 'baseline' -- baseline.yaml had 'selected: true' persisted while the
+    operator's actually-chosen instance's own file had no 'selected' key at
+    all, even though select() always clears every other instance's flag
+    before setting the new one's. The likely cause: os.listdir() order is
+    filesystem-dependent, not alphabetical or creation-order -- if two
+    files ever transiently both carried 'selected: true' (e.g. a restart
+    landing between select()'s clear-old and persist-new writes), which one
+    "won" here depended on that arbitrary order, silently and
+    non-deterministically, across restarts. Sorted filenames below remove
+    that nondeterminism; the dedup pass after the loop makes a second
+    'selected: true' self-healing instead of a silent, unpredictable
+    reversion -- and prefers a real, operator-chosen instance over baseline
+    (see BASELINE_INSTANCE_ID's own comment: baseline is a fallback-of-last-
+    resort, never something worth silently preferring over a real choice)."""
     try:
-      filenames = os.listdir(self.storage_dir)
+      filenames = sorted(os.listdir(self.storage_dir))
     except OSError:
       return
+    selected_ids = []
     for filename in filenames:
       if not filename.endswith('.yaml'):
         continue
@@ -181,7 +231,17 @@ class OsInstanceRegistry(object):
         continue
       self.instances[instance_id] = entry
       if entry.get('selected', False):
-        self.selected_instance_id = instance_id
+        selected_ids.append(instance_id)
+    if len(selected_ids) > 1:
+      non_baseline = [iid for iid in selected_ids if iid != BASELINE_INSTANCE_ID]
+      winner = non_baseline[0] if non_baseline else selected_ids[0]
+      for iid in selected_ids:
+        if iid != winner:
+          self.instances[iid].pop('selected', None)
+          self._persist(iid)
+      self.selected_instance_id = winner
+    elif selected_ids:
+      self.selected_instance_id = selected_ids[0]
 
   def _persist(self, instance_id):
     entry = dict(self.instances[instance_id])
@@ -387,9 +447,23 @@ class OsInstanceRegistry(object):
       Confirmed by reproducing the exact failure locally. Fixed by keeping
       the terminator (and the whole heredoc body, which is file content,
       not a shell command) flush-left; only the surrounding shell commands
-      keep the visual indent."""
+      keep the visual indent.
+
+    STEP 2's tunnel widened (2026-09-03) to also forward
+    SIM_UTILITY_TUNNEL_PORTS, not just the SSH control-leg port -- see that
+    constant's own comment for the full "robot controls don't work, TCP
+    isn't getting detected" root cause this fixes. Automatic for every
+    instance's own generated tunnel, no separate operator step -- reported
+    requirement: "this should automatically happen for any connected vm
+    without me prompting.\""""
     port = instance['ssh_port']
     iid = instance['instance_id']
+    # One -R flag per fixed sim-utility port, same numbers for every
+    # instance (see SIM_UTILITY_TUNNEL_PORTS) plus this instance's own
+    # allocated SSH control-leg port -- built once, used in both Option A's
+    # ExecStart and Option B's one-liner below so the two can't drift apart.
+    port_forward_args = " ".join(
+        "-R " + str(p) + ":127.0.0.1:" + str(p) for p in SIM_UTILITY_TUNNEL_PORTS)
     # No angle brackets in this fallback placeholder (rare -- only when
     # _guess_device_ip finds neither a config file nor a route) -- reported
     # live: pasting a bracketed placeholder verbatim into a real shell
@@ -466,7 +540,7 @@ class OsInstanceRegistry(object):
         "\n"
         "[Service]\n"
         "Type=simple\n"
-        "ExecStart=/usr/bin/autossh -M 0 -N -R " + str(port) + ":127.0.0.1:22 -p 2222 "
+        "ExecStart=/usr/bin/autossh -M 0 -N -R " + str(port) + ":127.0.0.1:22 " + port_forward_args + " -p 2222 "
         "-o ServerAliveInterval=15 -o ServerAliveCountMax=3 "
         "-o ExitOnForwardFailure=yes -o ConnectTimeout=5 "
         "-i %h/.ssh/nepi_default_ssh_key nepi@" + device_host + "\n"
@@ -494,7 +568,9 @@ class OsInstanceRegistry(object):
         "  running\" until this command is run again by hand -- confirmed\n"
         "  live, 2026-09-02.\n"
         "\n"
-        "    autossh -M 0 -f -N -R " + str(port) + ":127.0.0.1:22 -p 2222 \\\n"
+        "    autossh -M 0 -f -N -R " + str(port) + ":127.0.0.1:22 \\\n"
+        "      " + port_forward_args + " \\\n"
+        "      -p 2222 \\\n"
         "      -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \\\n"
         "      -o ExitOnForwardFailure=yes -o ConnectTimeout=5 \\\n"
         "      -i ~/.ssh/nepi_default_ssh_key nepi@" + device_host + "\n"
@@ -592,7 +668,21 @@ class OsInstanceRegistry(object):
     here too. selected_instance_id is left alone if the operator already
     chose a real, different instance on a previous run; only defaults to
     this baseline when nothing has ever been selected (a genuinely first
-    boot, or after a fresh install)."""
+    boot, or after a fresh install).
+
+    Deliberately does NOT recreate baseline if it was explicitly removed
+    (see remove()) AND at least one other instance is still registered --
+    reported live: "the previous vm that was originally set up is not
+    removable... make sure any vm is removable." baseline used to be
+    unconditionally (re)created here on every single app startup, which
+    made remove()'s own baseline guard below moot even if it were lifted --
+    the very next restart would just bring it back. Still recreated when
+    self.instances is completely empty, matching this method's original
+    purpose (never leave the picker with zero options) -- that case is
+    indistinguishable from "never registered anything yet" and a genuinely
+    fresh install still needs a starting point."""
+    if BASELINE_INSTANCE_ID not in self.instances and len(self.instances) > 0:
+      return
     instance = self.instances.get(BASELINE_INSTANCE_ID, {})
     instance.update({
         'instance_id': BASELINE_INSTANCE_ID,
@@ -610,8 +700,13 @@ class OsInstanceRegistry(object):
       self.selected_instance_id = BASELINE_INSTANCE_ID
 
   def remove(self, instance_id):
-    if instance_id == BASELINE_INSTANCE_ID:
-      raise LauncherError("Cannot remove the default NEPI-device connection")
+    # Every instance is removable, baseline included -- see ensure_baseline's
+    # own comment for how a removed baseline is kept from silently coming
+    # back on the next app restart. If this was the only instance left,
+    # ensure_baseline will recreate it next boot regardless (never leave the
+    # picker with zero options); that's the one case removing it doesn't
+    # stick, and it's the same "genuinely nothing registered" case a fresh
+    # install starts from anyway.
     if instance_id not in self.instances:
       return
     try:

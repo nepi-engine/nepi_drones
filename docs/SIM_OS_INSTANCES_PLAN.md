@@ -421,6 +421,80 @@ resulting systemd unit is well-formed and the service starts clean, and
 confirmed the forward is actually live from the device's own side (`ssh -p
 <port> ... echo ok` through the tunnel succeeds).
 
+## 3j. Baseline made removable, and robot discovery fixed (2026-09-03)
+
+Two issues reported live in the same session:
+
+**"The previous vm that was originally set up is not removable -- make sure
+any vm is removable."** `remove()` special-cased `BASELINE_INSTANCE_ID` with
+a hard refusal, and `ensure_baseline()` unconditionally (re)created it on
+every single app startup regardless -- even lifting the first guard alone
+would have made removal look like it worked until the next restart quietly
+undid it. Fixed both together: `remove()` now treats baseline like any
+other instance, and `ensure_baseline()` only (re)creates it when
+`self.instances` is completely empty (a genuinely fresh install/nothing
+ever registered) -- once something else is registered, an explicitly
+removed baseline stays gone. The RUI (`Nepi_IF_SimOsInstances.js`) always
+shows a Remove button now instead of hiding it for `id === 'baseline'`.
+
+**"It doesn't seem like any of the robot controls work for the robot -- i
+don't think that tcp is getting detected. This should automatically happen
+for any connected vm without me prompting."** Root cause, confirmed by
+reading `rbx_sim_discovery.py`: it runs ON THE DEVICE and probes
+`127.0.0.1:<heartbeat_port>` -- it only ever finds anything because a
+reverse tunnel forwards those ports there. The original single-VM
+`nepi_tunnel()`/`nepi-tunnel.service` forwards a whole fixed list of
+sim-utility ports (5760, 5771, 9021-9029, 9041/9042/9046/9047) alongside its
+SSH leg; this module's own generated tunnel (STEP 2 of
+`build_setup_commands`) forwarded ONLY the SSH control-leg port -- enough
+for `simulator_launcher.py` to reach the target machine and run
+`launch_command` at all, but nothing forwarded the heartbeat/bridge ports
+the just-launched simulator's own processes bind to back to the device.
+The launch itself reported "running" (nothing there depends on the
+tunnel), so this failed completely silently -- confirmed live: a real
+launch produced a healthy `gzserver`/`sim_heartbeat_listener.py`/
+`sim_bridge_node.py` on the VM, `ss -tln` on the device showed nothing on
+9022, and a direct probe from the device (mirroring
+`checkForSimDevice`'s own connect+`ALIVE`-reply check) got `b''` back --
+TCP connects (a bare `ssh -R` forward accepts locally even with nothing
+listening on the far end, per that function's own comment) but the
+listener's actual reply never arrives. Fixed by adding the same fixed
+`SIM_UTILITY_TUNNEL_PORTS` list to every OS instance's own generated
+tunnel (both Option A and B), automatically -- no separate operator step,
+matching the reported requirement.
+
+Fixing this surfaced a THIRD, independent bug while verifying end to end:
+`selected_instance_id` had silently reverted to `'baseline'` even though
+`os_surajwsl` (this instance) was still registered and verified -- found by
+reading the actual persisted files: `baseline.yaml` had `selected: true`,
+`os_surajwsl.yaml` had no `selected` key at all. `select()` always clears
+every other instance's flag before setting the new one's, so this shouldn't
+be reachable in steady state; the likely cause is `_load_all()`'s use of
+plain `os.listdir()`, whose order is filesystem-dependent, not alphabetical
+or creation-order -- if two files were ever transiently both `selected:
+true` (e.g. a restart landing between `select()`'s clear-old and
+persist-new writes), which one "won" depended on that arbitrary order,
+silently and non-deterministically, across restarts. Fixed by sorting
+filenames before processing and adding a self-healing dedup pass: if more
+than one file claims `selected: true`, a real (non-baseline) instance
+always wins over baseline (baseline is a fallback-of-last-resort, never
+worth silently preferring over an operator's real choice), and the losing
+file(s) get corrected on disk rather than left to cause the same silent
+reversion again later. The immediate live case (single winner, "baseline",
+not a live ambiguity) needed a manual reselect on top of the code fix,
+since there was nothing ambiguous left for the dedup pass itself to catch.
+
+Confirmed working end to end after all of the above: reselected
+`os_surajwsl`, relaunched `gazebo_rover` (the VM had rebooted since the
+last verified session, silently killing every non-systemd-managed sim
+process -- gzserver, roscore, the heartbeat listener, the bridge -- while
+the device's own `launcher_state` still reported the stale `"running"` from
+before; this is a known, accepted gap, see `SIMULATOR_AUTO_LAUNCH_PLAN.md`'s
+own open item on stale state), confirmed the heartbeat probe now gets a
+real `ALIVE` reply through the tunnel, and confirmed `rbx_sim_discovery`
+found and launched `sim_rover1` within one polling cycle (~5s) with no
+operator action beyond the normal Deploy click.
+
 ## 4. Explicitly not doing
 
 - Running more than one simulator across instances at once -- matches the

@@ -215,12 +215,15 @@ class NepiIFSimOsInstances extends Component {
   //
   // Never a generic "Default"/"None" placeholder -- reported live: the
   // picker should "name the name of the one it's currently connected to."
-  // The backend always registers a real, named, already-verified 'baseline'
-  // entry (see os_instance_registry.py's ensure_baseline) representing
-  // whatever connection simulator_launch_targets.yaml itself hardcodes, so
-  // selected_instance_id is never actually empty once status_msg exists --
-  // it shows up in this same loop like any other instance, just first and
-  // never removable (see renderInstanceList).
+  // The backend registers a real, named, already-verified 'baseline' entry
+  // (see os_instance_registry.py's ensure_baseline) representing whatever
+  // connection simulator_launch_targets.yaml itself hardcodes, so
+  // selected_instance_id is usually not empty once status_msg exists -- it
+  // shows up in this same loop like any other instance, just first. Now
+  // removable like any other instance (reported live: "the previous vm that
+  // was originally set up is not removable... make sure any vm is
+  // removable") -- see renderInstanceList and ensure_baseline's own comment
+  // for how a removed baseline is kept from silently reappearing.
   renderOsSelector() {
     const status_msg = this.state.status_msg
     if (status_msg == null) {
@@ -371,18 +374,19 @@ class NepiIFSimOsInstances extends Component {
       <React.Fragment>
         {ids.map((id, i) => {
           const label = names[i] + " (" + statuses[i] + ")" + ((id === selected) ? " -- selected" : "")
-          // 'baseline' (the always-present entry for whatever
-          // simulator_launch_targets.yaml itself hardcodes) is never
-          // removable -- there's nothing to fall back to if it were gone,
-          // see os_instance_registry.py's remove().
-          const removable = (id !== 'baseline')
+          // Every instance is removable, 'baseline' (the entry for whatever
+          // simulator_launch_targets.yaml itself hardcodes) included --
+          // reported live: "the previous vm that was originally set up is
+          // not removable... make sure any vm is removable." See
+          // os_instance_registry.py's ensure_baseline/remove for how a
+          // removed baseline is kept from silently reappearing on the next
+          // app restart (it only comes back if nothing else is registered
+          // at all, same as a genuinely fresh install).
           return (
             <Columns key={id}>
               <Column>
                 <Label title={label}>
-                  {removable
-                    ? <Button onClick={() => this.onRemoveInstance(id)}>{"Remove"}</Button>
-                    : null}
+                  <Button onClick={() => this.onRemoveInstance(id)}>{"Remove"}</Button>
                 </Label>
               </Column>
             </Columns>
