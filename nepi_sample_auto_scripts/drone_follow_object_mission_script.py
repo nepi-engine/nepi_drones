@@ -54,21 +54,33 @@
 # that had silently diverged from the Deploy-button path this app's RUI actually exposes.
 #
 # Live-tested result (2026-09-01, see that date's own commit): with the stand-in running,
-# this script gets past wait_for_topic(AI_TARGETING_TOPIC), detects the simulated "chair"
-# target with a live range_m/azimuth_deg/elevation_deg, and move_to_object_callback
-# correctly computes and issues a body-frame goto_rbx_position command toward it -- and,
-# after that same commit's takeoff-completion-latch fix, the vehicle actually closes
-# distance and reports genuine "Goto Position completed" convergence near
-# TARGET_OFFSET_GOAL_M. The earlier-reported "vehicle doesn't visibly close the distance"
-# symptom (LAUNCH's takeoff step timing out before reaching altitude) is fixed -- see
-# rbx_ardupilot_node.py's isAirborne(), which no longer trusts a one-shot latch that could
-# stay stuck False even after the vehicle safely reached altitude a bit later.
+# this script gets past wait_for_topic(AI_TARGETING_TOPIC) and detects the simulated
+# "chair" target with a live range_m/azimuth_deg/elevation_deg. The earlier-reported
+# "vehicle doesn't visibly close the distance" symptom (LAUNCH's takeoff step timing out
+# before reaching altitude) is fixed -- see rbx_ardupilot_node.py's isAirborne(), which no
+# longer trusts a one-shot latch that could stay stuck False even after the vehicle safely
+# reached altitude a bit later.
+#
+# 2026-09-04: move_to_object_callback originally issued a discrete
+# goto_rbx_position (absolute position setpoint) per detection. Even after
+# tightening that to fire on essentially every detection instead of once
+# per ~30s+ cycle, live testing showed the vehicle's ground-truth distance
+# to the target oscillating rather than closing (a clean run: 6.5m -> 5.8m
+# -> 8.8m -> 5.4m -> 14.4m) -- repeatedly retargeting an ABSOLUTE point,
+# computed from a vehicle that's still mid-maneuver toward the previous
+# one, compounds into wander rather than a smooth approach. Replaced
+# entirely with a continuous proportional VELOCITY controller (see
+# FOLLOW_CONTROL_RATE_HZ's own comment) modeled on
+# https://github.com/sieuwe1/Autonomous-Ai-drone-scripts's own
+# modules/control.py, driving rbx/set_teleop_velocity instead of
+# rbx/goto_position.
 
 import rospy
 import sys
 import os
 import time
 import math
+import threading
 import socket
 from nepi_sdk import nepi_ros
 from nepi_sdk import nepi_settings
@@ -76,6 +88,7 @@ from nepi_api.messages_if import MsgIF
 
 from std_msgs.msg import Empty, Bool, String, UInt32, Int32, Float32, Float64
 from geographic_msgs.msg import GeoPoint
+from geometry_msgs.msg import Twist
 from nepi_interfaces.msg import DeviceRBXInfo, DeviceRBXStatus, AxisControls, ErrorBounds, GotoErrors, MotorControl, \
      GotoPose, GotoPosition, GotoLocation, Setting, Settings, SettingsStatus
 from nepi_interfaces.srv import RBXCapabilitiesQuery, RBXCapabilitiesQueryResponse
@@ -91,7 +104,13 @@ RBX_ROBOT_NAME = "ardupilot"
 # Robot Settings Overides
 ###################
 TAKEOFF_HEIGHT_M = 10.0
-# Ignore Yaw Control
+# Ignore Yaw Control -- True (default) leaves the vehicle's heading alone
+# while following: a holonomic multirotor can close on a target that isn't
+# dead ahead without turning to face it (see velocityControlLoopCb's own
+# comment), so this is a style choice, not a requirement. Set False to
+# also yaw toward the target proportionally (FOLLOW_YAW_GAIN_PER_DEG
+# below), same idea as
+# https://github.com/sieuwe1/Autonomous-Ai-drone-scripts's own pidYaw.
 IGNORE_YAW_CONTROL = True
 
 ###!!!!!!!! Set Automation action parameters !!!!!!!!
@@ -162,21 +181,74 @@ CMD_MODE_TIMEOUT_SEC = 5
 # the timeout and was scored a failure. 60 s leaves real headroom without
 # masking an actually-stuck takeoff.
 CMD_ACTION_TIMEOUT_SEC = 60
-# Lowered from 30 for continuous tracking (2026-09-03: "constantly follow
-# it" -- see move_to_object_callback's own comment). This isn't just a
-# do-or-give-up budget for one move any more -- it's also, indirectly, how
-# often the driver can accept a NEW setpoint at all: gotoPositionCb
-# (nepi_api's device_if_rbx.py) drops any incoming GotoPosition message
-# outright ("Ignoring GoTo Position Request, Another GoTo Command Process
-# is Active") for as long as the PREVIOUS one is still inside its own
-# blocking convergence wait, which runs for up to this many seconds
-# whenever it doesn't converge sooner. 30s meant most detections streaming
-# in during that window were silently discarded, not queued -- the
-# opposite of "constantly follow, as it keeps updating". A short budget
-# means a call either converges quickly (already close) or times out
-# quickly and returns to ready, so a fresh detection's setpoint actually
-# gets through far more often.
-CMD_GOTO_TIMEOUT_SEC = 3
+
+# Continuous body-frame VELOCITY following (2026-09-04), replacing the
+# earlier goto_position-based approach entirely. History: that approach
+# (repeated absolute position setpoints, tightened from a 30s to a 3s
+# per-attempt budget the same day to let detections "constantly follow, as
+# it keeps updating" -- see git history) still measurably struggled live:
+# with the tighter timeout the vehicle no longer spun to a corrupted
+# heading (that was a separate, since-fixed -999 yaw sentinel bug), but its
+# ground-truth distance to the target oscillated rather than closing
+# (6.5m -> 5.8m -> 8.8m -> 5.4m -> 14.4m over one clean, closely-watched
+# run) -- wandering, not homing in. Root cause: gotoPositionCb (nepi_api's
+# device_if_rbx.py) re-bases each new absolute position target on
+# wherever the vehicle happens to be AND however it's currently moving at
+# the moment each new (still only ~1s-fresh) detection arrives, then hands
+# that off to ArduPilot's own position controller, which has its own
+# accel/decel profile for reaching an absolute point -- retargeting an
+# absolute point every ~3s, computed from a moving vehicle's transient
+# state, compounds into exactly this kind of wander rather than a smooth
+# approach.
+#
+# Requested live: "see if you can implement similar logic of that into
+# this sim" pointing at
+# https://github.com/sieuwe1/Autonomous-Ai-drone-scripts -- that project's
+# modules/control.py drives a person-following drone with a continuous
+# proportional (P/PID) VELOCITY command instead of discrete position
+# setpoints: a speed proportional to how far off distance/centering is,
+# streamed continuously, rather than "fly to this point, then evaluate
+# again". This app's own RBX driver already exposes exactly the primitive
+# that needs (rbx/set_teleop_velocity, body-frame [-1,1] forward/right/up
+# ratios + yaw-rate, already used by the RUI's own keyboard teleop) --
+# see move_to_object_callback and its new velocityControlLoopCb for the
+# adapted version: azimuth/elevation decompose the same proportional
+# "how eager to move" scalar into forward/right/up components (an
+# omnidirectional multirotor doesn't need to yaw to face a target the way
+# the reference project's fixed-camera gimbal drone does, so yaw-rate
+# stays 0 here, preserving this script's own pre-existing
+# IGNORE_YAW_CONTROL design choice), republished at FOLLOW_CONTROL_RATE_HZ
+# so the stream never lapses past the driver's own
+# TELEOP_CMD_TIMEOUT_SEC (0.75s) safety cutoff.
+#
+# goto_rbx_position/CMD_GOTO_TIMEOUT_SEC (the old approach) are removed
+# entirely rather than left as unused dead code -- wait_for_rbx_status_
+# ready/busy stay, still used by pre_mission_actions' own LAUNCH action.
+FOLLOW_CONTROL_RATE_HZ = 8.0
+# Must comfortably beat rbx_ardupilot_node.py's own TELEOP_CMD_TIMEOUT_SEC
+# (0.75s) -- a lapse here means the driver stops actuating entirely
+# (a deliberate safety behavior on ITS side, not a bug to work around),
+# which would otherwise look like "it randomly stops following".
+FOLLOW_TARGET_STALE_SEC = 0.5
+# Ratio-per-meter proportional gain: the speed ratio [-1,1] sent to
+# set_teleop_velocity climbs at this rate per meter of remaining range
+# error (target_range_m - TARGET_OFFSET_GOAL_M), capped by
+# FOLLOW_MAX_SPEED_RATIO below. At 0.1, the cap is reached at 5m of error
+# -- conservative on purpose; TELEOP_MAX_LINEAR_MPS (rbx_ardupilot_node.py)
+# is 2.0 m/s, so ratio 1.0 would mean a 2 m/s closing speed even right at
+# the standoff distance if this were set too aggressively.
+FOLLOW_SPEED_GAIN_PER_M = 0.1
+# Well under the driver's own ratio range of 1.0 -- leaves headroom so a
+# momentarily large range error (e.g. right after a reset) still produces
+# a bounded, controllable speed rather than commanding the driver's own
+# absolute max.
+FOLLOW_MAX_SPEED_RATIO = 0.5
+# Only used when IGNORE_YAW_CONTROL is False -- ratio-per-degree gain for
+# the optional yaw-toward-target term, same proportional idea as
+# FOLLOW_SPEED_GAIN_PER_M above but on azimuth instead of range. At 0.02,
+# the yaw-rate ratio cap (1.0, i.e. TELEOP_MAX_ANGULAR_DPS) is reached at
+# 50 degrees off-center.
+FOLLOW_YAW_GAIN_PER_DEG = 0.02
 
 # Sim target teardown (added 2026-08-26) -- best-effort signal to the dev
 # VM's ai_targeting_controller_ardupilot.py (see its TEARDOWN_PORT) to
@@ -204,6 +276,18 @@ class drone_follow_object_mission(object):
 
   img_height = 0
   img_width = 0
+
+  # Latest cached target reading, written by move_to_object_callback and
+  # read by velocityControlLoopCb on a Timer -- see FOLLOW_CONTROL_RATE_HZ's
+  # own comment for why following is split this way now. latest_target_time
+  # stays 0.0 (never a valid time.time() value) until the first real
+  # detection arrives, doubling as the "nothing cached yet" sentinel
+  # velocityControlLoopCb checks for.
+  follow_lock = threading.Lock()
+  latest_target_time = 0.0
+  latest_target_range_m = 0.0
+  latest_target_azimuth_deg = 0.0
+  latest_target_elevation_deg = 0.0
 
   settings_update =  dict(
     takeoff_height_m = {"type":"Float","name":"takeoff_height_m","value":str(TAKEOFF_HEIGHT_M)}
@@ -299,6 +383,10 @@ class drone_follow_object_mission(object):
     # Start misson processes
     self.msg_if.pub_info("Starting move to object callback")
     rospy.Subscriber(ai_targeting_topic, Targets, self.move_to_object_callback, queue_size = 1)
+    # Continuous velocity control loop -- see FOLLOW_CONTROL_RATE_HZ's own
+    # comment for why following is driven by a Timer reading the latest
+    # cached detection, not directly by the detection callback above.
+    rospy.Timer(rospy.Duration(1.0 / FOLLOW_CONTROL_RATE_HZ), self.velocityControlLoopCb)
 
     ##############################
     ## Initiation Complete
@@ -399,6 +487,10 @@ class drone_follow_object_mission(object):
     NEPI_RBX_GOTO_POSE_TOPIC = NEPI_RBX_NAMESPACE + "goto_pose"
     NEPI_RBX_GOTO_POSITION_TOPIC = NEPI_RBX_NAMESPACE + "goto_position"
     NEPI_RBX_GOTO_LOCATION_TOPIC = NEPI_RBX_NAMESPACE + "goto_location"
+    # Continuous body-frame velocity control -- see move_to_object_callback's
+    # own comment (2026-09-04 rewrite) for why following now uses this
+    # instead of repeated goto_position setpoints.
+    NEPI_RBX_SET_TELEOP_VELOCITY_TOPIC = NEPI_RBX_NAMESPACE + "set_teleop_velocity"
 
     self.rbx_go_action_pub = nepi_ros.create_publisher(NEPI_RBX_GO_ACTION_TOPIC, Int32, queue_size=1)
     self.rbx_go_home_pub = nepi_ros.create_publisher(NEPI_RBX_GO_HOME_TOPIC, Empty, queue_size=1)
@@ -406,6 +498,8 @@ class drone_follow_object_mission(object):
     self.rbx_goto_pose_pub = nepi_ros.create_publisher(NEPI_RBX_GOTO_POSE_TOPIC, GotoPose, queue_size=1)
     self.rbx_goto_position_pub = nepi_ros.create_publisher(NEPI_RBX_GOTO_POSITION_TOPIC, GotoPosition, queue_size=1)
     self.rbx_goto_location_pub = nepi_ros.create_publisher(NEPI_RBX_GOTO_LOCATION_TOPIC, GotoLocation, queue_size=1)
+    self.rbx_set_teleop_velocity_pub = nepi_ros.create_publisher(
+        NEPI_RBX_SET_TELEOP_VELOCITY_TOPIC, Twist, queue_size=1)
 
     # Fake GPS is a standalone app now (nepi_app_fake_gps), not a per-robot rbx/ topic --
     # a single instance at the base namespace injects HilGPS into whichever mavros node
@@ -532,51 +626,6 @@ class drone_follow_object_mission(object):
     self.rbx_set_process_name_pub.publish(process_name)
     return True
 
-  def goto_rbx_position(self, goto_data, timeout_sec=10, wait_for_completion=True):
-    # wait_for_completion=False (see move_to_object_callback's own comment
-    # on continuous tracking): publishes the setpoint and returns
-    # immediately instead of blocking on busy->ready convergence. Safe to
-    # skip that wait for a moving target -- gotoPosition() on the driver
-    # side (rbx_ardupilot_node.py) re-bases the body-frame offset onto
-    # wherever the vehicle currently is on EVERY publish, it doesn't queue
-    # or require the previous setpoint to finish first, so publishing a
-    # fresh setpoint here always immediately supersedes whatever the
-    # vehicle was flying toward before.
-    self.rbx_set_cmd_timeout_pub.publish(timeout_sec)
-    time.sleep(0.1)
-    if len(goto_data) != 4:
-      return False
-    if not wait_for_completion:
-      # Skip the ready-gate too, not just the post-publish wait -- "busy"
-      # here just means "still flying toward the previous setpoint", which
-      # for a continuously-tracked moving target is exactly the state a new
-      # setpoint is meant to interrupt, not wait out. Blocking here on the
-      # SAME condition this call exists to supersede would mean each
-      # tracking update waits out however long the last one takes to
-      # "finish" (which for a moving target may be never), defeating the
-      # whole point of following continuously.
-      goto_msg = GotoPosition()
-      goto_msg.x_meters = goto_data[0]
-      goto_msg.y_meters = goto_data[1]
-      goto_msg.z_meters = goto_data[2]
-      goto_msg.yaw_deg = goto_data[3]
-      self.rbx_goto_position_pub.publish(goto_msg)
-      return True
-    ready = self.wait_for_rbx_status_ready(timeout_sec)
-    if ready:
-      self.msg_if.pub_info("Starting goto Position Body Process")
-      goto_msg = GotoPosition()
-      goto_msg.x_meters = goto_data[0]
-      goto_msg.y_meters = goto_data[1]
-      goto_msg.z_meters = goto_data[2]
-      goto_msg.yaw_deg = goto_data[3]
-      self.rbx_goto_position_pub.publish(goto_msg)
-      busy = self.wait_for_rbx_status_busy(timeout_sec)
-      if busy:
-        self.wait_for_rbx_status_ready(timeout_sec)
-    time.sleep(1)
-    return self.rbx_status.cmd_success
-
   #######################
   ### Node Methods
 
@@ -649,9 +698,14 @@ class drone_follow_object_mission(object):
       self.img_height = img_msg.height
       self.img_width = img_msg.width
 
-  # Action upon detection and targeting for object of interest
+  # Action upon detection and targeting for object of interest -- just
+  # caches the latest reading (thread-safe: this callback and
+  # velocityControlLoopCb below run on different threads, rospy's own
+  # subscriber-callback thread vs. the Timer's). See velocityControlLoopCb
+  # for what actually drives the vehicle now, and FOLLOW_CONTROL_RATE_HZ's
+  # own comment for why this split into "cache the reading"/"continuously
+  # act on the latest cached reading" replaced one callback that did both.
   def move_to_object_callback(self,targets_data_msg):
-    # Check for the object of interest and take appropriate actions
     for target_data_msg in targets_data_msg.targets:
       # nepi_interfaces/Target's class field is "name". This read "target_name",
       # which raised AttributeError inside the subscriber callback on EVERY
@@ -662,94 +716,62 @@ class drone_follow_object_mission(object):
       # altitude with local x/y pinned at 0.01 m while valid targets streamed in
       # at ~1 Hz. (This module's own header claims the rename went "Class ->
       # target_name"; the actual field is plain "name".)
-      target_class = target_data_msg.name
-      target_range_m = target_data_msg.range_m # [x,y,z]
-      target_yaw_d = target_data_msg.azimuth_deg  # dz
-      target_pitch_d = target_data_msg.elevation_deg # dy
-      if target_class == TARGET_TO_FOLLOW and target_range_m != -999:
-        self.msg_if.pub_info("Detected a " + TARGET_TO_FOLLOW + "with valid range")
-        setpoint_range_m = target_range_m - TARGET_OFFSET_GOAL_M
-        # Y/Z were computed in the AI-targeting sensor's own convention
-        # (X forward, Y RIGHT, Z DOWN -- see ai_targeting_controller_ardupilot.py's
-        # own docstring), but goto_rbx_position() ultimately calls
-        # device_if_rbx.py's setpoint_position_local_body(), whose docstring
-        # states its body frame is X forward, Y LEFT, Z UP -- the opposite
-        # sign on both axes. Sending the sensor's raw right/down values
-        # there means "descend toward a low target" got interpreted as
-        # "climb", and left/right got mirrored too. Confirmed live
-        # 2026-08-26: the drone climbed to ~18m (10m takeoff + ~8m of
-        # wrong-direction climb) chasing a target near ground level, instead
-        # of descending to meet it -- exactly the ~8-9m magnitude of the
-        # elevation-driven Z command being applied with the wrong sign.
-        # Fixed by negating both axes when building the driver-frame
-        # setpoint, rather than touching the sensor's own (correct, and
-        # shared with other consumers) right/down convention.
-        sp_x_m = setpoint_range_m * math.cos(math.radians(target_yaw_d))  # X is Forward in both conventions
-        sp_y_m = -setpoint_range_m * math.sin(math.radians(target_yaw_d)) # sensor Y is Right -> driver Y is Left
-        sp_z_m = setpoint_range_m * math.sin(math.radians(target_pitch_d)) # sensor Z is Down -> driver Z is Up
-        sp_yaw_d = target_yaw_d
-        if IGNORE_YAW_CONTROL:
-          # NOT -999. Confirmed live 2026-09-03 ("the drone just fell over
-          # and is upside down" / "it's just flying in a random place"):
-          # nepi_api's setpoint_position_local_body() only honors -999 as
-          # a "hold current yaw" sentinel for its OWN convergence check
-          # (skips waiting on yaw error) -- the actual command value is
-          # computed unconditionally as new_yaw_enu_deg = start_yaw_enu_deg
-          # + input_yaw_body_deg regardless, and its +-180 wraparound is a
-          # single if/elif, not a real modulo, so passing -999 there sends
-          # a wildly wrong ABSOLUTE yaw target (e.g. current 234.6 degrees
-          # becomes -764.4, "wrapped" once to -404.4 -- still nowhere near
-          # a real heading). With the old, long-blocking single-shot goto
-          # this got sent once per ~30s+ cycle and had time to settle
-          # before mattering much; continuously re-firing a setpoint on
-          # every detection (see this method's own comment above) means
-          # it's now re-corrupting the actual commanded yaw every cycle,
-          # and since setpoint_position_local_body() rotates the NEXT
-          # body-frame position offset by whatever yaw the vehicle is
-          # ACTUALLY at when that next call starts, a vehicle spun to a
-          # garbage heading also sends the FOLLOWING position setpoint in
-          # a garbage direction -- compounding into the vehicle apparently
-          # flying to a random place. setpoint_position_local_body()'s own
-          # semantics are new_yaw = current_yaw + input_yaw_body_deg, so 0
-          # (not -999) is the correct "no yaw change" delta -- this is a
-          # workaround kept entirely on this script's side rather than
-          # touching nepi_api (shared platform code used well beyond this
-          # app) for what is ultimately that function's own bug.
-          sp_yaw_d = 0
-        setpoint_position_body_m = [sp_x_m,sp_y_m,sp_z_m,sp_yaw_d]
-        rospy.logwarn(setpoint_position_body_m)
-        # Send poisition update
-        self.msg_if.pub_info("Sending setpoint position body command")
-        self.msg_if.pub_info(str(setpoint_position_body_m))
-        # Pass CMD_GOTO_TIMEOUT_SEC explicitly. It is defined up in USER SETTINGS
-        # but was never used -- goto_rbx_position's own default of 10 s applied
-        # instead, so the configured value was silently ignored. 10 s is not
-        # enough to close 10+ m on a target that is itself circling (radius
-        # 2.5 m, 50 s period) to within GOTO_MAX_ERROR_M = 2.0 m, especially with
-        # SITL running slower than realtime: confirmed live 2026-08-12, every
-        # goto reported "Setpoint cmd timed out" / "Goto Position failed" while
-        # the vehicle was in fact tracking the target correctly.
-        # Requested live (2026-09-03): "keep making it an action to go to
-        # that point. as it keeps updating, constantly follow it." -- the
-        # previous version blocked here (goto_rbx_position's default
-        # wait_for_completion=True) for up to CMD_GOTO_TIMEOUT_SEC, then
-        # added a further TRIGGER_RESET_DELAY_S + nepi_ros.sleep(2,10)
-        # pause before the NEXT detection was even looked at -- up to ~37s
-        # of committing to one single, increasingly stale setpoint against
-        # a target that circles with a 50s period. That's "fly to where it
-        # was a while ago, pause, repeat", not tracking. wait_for_completion
-        # =False publishes the updated setpoint and returns immediately
-        # (see that method's own comment for why this is safe to do on
-        # every detection rather than waiting each one out), so this now
-        # re-aims at the target's CURRENT bearing on essentially every
-        # incoming detection (~the AI-targeting stream's own rate) instead
-        # of once per ~37s cycle -- continuous pursuit rather than discrete
-        # hops.
-        self.goto_rbx_position(setpoint_position_body_m, timeout_sec = CMD_GOTO_TIMEOUT_SEC,
-                                wait_for_completion = False)
-      else:
-        self.msg_if.pub_info("Target range value invalid, skipping actions")
-        time.sleep(1)
+      if target_data_msg.name != TARGET_TO_FOLLOW or target_data_msg.range_m == -999:
+        continue
+      with self.follow_lock:
+        self.latest_target_range_m = target_data_msg.range_m
+        self.latest_target_azimuth_deg = target_data_msg.azimuth_deg
+        self.latest_target_elevation_deg = target_data_msg.elevation_deg
+        self.latest_target_time = time.time()
+      return
+
+  def velocityControlLoopCb(self, timer_event):
+    """Runs at FOLLOW_CONTROL_RATE_HZ (see that constant's own comment for
+    the full history of why following now works this way, replacing
+    repeated goto_position setpoints). Continuous PROPORTIONAL velocity
+    control, the same shape
+    https://github.com/sieuwe1/Autonomous-Ai-drone-scripts's modules/
+    control.py uses (a speed proportional to how far off the goal is,
+    streamed continuously) -- adapted to this app's own rbx/
+    set_teleop_velocity primitive (body-frame [-1,1] forward/right/up
+    ratios + yaw-rate) instead of that project's MAVLink velocity calls.
+
+    Stops (publishes nothing further, letting the driver's own
+    TELEOP_CMD_TIMEOUT_SEC safety cutoff take over) whenever the cached
+    target reading is missing or older than FOLLOW_TARGET_STALE_SEC --
+    "haven't seen it recently" and "never saw it" should both mean "don't
+    move", not extrapolate from a stale bearing."""
+    with self.follow_lock:
+      target_time = self.latest_target_time
+      range_m = self.latest_target_range_m
+      azimuth_deg = self.latest_target_azimuth_deg
+      elevation_deg = self.latest_target_elevation_deg
+    if target_time == 0.0 or (time.time() - target_time) > FOLLOW_TARGET_STALE_SEC:
+      return
+    range_error_m = range_m - TARGET_OFFSET_GOAL_M
+    speed_ratio = max(-FOLLOW_MAX_SPEED_RATIO, min(FOLLOW_MAX_SPEED_RATIO,
+                       range_error_m * FOLLOW_SPEED_GAIN_PER_M))
+    azimuth_rad = math.radians(azimuth_deg)
+    elevation_rad = math.radians(elevation_deg)
+    # Decomposing the single "how eager to move" scalar by azimuth/elevation
+    # (rather than always driving straight ahead) is what lets a holonomic
+    # multirotor close on a target that isn't dead ahead without ever
+    # needing to yaw toward it first -- azimuth/elevation positive already
+    # match set_teleop_velocity's own documented body-frame convention
+    # (forward/RIGHT/up, see rbx_ardupilot_node.py's setTeleopVelocity)
+    # directly, with no sign flip needed: unlike goto_position's Y-is-LEFT
+    # convention (the source of the 2026-08-26 sign bug in the old
+    # approach this replaces), teleop's Y-is-RIGHT already matches this
+    # sensor's own right-positive azimuth convention as-is.
+    twist = Twist()
+    twist.linear.x = speed_ratio * math.cos(azimuth_rad)
+    twist.linear.y = speed_ratio * math.sin(azimuth_rad)
+    twist.linear.z = speed_ratio * math.sin(elevation_rad)
+    if IGNORE_YAW_CONTROL:
+      twist.angular.z = 0.0
+    else:
+      twist.angular.z = max(-1.0, min(1.0, azimuth_deg * FOLLOW_YAW_GAIN_PER_DEG))
+    self.rbx_set_teleop_velocity_pub.publish(twist)
 
 
   #######################
