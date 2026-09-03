@@ -220,6 +220,36 @@ line alone (sustained wheel motion needs the RUI's own teleop path, not
 `rostopic pub`) -- code-reviewed and physics-verified, visual confirmation
 still open.
 
+## NavPose mirror, for the same reason the image mirror exists (2026-09-03)
+
+Reported live: "navpose data in devices -> apps also doesn't seem to detect
+any of the values -- the robot data should be accessible by pretty much all
+other ros topics that need it, for any sim." Root cause: `self.navpose_dict`
+(feeding this app's own NavPoseIF, the thing "Devices -> Select App ->
+NavPose" actually connects to as e.g. "sim_connector_1") was only ever
+populated by `processTelemetryLine`, fed exclusively from the generic-
+connector bridge protocol (webots_rover/pybullet_rover/wpilib_rover).
+Gazebo rover/quadcopter go through an RBX driver instead (`rbx_sim_node.py`/
+`rbx_ardupilot_node.py`) -- exactly the same "which targets actually use
+which pipe" split the existing six-topic image mirror's own comment already
+documents -- and that driver's own, already-correct NavPose (its own
+NPXDeviceIF, publishing `<device>/npx/navpose`) was never connected to this
+app's copy at all. Confirmed via `rostopic info`: the real RBX driver
+(`sim_rover1`) had a live publisher on `.../npx/navpose`, but nothing on
+this app's side was ever subscribed to it.
+
+Fixed with a `updateNavPoseMirrorSubscription`/`navPoseMirrorCb` pair,
+structurally identical to `updateCommonViewSubscriptions`'s own image
+mirror: re-points at whichever `<node_namespace>/npx/navpose` topic
+`selected_simulator` currently resolves to, copying every `has_*`-gated
+field group present into `self.navpose_dict` on each message. Verified
+live: relaunched `gazebo_rover`, confirmed `app_sim_connector` shows up as
+a subscriber on `sim_rover1`'s own `.../npx/navpose` topic (~23 Hz), and
+`rostopic echo` on both topics side by side shows this app's own NavPose
+now tracking the real rover's position/orientation in real time (small
+differences between the two only from the ~40ms gap between separate
+`echo` calls, not a bug).
+
 ## Explicitly not doing
 
 - Not building pre-deploy preset-editing UI (editing `robot_configs` entries themselves) --

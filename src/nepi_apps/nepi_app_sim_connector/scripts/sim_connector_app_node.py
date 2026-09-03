@@ -122,7 +122,7 @@ from std_msgs.msg import Bool, Empty, String, Float32
 from sensor_msgs.msg import Image
 from geographic_msgs.msg import GeoPoint
 
-from nepi_interfaces.msg import AxisControls, DeviceRBXStatus
+from nepi_interfaces.msg import AxisControls, DeviceRBXStatus, NavPose
 
 from nepi_api.messages_if import MsgIF
 
@@ -497,6 +497,25 @@ class NepiSimConnectorApp:
       self.mirror_pubs[view] = nepi_sdk.create_publisher(self.node_name + "/" + view, Image, queue_size = 1)
       self.mirror_subs[view] = None
       self.mirror_source_topics[view] = None
+
+    # NavPose mirror -- same "one stable thing to look at no matter the
+    # simulator" reasoning as the six-topic image mirror above, for
+    # self.navpose_dict (which already feeds this app's own NavPoseIF via
+    # getNavPoseCb below). Reported live (2026-09-03): "navpose data in
+    # devices -> apps also doesn't seem to detect any of the values" --
+    # root cause: self.navpose_dict was only ever populated by
+    # processTelemetryLine, fed from the generic-connector bridge protocol
+    # (webots_rover/pybullet_rover/wpilib_rover) -- Gazebo rover/quadcopter
+    # go through an RBX driver instead (rbx_sim_node.py/rbx_ardupilot_node.py),
+    # exactly like the image mirror's own comment already documents, and
+    # that driver's already-correct NavPose (its own NPXDeviceIF, publishing
+    # <device>/npx/navpose) was never connected to this app's copy at all --
+    # so this app's own NavPose consumer showed nothing whenever a Gazebo/
+    # Webots target was actually selected. Mirrors that topic the same way
+    # updateCommonViewSubscriptions already mirrors images, from whichever
+    # node_namespace selected_simulator currently resolves to.
+    self.navpose_mirror_sub = None
+    self.navpose_mirror_source_topic = None
 
     ##############################
     # FOV data -- published as plain, latched Float32 topics rather than
@@ -1953,6 +1972,88 @@ class NepiSimConnectorApp:
         self.setSelectedSimulator(available[0])
 
     self.updateCommonViewSubscriptions()
+    self.updateNavPoseMirrorSubscription()
+
+  def updateNavPoseMirrorSubscription(self):
+    # Re-points the NavPose mirror at whichever real <device>/npx/navpose
+    # topic the currently selected_simulator's own RBX driver publishes --
+    # see self.navpose_mirror_sub's own comment in __init__ for the full
+    # reasoning. node_namespace derivation matches
+    # updateCommonViewSubscriptions exactly (same selected_simulator value,
+    # same "strip /rbx" relationship to the driver's own node namespace).
+    node_namespace = self.selected_simulator.split('/rbx')[0] if self.selected_simulator else ""
+    source_topic = ""
+    if node_namespace != "":
+      source_topic = nepi_sdk.find_topic(node_namespace + "/npx/navpose", exact = True)
+    if source_topic == self.navpose_mirror_source_topic:
+      return  # Already pointed at the right thing (including both empty).
+    if self.navpose_mirror_sub is not None:
+      try:
+        self.navpose_mirror_sub.unregister()
+      except Exception:
+        pass
+      self.navpose_mirror_sub = None
+    self.navpose_mirror_source_topic = source_topic
+    if source_topic == "":
+      # The underlying RBX driver's own NavPose topic just disappeared
+      # (SITL/Gazebo stopped, or nothing selected) -- leave navpose_dict at
+      # whatever it last reported rather than snapping it back to blank;
+      # matches processTelemetryLine's own "last known good" behavior when
+      # the generic bridge connection drops.
+      return
+    self.navpose_mirror_sub = nepi_sdk.create_subscriber(
+        source_topic, NavPose, self.navPoseMirrorCb, queue_size = 1)
+    self.msg_if.pub_info("NavPose mirror now following: " + source_topic)
+
+  def navPoseMirrorCb(self, msg):
+    # Copies every has_*/value field this message carries into
+    # self.navpose_dict, the exact same dict processTelemetryLine populates
+    # for the generic-connector bridge protocol -- see
+    # updateNavPoseMirrorSubscription's own comment for why a second,
+    # independent source for the same dict is correct here (the two are
+    # mutually exclusive in practice: a given launch target uses one path
+    # or the other, never both).
+    nd = self.navpose_dict
+    if msg.has_location:
+      nd['has_location'] = True
+      nd['time_location'] = msg.time_location
+      nd['latitude'] = msg.latitude
+      nd['longitude'] = msg.longitude
+      nd['location_m_per_sec'] = msg.location_m_per_sec
+    if msg.has_heading:
+      nd['has_heading'] = True
+      nd['time_heading'] = msg.time_heading
+      nd['heading_deg'] = msg.heading_deg
+      nd['heading_m_per_sec'] = msg.heading_m_per_sec
+    if msg.has_position:
+      nd['has_position'] = True
+      nd['time_position'] = msg.time_position
+      nd['x_m'] = msg.x_m
+      nd['y_m'] = msg.y_m
+      nd['z_m'] = msg.z_m
+      nd['x_m_per_sec'] = msg.x_m_per_sec
+      nd['y_m_per_sec'] = msg.y_m_per_sec
+      nd['z_m_per_sec'] = msg.z_m_per_sec
+    if msg.has_orientation:
+      nd['has_orientation'] = True
+      nd['time_orientation'] = msg.time_orientation
+      nd['roll_deg'] = msg.roll_deg
+      nd['pitch_deg'] = msg.pitch_deg
+      nd['yaw_deg'] = msg.yaw_deg
+      nd['roll_deg_per_sec'] = msg.roll_deg_per_sec
+      nd['pitch_deg_per_sec'] = msg.pitch_deg_per_sec
+      nd['yaw_deg_per_sec'] = msg.yaw_deg_per_sec
+    if msg.has_altitude:
+      nd['has_altitude'] = True
+      nd['time_altitude'] = msg.time_altitude
+      nd['altitude_m'] = msg.altitude_m
+      nd['geoid_height_meters'] = msg.geoid_height_meters
+      nd['altitude_m_per_sec'] = msg.altitude_m_per_sec
+    if msg.has_depth:
+      nd['has_depth'] = True
+      nd['time_depth'] = msg.time_depth
+      nd['depth_m'] = msg.depth_m
+      nd['depth_m_per_sec'] = msg.depth_m_per_sec
 
   def updateCommonViewSubscriptions(self):
     # Re-points each of the six mirror_pubs at whichever real Image topics
