@@ -146,7 +146,7 @@ from nepi_app_sim_connector.msg import SimLauncherStatus
 # below (it has its own empty-by-default persistence, independent of whether
 # self.launcher itself is configured) so the OS picker is always available
 # even on a deployment with no simulator_launch_targets.yaml at all.
-from nepi_api.os_instance_registry import OsInstanceRegistry
+from nepi_api.os_instance_registry import OsInstanceRegistry, DEFAULT_CONNECTION_MODE
 from nepi_app_sim_connector.msg import SimOsInstancesStatus
 
 PKG_NAME = 'SIM_CONNECTOR'
@@ -2795,6 +2795,7 @@ class NepiSimConnectorApp:
     status.instance_hosts = [instances[i].get('host', '') for i in ids]
     status.instance_ssh_users = [instances[i].get('ssh_user', '') for i in ids]
     status.instance_ssh_ports = [int(instances[i].get('ssh_port', 0)) for i in ids]
+    status.instance_connection_modes = [instances[i].get('connection_mode', DEFAULT_CONNECTION_MODE) for i in ids]
     status.instance_statuses = [instances[i].get('status', 'pending') for i in ids]
     status.selected_instance_id = self.os_instance_registry.selected_instance_id
     status.setup_state = self.os_instance_setup_state
@@ -2804,12 +2805,29 @@ class NepiSimConnectorApp:
     self.os_instances_status_pub.publish(status)
 
   def registerOsInstanceCb(self, msg):
-    display_name = str(msg.data).strip()
+    # Payload is either a plain display name (connection_mode defaults to
+    # 'ssh', unchanged from before shared_storage existed) or JSON
+    # {"display_name": ..., "connection_mode": "ssh"|"shared_storage"} --
+    # same "plain string still works, JSON is the opt-in extension" shape
+    # verifyOsInstanceCb's own payload already uses. A plain string that
+    # merely LOOKS like JSON (starts with '{') but fails to parse falls
+    # back to treating the whole raw text as the display name rather than
+    # silently registering an instance named '{'.
+    raw = str(msg.data).strip()
+    display_name = raw
+    connection_mode = DEFAULT_CONNECTION_MODE
+    if raw.startswith('{'):
+      try:
+        payload = json.loads(raw)
+        display_name = str(payload.get('display_name', '')).strip()
+        connection_mode = str(payload.get('connection_mode', DEFAULT_CONNECTION_MODE)).strip()
+      except (ValueError, AttributeError):
+        pass
     if not display_name:
       self.msg_if.pub_warn("Cannot register an OS instance with an empty name")
       return
     try:
-      instance_id, setup_commands = self.os_instance_registry.register(display_name)
+      instance_id, setup_commands = self.os_instance_registry.register(display_name, connection_mode)
     except LauncherError as e:
       self.os_instance_setup_state = 'failed'
       self.os_instance_last_error = str(e)

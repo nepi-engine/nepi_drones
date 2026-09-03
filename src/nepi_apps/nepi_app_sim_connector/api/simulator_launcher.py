@@ -27,6 +27,7 @@
 # private key path comes from the NEPI_SSH_KEY environment variable, same
 # convention every deploy_*.sh script in this repo already uses.
 
+import json
 import os
 import re
 import subprocess
@@ -66,6 +67,24 @@ READY_CHECK_INTERVAL_SEC = 3
 # 10 minutes on modest hardware -- 600s was sized for the package-manager
 # one-liners every other target uses, not a build like this one.
 INSTALL_TIMEOUT_SEC = 3600
+
+# Shared-storage transport (additive alongside SSH -- see
+# os_instance_registry.py's CONNECTION_MODES and vm_command_watcher.py's own
+# module docstring for the full design/protocol). Duplicated, not imported,
+# from os_instance_registry.py's own identical constant -- same reasoning
+# that module already gives for duplicating THIS file's SSH-key logic
+# instead of importing it: os_instance_registry.py imports LauncherError
+# from here, so importing back would be circular, and the two modules are
+# meant to stay independently optional.
+VM_COMMANDS_STORAGE_DIR = '/mnt/nepi_storage/databases/nepi_app_sim_connector/vm_commands'
+# Extra slack added on top of a dispatched command's own timeout_sec before
+# giving up on ever seeing its status file at all -- covers the watcher's
+# own poll-interval granularity (it only checks for new command files once
+# per tick) plus this process's own poll granularity below, so a command
+# that itself finishes right at its deadline doesn't lose a race against
+# this side's own polling loop.
+SHARED_STORAGE_POLL_GRACE_SEC = 5
+SHARED_STORAGE_POLL_INTERVAL_SEC = 1.0
 
 
 class LauncherError(Exception):
@@ -159,6 +178,10 @@ class SimulatorLauncher(object):
     # in simulator_launch_targets.yaml for why) -- must not be garbage
     # collected or waited on while the sim should still be running.
     self._launch_procs = {}
+    # Monotonic counter for _dispatch_shared_storage's own request_id
+    # generation -- see that method's own comment for why timestamp alone
+    # isn't quite enough.
+    self._shared_storage_seq = 0
 
   def _load_config(self, config_path):
     if not os.path.isfile(config_path):
@@ -411,6 +434,65 @@ class SimulatorLauncher(object):
     self._push_file_content(target, remote_path, script_body)
     return remote_path
 
+  #**********************
+  # Shared-storage transport -- the connection_mode='shared_storage'
+  # counterpart of _ssh_cmd/_run_remote above. See
+  # os_instance_registry.py's CONNECTION_MODES and vm_command_watcher.py's
+  # own module docstring for the full design: a target selected onto a
+  # shared_storage instance (os_instance_registry.select()) carries
+  # os_instance_id instead of host/ssh_user/ssh_port, and every method
+  # below that currently branches on connection_mode calls this instead of
+  # _ssh_cmd/_run_remote for that target.
+
+  def _dispatch_shared_storage(self, target, target_key, action, script_text, timeout_sec):
+    """Writes a command file to target's OS instance's mailbox and blocks
+    until a matching status file appears (or timeout_sec plus
+    SHARED_STORAGE_POLL_GRACE_SEC elapses). Returns the parsed status dict
+    (at least 'state'/'exit_code'/'error', see vm_command_watcher.py's own
+    _writeStatus) on any response, even a failed one -- callers decide what
+    a failed/nonzero result means for their own action, same division of
+    responsibility _run_remote/is_installed already have for the SSH path.
+
+    Raises LauncherError only when the watcher never responds AT ALL within
+    the deadline -- this is this transport's equivalent of an SSH
+    connection-level failure (dead tunnel, unreachable host): "the command
+    might not have run at all" is a different, worse condition than "the
+    command ran and reported failure", and callers like is_installed()
+    already need to tell those apart (see that method's own docstring)."""
+    os_instance_id = target.get('os_instance_id', '')
+    if not os_instance_id:
+      raise LauncherError(
+          "'" + target.get('display_name', target_key) + "' is set to the shared_storage "
+          "connection mode but has no os_instance_id -- select a shared_storage OS "
+          "instance for it first.")
+    mailbox = os.path.join(VM_COMMANDS_STORAGE_DIR, os_instance_id)
+    try:
+      os.makedirs(mailbox, exist_ok=True)
+    except OSError as e:
+      raise LauncherError("Could not reach the shared-storage mailbox for '" +
+                           target.get('display_name', target_key) + "': " + str(e))
+    self._shared_storage_seq += 1
+    request_id = target_key + '_' + str(int(time.time() * 1000)) + '_' + str(self._shared_storage_seq)
+    cmd_path = os.path.join(mailbox, 'cmd_' + request_id + '.json')
+    tmp_path = cmd_path + '.tmp'
+    with open(tmp_path, 'w') as f:
+      json.dump({'action': action, 'target_key': target_key, 'script': script_text,
+                 'timeout_sec': timeout_sec}, f)
+    os.replace(tmp_path, cmd_path)
+    status_path = os.path.join(mailbox, 'status_' + request_id + '.json')
+    deadline = time.time() + timeout_sec + SHARED_STORAGE_POLL_GRACE_SEC
+    while time.time() < deadline:
+      try:
+        with open(status_path, 'r') as f:
+          return request_id, json.load(f)
+      except (OSError, ValueError):
+        time.sleep(SHARED_STORAGE_POLL_INTERVAL_SEC)
+    raise LauncherError(
+        "No response from the shared-storage watcher for '" +
+        target.get('display_name', target_key) + "' within " + str(timeout_sec) +
+        "s -- is vm_command_watcher.py running on that machine and pointed at "
+        "the same nepi_storage mount this device uses?")
+
   def push_dimensions(self, target, model_name, dimensions_yaml_text, sdf_override_text):
     """Pushes one model's editable geometry to the VM ahead of a launch --
     see sim_connector_app_node.py's device-side dimensions store for the
@@ -606,6 +688,21 @@ class SimulatorLauncher(object):
     device_port = self.config.get("device_bridge_port", "")
     command = launch_command.format(
         device_bridge_host=device_host, device_bridge_port=device_port)
+    if target.get("connection_mode") == "shared_storage":
+      # No local process to hold open here -- the watcher on the OTHER end
+      # owns the actual launched process; this side only needs to know it
+      # started (or didn't) before returning, exactly like the SSH path's
+      # own startup-grace-period check just below, just over a different
+      # transport. See _dispatch_shared_storage's own docstring for why a
+      # 'failed' status here (as opposed to no response at all) still
+      # raises, matching the SSH path's own "exited within the startup
+      # grace period" failure.
+      _, status = self._dispatch_shared_storage(
+          target, target_key, "launch", command, LAUNCH_STARTUP_GRACE_SEC)
+      if status.get("state") == "failed":
+        raise LauncherError(
+            "Launch failed via shared storage: " + status.get("error", ""))
+      return
     remote_script_path = self._stage_launch_script(target, target_key, command)
     ssh_cmd = self._ssh_cmd(target, "bash -l " + remote_script_path)
     proc = subprocess.Popen(ssh_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
@@ -622,12 +719,21 @@ class SimulatorLauncher(object):
 
   def is_ready(self, target_key):
     """One-shot readiness check via ready_check_command -- exit code 0 means
-    ready. Returns False (not raises) on any SSH failure, since "can't tell
-    yet" and "not ready yet" should look the same to a caller polling this."""
+    ready. Returns False (not raises) on any connection failure (SSH or
+    shared-storage), since "can't tell yet" and "not ready yet" should look
+    the same to a caller polling this."""
     target = self.get_target(target_key)
     ready_check_command = target.get("ready_check_command")
     if not ready_check_command:
       return True
+    if target.get("connection_mode") == "shared_storage":
+      try:
+        _, status = self._dispatch_shared_storage(
+            target, target_key, "ready_check", ready_check_command,
+            SSH_CONNECT_TIMEOUT_SEC + 2)
+      except LauncherError:
+        return False
+      return status.get("exit_code") == 0
     try:
       result = self._run_remote(target, ready_check_command, timeout_sec=SSH_CONNECT_TIMEOUT_SEC + 2)
     except LauncherError:
@@ -648,9 +754,19 @@ class SimulatorLauncher(object):
   def stop(self, target_key):
     """Runs stop_command (pkills the sim's remote processes), which makes
     the still-open launch() connection's `wait <pids>` return on its own --
-    reaps that connection afterward so it doesn't linger as a zombie."""
+    reaps that connection afterward so it doesn't linger as a zombie.
+
+    For a shared_storage target there is no local connection to reap (the
+    watcher on the other end owns the actual launched process, not this
+    launcher -- see _dispatch_shared_storage's own docstring); running
+    stop_command through it is the whole job."""
     target = self.get_target(target_key)
     stop_command = target.get("stop_command")
+    if target.get("connection_mode") == "shared_storage":
+      if stop_command:
+        self._dispatch_shared_storage(target, target_key, "stop", stop_command,
+                                       SSH_CONNECT_TIMEOUT_SEC + 5)
+      return
     if stop_command:
       self._run_remote(target, stop_command, timeout_sec=SSH_CONNECT_TIMEOUT_SEC + 5)
     proc = self._launch_procs.pop(target_key, None)
@@ -757,6 +873,16 @@ class SimulatorLauncher(object):
     check_command = target.get("check_installed_command")
     if not check_command:
       return True
+    if target.get("connection_mode") == "shared_storage":
+      # _dispatch_shared_storage already raises when the watcher never
+      # responds at all -- this transport's equivalent of the
+      # connection-level failure _is_connection_level_failure detects for
+      # the SSH path below, so no extra handling is needed here for that
+      # case.
+      _, status = self._dispatch_shared_storage(
+          target, target_key, "check_installed", check_command,
+          SSH_CONNECT_TIMEOUT_SEC + 5)
+      return status.get("exit_code") == 0
     result = self._run_remote(target, check_command, timeout_sec=SSH_CONNECT_TIMEOUT_SEC + 5)
     if self._is_connection_level_failure(result):
       tunnel_message = self._classify_connection_failure(target, result.stderr)
@@ -777,6 +903,26 @@ class SimulatorLauncher(object):
     if not install_command:
       raise LauncherError(
           "'" + target.get("display_name", target_key) + "' has no install_command configured yet.")
+    if target.get("connection_mode") == "shared_storage":
+      # _dispatch_shared_storage already raises if the watcher never
+      # responds at all within INSTALL_TIMEOUT_SEC -- the sudo-password
+      # check below is the one piece of the SSH path's own error handling
+      # that's still relevant here (it inspects the REMOTE command's own
+      # stderr, not anything SSH-specific).
+      _, status = self._dispatch_shared_storage(
+          target, target_key, "install", install_command, INSTALL_TIMEOUT_SEC)
+      if status.get("exit_code") != 0:
+        error_lower = (status.get("error") or "").lower()
+        if ("a terminal is required to read the password" in error_lower
+            or "sudo: no tty present" in error_lower):
+          raise LauncherError(
+              "Install failed: sudo needs a password, but Install runs non-interactively "
+              "with no way to prompt for one.",
+              manual_fallback_commands=SUDO_NOPASSWD_FALLBACK_COMMANDS)
+        raise LauncherError(
+            "Install command exited " + str(status.get("exit_code")) + ": " +
+            (status.get("error") or "").strip())
+      return
     result = self._run_remote(target, install_command, timeout_sec=INSTALL_TIMEOUT_SEC)
     if self._is_connection_level_failure(result):
       tunnel_message = self._classify_connection_failure(target, result.stderr)

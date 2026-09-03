@@ -41,10 +41,12 @@
 # simulator_launch_targets.yaml at all (the two features are independently
 # optional).
 
+import json
 import os
 import re
 import socket
 import subprocess
+import time
 
 import yaml
 
@@ -57,6 +59,45 @@ from nepi_api.simulator_launcher import LauncherError
 # belong in the read/write database tree, not the dev-only checked-in config
 # tree.
 OS_INSTANCES_STORAGE_DIR = '/mnt/nepi_storage/databases/nepi_app_sim_connector/os_instances'
+
+# Mailbox root for 'shared_storage'-mode instances (see CONNECTION_MODES'
+# own comment) -- one subfolder per instance_id, matching
+# vm_command_watcher.py's own convention exactly (that script builds this
+# same path from a --storage-root it's given; this is the device's own
+# local view of the identical nepi_storage tree, so no coordination beyond
+# "the operator mounted the same share" is needed). Deliberately a sibling
+# of OS_INSTANCES_STORAGE_DIR under the same app database tree, not nested
+# under it -- these are message-passing scratch files, not persisted
+# instance records.
+VM_COMMANDS_STORAGE_DIR = '/mnt/nepi_storage/databases/nepi_app_sim_connector/vm_commands'
+
+# Requested live (2026-09-04): reverse SSH into an operator's own laptop is
+# a real security concern (a trusted key that can run ANY remote command).
+# 'shared_storage' is an additive alternative -- nepi_storage is already a
+# shared SMB drive both the device and the operator's machine can read/
+# write, so a small file-drop protocol (see vm_command_watcher.py's own
+# module docstring for the full command/status file protocol) replaces
+# "SSH in and run a command" with "write a command file, a local watcher
+# picks it up and runs a pre-defined command locally, writes a status file
+# back" -- no listening port anywhere, and the watcher can only ever do
+# what it's coded to do (run this app's own authored launch_command/
+# stop_command/install_command/check_installed_command text), not arbitrary
+# commands. 'ssh' stays the default and is unaffected -- this is a second
+# choice per instance, not a replacement (confirmed: keep both, additive).
+CONNECTION_MODES = ('ssh', 'shared_storage')
+DEFAULT_CONNECTION_MODE = 'ssh'
+
+# A shared_storage watcher writes watcher_heartbeat.json on this cadence
+# (see vm_command_watcher.py's own HEARTBEAT_INTERVAL_SEC, kept in sync
+# manually since this module deliberately doesn't import that script --
+# it's meant to run standalone on a machine with no NEPI code installed).
+# verify() treats a heartbeat older than
+# WATCHER_HEARTBEAT_STALE_AFTER_SEC as "no watcher actually running here",
+# not just "briefly between polls" -- several multiples of the write
+# cadence so one slow tick under load doesn't read as unreachable.
+WATCHER_HEARTBEAT_INTERVAL_SEC = 5
+WATCHER_HEARTBEAT_STALE_AFTER_SEC = WATCHER_HEARTBEAT_INTERVAL_SEC * 4
+WATCHER_VERIFY_TIMEOUT_SEC = 10
 
 # The existing single-VM default every launch target hardcodes is 12222 --
 # allocation starts one above it so a freshly-registered instance can never
@@ -360,11 +401,94 @@ class OsInstanceRegistry(object):
     return True, ''
 
   #**********************
+  # shared_storage transport -- see CONNECTION_MODES' own comment and
+  # vm_command_watcher.py's module docstring for the full design/protocol.
+
+  def _mailbox_dir(self, instance_id):
+    return os.path.join(VM_COMMANDS_STORAGE_DIR, instance_id)
+
+  def _heartbeat_path(self, instance_id):
+    return os.path.join(self._mailbox_dir(instance_id), 'watcher_heartbeat.json')
+
+  def _shared_storage_setup_commands(self, instance):
+    """The copy-paste block for a 'shared_storage' instance -- no SSH key,
+    no reverse tunnel, no listening port. The operator only needs the same
+    nepi_storage SMB share already mounted (see this module's own
+    CONNECTION_MODES comment for why that's the whole point) and a copy of
+    vm_command_watcher.py, which ships in this repo's own
+    sim_container/scripts/ -- the exact same file this device's own
+    checkout has, since the protocol is a strict file contract, not a
+    version-sensitive API.
+
+    MOUNT_PATH_PLACEHOLDER is deliberately left for the operator to fill
+    in: unlike build_setup_commands' device_host (a real, guessable value
+    on the DEVICE side), this script has no way to know what local path an
+    arbitrary laptop mounted the SAME share at (a drive letter on Windows,
+    an arbitrary mountpoint on Linux/WSL) -- see _guess_device_ip's own
+    docstring for the same reasoning applied to the SSH path's device_host,
+    which faces the opposite direction (that one IS guessable, this one
+    genuinely is not)."""
+    iid = instance['instance_id']
+    return (
+        "Run this on the NEW machine (" + instance['display_name'] + ").\n"
+        "No SSH key, tunnel, or listening port needed for this connection\n"
+        "type -- it talks to the device only through the nepi_storage share\n"
+        "you already have mounted.\n"
+        "\n"
+        "1. Confirm nepi_storage is mounted locally and you can see:\n"
+        "     <your mount path>/databases/nepi_app_sim_connector/\n"
+        "   (ask your NEPI admin for the mount details if you don't already\n"
+        "   have this share mounted -- it's the same share nepi setup itself\n"
+        "   uses, nothing new to provision.)\n"
+        "\n"
+        "2. Copy vm_command_watcher.py (from this device's own checkout,\n"
+        "   nepi_drones/sim_container/scripts/vm_command_watcher.py) to this\n"
+        "   machine, then start it -- re-run this command any time the\n"
+        "   watcher needs restarting; wrap it in a systemd/scheduled-task\n"
+        "   unit yourself if you want it to survive a reboot, that's not\n"
+        "   required for it to work:\n"
+        "\n"
+        "     python3 vm_command_watcher.py --storage-root <your mount path> "
+        "--instance-id " + iid + "\n"
+        "\n"
+        "Then back here in the RUI: click \"Test Connection.\""
+    )
+
+  def _verify_shared_storage(self, instance):
+    """'Test Connection' for a shared_storage instance -- there is no SSH
+    endpoint to probe, so this checks for a live watcher_heartbeat.json
+    instead (see WATCHER_HEARTBEAT_STALE_AFTER_SEC's own comment for why
+    'exists but stale' still counts as unreachable, not just 'missing').
+    Returns (ok, error_message)."""
+    path = self._heartbeat_path(instance['instance_id'])
+    try:
+      with open(path, 'r') as f:
+        heartbeat = json.load(f)
+    except (OSError, ValueError):
+      return False, ("No watcher_heartbeat.json found yet at " + path +
+                      " -- has vm_command_watcher.py been started on that "
+                      "machine, pointed at the right --instance-id and a "
+                      "nepi_storage mount that's actually the same share "
+                      "this device uses?")
+    alive_at = heartbeat.get('alive_at')
+    if not isinstance(alive_at, (int, float)):
+      return False, "watcher_heartbeat.json is malformed (no numeric 'alive_at')"
+    age_sec = time.time() - alive_at
+    if age_sec > WATCHER_HEARTBEAT_STALE_AFTER_SEC:
+      return False, ("Last watcher heartbeat was " + str(int(age_sec)) +
+                      "s ago (stale) -- the watcher process on that machine "
+                      "appears to have stopped")
+    return True, ''
+
+  #**********************
   # Setup-command generation
 
   def build_setup_commands(self, instance):
     """The exact copy-paste block the RUI shows for a freshly-registered
-    instance. History: went through three earlier shapes this same week
+    instance. Dispatches on connection_mode first (see CONNECTION_MODES'
+    own comment) -- shared_storage's own build_setup_commands equivalent,
+    _shared_storage_setup_commands, has none of this SSH-specific history
+    below to inherit at all. History: went through three earlier shapes this same week
     (a numbered STEP 1/2/3 walkthrough with lettered sub-steps and two
     parallel "Option A/B" tunnel paths each with several paragraphs of
     prose) as each individually-reported gap got fixed -- see
@@ -403,6 +527,8 @@ class OsInstanceRegistry(object):
     per-instance SSH control-leg port -- see that constant's own comment
     for why (a second registered instance's copy would otherwise crash-loop
     fighting the first for the same shared ports)."""
+    if instance.get('connection_mode', DEFAULT_CONNECTION_MODE) == 'shared_storage':
+      return self._shared_storage_setup_commands(instance)
     port = instance['ssh_port']
     iid = instance['instance_id']
     # One -R flag per fixed sim-utility port, same numbers for every
@@ -500,15 +626,24 @@ class OsInstanceRegistry(object):
       raise LauncherError("Unknown OS instance: " + str(instance_id))
     return self.instances[instance_id]
 
-  def register(self, display_name):
+  def register(self, display_name, connection_mode=DEFAULT_CONNECTION_MODE):
     """Creates a new, unverified instance and returns (instance_id,
     setup_commands). host/ssh_user stay blank until verify() fills them in
-    -- nothing here can guess a real reachable address up front."""
+    -- nothing here can guess a real reachable address up front (ssh mode
+    only -- shared_storage mode never uses them at all, see
+    CONNECTION_MODES' own comment). ssh_port is still allocated even for a
+    shared_storage instance: cheap, harmless if unused, and means switching
+    an existing instance's mode later (not currently exposed, but plausible)
+    never has to worry about a port collision that was never checked."""
+    if connection_mode not in CONNECTION_MODES:
+      raise LauncherError("Unknown connection_mode: " + str(connection_mode) +
+                           " (expected one of " + ", ".join(CONNECTION_MODES) + ")")
     display_name = _sanitize_display_name(display_name)
     instance_id = _instance_id_from_name(display_name, self.instances.keys())
     instance = {
         'instance_id': instance_id,
         'display_name': display_name,
+        'connection_mode': connection_mode,
         'host': '',
         'ssh_user': '',
         'ssh_port': self._next_ssh_port(),
@@ -519,13 +654,24 @@ class OsInstanceRegistry(object):
     return instance_id, self.build_setup_commands(instance)
 
   def verify(self, instance_id, host=None, ssh_user=None):
-    """Runs the real SSH probe and updates + persists the instance's status.
+    """Runs the real reachability probe and updates + persists the
+    instance's status. For a shared_storage instance this means checking
+    for a live watcher_heartbeat.json (see _verify_shared_storage) instead
+    of an SSH probe -- host/ssh_user are ignored entirely in that mode,
+    there's nothing to fill in. For an ssh instance (default, unchanged):
     host defaults to 127.0.0.1 (the reverse-tunnel convention every existing
     launch target already uses) the first time, when not given explicitly --
     a caller reaching the machine directly on a routable LAN address passes
-    host itself instead. Raises LauncherError (with the real SSH failure
-    text) on a failed probe, after still recording/persisting 'unreachable'."""
+    host itself instead. Raises LauncherError (with the real failure text)
+    on a failed probe, after still recording/persisting 'unreachable'."""
     instance = self.get_instance(instance_id)
+    if instance.get('connection_mode', DEFAULT_CONNECTION_MODE) == 'shared_storage':
+      ok, error = self._verify_shared_storage(instance)
+      instance['status'] = 'verified' if ok else 'unreachable'
+      self._persist(instance_id)
+      if not ok:
+        raise LauncherError("Connection test failed for '" + instance['display_name'] + "': " + error)
+      return instance
     if host:
       instance['host'] = host
     elif not instance.get('host'):
@@ -610,31 +756,42 @@ class OsInstanceRegistry(object):
 
   def select(self, instance_id, launcher):
     """The one integration point with the existing launch machinery: applies
-    the given instance's host/ssh_user/ssh_port onto EVERY target in
+    the given instance's connection info onto EVERY target in
     launcher.config['launch_targets'] (a plain in-memory dict -- confirmed by
-    reading simulator_launcher.py), in place. Every existing code path
+    reading simulator_launcher.py), in place. For an ssh instance (default,
+    unchanged) that means host/ssh_user/ssh_port -- every existing code path
     (launch/stop/is_installed/install/_ssh_cmd) already reads those three
-    fields per-target, so nothing else needs to change for this to take
-    effect immediately on the next launch/install/check.
+    fields per-target. For a shared_storage instance it means
+    connection_mode + os_instance_id, which simulator_launcher.py's own
+    dispatch (see its own comment on _dispatch_shared_storage) reads instead
+    of ever building an SSH command at all -- so nothing else needs to
+    change for either mode to take effect immediately on the next
+    launch/install/check.
 
     Raises if the instance isn't 'verified' yet (Test Connection first) --
     selecting an unconfirmed instance would silently point every target at
-    an address that was never actually shown to accept the SSH key, which
-    would surface later as a confusing launch failure instead of here, where
-    the real cause is obvious. launcher may be None (auto-launch not
-    configured on this deployment at all) -- selection is still recorded so
-    the RUI's picker reflects it, just with nothing to actually apply."""
+    a connection that was never actually shown to work (an SSH key never
+    tested, or a watcher never confirmed alive), which would surface later
+    as a confusing launch failure instead of here, where the real cause is
+    obvious. launcher may be None (auto-launch not configured on this
+    deployment at all) -- selection is still recorded so the RUI's picker
+    reflects it, just with nothing to actually apply."""
     instance = self.get_instance(instance_id)
     if instance.get('status') != 'verified':
       raise LauncherError("Cannot select '" + instance['display_name'] +
                            "': not yet verified (Test Connection first)")
+    connection_mode = instance.get('connection_mode', DEFAULT_CONNECTION_MODE)
     if launcher is not None:
       for target in launcher.config.get('launch_targets', {}).values():
         if not target:
           continue
-        target['host'] = instance['host']
-        target['ssh_user'] = instance['ssh_user']
-        target['ssh_port'] = instance['ssh_port']
+        target['connection_mode'] = connection_mode
+        if connection_mode == 'shared_storage':
+          target['os_instance_id'] = instance_id
+        else:
+          target['host'] = instance['host']
+          target['ssh_user'] = instance['ssh_user']
+          target['ssh_port'] = instance['ssh_port']
     for iid, entry in self.instances.items():
       if entry.get('selected'):
         entry.pop('selected', None)

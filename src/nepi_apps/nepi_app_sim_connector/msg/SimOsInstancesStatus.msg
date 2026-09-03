@@ -17,6 +17,13 @@ string[] instance_hosts
 string[] instance_ssh_users
 int32[] instance_ssh_ports
 
+# ssh | shared_storage (see os_instance_registry.py's CONNECTION_MODES) --
+# host/ssh_user/ssh_port above are meaningless for a shared_storage entry
+# (it talks to the device over the nepi_storage share instead, see
+# vm_command_watcher.py), which is why this is its own parallel array
+# rather than folded into instance_hosts as a special value.
+string[] instance_connection_modes
+
 # pending | verified | unreachable -- pending until Test Connection succeeds
 # at least once; unreachable after a Test Connection attempt fails (distinct
 # from pending, which just means never tried yet).
