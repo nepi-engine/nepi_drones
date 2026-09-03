@@ -1148,6 +1148,24 @@ class ArdupilotNode:
       # was last commanded (which may itself have been a dropped stop).
       enu = [0.0, 0.0, 0.0]
       ang_z = 0.0
+    # Direct (enu[0], enu[1]) passthrough. A "-90 degree world-frame
+    # rotation" compensation was added here on 2026-09-04, derived from a
+    # live measurement that a pure "forward" command produced almost pure
+    # -Y Gazebo movement. Re-measured live on 2026-09-04 with the vehicle's
+    # yaw properly read (odom_topic_callback's NED->ENU yaw fix, committed
+    # separately) at yaw ~= 0.4 degrees: sending a pure body-forward
+    # command with that compensation in place produced almost pure +Y
+    # movement (dx ~= -0.05 m, dy ~= +5.7 m over the test window) instead
+    # of the intended +X -- i.e. the compensation itself was a spurious
+    # extra 90 degree rotation, not a fix. The original measurement that
+    # motivated it was almost certainly taken against a stale/incorrect
+    # yaw reading (from before that same-day yaw fix), so what looked like
+    # a "separate world-frame rotation bug" was actually the yaw bug's own
+    # rotation error, already resolved upstream once yaw_deg reads
+    # correctly. Removed rather than re-derived a new correction on top --
+    # a straight passthrough now matches setTeleopVelocity's own
+    # already-correct body->ENU rotation with no further compensation
+    # needed.
     twist = Twist()
     twist.linear.x = enu[0]
     twist.linear.y = enu[1]
