@@ -119,6 +119,35 @@ sensor topics, a genuinely separate, bigger change than what's asked for, not im
 in this pass. `renderCameraControls()` stays classified as "live control" (gated by
 `show_live_controls`) since none of it is real configuration.
 
+## Incident: `renderEnvironmentSetting()` briefly deleted, then restored + unified (2026-09-03)
+
+While reorganizing `Nepi_IF_Sim.js`'s own "Environment Config" dimensions
+selector (see `SIM_OS_INSTANCES_PLAN.md`'s dated entries for that
+reorganization), `renderEnvironmentSetting()` (this doc's own "Flat
+Ground"/"Obstacle Course" dropdown for the RBX driver's `environment`
+Setting) was mistakenly deleted under the belief that it duplicated that
+other, unrelated dropdown. It does not: `environment_dimensions_selected_config`
+(Flat/Obstacle Course/Aerial Obstacle Course/Custom Obstacles) only edits a
+model's *geometry fields* (`pushDirtyDimensions` explicitly does nothing at
+all for the Flat/`ENVIRONMENT_MODEL_NONE` case); `renderEnvironmentSetting()`'s
+own `environment` Setting is the ONLY thing that actually spawns/despawns
+obstacles in a running Gazebo world (`rbx_sim_node.py` ->
+`sim_bridge_node.py` -> `environment_models.py`'s real
+`/gazebo/spawn_sdf_model`/`delete_model` calls). Deleting it broke real
+spawn state entirely -- reported live: "the environment config on the top
+is selected as flat, but it still shows the obstacle course in the
+gazebo... i think you confused environment yaml with the dropdown."
+
+Restored verbatim, then additionally wired the two together:
+`Nepi_IF_Sim.js`'s `onSelectDimensionConfig('environment', name)` now also
+calls `NepiIFSimControls.setEnvironmentSetting()` (a new public method,
+factored out of `renderEnvironmentSetting()`'s own `onChange`, reached via
+a `React.createRef()` from the parent) whenever `name` is exactly "Flat" or
+"Obstacle Course" -- the only two names with a direct `environment` Setting
+equivalent. Picking either dropdown now keeps both in sync; "Aerial
+Obstacle Course"/"Custom Obstacles"/any other saved name has no Setting
+equivalent to guess at and is left alone on purpose.
+
 ## Explicitly not doing
 
 - Not building pre-deploy preset-editing UI (editing `robot_configs` entries themselves) --

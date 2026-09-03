@@ -245,6 +245,13 @@ class NepiIFSim extends Component {
   constructor(props) {
     super(props)
 
+    // Lets onSelectDimensionConfig reach NepiIFSimControls's own
+    // setEnvironmentSetting directly -- see that method's own comment for
+    // why the two components need to stay in sync (this dropdown edits
+    // geometry fields only; NepiIFSimControls's "Environment" dropdown is
+    // the one that actually spawns/despawns obstacles in Gazebo).
+    this.simControlsRef = React.createRef()
+
     this.state = {
 
       // Sim device namespace (<app>/sim), from the namespace prop
@@ -270,6 +277,9 @@ class NepiIFSim extends Component {
       // per-config buttons + text area, instead of that whole block always
       // taking up space on the page.
       show_robot_config_viewer: false,
+      // Same collapsed-by-default pattern, environment's own equivalent
+      // panel (see renderEnvironmentConfigSettings).
+      show_environment_config_viewer: false,
 
       // Lifted up from NepiIFSimLauncher: two separate instances are mounted
       // below (selector up top, deploy controls at the bottom -- see their
@@ -401,6 +411,7 @@ class NepiIFSim extends Component {
     this.renderRobotConfigSelector = this.renderRobotConfigSelector.bind(this)
     this.renderEnvironmentConfigSelector = this.renderEnvironmentConfigSelector.bind(this)
     this.renderRobotConfigSettings = this.renderRobotConfigSettings.bind(this)
+    this.renderEnvironmentConfigSettings = this.renderEnvironmentConfigSettings.bind(this)
     this.renderFieldPair = this.renderFieldPair.bind(this)
     this.renderData = this.renderData.bind(this)
 
@@ -884,6 +895,22 @@ class NepiIFSim extends Component {
       return
     }
     this.props.ros.sendStringMsg(namespace + '/select_' + role + '_dimensions_config', name)
+    // Keeps NepiIFSimControls's own "Environment" dropdown (the control
+    // that actually spawns/despawns obstacles in Gazebo) in sync with this
+    // one (which only edits geometry fields) -- reported live: "the
+    // environment config on the top is selected as flat, but it still
+    // shows the obstacle course in the gazebo." Only these two names have
+    // a direct RBX Setting equivalent (FLAT_GROUND/OBSTACLE_COURSE);
+    // "Aerial Obstacle Course"/"Custom Obstacles"/any other saved name
+    // has none to guess at, so those are left alone on purpose -- see
+    // NepiIFSimControls's own setEnvironmentSetting for the other half.
+    if (role === 'environment' && this.simControlsRef.current) {
+      if (name === 'Flat') {
+        this.simControlsRef.current.setEnvironmentSetting('Flat Ground')
+      } else if (name === 'Obstacle Course') {
+        this.simControlsRef.current.setEnvironmentSetting('Obstacle Course')
+      }
+    }
   }
 
   // Saves the CURRENTLY EDITED fields (not the last-loaded config) under a
@@ -1066,57 +1093,95 @@ class NepiIFSim extends Component {
   // not gated on launcher_state: picking a different one still only takes
   // effect at the next Launch (Gazebo has no way to hot-reload a course
   // layout into a running world), but there is no reason to block the
-  // SELECTION itself while a sim happens to be running, the same way the
-  // Flat Ground/Obstacle Course Setting toggle (Nepi_IF_Sim-Controls.js) is
-  // never disabled either.
-  // Also renders the YAML viewer and a Delete button, absorbing what used
-  // to be a second, separate "Environment Dimensions Configs" button row
-  // down in the collapsed Config Settings panel (renderDimensionsConfigButtons)
-  // -- reported live (2026-09-03): that row picked from the exact same list
-  // via the exact same onSelectDimensionConfig call, just as a row of
-  // buttons instead of a dropdown, entirely redundant with this one. Removed
-  // there, folded in here instead of duplicated, so there is exactly one
-  // place to pick AND inspect the active environment config. "Save As New
-  // Config" stays down in renderDimensionsEditor -- that's where the fields
-  // actually being saved are edited, this is only ever a fast switch, not
-  // where a new config gets created.
+  // SELECTION itself while a sim happens to be running.
+  // Plain picker only, same as renderRobotConfigSelector above -- viewing
+  // the YAML, deleting a config, and editing dimension fields all live down
+  // in renderEnvironmentConfigSettings's own collapsed panel instead
+  // (mirrors Robot Config Settings exactly). Reported live (2026-09-03):
+  // an earlier version of this method rendered the YAML viewer and a
+  // Delete button directly here, "just out there" instead of tucked into a
+  // panel like Robot Config's own management controls -- moved.
   // selected === '' means the active values no longer match ANY saved
   // config (an in-progress, unsaved edit -- see setDimensionsCb's own
   // comment on the device) -- shown as its own explicit placeholder option
   // rather than letting the browser fall back to silently highlighting
   // whichever option happens to be first, which would misleadingly look
-  // like that config is what's actually active. Delete is disabled (not
-  // hidden -- keeps the row from jumping around) in that same case, since
-  // there's no saved config selected to delete.
+  // like that config is what's actually active.
   renderEnvironmentConfigSelector() {
     const names = this.state.environment_dimensions_config_names
     const selected = this.state.environment_dimensions_selected_config
+    return (
+      <Label title={"Environment Config"}>
+        <Select
+          onChange={(event) => this.onSelectDimensionConfig('environment', event.target.value)}
+          value={selected}
+        >
+          {(selected === '') ? <Option key={''} value={''}>{'(Unsaved Edits)'}</Option> : null}
+          {names.map((name) => <Option key={name} value={name}>{name}</Option>)}
+        </Select>
+      </Label>
+    )
+  }
+
+  // Config-settings-panel counterpart of the plain selector above -- same
+  // "Show/Hide Config Settings" collapsed-panel pattern renderRobotConfigSettings
+  // already uses, so Environment gets its own equally-scoped panel instead
+  // of sharing one with Robot's own management controls (which is what an
+  // earlier version of this file did -- reported live (2026-09-03):
+  // "the environment config and dimensions stuff should only be in its
+  // panel similar to the robot config one -- not just out there").
+  // Houses: the config picker's own YAML viewer + Delete button (moved out
+  // of the always-visible selector above), the dimension fields
+  // editor/diagram (or the custom obstacles editor, for that one model),
+  // and a Reset button that returns to the built-in "Obstacle Course"
+  // config -- requested live: "there should be reset buttons that moves it
+  // back to the default rover/obstacle course values" (see
+  // renderRobotConfigSettings's own matching Reset button for the robot
+  // side, and FALLBACK_DIMENSION_CONFIG_NAME for where these two built-in
+  // names come from).
+  renderEnvironmentConfigSettings() {
+    const status_msg = this.state.status_msg
+    if (status_msg == null) {
+      return null
+    }
+    const selected = this.state.environment_dimensions_selected_config
     const yamlText = this.state.environment_dimensions_config_yaml_text
+    const environmentFieldDefs = ENVIRONMENT_DIMENSION_FIELDS_BY_MODEL[this.state.environment_dimensions_model] || []
     return (
       <React.Fragment>
-        <Label title={"Environment Config"}>
-          <Select
-            onChange={(event) => this.onSelectDimensionConfig('environment', event.target.value)}
-            value={selected}
-          >
-            {(selected === '') ? <Option key={''} value={''}>{'(Unsaved Edits)'}</Option> : null}
-            {names.map((name) => <Option key={name} value={name}>{name}</Option>)}
-          </Select>
-        </Label>
+        <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
         <ButtonMenu>
-          <Button disabled={!selected} onClick={() => this.onDeleteDimensionConfigClicked('environment')}>
-            {"Delete Selected Config"}
+          <Button onClick={() => this.setState({ show_environment_config_viewer: !this.state.show_environment_config_viewer })}>
+            {(this.state.show_environment_config_viewer ? "Hide" : "Show") + " Environment Config Settings"}
           </Button>
         </ButtonMenu>
-        {(yamlText !== '') ?
-          <textarea
-            readOnly
-            value={yamlText}
-            rows={6}
-            style={{ width: "60%", maxWidth: "40em", fontFamily: "monospace",
-                    whiteSpace: "pre", overflow: "auto", display: "block",
-                    backgroundColor: DIAGRAM_BG, color: Styles.vars.colors.grey0 }}
-          />
+        {(this.state.show_environment_config_viewer === true) ?
+          <Section title={"Environment Config Settings"}>
+            <ButtonMenu>
+              <Button disabled={!selected} onClick={() => this.onDeleteDimensionConfigClicked('environment')}>
+                {"Delete Selected Config"}
+              </Button>
+              <Button onClick={() => this.onSelectDimensionConfig('environment', FALLBACK_DIMENSION_CONFIG_NAME.environment)}>
+                {"Reset to " + FALLBACK_DIMENSION_CONFIG_NAME.environment}
+              </Button>
+            </ButtonMenu>
+            {(yamlText !== '') ?
+              <textarea
+                readOnly
+                value={yamlText}
+                rows={6}
+                style={{ width: "60%", maxWidth: "40em", fontFamily: "monospace",
+                        whiteSpace: "pre", overflow: "auto", display: "block",
+                        backgroundColor: DIAGRAM_BG, color: Styles.vars.colors.grey0 }}
+              />
+            : null}
+            {(this.state.environment_dimensions_model === CUSTOM_OBSTACLES_MODEL) ?
+              this.renderCustomObstaclesEditor()
+            :
+              this.renderDimensionsEditor('environment', 'Environment Dimensions', environmentFieldDefs,
+                                            this.uploadEnvironmentSdfInputRef)
+            }
+          </Section>
         : null}
       </React.Fragment>
     )
@@ -1245,23 +1310,32 @@ class NepiIFSim extends Component {
   // Wrapped in Section (bordered box + title) once expanded so it reads as
   // its own distinct panel -- previously just a bare top border on the same
   // black background as everything else, easy to miss entirely.
+  // Scoped to ROBOT only -- environment's own dimensions editor used to
+  // live in here too, sharing this one panel; split out into its own
+  // renderEnvironmentConfigSettings instead (reported live, 2026-09-03:
+  // "the environment config and dimensions stuff should only be in its
+  // panel similar to the robot config one"). Renamed "Config Settings" ->
+  // "Robot Config Settings" at the same time, for that same symmetry.
+  // Reset button added alongside Delete -- requested live: "there should be
+  // reset buttons that moves it back to the default rover/obstacle course
+  // values" (see FALLBACK_DIMENSION_CONFIG_NAME for where "4-Wheel Rover"
+  // comes from, and renderEnvironmentConfigSettings for its counterpart).
   renderRobotConfigSettings() {
     const status_msg = this.state.status_msg
     if (status_msg == null) {
       return null
     }
-    const environmentFieldDefs = ENVIRONMENT_DIMENSION_FIELDS_BY_MODEL[this.state.environment_dimensions_model] || []
 
     return (
       <React.Fragment>
         <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
         <ButtonMenu>
           <Button onClick={() => this.setState({ show_robot_config_viewer: !this.state.show_robot_config_viewer })}>
-            {(this.state.show_robot_config_viewer ? "Hide" : "Show") + " Config Settings"}
+            {(this.state.show_robot_config_viewer ? "Hide" : "Show") + " Robot Config Settings"}
           </Button>
         </ButtonMenu>
         {(this.state.show_robot_config_viewer === true) ?
-          <Section title={"Config Settings"}>
+          <Section title={"Robot Config Settings"}>
             <input
               type="file"
               accept=".yaml,.yml,text/yaml"
@@ -1272,16 +1346,13 @@ class NepiIFSim extends Component {
             <ButtonMenu>
               <Button onClick={this.onUploadConfigClicked}>{"Upload Robot Config"}</Button>
               <Button onClick={this.onDownloadSampleConfigClicked}>{"Download Sample Config"}</Button>
+              <Button onClick={() => this.onSelectDimensionConfig('robot', FALLBACK_DIMENSION_CONFIG_NAME.robot)}>
+                {"Reset to " + FALLBACK_DIMENSION_CONFIG_NAME.robot}
+              </Button>
             </ButtonMenu>
             {this.renderRobotConfigAndDimensionsButtons()}
             {this.renderDimensionsEditor('robot', 'Robot Dimensions', ROBOT_DIMENSION_FIELDS,
                                           this.uploadRobotSdfInputRef)}
-            {(this.state.environment_dimensions_model === CUSTOM_OBSTACLES_MODEL) ?
-              this.renderCustomObstaclesEditor()
-            :
-              this.renderDimensionsEditor('environment', 'Environment Dimensions', environmentFieldDefs,
-                                            this.uploadEnvironmentSdfInputRef)
-            }
           </Section>
         : null}
       </React.Fragment>
@@ -2212,6 +2283,52 @@ class NepiIFSim extends Component {
               ? round(this.state.camera_vertical_fov_deg, 1) : ""} />
           </Label>
         )}
+        {/* Edit box for horizontal FOV, right under its own read-only
+            reading above -- reported live (2026-09-03): "camera horizontal
+            and vertical fov dont seem to be editable yet." Horizontal FOV
+            already WAS editable, just only reachable via Robot Config
+            Settings -> Robot Dimensions (camera_horizontal_fov_deg is one
+            of ROBOT_DIMENSION_FIELDS) -- this reuses that exact same field/
+            save mechanism (onSaveDimensionsClicked('robot')) rather than
+            inventing a second one, just placed where the reading itself is
+            shown, so there's no need to go hunting for it. Vertical FOV has
+            no edit box here on purpose: it's derived from horizontal FOV
+            and the camera's aspect ratio (see generate_model_sdf.py's
+            buildRoverSdf, which only ever takes camera_horizontal_fov_deg
+            as an input), not an independent physical parameter -- adding a
+            box that silently did nothing would be worse than not having
+            one. */}
+        {this.renderFieldPair(
+          <Label title={"Set Horizontal FOV (deg)"}>
+            <Input
+              id={"SimDim_robot_camera_horizontal_fov_deg_quick"}
+              value={this.state.robot_dimensions_fields.camera_horizontal_fov_deg}
+              onChange={(event) => {
+                const el = document.getElementById("SimDim_robot_camera_horizontal_fov_deg_quick")
+                if (el) {
+                  setElementStyleModified(el)
+                }
+                const value = event.target.value
+                this.setState((prevState) => ({
+                  robot_dimensions_fields: { ...prevState.robot_dimensions_fields, camera_horizontal_fov_deg: value }
+                }))
+              }}
+              onKeyDown={(event) => {
+                if (event.key !== 'Enter') {
+                  return
+                }
+                const el = document.getElementById("SimDim_robot_camera_horizontal_fov_deg_quick")
+                if (el) {
+                  clearElementStyleModified(el)
+                }
+                this.onSaveDimensionsClicked('robot')
+              }}
+            />
+          </Label>,
+          <Label title={"Vertical FOV"}>
+            <Input disabled value={"derived from horizontal + aspect ratio"} />
+          </Label>
+        )}
 
         <Label title={"Last Error"}>
           <Input disabled value={status_msg.last_error_message} />
@@ -2305,6 +2422,7 @@ class NepiIFSim extends Component {
             />
 
             {this.renderRobotConfigSettings()}
+            {this.renderEnvironmentConfigSettings()}
           </React.Fragment>
         : null}
 
@@ -2323,6 +2441,7 @@ class NepiIFSim extends Component {
             was an unintended side effect of the two being bundled into one
             gated component. See docs/SIM_CONNECTOR_CONFIG_CONTROLS_PLAN.md. */}
         <NepiIFSimControls
+          ref={this.simControlsRef}
           namespace={namespace}
           make_section={false}
           show_live_controls={show_controls}

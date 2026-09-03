@@ -223,8 +223,9 @@ class NepiIFSimControls extends Component {
 
     this.onEnterSetRbxFloatSetting = this.onEnterSetRbxFloatSetting.bind(this)
     this.renderCameraOffsetControls = this.renderCameraOffsetControls.bind(this)
-    this.renderEnvironmentSetting = this.renderEnvironmentSetting.bind(this)
     this.renderDepthMapToggle = this.renderDepthMapToggle.bind(this)
+    this.renderEnvironmentSetting = this.renderEnvironmentSetting.bind(this)
+    this.setEnvironmentSetting = this.setEnvironmentSetting.bind(this)
 
     this.renderLiveControls = this.renderLiveControls.bind(this)
     this.renderConfigControls = this.renderConfigControls.bind(this)
@@ -1267,6 +1268,44 @@ class NepiIFSimControls extends Component {
   // (a different, currently-dead-for-every-deployable-target mechanism, see
   // docs/SIM_CONNECTOR_CONFIG_CONTROLS_PLAN.md). Ported from
   // NepiDeviceRBX.js's onSelectEnvironment, same hardcoded label convention.
+  //
+  // THIS is the control that actually spawns/despawns obstacles in Gazebo
+  // (rbx_sim_node.py's setEnvironmentAction -> sim_bridge_node.py ->
+  // environment_models.py's real /gazebo/spawn_sdf_model|delete_model calls)
+  // -- Nepi_IF_Sim.js's own "Environment Config" dropdown is a COMPLETELY
+  // SEPARATE axis that only edits a model's geometry FIELDS (obstacle
+  // positions/sizes), never whether it's actually present in the world.
+  // Briefly deleted this same day under the mistaken belief that it
+  // duplicated that other dropdown -- it was actually the ONLY working
+  // control for real spawn state, and removing it broke "Obstacle Course"/
+  // "Flat" ever taking visual effect in Gazebo at all. Restored, and
+  // renderEnvironmentConfigSelector's onChange (Nepi_IF_Sim.js) now also
+  // drives this same Setting by name whenever the two happen to share a
+  // name (Flat/Obstacle Course), so picking either one keeps both in sync
+  // instead of silently disagreeing -- reported live: "the environment
+  // config on the top is selected as flat, but it still shows the obstacle
+  // course in the gazebo... i think you confused environment yaml with the
+  // dropdown." See Nepi_IF_Sim.js's own onSelectDimensionConfig for that
+  // half of the fix.
+  // Public (called via ref from Nepi_IF_Sim.js's onSelectDimensionConfig) --
+  // shares the exact same live/pending logic the dropdown's own onChange
+  // uses below, so a config-selector pick and a direct dropdown pick behave
+  // identically. value must be exactly "Flat Ground" or "Obstacle Course".
+  setEnvironmentSetting(value) {
+    const live = this.isRbxLive()
+    const { updateSetting } = this.props.ros
+    if (!live) {
+      // No driver namespace to send updateSetting to yet -- remember the
+      // pick as pending so rbxSettingsListener can send it the moment this
+      // device goes live, instead of it being lost.
+      this.setState({ selected_environment_setting: value, environment_setting_pending: value })
+      return
+    }
+    this.setState({ selected_environment_setting: value, environment_setting_pending: null })
+    updateSetting(this.state.rbx_namespace + "/settings", "environment", "Discrete",
+      value === "Obstacle Course" ? "OBSTACLE_COURSE" : "FLAT_GROUND")
+  }
+
   renderEnvironmentSetting() {
     const live = this.isRbxLive()
     if (!this.state.show_settings) {
@@ -1275,23 +1314,10 @@ class NepiIFSimControls extends Component {
     if (live && !this.state.rbxSettingsNamesList.includes("environment")) {
       return null
     }
-    const { updateSetting } = this.props.ros
     return (
       <Label title={"Environment"}>
         <Select
-          onChange={(event) => {
-            const value = event.target.value
-            if (!live) {
-              // No driver namespace to send updateSetting to yet -- remember
-              // the pick as pending so rbxSettingsListener can send it the
-              // moment this device goes live, instead of it being lost.
-              this.setState({ selected_environment_setting: value, environment_setting_pending: value })
-              return
-            }
-            this.setState({ selected_environment_setting: value, environment_setting_pending: null })
-            updateSetting(this.state.rbx_namespace + "/settings", "environment", "Discrete",
-              value === "Obstacle Course" ? "OBSTACLE_COURSE" : "FLAT_GROUND")
-          }}
+          onChange={(event) => this.setEnvironmentSetting(event.target.value)}
           value={this.state.selected_environment_setting}
         >
           <Option value="Flat Ground">{"Flat Ground"}</Option>
@@ -1472,14 +1498,8 @@ class NepiIFSimControls extends Component {
             {this.renderCameraOffsetControls("scene_offset", "Scene View Camera")}
           </Column>
         </Columns>
-        <Columns>
-          <Column>
-            {this.renderDepthMapToggle()}
-          </Column>
-          <Column>
-            {this.renderEnvironmentSetting()}
-          </Column>
-        </Columns>
+        {this.renderDepthMapToggle()}
+        {this.renderEnvironmentSetting()}
         {this.renderEnvironmentControls()}
       </React.Fragment>
     )
