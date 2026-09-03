@@ -1211,7 +1211,28 @@ class ArdupilotNode:
       self.navpose_dict['time_orientation'] = time_ns
       self.navpose_dict['roll_deg'] = rpy[0]
       self.navpose_dict['pitch_deg'] = rpy[1]
-      self.navpose_dict['yaw_deg'] = rpy[2]
+      # NOT rpy[2] directly. Confirmed live 2026-09-04 (a follow-mission
+      # controller commanding rbx/set_teleop_velocity consistently ended
+      # up 15-20+ m off course, in a consistent, reproducible direction
+      # each run -- not the random scatter a numerically noisy bearing
+      # would produce): mavros's global_position/local orientation
+      # quaternion, on this ArduPilot/mavros combination, comes out
+      # yaw-referenced from NORTH (NED-style, 0 deg = facing Gazebo's own
+      # +Y/"north"), not from EAST/ENU's own +X axis the way every other
+      # yaw source in this app (ai_targeting_controller_ardupilot.py's own
+      # ground-truth drone_yaw, Gazebo's raw model_states orientation)
+      # assumes -- a consistent ~90 degree offset measured directly
+      # against Gazebo ground truth at rest (yaw_deg reporting ~90 while
+      # ground truth read ~1, repeatably). setTeleopVelocity (this
+      # variable's only other reader in this file) rotates a caller's
+      # body-frame command into world ENU using this value, so that fixed
+      # ~90 degree error rotated every commanded direction by a fixed
+      # wrong amount -- not noise, a real and entirely reproducible
+      # misdirection. convert_yaw_ned2enu is nepi_sdk's own existing
+      # utility for exactly this conversion (already used elsewhere in
+      # this platform for the identical NED<->ENU yaw mismatch), just
+      # never applied to this particular odometry source before.
+      self.navpose_dict['yaw_deg'] = nepi_nav.convert_yaw_ned2enu(rpy[2])
 
       # Relative Position Meters in selected 3d frame (x,y,z) with x forward, y right/left, and z up/down
       self.navpose_dict['has_position'] = True
