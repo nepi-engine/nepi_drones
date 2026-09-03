@@ -76,6 +76,17 @@ command -v sshd >/dev/null || sudo apt-get install -y openssh-server
 sudo systemctl enable --now ssh
 ```
 
+**Second prerequisite** (also confirmed live, 2026-09-02): the VM needs
+passwordless sudo for the Deploy button's Install step to work at all --
+`install_command` runs `apt-get` over this same non-interactive SSH
+connection, which has no terminal for `sudo` to read a password from.
+Without this, every target's install fails with "sudo: a terminal is
+required to read the password," not just the one you tried:
+```bash
+echo "$USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/nepi-sim-connector
+sudo chmod 0440 /etc/sudoers.d/nepi-sim-connector
+```
+
 ## Step 1 — SSH keys
 
 You need two separate keypairs (despite sharing a filename convention,

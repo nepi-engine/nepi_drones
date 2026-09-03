@@ -101,6 +101,29 @@ WSL / WSL2 (systemd is not enabled by default):
 Full setup (SSH keys, env var overrides for a non-default device/VM
 username): nepi_drones/docs/SIM_VM_CONNECTION_SETUP.md"""
 
+# Reported live (2026-09-02): every install_command needing apt-get failed
+# on a genuinely fresh VM with "sudo: a terminal is required to read the
+# password" -- _ssh_cmd() never allocates a pty (no -t), so a remote sudo
+# call has nothing to prompt on. The original developer's own VM never hit
+# this because it already had passwordless sudo configured by hand, long
+# before this feature existed. There is no fix that doesn't require the
+# operator to configure this once, interactively: piping a password over a
+# non-interactive SSH session would mean storing/transmitting a sudo
+# password, which this whole file's own design explicitly avoids for SSH
+# keys already (see the module docstring) and shouldn't start doing for
+# sudo either.
+SUDO_NOPASSWD_FALLBACK_COMMANDS = """Run this ONCE on the sim VM (interactively, in a real terminal, so sudo
+can prompt for your password this one time):
+
+  echo "$USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/nepi-sim-connector
+  sudo chmod 0440 /etc/sudoers.d/nepi-sim-connector
+
+Every future Install click works without prompting after this -- Install
+runs apt-get over a non-interactive SSH connection with no terminal for
+sudo to read a password from, so without passwordless sudo configured,
+every target's install_command fails the same way, not just the one you
+just tried."""
+
 
 def find_config_path():
   """Returns the launch-targets config path to use, or "" if this deployment
@@ -703,6 +726,17 @@ class SimulatorLauncher(object):
       if tunnel_message:
         raise LauncherError(tunnel_message, manual_fallback_commands=REVERSE_TUNNEL_FALLBACK_COMMANDS)
     if result.returncode != 0:
+      stderr_lower = (result.stderr or "").lower()
+      # Reported live: this exact failure on a genuinely fresh VM, for
+      # EVERY target that needs apt-get -- not specific to which simulator
+      # was being installed. See SUDO_NOPASSWD_FALLBACK_COMMANDS's own
+      # comment for why this can't just be worked around silently.
+      if ("a terminal is required to read the password" in stderr_lower
+          or "sudo: no tty present" in stderr_lower):
+        raise LauncherError(
+            "Install failed: sudo needs a password, but Install runs over a "
+            "non-interactive SSH connection with no way to prompt for one.",
+            manual_fallback_commands=SUDO_NOPASSWD_FALLBACK_COMMANDS)
       raise LauncherError(
           "Install command exited " + str(result.returncode) + ": " + result.stderr.strip())
 
