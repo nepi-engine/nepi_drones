@@ -269,7 +269,7 @@ class Watcher(object):
       launched = self.launch_procs.pop(target_key, None)
       if launched is not None:
         self._writeStatus(launched['request_id'], target_key, 'launch', 'exited')
-    elif action in ('install', 'check_installed', 'ready_check'):
+    elif action in ('install', 'check_installed', 'ready_check', 'push_dimensions'):
       self._handleOneShot(request_id, target_key, action, script_path, timeout_sec)
     else:
       self._writeStatus(request_id, target_key, action, 'failed',

@@ -364,6 +364,31 @@ class SimulatorLauncher(object):
     host = target["host"]
     user = target["ssh_user"]
     port = int(target.get("ssh_port", 22))
+    # Confirmed live (2026-09-04): a device running a STALE copy of this
+    # app (the /opt/nepi install path is ephemeral, resets to a baseline
+    # image on restart -- see NEPI_APP_BUILD_AND_TEST_CHECKLIST.md) hit
+    # this with both host and ssh_user empty, because that older
+    # os_instance_registry.py's select() had no connection_mode guard yet
+    # and blindly copied a shared_storage instance's own (deliberately
+    # blank) host/ssh_user onto every target. The resulting destination
+    # ("" + "@" + "" = "@") isn't a bad host -- it's not a valid ssh
+    # argument at all, so ssh refuses to even parse it and dumps its own
+    # usage/help banner (exit 255) instead of a normal connection error,
+    # which is a genuinely confusing thing to hit from the RUI ("Install
+    # command exited 255: usage: ssh ..."). This guard turns that into an
+    # immediate, clear LauncherError regardless of WHY host/user ended up
+    # blank (stale deploy, a future select() regression, anything else) --
+    # every caller here already surfaces LauncherError as a normal
+    # RUI-visible error message.
+    if not host or not user:
+      raise LauncherError(
+          "Refusing to build an SSH command with an empty host ('" + str(host) +
+          "') or user ('" + str(user) + "') -- this target's connection_mode is '" +
+          str(target.get("connection_mode")) + "', which should never reach _ssh_cmd " +
+          "at all if it's 'shared_storage'. Likely a stale app deployment (the " +
+          "/opt/nepi install path resets on restart) running old code without the " +
+          "connection_mode-aware select()/dispatch logic -- redeploy this app's " +
+          "current nepi_api/nepi_app_sim_connector packages.")
     return [
         "ssh",
         "-i", ssh_key,
@@ -602,8 +627,26 @@ class SimulatorLauncher(object):
     model.sdf from it. Raises LauncherError on any failure -- callers decide
     whether that should block the launch it's ahead of (see
     sim_connector_app_node.py's pushDirtyDimensions, which treats this as
-    best-effort and logs rather than aborting)."""
+    best-effort and logs rather than aborting).
+
+    Confirmed live (2026-09-04): this method never checked connection_mode
+    at all -- unlike launch/stop/install/is_ready, which all branch on
+    'shared_storage' before ever building an SSH command -- so it always
+    tried SSH regardless of transport. Combined with a stale deployment (an
+    older os_instance_registry.py with no connection_mode guard on its own
+    select(), see _ssh_cmd's own comment) this is exactly what produced the
+    "Install command exited 255: usage: ssh ..." error reported live: this
+    same push, not the Install button itself, hit an SSH command built from
+    an empty host/user. That specific crash is fixed at the source now (a
+    fresh deploy of this file's own select() and _ssh_cmd's new empty-host/
+    user guard), but this method still owed its own shared_storage branch
+    regardless -- "since reverse ssh isnt an option anymore, this shouldnt
+    even come up" applies here exactly as much as it does to Install."""
     remote_dir = "$HOME/nepi_engine_ws/nepi_drones/sim_container/models/" + model_name
+    if target.get("connection_mode") == "shared_storage":
+      self._push_dimensions_shared_storage(target, model_name, remote_dir,
+                                            dimensions_yaml_text, sdf_override_text)
+      return
     if sdf_override_text:
       self._push_file_content(target, remote_dir + "/model.sdf", sdf_override_text)
       return
@@ -616,6 +659,42 @@ class SimulatorLauncher(object):
     if result.returncode != 0:
       raise LauncherError("generate_model_sdf.py failed for " + model_name + ": " +
                           (result.stderr or result.stdout or "unknown error"))
+
+  def _push_dimensions_shared_storage(self, target, model_name, remote_dir,
+                                       dimensions_yaml_text, sdf_override_text):
+    """connection_mode='shared_storage' counterpart of push_dimensions's own
+    SSH path -- writes the same content and (unless it's a raw SDF
+    override) runs the same generate_model_sdf.py, via the same
+    _dispatch_shared_storage mailbox every launch/stop/install/is_ready
+    already use for this transport, instead of an SSH `cat >` plus a
+    separate remote python3 call. One dispatched script does both steps
+    (write, then generate) since there's no SSH round-trip cost to avoid
+    here the way there is over a real network link. See
+    vm_command_watcher.py's own 'push_dimensions' action (reuses its
+    existing one-shot handling, the same as 'install'/'check_installed'/
+    'ready_check'). The heredoc delimiter is fixed, not randomized --
+    dimensions_yaml_text is this app's own generated YAML and
+    sdf_override_text is a raw-SDF upload, both already treated as trusted,
+    non-arbitrary content by push_dimensions' own SSH path (see
+    _push_file_content's docstring on remote_path for the same reasoning
+    applied to path interpolation)."""
+    heredoc_delim = "NEPI_PUSH_DIMENSIONS_EOF"
+    if sdf_override_text:
+      script = ("cat > " + remote_dir + "/model.sdf << '" + heredoc_delim + "'\n" +
+                sdf_override_text + "\n" + heredoc_delim + "\n")
+    elif dimensions_yaml_text:
+      script = ("cat > " + remote_dir + "/dimensions.yaml << '" + heredoc_delim + "'\n" +
+                dimensions_yaml_text + "\n" + heredoc_delim + "\n" +
+                "python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/"
+                "generate_model_sdf.py " + model_name + "\n")
+    else:
+      return
+    target_key = "push_dimensions_" + model_name
+    _, status = self._dispatch_shared_storage(
+        target, target_key, "push_dimensions", script, SSH_CONNECT_TIMEOUT_SEC + 10)
+    if status.get("exit_code") != 0:
+      raise LauncherError("push_dimensions failed for " + model_name + ": " +
+                          (status.get("error") or "").strip())
 
   _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
