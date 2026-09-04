@@ -227,6 +227,7 @@ class NepiIFSimControls extends Component {
 
     this.onEnterSetRbxFloatSetting = this.onEnterSetRbxFloatSetting.bind(this)
     this.renderCameraOffsetControls = this.renderCameraOffsetControls.bind(this)
+    this.renderCompactToggle = this.renderCompactToggle.bind(this)
     this.setEnvironmentSetting = this.setEnvironmentSetting.bind(this)
 
     this.renderLiveControls = this.renderLiveControls.bind(this)
@@ -975,24 +976,35 @@ class NepiIFSimControls extends Component {
 
         <Label title={"Robot Capabilities"} labelStyle={{ fontWeight: 'bold' }}/>
 
+        {/* Compact (text immediately beside its own dial), not the usual
+            Label 50/50 title/value split -- that split works fine for a
+            value that fills real width (an Input, a Select) but for a
+            short toggle it left the dial visually far from a short label.
+            Requested live (2026-09-04): "the automated movement and camera
+            controls dials are far frm their text - those can be on just
+            their side." Side by side in their own Columns so both fit on
+            one row instead of stacked. */}
         <Columns>
           <Column>
             {(has_autonomous_toggle === true) ?
-              <Label title={"Automated Movement"}>
+              this.renderCompactToggle(
+                "Automated Movement",
                 <Toggle
                   checked={values["autonomous_movement_enabled"] !== "FALSE"}
                   onClick={() => setToggle("autonomous_movement_enabled", values["autonomous_movement_enabled"] === "FALSE")}
                 />
-              </Label>
+              )
             : null}
-
+          </Column>
+          <Column>
             {(has_camera_toggle === true) ?
-              <Label title={"Camera Controls"}>
+              this.renderCompactToggle(
+                "Camera Controls",
                 <Toggle
                   checked={values["camera_controls_enabled"] !== "FALSE"}
                   onClick={() => setToggle("camera_controls_enabled", values["camera_controls_enabled"] === "FALSE")}
                 />
-              </Label>
+              )
             : null}
           </Column>
         </Columns>
@@ -1000,6 +1012,22 @@ class NepiIFSimControls extends Component {
         {this.renderImageSourceCuration()}
 
       </React.Fragment>
+    )
+  }
+
+  // Puts a toggle immediately beside its own label text (a small gap, not
+  // Label's usual 50/50 title/value split, which pins a short toggle's
+  // dial far from a short label) -- see renderRobotCapabilityControls's
+  // own comment for the request that drove this. Takes the ALREADY-BUILT
+  // <Toggle>/<AsyncToggle> element rather than a checked/onClick pair, so
+  // callers can keep whichever click/change convention they already use
+  // (setToggle's onClick vs. Lock Scene Camera's plain onChange) unchanged.
+  renderCompactToggle(title, toggleElement) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", marginTop: Styles.vars.spacing.regular }}>
+        <span style={{ marginRight: Styles.vars.spacing.small }}>{title}</span>
+        {toggleElement}
+      </div>
     )
   }
 
@@ -1272,12 +1300,13 @@ class NepiIFSimControls extends Component {
     return (
       <React.Fragment>
         {isScene ?
-          <Label title={"Lock Scene Camera To Robot"}>
+          this.renderCompactToggle(
+            "Lock Scene Camera To Robot",
             <Toggle
               checked={locked}
               onChange={(event) => this.onToggleLockSceneToRobot(event.target.checked)}
             />
-          </Label>
+          )
         : null}
         {offsets.map((offset) => {
           const isDisabled = locked && offset.is_angle
@@ -1521,10 +1550,10 @@ class NepiIFSimControls extends Component {
         {this.renderRobotCapabilityControls()}
         <Columns>
           <Column>
-            {this.renderCameraOffsetControls("camera_offset", "Robot View Camera")}
+            {this.renderCameraOffsetControls("camera_offset", "Robot View Cam")}
           </Column>
           <Column>
-            {this.renderCameraOffsetControls("scene_offset", "Scene View Camera")}
+            {this.renderCameraOffsetControls("scene_offset", "Scene View Cam")}
           </Column>
         </Columns>
         {this.renderEnvironmentControls()}

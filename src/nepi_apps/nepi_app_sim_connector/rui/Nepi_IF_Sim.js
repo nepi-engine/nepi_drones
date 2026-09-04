@@ -2605,15 +2605,16 @@ class NepiIFSim extends Component {
             this app's actual purpose -- hiding it along with live control
             was an unintended side effect of the two being bundled into one
             gated component. See docs/SIM_CONNECTOR_CONFIG_CONTROLS_PLAN.md.
-            make_section=true (was false) + title given here now that this
-            is the first thing in the right column, not a headerless block
-            under Robot/Environment Config Settings -- gives it the same
-            bordered-box-with-title look those two already have. */}
+            make_section left false (no title, no box) -- a "Sim Control
+            Settings" heading here was tried and dropped same-day: "the
+            title of sim control settings is also useless honestly - the
+            robot capabilities is good enough to title that section"
+            (renderRobotCapabilityControls's own "Robot Capabilities" label
+            is the first thing rendered here, right below). */}
         <NepiIFSimControls
           ref={this.simControlsRef}
           namespace={namespace}
-          make_section={true}
-          title={"Sim Control Settings"}
+          make_section={false}
           show_live_controls={show_controls}
         />
 
