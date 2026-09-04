@@ -201,6 +201,22 @@ const CUSTOM_OBSTACLE_TYPE_FIELD_NAMES = {
   circle: ['x', 'y', 'radius_m', 'height_m'],
   triangle: ['x', 'y', 'yaw_deg', 'base_m', 'depth_m', 'height_m'],
 }
+// Human-readable title per raw field name -- requested live (2026-09-04):
+// "theres also just a bunch of numbers when you try to add them which
+// doesnt make sense since its not properly labeled what the number boxes
+// mean. make sure its pretty obvious." Used by renderObstacleFieldRow
+// instead of the bare snake_case field name (e.g. "thickness_m").
+const CUSTOM_OBSTACLE_FIELD_TITLES = {
+  x: "X (m)",
+  y: "Y (m)",
+  yaw_deg: "Rotation (deg)",
+  length_m: "Length (m)",
+  thickness_m: "Thickness (m)",
+  height_m: "Height (m)",
+  radius_m: "Radius (m)",
+  base_m: "Base (m)",
+  depth_m: "Depth (m)",
+}
 
 // Rotates a LOCAL (obstacle-frame) offset by yaw_deg and translates it to
 // the obstacle's world position -- shared by every rotated obstacle type's
@@ -398,6 +414,22 @@ class NepiIFSim extends Component {
       // config, see its YAML" pattern both axes share.
       robot_dimensions_config_yaml_text: '',
       environment_dimensions_config_yaml_text: '',
+      // Top "Environment Config" selector's own picked name -- purely
+      // local/optimistic, since deploying to Gazebo is no longer coupled
+      // to select_environment_dimensions_config (nothing server-side
+      // tracks "what name is currently deployed" the way it tracks "what's
+      // selected for editing"). See onDeployEnvironmentConfig.
+      environment_deploy_selected_name: '',
+      // "Environment Configs" read-only YAML preview dropdown's own state
+      // -- deliberately separate from environment_dimensions_config_yaml_text
+      // (owned by the Dimensions-editing selector) and from
+      // environment_deploy_selected_name (owned by the top deploy
+      // selector), so viewing a config's YAML here can never affect either.
+      // See onViewEnvironmentDimensionsConfigClicked and
+      // sim_connector_app_node.py's getEnvironmentDimensionsConfigCb.
+      environment_dimensions_viewing_config_name: '',
+      environment_dimensions_viewing_yaml_text: '',
+      environmentDimensionsViewingYamlListener: null,
       robot_dimensions_save_as_name: '',
       environment_dimensions_save_as_name: '',
       robotDimensionsConfigNamesListener: null,
@@ -443,6 +475,8 @@ class NepiIFSim extends Component {
     this.applyDimensionConfigNames = this.applyDimensionConfigNames.bind(this)
     this.onSaveDimensionsClicked = this.onSaveDimensionsClicked.bind(this)
     this.onSelectDimensionConfig = this.onSelectDimensionConfig.bind(this)
+    this.onDeployEnvironmentConfig = this.onDeployEnvironmentConfig.bind(this)
+    this.onViewEnvironmentDimensionsConfigClicked = this.onViewEnvironmentDimensionsConfigClicked.bind(this)
     this.saveDimensionsAsNamed = this.saveDimensionsAsNamed.bind(this)
     this.onSaveDimensionConfigAsClicked = this.onSaveDimensionConfigAsClicked.bind(this)
     this.onDeleteDimensionConfigClicked = this.onDeleteDimensionConfigClicked.bind(this)
@@ -465,8 +499,10 @@ class NepiIFSim extends Component {
     this.renderCustomObstaclesDiagram = this.renderCustomObstaclesDiagram.bind(this)
     this.renderCustomObstaclesEditor = this.renderCustomObstaclesEditor.bind(this)
     this.renderCustomObstacleControls = this.renderCustomObstacleControls.bind(this)
+    this.renderObstacleOverlay = this.renderObstacleOverlay.bind(this)
     this.renderDimensionFields = this.renderDimensionFields.bind(this)
     this.renderDimensionsEditor = this.renderDimensionsEditor.bind(this)
+    this.renderEnvironmentDimensionsLoadSelector = this.renderEnvironmentDimensionsLoadSelector.bind(this)
     this.renderRobotDimensionsDiagram = this.renderRobotDimensionsDiagram.bind(this)
     this.renderEnvironmentDimensionsDiagram = this.renderEnvironmentDimensionsDiagram.bind(this)
     this.renderDimensionsDiagramSafe = this.renderDimensionsDiagramSafe.bind(this)
@@ -535,7 +571,7 @@ class NepiIFSim extends Component {
     }
     ;[this.state.robotDimensionsConfigNamesListener, this.state.environmentDimensionsConfigNamesListener,
       this.state.robotDimensionsSelectedConfigListener, this.state.environmentDimensionsSelectedConfigListener,
-      this.state.environmentDimensionsModelListener]
+      this.state.environmentDimensionsModelListener, this.state.environmentDimensionsViewingYamlListener]
       .forEach((listener) => { if (listener != null) { listener.unsubscribe() } })
     this.setState({ statusListener: null, robotConfigYamlListener: null,
                     cameraHorizontalFovListener: null, cameraVerticalFovListener: null,
@@ -543,7 +579,7 @@ class NepiIFSim extends Component {
                     robotDimensionsDirtyListener: null, environmentDimensionsDirtyListener: null,
                     robotDimensionsConfigNamesListener: null, environmentDimensionsConfigNamesListener: null,
                     robotDimensionsSelectedConfigListener: null, environmentDimensionsSelectedConfigListener: null,
-                    environmentDimensionsModelListener: null })
+                    environmentDimensionsModelListener: null, environmentDimensionsViewingYamlListener: null })
   }
 
   // Function for configuring and subscribing to the two static FOV topics --
@@ -653,6 +689,15 @@ class NepiIFSim extends Component {
         }))
       }
     )
+    // Read-only YAML preview for the "Environment Configs" viewer dropdown
+    // -- see onViewEnvironmentDimensionsConfigClicked and
+    // sim_connector_app_node.py's getEnvironmentDimensionsConfigCb. Its own
+    // state field, never environment_dimensions_config_yaml_text (owned by
+    // the Dimensions-editing selector).
+    const environmentDimensionsViewingYamlListener = this.props.ros.setupStatusListener(
+      namespace + '/environment_dimensions_config_yaml_preview', "std_msgs/String",
+      (message) => this.setState({ environment_dimensions_viewing_yaml_text: message.data })
+    )
     this.setState({ robotDimensionsYamlListener: robotYamlListener,
                     environmentDimensionsYamlListener: environmentYamlListener,
                     robotDimensionsDirtyListener: robotDirtyListener,
@@ -661,7 +706,8 @@ class NepiIFSim extends Component {
                     environmentDimensionsConfigNamesListener: environmentConfigNamesListener,
                     robotDimensionsSelectedConfigListener: robotSelectedConfigListener,
                     environmentDimensionsSelectedConfigListener: environmentSelectedConfigListener,
-                    environmentDimensionsModelListener: environmentModelListener })
+                    environmentDimensionsModelListener: environmentModelListener,
+                    environmentDimensionsViewingYamlListener: environmentDimensionsViewingYamlListener })
     this.props.ros.sendTriggerMsg(namespace + '/get_robot_dimensions')
     this.props.ros.sendTriggerMsg(namespace + '/get_environment_dimensions')
   }
@@ -920,30 +966,72 @@ class NepiIFSim extends Component {
       return
     }
     this.props.ros.sendStringMsg(namespace + '/select_' + role + '_dimensions_config', name)
-    // Drives NepiIFSimControls's own "environment" Setting (the control
-    // that actually spawns/despawns obstacles in Gazebo) so this selector
-    // is the ONE place environment changes take visual effect -- requested
-    // live (2026-09-04): "environment should be live changeable from the
-    // top selector too" (the separate dropdown this used to also require
-    // picking is gone now, see NepiIFSimControls's own setEnvironmentSetting
-    // comment). Sends every environment dimensions-config name now, not
-    // just "Flat"/"Obstacle Course" -- setEnvironmentSetting translates the
-    // name and the backend's own Setting validation harmlessly ignores a
-    // guess that doesn't match any real currently-scanned model, so this
-    // is safe even for a name with nothing to actually spawn.
-    if (role === 'environment' && this.simControlsRef.current) {
-      this.simControlsRef.current.setEnvironmentSetting(name)
-    }
+    // NOTE: this used to ALSO call NepiIFSimControls's own
+    // setEnvironmentSetting here (driving live Gazebo spawn/despawn) --
+    // removed. Requested live (2026-09-04): "changing the environment
+    // config in the dropdown also messed with the dimensions and what
+    // that shows - it shouldnt do that. those are again separate." /
+    // "in the environment configs section in the bottom to view the yaml
+    // files, clicking between those shouldnt change the actual env config
+    // in the dropdown - they should be separate. doing that would also
+    // change it in the real gazebo window then which can be annoying."
+    // This method is now PURELY "load this saved config's numbers into
+    // the Dimensions editor for editing/reference" -- called only from
+    // the Dimensions area's own selector (renderDimensionsEditor) and
+    // Reset-to-Default buttons, never from anything that also deploys.
+    // Deploying to Gazebo is now onDeployEnvironmentConfig's own, separate
+    // job (see that method and renderEnvironmentConfigSelector).
+    //
     // Auto-expand the matching Config Settings panel -- both panels default
     // collapsed (show_robot_config_viewer/show_environment_config_viewer
-    // start false), so picking a new config from the plain selector above
-    // (or from the merged Robot Configs / Environment Configs button rows
-    // inside an ALREADY-expanded panel) used to send the request but never
-    // visibly show its result unless the panel happened to already be open.
-    // Requested live (2026-09-04): "changing a different environment in the
-    // dropdown should automatically pull up the right environment the
-    // second it happens, like what it was in the bottom."
+    // start false), so picking a new config to edit used to send the
+    // request but never visibly show its result unless the panel happened
+    // to already be open. Requested live (2026-09-04): "changing a
+    // different environment in the dropdown should automatically pull up
+    // the right environment the second it happens, like what it was in
+    // the bottom."
     this.setState(role === 'robot' ? { show_robot_config_viewer: true } : { show_environment_config_viewer: true })
+  }
+
+  // Drives NepiIFSimControls's own "environment" Setting (the control that
+  // actually spawns/despawns obstacles in Gazebo) -- the ONE thing the top
+  // "Environment Config" selector does now, decoupled entirely from the
+  // Dimensions editor (see onSelectDimensionConfig's own comment for the
+  // request that split these apart). environment_deploy_selected_name is
+  // local-only state (nothing server-side tracks "what's deployed" as a
+  // NAME the way it tracks "what's selected for editing") so this dropdown
+  // has something to show as picked between renders. Sends every
+  // environment dimensions-config name, not just "Flat"/"Obstacle Course"
+  // -- setEnvironmentSetting translates the name and the backend's own
+  // Setting validation harmlessly ignores a guess that doesn't match any
+  // real currently-scanned model, so this is safe even for a name with
+  // nothing to actually spawn.
+  onDeployEnvironmentConfig(name) {
+    if (!name) {
+      return
+    }
+    this.setState({ environment_deploy_selected_name: name })
+    if (this.simControlsRef.current) {
+      this.simControlsRef.current.setEnvironmentSetting(name)
+    }
+  }
+
+  // Read-only YAML preview for the "Environment Configs" viewer dropdown --
+  // see sim_connector_app_node.py's getEnvironmentDimensionsConfigCb for
+  // why this is a genuinely separate request/response pair from
+  // select_environment_dimensions_config, not a client-side filter on the
+  // same data: that mutating call is now exclusively owned by the
+  // Dimensions-editing dropdown, and this preview must have zero effect on
+  // it (or on Gazebo) -- same "these are separate" requirement as
+  // onDeployEnvironmentConfig. Mirrors onViewConfigClicked's own shape for
+  // robot's capability axis.
+  onViewEnvironmentDimensionsConfigClicked(name) {
+    const namespace = this.getSimNamespace()
+    if (namespace == null || namespace === 'None' || !name) {
+      return
+    }
+    this.setState({ environment_dimensions_viewing_config_name: name })
+    this.props.ros.sendStringMsg(namespace + '/get_environment_dimensions_config', name)
   }
 
   // Saves the CURRENTLY EDITED fields (not the last-loaded config) under a
@@ -1134,32 +1222,39 @@ class NepiIFSim extends Component {
   // an earlier version of this method rendered the YAML viewer and a
   // Delete button directly here, "just out there" instead of tucked into a
   // panel like Robot Config's own management controls -- moved.
-  // selected === '' means the active values no longer match ANY saved
-  // config (an in-progress, unsaved edit -- see setDimensionsCb's own
-  // comment on the device) -- shown as its own explicit placeholder option
-  // rather than letting the browser fall back to silently highlighting
-  // whichever option happens to be first, which would misleadingly look
-  // like that config is what's actually active.
+  //
+  // This is now PURELY a deploy control -- picking a name here only drives
+  // NepiIFSimControls's own "environment" Setting (real Gazebo spawn/
+  // despawn) via onDeployEnvironmentConfig, and has zero effect on the
+  // Dimensions editor (a separate selector further down owns that -- see
+  // renderDimensionsEditor). Requested live (2026-09-04): "changing the
+  // environment config in the dropdown also messed with the dimensions and
+  // what that shows - it shouldnt do that. those are again separate."
+  // environment_deploy_selected_name is local-only state (see that field's
+  // own comment) -- '' means nothing picked here yet, shown as its own
+  // placeholder option rather than letting the browser silently highlight
+  // whichever real name happens to be first.
   renderEnvironmentConfigSelector() {
     // "Custom Obstacles" excluded here (and from the Environment Configs
-    // button row in renderEnvironmentConfigSettings) -- requested live
-    // (2026-09-04): "remove 'custom obstacles' since you need to save it
-    // as a new name to select it anyways." It's a template with no
-    // obstacles of its own, never directly deployable; Add Wall/Circle/
-    // Triangle is now available from every environment's own dimensions
-    // editor (see renderCustomObstacleControls), so reaching the same
-    // result no longer needs picking this placeholder first. A config a
-    // user actually SAVED from it keeps appearing here under its own given
+    // viewer dropdown / the Dimensions-editing dropdown in
+    // renderEnvironmentConfigSettings) -- requested live (2026-09-04):
+    // "remove 'custom obstacles' since you need to save it as a new name
+    // to select it anyways." It's a template with no obstacles of its
+    // own, never directly deployable; Add Wall/Circle/Triangle is now
+    // available from every environment's own dimensions editor (see
+    // renderCustomObstacleControls), so reaching the same result no
+    // longer needs picking this placeholder first. A config a user
+    // actually SAVED from it keeps appearing here under its own given
     // name -- only the literal built-in template name is hidden.
     const names = this.state.environment_dimensions_config_names.filter((n) => n !== 'Custom Obstacles')
-    const selected = this.state.environment_dimensions_selected_config
+    const selected = this.state.environment_deploy_selected_name
     return (
       <Label title={"Environment Config"}>
         <Select
-          onChange={(event) => this.onSelectDimensionConfig('environment', event.target.value)}
+          onChange={(event) => this.onDeployEnvironmentConfig(event.target.value)}
           value={selected}
         >
-          {(selected === '') ? <Option key={''} value={''}>{'(Unsaved Edits)'}</Option> : null}
+          {(selected === '') ? <Option key={''} value={''}>{'(Select to Deploy)'}</Option> : null}
           {names.map((name) => <Option key={name} value={name}>{name}</Option>)}
         </Select>
       </Label>
@@ -1191,7 +1286,8 @@ class NepiIFSim extends Component {
     // "Custom Obstacles" excluded here too -- see renderEnvironmentConfigSelector's
     // own comment for why.
     const names = this.state.environment_dimensions_config_names.filter((n) => n !== 'Custom Obstacles')
-    const yamlText = this.state.environment_dimensions_config_yaml_text
+    const viewingName = this.state.environment_dimensions_viewing_config_name
+    const yamlText = this.state.environment_dimensions_viewing_yaml_text
     const environmentFieldDefs = ENVIRONMENT_DIMENSION_FIELDS_BY_MODEL[this.state.environment_dimensions_model] || []
     return (
       <React.Fragment>
@@ -1211,47 +1307,57 @@ class NepiIFSim extends Component {
                 itself (renderDimensionsEditor/renderCustomObstaclesEditor),
                 not as a config-viewer action.
                 The Add Wall/Circle/Triangle obstacle controls
-                (renderCustomObstacleControls) now always render here too,
-                not just for the Custom Obstacles model -- requested live
+                (renderCustomObstacleControls) now always render for every
+                model, not just Custom Obstacles -- requested live
                 (2026-09-04): "the environment dimensions area also doesnt
                 show the adding obstacles stuff for like walls, circles,
-                etc. that should always be there." When the model already
-                IS Custom Obstacles, renderCustomObstaclesEditor already
-                includes them, so it isn't called a second time here. */}
+                etc. that should always be there." renderDimensionsEditor
+                itself now calls renderCustomObstacleControls right after
+                its own fields grid (role==='environment' only), and
+                renderCustomObstaclesEditor already includes them for the
+                Custom Obstacles model -- neither is called a second time
+                here. */}
             {(this.state.environment_dimensions_model === CUSTOM_OBSTACLES_MODEL) ?
               this.renderCustomObstaclesEditor()
             :
-              <React.Fragment>
-                {this.renderDimensionsEditor('environment', 'Environment Dimensions', environmentFieldDefs,
-                                              this.uploadEnvironmentSdfInputRef)}
-                {this.renderCustomObstacleControls()}
-              </React.Fragment>
+              this.renderDimensionsEditor('environment', 'Environment Dimensions', environmentFieldDefs,
+                                            this.uploadEnvironmentSdfInputRef)
             }
             {/* Missing entirely before this change -- requested live
                 (2026-09-04): "for the environment configs section, there
                 isnt a title in the bottom like robot configs, and it
                 doesnt show all the current options, like flat, obstacle
-                course, etc to view." Mirrors renderRobotConfigAndDimensions
-                Buttons's own title+button-row+viewer shape, simpler since
-                environment has only the one axis (no separate capability
-                list to merge in) -- every name in
-                environment_dimensions_config_names, built-ins included
-                (ensureBuiltinDimensionConfigs on the backend always writes
-                Flat/Obstacle Course/Aerial Obstacle Course/Custom Obstacles
-                to disk, so they're always in this list, not just
-                whatever's been saved). */}
+                course, etc to view." A dropdown, not individual buttons --
+                "same for environment configs - a separate dropdown for
+                showing that instead of individual buttons for each
+                environment." Every name in environment_dimensions_config_names,
+                built-ins included (ensureBuiltinDimensionConfigs on the
+                backend always writes Flat/Obstacle Course/Aerial Obstacle
+                Course/Custom Obstacles to disk, so they're always in this
+                list, not just whatever's been saved).
+                PURELY a read-only preview -- picking a name here calls
+                onViewEnvironmentDimensionsConfigClicked, a genuinely
+                separate request/response pair
+                (get_environment_dimensions_config /
+                environment_dimensions_config_yaml_preview) from the
+                Dimensions-editing selector's select_environment_dimensions_config,
+                so it can never change what's loaded for editing or what's
+                deployed to Gazebo. Requested live (2026-09-04): "clicking
+                between those shouldnt change the actual env config in the
+                dropdown - they should be separate. doing that would also
+                change it in the real gazebo window then which can be
+                annoying." */}
             <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
-            <Label title={"Environment Configs"} labelStyle={{ fontWeight: 'bold' }} />
+            <Label title={"Environment Configs"}>
+              <Select
+                onChange={(event) => this.onViewEnvironmentDimensionsConfigClicked(event.target.value)}
+                value={viewingName}
+              >
+                <Option key={''} value={''}>{'(None Selected)'}</Option>
+                {names.map((name) => <Option key={name} value={name}>{name}</Option>)}
+              </Select>
+            </Label>
             <ButtonMenu>
-              {names.map((name) => (
-                <Button
-                  key={name}
-                  style={(name === selected) ? { backgroundColor: Styles.vars.colors.blue } : undefined}
-                  onClick={() => this.onSelectDimensionConfig('environment', name)}
-                >
-                  {name}
-                </Button>
-              ))}
               <Button disabled={!selected} onClick={() => this.onDeleteDimensionConfigClicked('environment')}>
                 {"Delete Selected Config"}
               </Button>
@@ -1348,31 +1454,45 @@ class NepiIFSim extends Component {
             {"Delete Selected Config"}
           </Button>
         </ButtonMenu>
-        {(this.state.robot_config_yaml !== '') ?
-          <React.Fragment>
-            <textarea
-              readOnly
-              value={this.state.robot_config_yaml}
-              rows={8}
-              style={{ width: "60%", maxWidth: "40em", fontFamily: "monospace",
-                      whiteSpace: "pre", overflow: "auto", display: "block",
-                      backgroundColor: DIAGRAM_BG, color: Styles.vars.colors.grey0 }}
-            />
-            <ButtonMenu>
-              <Button onClick={this.onDownloadConfigClicked}>{"Download " + this.state.viewing_config_name + ".yaml"}</Button>
-            </ButtonMenu>
-          </React.Fragment>
-        : null}
-        {(this.state.robot_dimensions_config_yaml_text !== '') ?
-          <textarea
-            readOnly
-            value={this.state.robot_dimensions_config_yaml_text}
-            rows={6}
-            style={{ width: "60%", maxWidth: "40em", fontFamily: "monospace",
-                    whiteSpace: "pre", overflow: "auto", display: "block",
-                    backgroundColor: DIAGRAM_BG, color: Styles.vars.colors.grey0 }}
-          />
-        : null}
+        {/* Two conceptually separate YAML axes -- capability config
+            (display_name, goto flags, etc, from sim/get_robot_config) and
+            dimensions config (wheel/chassis/camera numeric fields) -- laid
+            out side by side rather than stacked. Requested live
+            (2026-09-04): "theres also two different yaml parts to the
+            robot configs... if possible, keep these side by side instead
+            of one on top of the other." Still two separate data sources/
+            mechanisms, just placed next to each other visually. */}
+        <Columns>
+          <Column>
+            {(this.state.robot_config_yaml !== '') ?
+              <React.Fragment>
+                <textarea
+                  readOnly
+                  value={this.state.robot_config_yaml}
+                  rows={8}
+                  style={{ width: "100%", fontFamily: "monospace",
+                          whiteSpace: "pre", overflow: "auto", display: "block",
+                          backgroundColor: DIAGRAM_BG, color: Styles.vars.colors.grey0 }}
+                />
+                <ButtonMenu>
+                  <Button onClick={this.onDownloadConfigClicked}>{"Download " + this.state.viewing_config_name + ".yaml"}</Button>
+                </ButtonMenu>
+              </React.Fragment>
+            : null}
+          </Column>
+          <Column>
+            {(this.state.robot_dimensions_config_yaml_text !== '') ?
+              <textarea
+                readOnly
+                value={this.state.robot_dimensions_config_yaml_text}
+                rows={8}
+                style={{ width: "100%", fontFamily: "monospace",
+                        whiteSpace: "pre", overflow: "auto", display: "block",
+                        backgroundColor: DIAGRAM_BG, color: Styles.vars.colors.grey0 }}
+              />
+            : null}
+          </Column>
+        </Columns>
       </React.Fragment>
     )
   }
@@ -1659,14 +1779,22 @@ class NepiIFSim extends Component {
   // fields. Enter commits, same convention as every other dimensions field.
   renderObstacleFieldRow(o, index) {
     const fieldNames = CUSTOM_OBSTACLE_TYPE_FIELD_NAMES[o.type] || []
+    // Per-obstacle "Wall #1"-style heading (1-based, matching how an
+    // operator counts items, not the 0-based array index) plus a real
+    // title per field ("Thickness (m)", not the bare "thickness_m") --
+    // requested live (2026-09-04): "theres also just a bunch of numbers
+    // when you try to add them which doesnt make sense since its not
+    // properly labeled what the number boxes mean. make sure its pretty
+    // obvious."
+    const typeLabel = o.type ? (o.type.charAt(0).toUpperCase() + o.type.slice(1)) : "Obstacle"
     return (
       <div key={index} style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-end',
                                  borderTop: "1px solid " + Styles.vars.colors.grey2,
                                  paddingTop: Styles.vars.spacing.xs, marginTop: Styles.vars.spacing.xs }}>
-        <div style={{ width: "90px", fontWeight: 'bold', textTransform: 'capitalize' }}>{o.type}</div>
+        <div style={{ width: "90px", fontWeight: 'bold' }}>{typeLabel + " #" + (index + 1)}</div>
         {fieldNames.map((fieldName) => (
           <div key={fieldName} style={{ width: "110px", marginRight: Styles.vars.spacing.xs }}>
-            <Label title={fieldName}>
+            <Label title={CUSTOM_OBSTACLE_FIELD_TITLES[fieldName] || fieldName}>
               <Input
                 id={"Obstacle_" + index + "_" + fieldName}
                 value={o[fieldName]}
@@ -1776,6 +1904,31 @@ class NepiIFSim extends Component {
     )
   }
 
+  // Overlays any operator-added obstacles (Add Wall/Circle/Triangle) on
+  // top of another diagram's own shapes, using THAT diagram's own
+  // toX/toY/scale so an obstacle placed relative to the course lines up
+  // with it correctly. Requested live (2026-09-04): "adding those
+  // components should show up on the viewer as well" -- Add Wall/Circle/
+  // Triangle now always renders (see renderCustomObstacleControls), but
+  // added obstacles previously had NO visual representation at all except
+  // as raw field rows for every model except Custom Obstacles (which has
+  // its own dedicated renderCustomObstaclesDiagram). Only wired into
+  // top-down (x-y plane) diagrams -- renderAerialObstacleCourseDiagram is
+  // a SIDE view (x-z plane); overlaying a top-down wall/circle/triangle
+  // shape onto that projection would misrepresent where it actually sits,
+  // so that one diagram intentionally does not get this overlay.
+  renderObstacleOverlay(toX, toY, scale, viewW) {
+    const obstacles = this.getCustomObstacles()
+    if (obstacles.length === 0) {
+      return null
+    }
+    return (
+      <React.Fragment>
+        {obstacles.map((o, i) => this.renderCustomObstacleShape(o, i, toX, toY, scale, viewW))}
+      </React.Fragment>
+    )
+  }
+
   // Top-down schematic (same x-right/y-up convention as every other
   // diagram here) auto-framed to whatever obstacles currently exist --
   // unlike the fixed-template diagrams, there's no fixed course geometry to
@@ -1836,6 +1989,7 @@ class NepiIFSim extends Component {
       <React.Fragment>
         <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
         <Section title={"Environment Dimensions -- Custom Obstacles"}>
+          {this.renderEnvironmentDimensionsLoadSelector()}
           {this.renderCustomObstaclesDiagram(previewFields)}
           {(dirty === true) ?
             <div style={{ fontStyle: "italic", color: Styles.vars.colors.grey1,
@@ -2184,6 +2338,7 @@ class NepiIFSim extends Component {
             <text x={toX((rampStartX + rampEndX) / 2)} y={toY(0) + 3} textAnchor="middle"
                   fill={Styles.vars.colors.blue} fontSize="10">{"RAMP"}</text>
           : null}
+          {this.renderObstacleOverlay(toX, toY, scale, viewW)}
         </svg>
         <div style={{ fontSize: 11, color: Styles.vars.colors.grey1, marginTop: Styles.vars.spacing.xs }}>
           {"Corridor " + corridorWidth.toFixed(2) + "m × " + wallLength.toFixed(2) +
@@ -2289,6 +2444,15 @@ class NepiIFSim extends Component {
         return this.renderAerialObstacleCourseDiagram(previewFields)
       }
       if (model === ENVIRONMENT_MODEL_NONE) {
+        // Flat has no course geometry of its own to preview, but an
+        // operator can still Add Wall/Circle/Triangle here (see
+        // renderCustomObstacleControls) -- once they have, show those
+        // instead of the plain "nothing to preview" message, reusing the
+        // same auto-framed top-down view Custom Obstacles' own dedicated
+        // diagram already uses.
+        if (this.getCustomObstacles().length > 0) {
+          return this.renderCustomObstaclesDiagram(previewFields)
+        }
         return (
           <div style={{ fontSize: 11, color: Styles.vars.colors.grey1, marginTop: Styles.vars.spacing.xs }}>
             {"Flat ground -- no environment geometry to preview."}
@@ -2305,6 +2469,35 @@ class NepiIFSim extends Component {
     }
   }
 
+  // "Dimensions" dropdown -- loads a saved environment config's numbers
+  // into the editable fields/diagram for editing or reference, with ZERO
+  // effect on what's deployed in Gazebo. Requested live (2026-09-04), the
+  // user's own answer for how the Dimensions editor should ever get loaded
+  // from a saved config once the top selector stopped doing that: "have
+  // another dropdown in the dimensions area for us to mess with that."
+  // Shared between renderDimensionsEditor (environment role) and
+  // renderCustomObstaclesEditor so it's available regardless of which
+  // model is currently active -- picking a different saved config here
+  // works the same way in either place. Uses the same onSelectDimensionConfig
+  // mechanism as Reset-to-Default and robot's own merged button row
+  // (select_environment_dimensions_config), now purely a "load for
+  // editing" action -- see that method's own comment.
+  renderEnvironmentDimensionsLoadSelector() {
+    const names = this.state.environment_dimensions_config_names.filter((n) => n !== 'Custom Obstacles')
+    const selected = this.state.environment_dimensions_selected_config
+    return (
+      <Label title={"Dimensions"}>
+        <Select
+          onChange={(event) => this.onSelectDimensionConfig('environment', event.target.value)}
+          value={selected}
+        >
+          {(selected === '') ? <Option key={''} value={''}>{'(Unsaved Edits)'}</Option> : null}
+          {names.map((name) => <Option key={name} value={name}>{name}</Option>)}
+        </Select>
+      </Label>
+    )
+  }
+
   renderDimensionsEditor(role, title, fieldDefs, uploadInputRef) {
     const dirty = this.state[role + '_dimensions_dirty']
     const previewFields = this.state[role + '_dimensions_preview_fields']
@@ -2312,7 +2505,15 @@ class NepiIFSim extends Component {
       <React.Fragment>
         <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
         <Section title={title}>
+          {(role === 'environment') ? this.renderEnvironmentDimensionsLoadSelector() : null}
           {this.renderDimensionFields(role, fieldDefs)}
+          {/* Add Wall/Circle/Triangle right below the numeric fields grid
+              (which for Obstacle Course ends with Ramp Plateau Length) --
+              requested live (2026-09-04): "the add wall, circle, and
+              triangle buttons should be right below the ramp plateau
+              length part." Environment only -- robot's own dimensions
+              editor (this same method, role='robot') never gets these. */}
+          {(role === 'environment') ? this.renderCustomObstacleControls() : null}
           {this.renderDimensionsDiagramSafe(role, previewFields)}
           {(dirty === true) ?
             <div style={{

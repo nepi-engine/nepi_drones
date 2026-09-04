@@ -904,6 +904,22 @@ class NepiSimConnectorApp:
     nepi_sdk.create_subscriber(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/delete_environment_dimensions_config'),
         String, self.deleteEnvironmentDimensionsConfigCb, queue_size = 1)
+    # Read-only YAML preview -- requested live (2026-09-04): "in the
+    # environment configs section in the bottom to view the yaml files,
+    # clicking between those shouldnt change the actual env config in the
+    # dropdown - they should be separate." Unlike
+    # select_environment_dimensions_config (which makes a config the active
+    # one being edited -- see applyDimensionConfigByName), this is a pure
+    # file read with no side effects at all: no selected_dimension_config
+    # change, no dimensions_dirty, no re-derived model, no
+    # dimensions_yaml_pubs echo. Mirrors get_robot_config/robot_config_yaml's
+    # own request/response shape for the capability axis.
+    self.environment_dimensions_config_yaml_preview_pub = nepi_sdk.create_publisher(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/environment_dimensions_config_yaml_preview'),
+        String, queue_size = 1, latch = True)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/get_environment_dimensions_config'),
+        String, self.getEnvironmentDimensionsConfigCb, queue_size = 1)
 
     ##############################
     # Phone-scan -> Gazebo environment conversion (see
@@ -1633,6 +1649,31 @@ class NepiSimConnectorApp:
     if pub is not None:
       pub.publish(String(data = yaml_text))
     return True
+
+  def getEnvironmentDimensionsConfigCb(self, msg):
+    # Read-only counterpart of applyDimensionConfigByName -- same file
+    # lookup (dimensionConfigPath), but returns the text without touching
+    # selected_dimension_config, dimension_config_model, dimensions_dirty,
+    # or the stored-active-yaml file at all. See this subscriber's own
+    # registration comment for why this needed to exist as its own
+    # request/response pair rather than reusing select_environment_
+    # dimensions_config.
+    name = str(msg.data).strip()
+    if not name:
+      return
+    path = self.dimensionConfigPath('environment', name)
+    if not os.path.exists(path):
+      self.msg_if.pub_warn("Environment dimensions config '" + name + "' not found, cannot preview it")
+      self.environment_dimensions_config_yaml_preview_pub.publish(String(data =
+          "# Environment dimensions config '" + name + "' not found"))
+      return
+    try:
+      with open(path, 'r') as f:
+        yaml_text = f.read()
+    except Exception as e:
+      self.msg_if.pub_warn("Failed to read environment dimensions config '" + name + "' for preview: " + str(e))
+      return
+    self.environment_dimensions_config_yaml_preview_pub.publish(String(data = yaml_text))
 
   def selectRobotDimensionsConfigCb(self, msg):
     self.selectDimensionConfigCb('robot', msg)
