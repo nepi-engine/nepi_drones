@@ -2448,14 +2448,16 @@ class NepiIFSim extends Component {
     // windows are like this too, while sim connector takes the whole
     // horizontal width per section."
     //
-    // Left: pick-and-deploy plus live data -- what to run and whether it's
-    // actually running. Right: everything that shapes WHAT gets deployed
-    // (Robot/Environment Config Settings' dimensions editors) and the
-    // live/config controls for whatever robot is currently connected
-    // (NepiIFSimControls). Not a strict alternative split (e.g.
-    // alphabetical) -- grouped by "operate the sim" vs. "configure the
-    // sim/robot/environment", the same kind of task-based grouping Device
-    // Manager's own split uses (device/license/admin vs. network/time).
+    // Left: pick-and-deploy plus live data up top (unchanged), Robot Config
+    // Settings below it. Right: Sim Control Settings (NepiIFSimControls)
+    // up top, Environment Config Settings below it. Re-requested live
+    // (2026-09-04): "keep the main settings in the left side front as it
+    // as, and the sim control settings that are currently at the bottom on
+    // the top right side. then, put the robot config settings under the
+    // main on the left, and the environment on the right of that under the
+    // sim control settings." -- NepiIFSimControls moved out of the deploy
+    // Column entirely, so it's the first thing in the config Column, not
+    // the last.
     const leftColumn = (
       <React.Fragment>
         {(show_selectors === true) ?
@@ -2514,18 +2516,13 @@ class NepiIFSim extends Component {
         {(show_data === true) ?
           this.renderData()
         : null}
+
+        {(show_selectors === true) ? this.renderRobotConfigSettings() : null}
       </React.Fragment>
     )
 
     const rightColumn = (
       <React.Fragment>
-        {(show_selectors === true) ?
-          <React.Fragment>
-            {this.renderRobotConfigSettings()}
-            {this.renderEnvironmentConfigSettings()}
-          </React.Fragment>
-        : null}
-
         {/* Always mounted, even when show_controls is false: NepiIFSimControls
             renders two logically separate groups internally -- live control
             (motor sliders, goto SEND buttons, home/stop actions, the live
@@ -2542,6 +2539,8 @@ class NepiIFSim extends Component {
           make_section={false}
           show_live_controls={show_controls}
         />
+
+        {(show_selectors === true) ? this.renderEnvironmentConfigSettings() : null}
       </React.Fragment>
     )
 
