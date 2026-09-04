@@ -114,32 +114,22 @@ class NepiIFSimControls extends Component {
       // truth. See docs/SIM_CONNECTOR_REMAINING_WORK.md if this needs fixing.
       environment_option_enabled: {},
 
-      // "Show Settings" button state -- lets the operator preview the full
-      // configuration surface (capability toggles, camera offsets, movement
-      // limits, environment) before any simulator is deployed. Found live
-      // (2026-08-18): every render* method below hid its controls entirely
-      // whenever rbx_namespace was empty, which is correct for anything that
-      // genuinely can't exist without a live device (the image-source
-      // candidate list, the live camera preview) but wrong for the Settings
-      // every RBX sim driver declares unconditionally (autonomous_movement_
-      // enabled/camera_controls_enabled are declared
-      // identically in rbx_sim_node.py, rbx_ardupilot_node.py,
-      // rbx_webots_node.py, and rbx_webots_quadcopter_node.py -- confirmed by
-      // direct inspection, not assumed). Toggling this on renders those
-      // universal controls with factory-default-style placeholder values;
-      // toggling a control while no device is live just no-ops harmlessly
-      // (updateSetting has nothing live to reach), same as this app's own
-      // documented "no-ops every command" pattern elsewhere. Once a real
-      // simulator connects, rbxSettingsNamesList/rbxSettingsValuesDict take
-      // over and the same controls become genuinely live.
-      //
-      // Auto-flips to true on the not-live -> live transition (see
-      // componentDidUpdate) so the pre-existing default (settings visible as
-      // soon as a simulator connects) is unchanged -- but unlike before
-      // (2026-08-19), it now genuinely gates visibility even while live too,
-      // so the Hide Settings button actually hides something instead of
-      // disappearing the moment there's something worth hiding.
-      show_settings: false,
+      // Every render* method below used to hide its controls entirely
+      // whenever rbx_namespace was empty, gated on a "Show Settings" toggle
+      // the operator had to click first. Removed entirely -- requested live
+      // (2026-09-04): "for sim control settings, theres no reason to have a
+      // hide or show for that - it can all just be there." The universal
+      // Settings every RBX sim driver declares unconditionally
+      // (autonomous_movement_enabled/camera_controls_enabled, identical in
+      // rbx_sim_node.py, rbx_ardupilot_node.py, rbx_webots_node.py, and
+      // rbx_webots_quadcopter_node.py -- confirmed by direct inspection, not
+      // assumed) now always render with factory-default-style placeholder
+      // values before a simulator connects; toggling one while no device is
+      // live just no-ops harmlessly (updateSetting has nothing live to
+      // reach), same as this app's own documented "no-ops every command"
+      // pattern elsewhere. Once a real simulator connects,
+      // rbxSettingsNamesList/rbxSettingsValuesDict take over and the same
+      // controls become genuinely live.
 
       // Live control of the RBX driver's own Settings (camera_offset_x/y/z,
       // scene_offset_x/y/z, camera_view_mode) used to be rendered HERE, bypassing
@@ -234,7 +224,6 @@ class NepiIFSimControls extends Component {
     this.renderEnvironmentControls = this.renderEnvironmentControls.bind(this)
     this.toggleEnvironmentOption = this.toggleEnvironmentOption.bind(this)
     this.isRbxLive = this.isRbxLive.bind(this)
-    this.toggleShowSettings = this.toggleShowSettings.bind(this)
 
     this.onEnterSetRbxFloatSetting = this.onEnterSetRbxFloatSetting.bind(this)
     this.renderCameraOffsetControls = this.renderCameraOffsetControls.bind(this)
@@ -352,18 +341,7 @@ class NepiIFSimControls extends Component {
     // is the status topic minus its trailing '/status'").
     const selected_simulator = (status_msg.selected_simulator !== undefined) ? status_msg.selected_simulator : ''
     if (selected_simulator !== prevState.rbx_namespace) {
-      const was_live = (prevState.rbx_namespace !== null && prevState.rbx_namespace !== ''
-        && prevState.rbx_namespace !== 'None')
-      const updates = { rbx_namespace: selected_simulator }
-      // Auto-open on the not-live -> live transition, matching the
-      // longstanding default (settings always visible once live) that
-      // existed before the Show/Hide button carried any real effect while
-      // live -- see the button's own comment for why it now does.
-      if (!was_live && selected_simulator !== null && selected_simulator !== ''
-          && selected_simulator !== 'None') {
-        updates.show_settings = true
-      }
-      this.setState(updates)
+      this.setState({ rbx_namespace: selected_simulator })
       this.updateRbxSettingsListener(selected_simulator)
     }
 
@@ -965,12 +943,9 @@ class NepiIFSimControls extends Component {
   // working exactly as before -- simply without a control for it here.
   renderRobotCapabilityControls() {
     const live = this.isRbxLive()
-    if (!this.state.show_settings) {
-      return null
-    }
     const settings = this.state.rbxSettingsNamesList
     const values = this.state.rbxSettingsValuesDict
-    // Preview mode (not live, Show Settings clicked): these three toggles are
+    // Preview mode (not live): these three toggles are
     // declared identically by every RBX sim driver's CAPABILITY_SETTING_NAMES
     // (confirmed by direct inspection of rbx_sim_node.py, rbx_ardupilot_node.py,
     // rbx_webots_node.py, rbx_webots_quadcopter_node.py), so showing them
@@ -1262,8 +1237,8 @@ class NepiIFSimControls extends Component {
   // concept (nothing to "offset" on a real camera the same way), so it
   // belongs exclusively here rather than duplicated on the generic RBX
   // device panel. Gated on the X field's own presence plus
-  // camera_controls_enabled. In preview mode (not live, Show Settings
-  // clicked) both triples are assumed present -- every current
+  // camera_controls_enabled. In preview mode (not live)
+  // both triples are assumed present -- every current
   // Gazebo-based driver (rbx_sim_node.py, rbx_ardupilot_node.py) declares
   // both; the Webots drivers only declare camera_offset (one real camera,
   // no scene view) and correctly narrow down to just that once a live
@@ -1277,9 +1252,6 @@ class NepiIFSimControls extends Component {
   // a camera mounted ON the robot).
   renderCameraOffsetControls(namePrefix, titlePrefix) {
     const live = this.isRbxLive()
-    if (!this.state.show_settings) {
-      return null
-    }
     const settings = this.state.rbxSettingsNamesList
     const values = this.state.rbxSettingsValuesDict
     const camera_controls_enabled = !live || !settings.includes("camera_controls_enabled")
@@ -1485,10 +1457,6 @@ class NepiIFSimControls extends Component {
     return !(rbx_ns === null || rbx_ns === '' || rbx_ns === 'None')
   }
 
-  toggleShowSettings() {
-    this.setState({ show_settings: !this.state.show_settings })
-  }
-
   // Environment toggles, one per reported environment option. The reported list
   // is what makes this generalize past any one hardcoded option.
   renderEnvironmentControls() {
@@ -1582,21 +1550,6 @@ class NepiIFSimControls extends Component {
       <React.Fragment>
 
         {(show_live_controls === true) ? this.renderLiveControls() : null}
-
-        {/* Always offered, live or not -- show_settings auto-opens on the
-            not-live -> live transition (see componentDidUpdate) so the
-            default behavior is unchanged (settings visible as soon as a
-            simulator connects), but the operator can still collapse this
-            whole section afterward if the robot/scene image views and
-            controls are taking up space they want back. Previously hidden
-            entirely once live, on the assumption there was "nothing left to
-            reveal" -- true for visibility, but that also meant no way to
-            HIDE it again once a sim was running (found live 2026-08-19). */}
-        <Label title={"Sim Control Settings"}>
-          <Button onClick={this.toggleShowSettings}>
-            {(this.state.show_settings === true) ? "Hide Settings" : "Show Settings"}
-          </Button>
-        </Label>
 
         {this.renderConfigControls()}
 

@@ -488,9 +488,14 @@ class NepiIFSimLauncher extends Component {
     // Plain wrapping text, not an <Input> -- these messages run long (the
     // launch_command refuse-guards in particular spell out exactly why and
     // what to do about it), and a single-line input box just clips them
-    // instead of showing the whole thing.
+    // instead of showing the whole thing. Stacked title-then-text, not the
+    // usual two-column Label (title on the left half, value on the right
+    // half) -- that split put a long wrapping message in the right half of
+    // the row, far from its own "Last Error" title. Requested live
+    // (2026-09-04): "for the 'last error' box, keep it close to the text."
     const error_row = (last_error !== '') ?
-      <Label title={"Last Error"}>
+      <div style={{ marginTop: Styles.vars.spacing.regular }}>
+        <div style={{ fontWeight: 'bold', textAlign: "left" }}>{"Last Error"}</div>
         <div style={{
           textAlign: "left",
           whiteSpace: "normal",
@@ -499,7 +504,7 @@ class NepiIFSimLauncher extends Component {
         }}>
           {last_error}
         </div>
-      </Label>
+      </div>
     : null
 
     // Elapsed-time reassurance while an install is in flight -- reported

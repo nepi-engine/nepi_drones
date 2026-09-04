@@ -450,6 +450,7 @@ class NepiIFSim extends Component {
     this.renderCustomObstacleShape = this.renderCustomObstacleShape.bind(this)
     this.renderCustomObstaclesDiagram = this.renderCustomObstaclesDiagram.bind(this)
     this.renderCustomObstaclesEditor = this.renderCustomObstaclesEditor.bind(this)
+    this.renderCustomObstacleControls = this.renderCustomObstacleControls.bind(this)
     this.renderDimensionFields = this.renderDimensionFields.bind(this)
     this.renderDimensionsEditor = this.renderDimensionsEditor.bind(this)
     this.renderRobotDimensionsDiagram = this.renderRobotDimensionsDiagram.bind(this)
@@ -1153,6 +1154,7 @@ class NepiIFSim extends Component {
       return null
     }
     const selected = this.state.environment_dimensions_selected_config
+    const names = this.state.environment_dimensions_config_names
     const yamlText = this.state.environment_dimensions_config_yaml_text
     const environmentFieldDefs = ENVIRONMENT_DIMENSION_FIELDS_BY_MODEL[this.state.environment_dimensions_model] || []
     return (
@@ -1165,20 +1167,55 @@ class NepiIFSim extends Component {
         </ButtonMenu>
         {(this.state.show_environment_config_viewer === true) ?
           <Section title={"Environment Config Settings"}>
-            {/* Dimensions editor first, config viewer (YAML + Delete) below
-                it -- same reordering as Robot Config Settings above, and
-                same reasoning. "Reset to Obstacle Course" removed from
-                here entirely -- it now lives as a "Reset to Default"
-                button inside the dimensions editor itself
-                (renderDimensionsEditor/renderCustomObstaclesEditor), not
-                as a config-viewer action. */}
+            {/* Dimensions editor first, config viewer (title + names +
+                Delete + YAML) below it -- same reordering as Robot Config
+                Settings above, and same reasoning. "Reset to Obstacle
+                Course" removed from here entirely -- it now lives as a
+                "Reset to Default" button inside the dimensions editor
+                itself (renderDimensionsEditor/renderCustomObstaclesEditor),
+                not as a config-viewer action.
+                The Add Wall/Circle/Triangle obstacle controls
+                (renderCustomObstacleControls) now always render here too,
+                not just for the Custom Obstacles model -- requested live
+                (2026-09-04): "the environment dimensions area also doesnt
+                show the adding obstacles stuff for like walls, circles,
+                etc. that should always be there." When the model already
+                IS Custom Obstacles, renderCustomObstaclesEditor already
+                includes them, so it isn't called a second time here. */}
             {(this.state.environment_dimensions_model === CUSTOM_OBSTACLES_MODEL) ?
               this.renderCustomObstaclesEditor()
             :
-              this.renderDimensionsEditor('environment', 'Environment Dimensions', environmentFieldDefs,
-                                            this.uploadEnvironmentSdfInputRef)
+              <React.Fragment>
+                {this.renderDimensionsEditor('environment', 'Environment Dimensions', environmentFieldDefs,
+                                              this.uploadEnvironmentSdfInputRef)}
+                {this.renderCustomObstacleControls()}
+              </React.Fragment>
             }
+            {/* Missing entirely before this change -- requested live
+                (2026-09-04): "for the environment configs section, there
+                isnt a title in the bottom like robot configs, and it
+                doesnt show all the current options, like flat, obstacle
+                course, etc to view." Mirrors renderRobotConfigAndDimensions
+                Buttons's own title+button-row+viewer shape, simpler since
+                environment has only the one axis (no separate capability
+                list to merge in) -- every name in
+                environment_dimensions_config_names, built-ins included
+                (ensureBuiltinDimensionConfigs on the backend always writes
+                Flat/Obstacle Course/Aerial Obstacle Course/Custom Obstacles
+                to disk, so they're always in this list, not just
+                whatever's been saved). */}
+            <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
+            <Label title={"Environment Configs"} labelStyle={{ fontWeight: 'bold' }} />
             <ButtonMenu>
+              {names.map((name) => (
+                <Button
+                  key={name}
+                  style={(name === selected) ? { backgroundColor: Styles.vars.colors.blue } : undefined}
+                  onClick={() => this.onSelectDimensionConfig('environment', name)}
+                >
+                  {name}
+                </Button>
+              ))}
               <Button disabled={!selected} onClick={() => this.onDeleteDimensionConfigClicked('environment')}>
                 {"Delete Selected Config"}
               </Button>
@@ -1759,7 +1796,6 @@ class NepiIFSim extends Component {
   renderCustomObstaclesEditor() {
     const dirty = this.state.environment_dimensions_dirty
     const previewFields = this.state.environment_dimensions_preview_fields
-    const obstacles = this.getCustomObstacles()
     return (
       <React.Fragment>
         <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
@@ -1771,12 +1807,8 @@ class NepiIFSim extends Component {
               {"Edited -- applies on the next Launch"}
             </div>
           : null}
+          {this.renderCustomObstacleControls()}
           <ButtonMenu>
-            {CUSTOM_OBSTACLE_TYPES.map((type) => (
-              <Button key={type} onClick={() => this.onAddObstacleClicked(type)}>
-                {"Add " + type.charAt(0).toUpperCase() + type.slice(1)}
-              </Button>
-            ))}
             {/* Same "Reset to Default" this role's other dimensions editor
                 (renderDimensionsEditor) has -- this custom-obstacles editor
                 is environment's OWN dimensions editor for that one model,
@@ -1787,7 +1819,6 @@ class NepiIFSim extends Component {
               {"Reset to " + FALLBACK_DIMENSION_CONFIG_NAME.environment}
             </Button>
           </ButtonMenu>
-          {obstacles.map((o, i) => this.renderObstacleFieldRow(o, i))}
           <Label title={"Name New Config"}>
             <Input
               id={"DimensionsSaveAsName_environment"}
@@ -1802,6 +1833,32 @@ class NepiIFSim extends Component {
             </Button>
           </ButtonMenu>
         </Section>
+      </React.Fragment>
+    )
+  }
+
+  // Add Wall/Circle/Triangle + the obstacle list itself -- factored out of
+  // renderCustomObstaclesEditor so it can ALSO render for every other
+  // environment model (Flat/Obstacle Course/Aerial Obstacle Course), not
+  // just Custom Obstacles -- requested live (2026-09-04): "the environment
+  // dimensions area also doesnt show the adding obstacles stuff for like
+  // walls, circles, etc. that should always be there." getCustomObstacles/
+  // setCustomObstacles read and write environment_dimensions_fields.obstacles,
+  // a plain array key that exists independently of which model's numeric
+  // fields happen to also be loaded, so adding one here alongside e.g. a
+  // Flat or Obstacle Course config's own fields doesn't clobber them.
+  renderCustomObstacleControls() {
+    const obstacles = this.getCustomObstacles()
+    return (
+      <React.Fragment>
+        <ButtonMenu>
+          {CUSTOM_OBSTACLE_TYPES.map((type) => (
+            <Button key={type} onClick={() => this.onAddObstacleClicked(type)}>
+              {"Add " + type.charAt(0).toUpperCase() + type.slice(1)}
+            </Button>
+          ))}
+        </ButtonMenu>
+        {obstacles.map((o, i) => this.renderObstacleFieldRow(o, i))}
       </React.Fragment>
     )
   }
@@ -2371,9 +2428,12 @@ class NepiIFSim extends Component {
             no edit box here on purpose: it's derived from horizontal FOV
             and the camera's aspect ratio (see generate_model_sdf.py's
             buildRoverSdf, which only ever takes camera_horizontal_fov_deg
-            as an input), not an independent physical parameter -- adding a
-            box that silently did nothing would be worse than not having
-            one. */}
+            as an input), not an independent physical parameter -- a small
+            italic note replaces the old disabled Input box that used to sit
+            here (requested live 2026-09-04: "vertical fov's edit box says
+            derived from horizontal, so its not editable anyways -- there
+            can just be a small italicized text saying that instead of it
+            taking a whole box"). */}
         {this.renderFieldPair(
           <Label title={"Set Horizontal FOV (deg)"}>
             <Input
@@ -2401,14 +2461,26 @@ class NepiIFSim extends Component {
               }}
             />
           </Label>,
-          <Label title={"Vertical FOV"}>
-            <Input disabled value={"derived from horizontal + aspect ratio"} />
-          </Label>
+          <div style={{ fontStyle: "italic", color: Styles.vars.colors.grey1, marginTop: Styles.vars.spacing.regular }}>
+            {"Vertical FOV is derived from horizontal FOV + aspect ratio"}
+          </div>
         )}
 
-        <Label title={"Last Error"}>
-          <Input disabled value={status_msg.last_error_message} />
-        </Label>
+        {/* Stacked title-then-text, not the two-column Label (title on the
+            left half, value on the right half) -- that split reads fine for
+            a short value but put a long wrapping error message in the
+            right half of the row, far from its own "Last Error" title.
+            Requested live (2026-09-04): "for the 'last error' box, keep it
+            close to the text." */}
+        {(status_msg.last_error_message !== '' && status_msg.last_error_message != null) ?
+          <div style={{ marginTop: Styles.vars.spacing.regular }}>
+            <div style={{ fontWeight: 'bold', textAlign: "left" }}>{"Last Error"}</div>
+            <div style={{ textAlign: "left", whiteSpace: "normal", wordBreak: "break-word",
+                          color: Styles.vars.colors.red }}>
+              {status_msg.last_error_message}
+            </div>
+          </div>
+        : null}
 
       </React.Fragment>
     )
@@ -2532,11 +2604,16 @@ class NepiIFSim extends Component {
             regardless. Configuring what shows up in Devices -> Robots is
             this app's actual purpose -- hiding it along with live control
             was an unintended side effect of the two being bundled into one
-            gated component. See docs/SIM_CONNECTOR_CONFIG_CONTROLS_PLAN.md. */}
+            gated component. See docs/SIM_CONNECTOR_CONFIG_CONTROLS_PLAN.md.
+            make_section=true (was false) + title given here now that this
+            is the first thing in the right column, not a headerless block
+            under Robot/Environment Config Settings -- gives it the same
+            bordered-box-with-title look those two already have. */}
         <NepiIFSimControls
           ref={this.simControlsRef}
           namespace={namespace}
-          make_section={false}
+          make_section={true}
+          title={"Sim Control Settings"}
           show_live_controls={show_controls}
         />
 
@@ -2544,10 +2621,15 @@ class NepiIFSim extends Component {
       </React.Fragment>
     )
 
+    // Divider between the two Columns -- requested live (2026-09-04):
+    // "since they're side by side but nothing is blocking one from the
+    // other." borderLeft on the right Column only (Column's own style prop
+    // merges into its root div), matching Section's own border color/width
+    // so it reads as part of the same visual language, not a one-off line.
     const content = (
       <Columns>
         <Column>{leftColumn}</Column>
-        <Column>{rightColumn}</Column>
+        <Column style={{ borderLeft: `1px solid ${Styles.vars.colors.grey1}`, paddingLeft: Styles.vars.spacing.regular }}>{rightColumn}</Column>
       </Columns>
     )
 
