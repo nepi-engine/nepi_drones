@@ -905,21 +905,19 @@ class NepiIFSim extends Component {
       return
     }
     this.props.ros.sendStringMsg(namespace + '/select_' + role + '_dimensions_config', name)
-    // Keeps NepiIFSimControls's own "Environment" dropdown (the control
-    // that actually spawns/despawns obstacles in Gazebo) in sync with this
-    // one (which only edits geometry fields) -- reported live: "the
-    // environment config on the top is selected as flat, but it still
-    // shows the obstacle course in the gazebo." Only these two names have
-    // a direct RBX Setting equivalent (FLAT_GROUND/OBSTACLE_COURSE);
-    // "Aerial Obstacle Course"/"Custom Obstacles"/any other saved name
-    // has none to guess at, so those are left alone on purpose -- see
-    // NepiIFSimControls's own setEnvironmentSetting for the other half.
+    // Drives NepiIFSimControls's own "environment" Setting (the control
+    // that actually spawns/despawns obstacles in Gazebo) so this selector
+    // is the ONE place environment changes take visual effect -- requested
+    // live (2026-09-04): "environment should be live changeable from the
+    // top selector too" (the separate dropdown this used to also require
+    // picking is gone now, see NepiIFSimControls's own setEnvironmentSetting
+    // comment). Sends every environment dimensions-config name now, not
+    // just "Flat"/"Obstacle Course" -- setEnvironmentSetting translates the
+    // name and the backend's own Setting validation harmlessly ignores a
+    // guess that doesn't match any real currently-scanned model, so this
+    // is safe even for a name with nothing to actually spawn.
     if (role === 'environment' && this.simControlsRef.current) {
-      if (name === 'Flat') {
-        this.simControlsRef.current.setEnvironmentSetting('Flat Ground')
-      } else if (name === 'Obstacle Course') {
-        this.simControlsRef.current.setEnvironmentSetting('Obstacle Course')
-      }
+      this.simControlsRef.current.setEnvironmentSetting(name)
     }
   }
 
@@ -1167,12 +1165,22 @@ class NepiIFSim extends Component {
         </ButtonMenu>
         {(this.state.show_environment_config_viewer === true) ?
           <Section title={"Environment Config Settings"}>
+            {/* Dimensions editor first, config viewer (YAML + Delete) below
+                it -- same reordering as Robot Config Settings above, and
+                same reasoning. "Reset to Obstacle Course" removed from
+                here entirely -- it now lives as a "Reset to Default"
+                button inside the dimensions editor itself
+                (renderDimensionsEditor/renderCustomObstaclesEditor), not
+                as a config-viewer action. */}
+            {(this.state.environment_dimensions_model === CUSTOM_OBSTACLES_MODEL) ?
+              this.renderCustomObstaclesEditor()
+            :
+              this.renderDimensionsEditor('environment', 'Environment Dimensions', environmentFieldDefs,
+                                            this.uploadEnvironmentSdfInputRef)
+            }
             <ButtonMenu>
               <Button disabled={!selected} onClick={() => this.onDeleteDimensionConfigClicked('environment')}>
                 {"Delete Selected Config"}
-              </Button>
-              <Button onClick={() => this.onSelectDimensionConfig('environment', FALLBACK_DIMENSION_CONFIG_NAME.environment)}>
-                {"Reset to " + FALLBACK_DIMENSION_CONFIG_NAME.environment}
               </Button>
             </ButtonMenu>
             {(yamlText !== '') ?
@@ -1185,12 +1193,6 @@ class NepiIFSim extends Component {
                         backgroundColor: DIAGRAM_BG, color: Styles.vars.colors.grey0 }}
               />
             : null}
-            {(this.state.environment_dimensions_model === CUSTOM_OBSTACLES_MODEL) ?
-              this.renderCustomObstaclesEditor()
-            :
-              this.renderDimensionsEditor('environment', 'Environment Dimensions', environmentFieldDefs,
-                                            this.uploadEnvironmentSdfInputRef)
-            }
           </Section>
         : null}
       </React.Fragment>
@@ -1346,6 +1348,17 @@ class NepiIFSim extends Component {
         </ButtonMenu>
         {(this.state.show_robot_config_viewer === true) ?
           <Section title={"Robot Config Settings"}>
+            {/* Dimensions editor first, config viewer/upload/download below
+                it -- requested live (2026-09-04): "in the robot and
+                environment config settings, the first thing in both should
+                be the respective dimensions editor, and then the config
+                viewers under that." Reset now lives in the dimensions
+                editor itself (renderDimensionsEditor's own Reset button),
+                not here -- "the reset config should be reset dimensions
+                instead there in the robot and environment dimensions
+                editing area." */}
+            {this.renderDimensionsEditor('robot', 'Robot Dimensions', ROBOT_DIMENSION_FIELDS,
+                                          this.uploadRobotSdfInputRef)}
             <input
               type="file"
               accept=".yaml,.yml,text/yaml"
@@ -1356,13 +1369,8 @@ class NepiIFSim extends Component {
             <ButtonMenu>
               <Button onClick={this.onUploadConfigClicked}>{"Upload Robot Config"}</Button>
               <Button onClick={this.onDownloadSampleConfigClicked}>{"Download Sample Config"}</Button>
-              <Button onClick={() => this.onSelectDimensionConfig('robot', FALLBACK_DIMENSION_CONFIG_NAME.robot)}>
-                {"Reset to " + FALLBACK_DIMENSION_CONFIG_NAME.robot}
-              </Button>
             </ButtonMenu>
             {this.renderRobotConfigAndDimensionsButtons()}
-            {this.renderDimensionsEditor('robot', 'Robot Dimensions', ROBOT_DIMENSION_FIELDS,
-                                          this.uploadRobotSdfInputRef)}
           </Section>
         : null}
       </React.Fragment>
@@ -1769,6 +1777,15 @@ class NepiIFSim extends Component {
                 {"Add " + type.charAt(0).toUpperCase() + type.slice(1)}
               </Button>
             ))}
+            {/* Same "Reset to Default" this role's other dimensions editor
+                (renderDimensionsEditor) has -- this custom-obstacles editor
+                is environment's OWN dimensions editor for that one model,
+                just a dynamic obstacle list instead of fixed numeric
+                fields, so it gets the same button rather than leaving this
+                one editor without a reset. */}
+            <Button onClick={() => this.onSelectDimensionConfig('environment', FALLBACK_DIMENSION_CONFIG_NAME.environment)}>
+              {"Reset to " + FALLBACK_DIMENSION_CONFIG_NAME.environment}
+            </Button>
           </ButtonMenu>
           {obstacles.map((o, i) => this.renderObstacleFieldRow(o, i))}
           <Label title={"Name New Config"}>
@@ -2224,6 +2241,15 @@ class NepiIFSim extends Component {
           <ButtonMenu>
             <Button onClick={() => this.onDownloadDimensionsClicked(role)}>{"Download Dimensions (YAML)"}</Button>
             <Button onClick={() => this.onUploadModelSdfClicked(role)}>{"Upload Raw model.sdf"}</Button>
+            {/* Requested live (2026-09-04): "the reset config should be
+                reset dimensions instead there in the robot and environment
+                dimensions editing area" -- moved here from the config-
+                viewer panel above (renderRobotConfigSettings/
+                renderEnvironmentConfigSettings), which no longer has a
+                Reset button of its own. */}
+            <Button onClick={() => this.onSelectDimensionConfig(role, FALLBACK_DIMENSION_CONFIG_NAME[role])}>
+              {"Reset to " + FALLBACK_DIMENSION_CONFIG_NAME[role]}
+            </Button>
           </ButtonMenu>
           {/* Names and persists the CURRENTLY EDITED fields (not just
               whichever config was last loaded), and makes the new name the
@@ -2412,9 +2438,26 @@ class NepiIFSim extends Component {
     const show_data = (this.props.show_data !== undefined) ? this.props.show_data : true
     const show_controls = (this.props.show_controls !== undefined) ? this.props.show_controls : true
 
-    const content = (
+    // Split into two half-width Columns, matching every other NEPI panel's
+    // own convention (System -> Device Manager's NepiSystemDevice.js splits
+    // its own content into two <Column> siblings the exact same way --
+    // Columns/Column's shared flex:1 style only actually halves the width
+    // when there are two sibling Columns to split; a single Column just
+    // fills 100%, which is what every section here rendered at before this
+    // change). Requested live (2026-09-04): "most of the other nepi
+    // windows are like this too, while sim connector takes the whole
+    // horizontal width per section."
+    //
+    // Left: pick-and-deploy plus live data -- what to run and whether it's
+    // actually running. Right: everything that shapes WHAT gets deployed
+    // (Robot/Environment Config Settings' dimensions editors) and the
+    // live/config controls for whatever robot is currently connected
+    // (NepiIFSimControls). Not a strict alternative split (e.g.
+    // alphabetical) -- grouped by "operate the sim" vs. "configure the
+    // sim/robot/environment", the same kind of task-based grouping Device
+    // Manager's own split uses (device/license/admin vs. network/time).
+    const leftColumn = (
       <React.Fragment>
-
         {(show_selectors === true) ?
           <React.Fragment>
             {/* NepiIFSimLauncher's own target selector IS the Simulator
@@ -2453,12 +2496,7 @@ class NepiIFSim extends Component {
 
             {/* Deploy/Kill/Install controls -- right after picking WHAT to
                 run (simulator), WHICH robot config, and WHICH environment
-                config, before Robot Config Settings and the capability-
-                configuration controls below.
-                Those only shape what a robot exposes once running (or, for
-                Robot Config Settings, manage config presets), not the
-                pick-and-go deploy decision -- keeping Deploy right under the
-                two things that actually decide what gets deployed. */}
+                config. */}
             <NepiIFSimLauncher
               namespace={namespace}
               make_section={false}
@@ -2470,14 +2508,22 @@ class NepiIFSim extends Component {
               unsaved_environment_dimensions={this.state.environment_dimensions_selected_config === ''}
               onSaveUnsavedDimensionsAs={this.saveDimensionsAsNamed}
             />
-
-            {this.renderRobotConfigSettings()}
-            {this.renderEnvironmentConfigSettings()}
           </React.Fragment>
         : null}
 
         {(show_data === true) ?
           this.renderData()
+        : null}
+      </React.Fragment>
+    )
+
+    const rightColumn = (
+      <React.Fragment>
+        {(show_selectors === true) ?
+          <React.Fragment>
+            {this.renderRobotConfigSettings()}
+            {this.renderEnvironmentConfigSettings()}
+          </React.Fragment>
         : null}
 
         {/* Always mounted, even when show_controls is false: NepiIFSimControls
@@ -2496,8 +2542,14 @@ class NepiIFSim extends Component {
           make_section={false}
           show_live_controls={show_controls}
         />
-
       </React.Fragment>
+    )
+
+    const content = (
+      <Columns>
+        <Column>{leftColumn}</Column>
+        <Column>{rightColumn}</Column>
+      </Columns>
     )
 
     if (make_section === false) {
