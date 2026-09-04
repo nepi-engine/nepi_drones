@@ -62,6 +62,17 @@ ROVER_DEFAULT_DIMENSIONS = {
     # gets reported, so the two can never drift out of sync with each
     # other.
     "camera_horizontal_fov_deg": 80.0,
+    # "Wheel independence" (crab-steering): each wheel gets its own vertical
+    # steering joint (a "steer hub" between base_link and the wheel) driven
+    # to point the commanded travel direction, so the rover can translate
+    # sideways/diagonally without its body yawing -- requested live
+    # (2026-09-04): "the robot (like a rover) can move to the side without
+    # its base moving, where only the wheels need to move a certain
+    # direction. the base can still face the same way... if its disabled,
+    # it will just work normally." 0 (default) = today's exact skid-steer
+    # behavior, byte-for-byte unchanged SDF output -- see buildRoverSdf's
+    # own branch on this field and docs/ROVER_WHEEL_INDEPENDENCE_PLAN.md.
+    "wheel_independence_enabled": 0.0,
 }
 
 OBSTACLE_COURSE_DEFAULT_DIMENSIONS = {
@@ -176,13 +187,34 @@ def buildRoverSdf(dims):
     mast_len = camera_rel_z - chassis_h / 2.0
     mast_z = chassis_h / 2.0 + mast_len / 2.0
 
+    wheel_independence_enabled = bool(dims["wheel_independence_enabled"])
+
     wheel_links = []
+    hub_links = []
     left_joint_tags = []
     right_joint_tags = []
     for name, x_sign, y_sign in ROVER_WHEELS:
         x = x_sign * x_off
         y = y_sign * y_off
-        wheel_links.append(_roverWheelLink(name, x, y, wheel_radius, wheel_width))
+        if wheel_independence_enabled:
+            # Real locomotion comes entirely from libgazebo_ros_planar_move
+            # in this mode (kinematic body-frame velocity, no wheel-ground
+            # traction involved at all) -- ground friction on the wheels
+            # serves no locomotion purpose here, only a chance of dragging
+            # against the body's own planar_move motion (the wheel is still
+            # in ground contact while being kinematically translated).
+            # Lowered as a precaution kept from an earlier debugging pass
+            # (mu=1.5/mu2=0.2, tuned for the disabled case's skid-steer
+            # turning) before the real steering bug -- a missing
+            # robotNamespace on nepi_crab_steer_plugin's own cmd_vel
+            # subscriber, see docs/ROVER_WHEEL_INDEPENDENCE_PLAN.md's "what
+            # went wrong" section -- was found; not re-verified against
+            # default friction since the passing live test below already
+            # ran with this value in place.
+            wheel_links.append(_roverWheelLink(name, x, y, wheel_radius, wheel_width, mu=0.05, mu2=0.05))
+            hub_links.append(_roverWheelHubLink(name, x, y, wheel_radius))
+        else:
+            wheel_links.append(_roverWheelLink(name, x, y, wheel_radius, wheel_width))
         if y_sign > 0:
             left_joint_tags.append(f"      <leftJoint>{name}_joint</leftJoint>")
         else:
@@ -193,6 +225,72 @@ def buildRoverSdf(dims):
 
     wheel_separation = track_width
     wheel_diameter = wheel_radius * 2.0
+
+    # Disabled (default): EXACTLY today's plugin, unchanged. Enabled:
+    # libgazebo_ros_planar_move (stock Gazebo plugin, real body-frame x/y/yaw
+    # kinematics from the same cmd_vel Twist -- unlike diff_drive it natively
+    # understands linear.y) drives the actual motion, and
+    # nepi_crab_steer_plugin (nepi_gazebo_plugins package, this repo's own)
+    # purely animates the 4 wheel corners to visually steer+spin in a way
+    # consistent with that motion. Two independent cmd_vel subscribers on
+    # one topic is fine.
+    if wheel_independence_enabled:
+        wheel_plugin_entries = "\n".join(
+            f'      <wheel steerJoint="{name}_steer_joint" spinJoint="{name}_joint"/>'
+            for name, _x, _y in ROVER_WHEELS
+        )
+        drive_plugin_block = f"""    <plugin name="planar_move_controller" filename="libgazebo_ros_planar_move.so">
+      <robotNamespace>/rover</robotNamespace>
+      <commandTopic>cmd_vel</commandTopic>
+      <odometryTopic>odom</odometryTopic>
+      <odometryFrame>odom</odometryFrame>
+      <odometryRate>30.0</odometryRate>
+      <robotBaseFrame>base_link</robotBaseFrame>
+    </plugin>
+
+    <plugin name="crab_steer_controller" filename="libnepi_crab_steer_plugin.so">
+      <robotNamespace>/rover</robotNamespace>
+      <commandTopic>cmd_vel</commandTopic>
+      <wheelRadius>{wheel_radius}</wheelRadius>
+{wheel_plugin_entries}
+    </plugin>"""
+    else:
+        drive_plugin_block = f"""    <plugin name="diff_drive_controller" filename="libgazebo_ros_diff_drive.so">
+      <robotNamespace>/rover</robotNamespace>
+      <commandTopic>cmd_vel</commandTopic>
+      <odometryTopic>odom</odometryTopic>
+      <odometryFrame>odom</odometryFrame>
+      <odometrySource>world</odometrySource>
+      <robotBaseFrame>base_link</robotBaseFrame>
+      <!-- Repeated leftJoint/rightJoint tags: gazebo_ros_diff_drive drives
+           every listed left-side joint identically and every right-side
+           joint identically, exactly the skid-steer pattern the front/rear
+           axle pairs need. -->
+{left_joint_tags}
+{right_joint_tags}
+      <wheelSeparation>{wheel_separation:.6f}</wheelSeparation>
+      <wheelDiameter>{wheel_diameter:.6f}</wheelDiameter>
+      <wheelTorque>25.0</wheelTorque>
+      <!-- 0.0 here means UNLIMITED (libgazebo_ros_diff_drive's own
+           documented meaning: no cap on how fast the plugin's internal PID
+           target can change per step), reported live: "if you change
+           motor controls too rapidly, ex: putting to 100% and then -100%
+           after 5 seconds, it starts going crazy and randomly glitching
+           out." A 100% to -100% command was a literal step-function
+           velocity reversal with the full 25 N*m of wheelTorque applied
+           instantly to chase it, exactly the kind of single-timestep delta
+           that diverges ODE's constraint solver. Capped instead of left
+           unlimited; RESET_SIM "helping" was never fixing the physics,
+           just teleporting the model back to clear the diverged state
+           (see rbx_sim_node.py's resetSimAction), this fixes the actual
+           cause. -->
+      <wheelAcceleration>3.0</wheelAcceleration>
+      <updateRate>30.0</updateRate>
+      <publishOdomTF>true</publishOdomTF>
+      <publishWheelTF>false</publishWheelTF>
+      <publishWheelJointState>false</publishWheelJointState>
+      <legacyMode>false</legacyMode>
+    </plugin>"""
 
     return f"""<?xml version='1.0'?>
 <sdf version="1.6">
@@ -264,8 +362,8 @@ def buildRoverSdf(dims):
          longitudinal traction and mu2 is lateral; 0.2 lateral keeps enough
          grip that the rover doesn't slide under its own weight while still
          allowing the skid a turn requires. -->
-{"".join(wheel_links)}
-{_roverJoints()}
+{"".join(wheel_links)}{"".join(hub_links)}
+{_roverJoints(wheel_independence_enabled)}
 
     <!-- Camera at (0.2, 0.0, 0.5) relative to base_link -- x offset is a
          fixed spec value (not a curated field), z offset (0.5m above
@@ -425,52 +523,47 @@ def buildRoverSdf(dims):
       <child>camera_link_chase</child>
     </joint>
 
-    <plugin name="diff_drive_controller" filename="libgazebo_ros_diff_drive.so">
-      <robotNamespace>/rover</robotNamespace>
-      <commandTopic>cmd_vel</commandTopic>
-      <odometryTopic>odom</odometryTopic>
-      <odometryFrame>odom</odometryFrame>
-      <odometrySource>world</odometrySource>
-      <robotBaseFrame>base_link</robotBaseFrame>
-      <!-- Repeated leftJoint/rightJoint tags: gazebo_ros_diff_drive drives
-           every listed left-side joint identically and every right-side
-           joint identically, exactly the skid-steer pattern the front/rear
-           axle pairs need. -->
-{left_joint_tags}
-{right_joint_tags}
-      <wheelSeparation>{wheel_separation:.6f}</wheelSeparation>
-      <wheelDiameter>{wheel_diameter:.6f}</wheelDiameter>
-      <wheelTorque>25.0</wheelTorque>
-      <!-- 0.0 here means UNLIMITED (libgazebo_ros_diff_drive's own
-           documented meaning: no cap on how fast the plugin's internal PID
-           target can change per step), reported live: "if you change
-           motor controls too rapidly, ex: putting to 100% and then -100%
-           after 5 seconds, it starts going crazy and randomly glitching
-           out." A 100% to -100% command was a literal step-function
-           velocity reversal with the full 25 N*m of wheelTorque applied
-           instantly to chase it, exactly the kind of single-timestep delta
-           that diverges ODE's constraint solver. Capped instead of left
-           unlimited; RESET_SIM "helping" was never fixing the physics,
-           just teleporting the model back to clear the diverged state
-           (see rbx_sim_node.py's resetSimAction), this fixes the actual
-           cause. -->
-      <wheelAcceleration>3.0</wheelAcceleration>
-      <updateRate>30.0</updateRate>
-      <publishOdomTF>true</publishOdomTF>
-      <publishWheelTF>false</publishWheelTF>
-      <publishWheelJointState>false</publishWheelJointState>
-      <legacyMode>false</legacyMode>
-    </plugin>
+{drive_plugin_block}
 
   </model>
 </sdf>
 """
 
 
-def _roverJoints():
-    return "".join(
-        f"""    <joint name="{name}_joint" type="revolute">
+def _roverJoints(wheel_independence_enabled=False):
+    if not wheel_independence_enabled:
+        return "".join(
+            f"""    <joint name="{name}_joint" type="revolute">
       <parent>base_link</parent>
+      <child>{name}</child>
+      <axis>
+        <xyz>0 1 0</xyz>
+        <use_parent_model_frame>true</use_parent_model_frame>
+      </axis>
+    </joint>
+
+"""
+            for name, _x, _y in ROVER_WHEELS
+        )
+    # Two-joint chain per wheel instead of one: a new steering revolute (Z
+    # axis, base_link -> {name}_hub) plus the SAME spin joint the disabled
+    # case above uses (Y axis, same name -- so left_joint_tags/
+    # right_joint_tags built in buildRoverSdf still reference a real joint
+    # even though this branch never actually uses them), just re-parented
+    # from base_link to the new hub link. nepi_crab_steer_plugin drives both
+    # by name -- see buildRoverSdf's own plugin block.
+    return "".join(
+        f"""    <joint name="{name}_steer_joint" type="revolute">
+      <parent>base_link</parent>
+      <child>{name}_hub</child>
+      <axis>
+        <xyz>0 0 1</xyz>
+        <use_parent_model_frame>true</use_parent_model_frame>
+      </axis>
+    </joint>
+
+    <joint name="{name}_joint" type="revolute">
+      <parent>{name}_hub</parent>
       <child>{name}</child>
       <axis>
         <xyz>0 1 0</xyz>
@@ -483,7 +576,7 @@ def _roverJoints():
     )
 
 
-def _roverWheelLink(name, x, y, radius, width):
+def _roverWheelLink(name, x, y, radius, width, mu=1.5, mu2=0.2):
     return f"""    <link name="{name}">
       <pose>{x:.6f} {y:.6f} {radius:.6f} -1.5707963 0 0</pose>
       <inertial>
@@ -507,8 +600,8 @@ def _roverWheelLink(name, x, y, radius, width):
         <surface>
           <friction>
             <ode>
-              <mu>1.5</mu>
-              <mu2>0.2</mu2>
+              <mu>{mu}</mu>
+              <mu2>{mu2}</mu2>
               <fdir1>1 0 0</fdir1>
             </ode>
           </friction>
@@ -526,6 +619,32 @@ def _roverWheelLink(name, x, y, radius, width):
           <diffuse>0.05 0.05 0.05 1</diffuse>
         </material>
       </visual>
+    </link>
+
+"""
+
+
+# Wheel-independence-only steering hub -- sits between base_link and a wheel
+# link, at the same (x, y, wheel_radius) point the wheel's own joint used to
+# attach directly to base_link at. Negligible mass/inertia, same convention
+# camera_link already uses for its own non-structural helper links (this
+# repo has no true massless/zero-inertia link -- ODE needs a real, if tiny,
+# inertia for numerical stability). No visual/collision of its own: it's a
+# kinematic bookkeeping link, not something meant to be seen.
+def _roverWheelHubLink(name, x, y, z):
+    return f"""    <link name="{name}_hub">
+      <pose>{x:.6f} {y:.6f} {z:.6f} 0 0 0</pose>
+      <inertial>
+        <mass>0.05</mass>
+        <inertia>
+          <ixx>0.00001</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.00001</iyy>
+          <iyz>0</iyz>
+          <izz>0.00001</izz>
+        </inertia>
+      </inertial>
     </link>
 
 """

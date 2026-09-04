@@ -141,6 +141,20 @@ const ROBOT_DIMENSION_FIELDS = [
   { name: "weight_kg", title: "Weight (kg)", default: 5.0,
     altUnit: { title: "Weight (lbs)", toAlt: (kg) => kg * 2.20462, fromAlt: (lbs) => lbs / 2.20462 } },
   { name: "camera_horizontal_fov_deg", title: "Camera Horizontal FOV (deg)", default: 80.0 },
+  // Crab-steering: each wheel gets its own steering joint and can point the
+  // commanded travel direction, so the rover translates sideways/diagonally
+  // without its body yawing -- requested live (2026-09-04): "the robot
+  // (like a rover) can move to the side without its base moving, where
+  // only the wheels need to move a certain direction... if its disabled,
+  // it will just work normally." Plain numeric 0/1 field, same convention
+  // every other curated dimension here already uses -- no dedicated toggle
+  // widget needed. 0 (default) is today's exact skid-steer behavior,
+  // unchanged; see generate_model_sdf.py's buildRoverSdf for the SDF this
+  // drives (a new steer-hub link + libgazebo_ros_planar_move +
+  // nepi_gazebo_plugins' own crab-steer plugin, in place of
+  // libgazebo_ros_diff_drive) and docs/ROVER_WHEEL_INDEPENDENCE_PLAN.md
+  // for the full design.
+  { name: "wheel_independence_enabled", title: "Wheel Independence (0=Off, 1=On)", default: 0.0 },
 ]
 
 const OBSTACLE_COURSE_DIMENSION_FIELDS = [

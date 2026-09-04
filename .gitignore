@@ -39,3 +39,9 @@ __pycache__/
 sim_container/scan_data/raw/
 sim_container/scan_data/processed/*
 !sim_container/scan_data/processed/.gitkeep
+
+# Local cmake/make build output for nepi_gazebo_plugins -- this dev machine
+# builds it directly (no catkin workspace here) for local verification;
+# the actual target workspace runs its own catkin build, this directory is
+# never the thing that gets deployed.
+sim_container/nepi_gazebo_plugins/build/
