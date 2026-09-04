@@ -281,8 +281,16 @@ class Watcher(object):
       self._writeStatus(request_id, target_key, 'launch', 'failed',
                          error=target_key + ' is already running')
       return
+    # start_new_session=True (setsid) so this script's own $$ is genuinely
+    # its process GROUP id too, not just its pid -- found live (2026-09-04)
+    # that stop_command's own `kill -- -$(cat pgid_file)` was a silent
+    # no-op without this: a plain subprocess.Popen child inherits ITS
+    # PARENT's (this watcher's) process group, so the pgid file recorded a
+    # number that named no real process group at all, and gzserver/the
+    # rest of the launched tree survived a "successful" stop untouched.
     proc = subprocess.Popen(['bash', '-l', script_path],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                             start_new_session=True)
     self.launch_procs[target_key] = {'proc': proc, 'request_id': request_id}
     time.sleep(LAUNCH_STARTUP_GRACE_SEC)
     rc = proc.poll()
@@ -405,8 +413,13 @@ class Watcher(object):
     try:
       with open(script_path, 'w') as f:
         f.write(_strip_wrapper(launch_command))
+      # start_new_session=True -- see _handleLaunch's own comment on this
+      # exact same line for why: without it, this script's own $$ (what it
+      # echoes into its pgid file) isn't really its process group id, and
+      # stop_command's `kill -- -$(cat pgid_file)` silently kills nothing.
       proc = subprocess.Popen(['bash', '-l', script_path],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                               start_new_session=True)
     except Exception as e:
       self._writeDeployStatus(target_key, 'failed', error=str(e))
       return
