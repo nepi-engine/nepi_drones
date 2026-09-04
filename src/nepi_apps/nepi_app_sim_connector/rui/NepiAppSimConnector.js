@@ -24,7 +24,6 @@ import { observer, inject } from "mobx-react"
 import { Columns, Column } from "./Columns"
 
 import NepiIFSim from "./Nepi_IF_Sim"
-import NepiIFSimOsInstances from "./Nepi_IF_SimOsInstances"
 
 @inject("ros")
 @observer
@@ -88,16 +87,16 @@ class NepiAppSimConnector extends Component {
       <Columns>
         <Column>
 
-          {/* Additive "OS selected" picker (see docs/SIM_OS_INSTANCES_PLAN.md) --
-              mounted above NepiIFSim so it reads as the top control of this
-              section. Selecting a registered instance here re-points every
-              simulator_launch_targets.yaml target's host/ssh_user/ssh_port at
-              that machine; NepiIFSim/NepiIFSimLauncher below are unmodified and
-              keep working exactly as before regardless of which instance (if
-              any) is selected. */}
-          <NepiIFSimOsInstances
-            namespace={simNamespace}
-          />
+          {/* The reverse-SSH "OS instance" deploy-target picker
+              (NepiIFSimOsInstances, see docs/SIM_OS_INSTANCES_PLAN.md) is
+              deliberately not mounted here anymore -- requested live
+              (2026-09-04): with the shared-storage deploy_state.yaml flag
+              file now the real deploy/kill transport (see
+              simulator_launcher.py's _launch_via_deploy_state), reverse SSH
+              and per-machine registration aren't needed for deploy/kill to
+              work. The component and its backend topics are untouched, just
+              unmounted -- remount it here if reverse SSH deploy targets are
+              needed again later. */}
 
           {/* show_controls is deliberately false, not a bug -- this panel's job is
               standing up the right sim/robot config, not direct control. Manual
