@@ -920,6 +920,16 @@ class NepiIFSim extends Component {
     if (role === 'environment' && this.simControlsRef.current) {
       this.simControlsRef.current.setEnvironmentSetting(name)
     }
+    // Auto-expand the matching Config Settings panel -- both panels default
+    // collapsed (show_robot_config_viewer/show_environment_config_viewer
+    // start false), so picking a new config from the plain selector above
+    // (or from the merged Robot Configs / Environment Configs button rows
+    // inside an ALREADY-expanded panel) used to send the request but never
+    // visibly show its result unless the panel happened to already be open.
+    // Requested live (2026-09-04): "changing a different environment in the
+    // dropdown should automatically pull up the right environment the
+    // second it happens, like what it was in the bottom."
+    this.setState(role === 'robot' ? { show_robot_config_viewer: true } : { show_environment_config_viewer: true })
   }
 
   // Saves the CURRENTLY EDITED fields (not the last-loaded config) under a
@@ -1117,7 +1127,17 @@ class NepiIFSim extends Component {
   // whichever option happens to be first, which would misleadingly look
   // like that config is what's actually active.
   renderEnvironmentConfigSelector() {
-    const names = this.state.environment_dimensions_config_names
+    // "Custom Obstacles" excluded here (and from the Environment Configs
+    // button row in renderEnvironmentConfigSettings) -- requested live
+    // (2026-09-04): "remove 'custom obstacles' since you need to save it
+    // as a new name to select it anyways." It's a template with no
+    // obstacles of its own, never directly deployable; Add Wall/Circle/
+    // Triangle is now available from every environment's own dimensions
+    // editor (see renderCustomObstacleControls), so reaching the same
+    // result no longer needs picking this placeholder first. A config a
+    // user actually SAVED from it keeps appearing here under its own given
+    // name -- only the literal built-in template name is hidden.
+    const names = this.state.environment_dimensions_config_names.filter((n) => n !== 'Custom Obstacles')
     const selected = this.state.environment_dimensions_selected_config
     return (
       <Label title={"Environment Config"}>
@@ -1154,7 +1174,9 @@ class NepiIFSim extends Component {
       return null
     }
     const selected = this.state.environment_dimensions_selected_config
-    const names = this.state.environment_dimensions_config_names
+    // "Custom Obstacles" excluded here too -- see renderEnvironmentConfigSelector's
+    // own comment for why.
+    const names = this.state.environment_dimensions_config_names.filter((n) => n !== 'Custom Obstacles')
     const yamlText = this.state.environment_dimensions_config_yaml_text
     const environmentFieldDefs = ENVIRONMENT_DIMENSION_FIELDS_BY_MODEL[this.state.environment_dimensions_model] || []
     return (
