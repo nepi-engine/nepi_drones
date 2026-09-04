@@ -786,9 +786,18 @@ class OsInstanceRegistry(object):
         if not target:
           continue
         target['connection_mode'] = connection_mode
-        if connection_mode == 'shared_storage':
-          target['os_instance_id'] = instance_id
-        else:
+        # Set unconditionally, even for an 'ssh' instance -- this is what
+        # lets simulator_launcher.py fall back to the shared_storage
+        # transport automatically when the reverse SSH tunnel dies mid-
+        # session (see that module's own _try_shared_storage_fallback):
+        # it needs to know WHICH instance's mailbox to check for a live
+        # watcher, and there is no separate "register a shared_storage
+        # instance too" step required for this -- an operator gets the
+        # fallback for free just by starting vm_command_watcher.py with
+        # this SAME instance_id on the SAME machine, as insurance, without
+        # ever touching connection_mode here at all.
+        target['os_instance_id'] = instance_id
+        if connection_mode != 'shared_storage':
           target['host'] = instance['host']
           target['ssh_user'] = instance['ssh_user']
           target['ssh_port'] = instance['ssh_port']

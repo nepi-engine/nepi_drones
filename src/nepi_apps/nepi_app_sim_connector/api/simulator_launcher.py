@@ -85,6 +85,14 @@ VM_COMMANDS_STORAGE_DIR = '/mnt/nepi_storage/databases/nepi_app_sim_connector/vm
 # this side's own polling loop.
 SHARED_STORAGE_POLL_GRACE_SEC = 5
 SHARED_STORAGE_POLL_INTERVAL_SEC = 1.0
+# Mirrors os_instance_registry.py's own WATCHER_HEARTBEAT_INTERVAL_SEC/
+# WATCHER_HEARTBEAT_STALE_AFTER_SEC (duplicated, not imported -- same reason
+# this file's own module docstring gives for why these two modules don't
+# import each other). Used by _shared_storage_watcher_alive below, the same
+# "is a watcher actually alive here" test _verify_shared_storage does for an
+# operator-initiated Test Connection, just reused here for an AUTOMATIC,
+# no-operator-action fallback check.
+WATCHER_HEARTBEAT_STALE_AFTER_SEC = 20
 
 
 class LauncherError(Exception):
@@ -599,7 +607,7 @@ class SimulatorLauncher(object):
       raise LauncherError("scan_to_environment.py failed for " + environment_name + ": " +
                           (result.stderr or result.stdout or "unknown error"))
 
-  def _is_connection_level_failure(self, result):
+  def _is_connection_level_failure(self, returncode, stderr):
     """True when the ssh CLIENT itself never reached the remote command --
     connection refused, timed out, host unreachable, auth rejected -- as
     opposed to the remote command running and exiting non-zero on its own.
@@ -609,16 +617,27 @@ class SimulatorLauncher(object):
     to tell them apart: confirmed the hard way when the reverse tunnel died
     across a device reboot and every target -- including gazebo_rover, which
     was never touched -- reported not_installed instead of unknown, sending
-    the operator to click Install on something already on the VM.
+    the operator to click Install on something already on the VM. Also the
+    gate _try_shared_storage_fallback's own callers use to decide whether a
+    failure is even eligible for that fallback -- a real remote script error
+    (e.g. gazebo_rover's own "a gzserver is already running" refuse-to-launch
+    guard, exit code 3) is NOT a connection problem and must not trigger a
+    fallback that would just hit the identical real error a second time
+    over a different transport.
 
     OpenSSH reserves exit code 255 for its own client-side errors and never
     uses it to relay a remote command's exit status (a real remote script
     exiting 255 -- reserved by POSIX shells for "exit status out of range" --
     would be a strange coincidence, so the stderr text is checked too rather
-    than trusting the exit code alone)."""
-    if result.returncode != 255:
+    than trusting the exit code alone).
+
+    Takes returncode/stderr directly rather than a subprocess.run result
+    object -- launch()'s own connection-level check is against a Popen it
+    already polled and communicate()'d, not a fresh result object, so this
+    needs to work from either call shape."""
+    if returncode != 255:
       return False
-    stderr = (result.stderr or "").lower()
+    stderr = (stderr or "").lower()
     connection_phrases = (
         "connection refused", "connection timed out", "operation timed out",
         "no route to host", "could not resolve hostname",
@@ -626,6 +645,90 @@ class SimulatorLauncher(object):
         "connection closed by remote host", "connection reset by peer",
     )
     return any(phrase in stderr for phrase in connection_phrases)
+
+  def _shared_storage_watcher_alive(self, os_instance_id):
+    """Cheap, local-file-only liveness check for a shared_storage fallback
+    watcher -- just a stat+read of one small JSON file, no network stall,
+    so this is safe to call on every single connection-level SSH failure
+    without adding meaningful latency (unlike re-probing SSH itself, or
+    dispatching a real command and waiting on it). Mirrors
+    os_instance_registry.py's own _verify_shared_storage (duplicated, not
+    imported -- see this file's own module docstring for why these two
+    modules stay independent). Returns False (never raises) for an empty/
+    missing os_instance_id, a missing heartbeat file, a malformed one, or
+    one older than WATCHER_HEARTBEAT_STALE_AFTER_SEC."""
+    if not os_instance_id:
+      return False
+    heartbeat_path = os.path.join(VM_COMMANDS_STORAGE_DIR, os_instance_id,
+                                   'watcher_heartbeat.json')
+    try:
+      with open(heartbeat_path, 'r') as f:
+        heartbeat = json.load(f)
+    except (OSError, ValueError):
+      return False
+    alive_at = heartbeat.get('alive_at')
+    if not isinstance(alive_at, (int, float)):
+      return False
+    return (time.time() - alive_at) <= WATCHER_HEARTBEAT_STALE_AFTER_SEC
+
+  def _try_shared_storage_fallback(self, target, target_key, action, script_text, timeout_sec):
+    """Automatic, no-operator-action fallback for an ssh-mode target whose
+    reverse SSH tunnel just failed at the connection level: requested live
+    (2026-09-04) after a reverse-SSH-into-an-operator's-own-machine
+    connectivity failure blocked a launch entirely -- "if that happens, fall
+    back to the nepi storage (shared file) architecture... so we don't have
+    to worry about reverse ssh. make that ready so its fool proof for any
+    type of machine."
+
+    If THIS SAME instance (target['os_instance_id'], now set unconditionally
+    by os_instance_registry.py's select() regardless of connection_mode --
+    see that method's own comment) also has a live vm_command_watcher.py
+    running there (checked via _shared_storage_watcher_alive, a cheap local
+    read, not another slow network probe), retries the exact same action
+    over the shared-storage transport instead of failing the whole call.
+    This is the ONLY thing that makes "just start vm_command_watcher.py on
+    the same machine, pointed at the same instance_id, as insurance" work
+    end to end -- the transport itself (_dispatch_shared_storage) already
+    existed for an operator-initiated, separately-registered
+    connection_mode='shared_storage' instance; this is what makes it kick in
+    automatically for an EXISTING ssh-mode instance's own failures, with no
+    separate registration, no mode switch, and no operator action beyond
+    having started that one watcher process ahead of time on any machine
+    that can mount the same nepi_storage share (which is the whole point of
+    that share already being universally reachable -- Windows, Linux, WSL,
+    whatever -- unlike a reverse SSH tunnel's own per-OS setup).
+
+    Returns (True, status_dict) on any response from the watcher (even a
+    failed one -- caller decides what that means for its own action, same
+    division of responsibility _dispatch_shared_storage's own docstring
+    already establishes), or (False, None) when there is no fallback to try
+    (no os_instance_id recorded on this target, its watcher isn't alive, or
+    the watcher never responds at all within the deadline) -- the caller's
+    existing SSH-failure error/message path is unchanged in that case, so a
+    deployment with no fallback watcher configured behaves exactly as
+    before this feature existed.
+
+    On success, flips target['connection_mode'] to 'shared_storage' in
+    place so every LATER call for this same target_key (is_ready polling a
+    launch that just fell back, a subsequent stop()) also goes straight to
+    the shared-storage transport instead of paying another SSH connection
+    timeout first -- the same in-place mutation os_instance_registry.py's
+    own select() already does for an operator's explicit mode choice, just
+    triggered by a failure instead of a click. Left in place for the rest of
+    this launcher's lifetime (or until reload_if_changed()/a fresh select()
+    resets it) rather than reverted once SSH recovers -- staying on a
+    transport that's confirmed working is the point ("so we don't have to
+    worry about reverse ssh"), not a reason to keep re-testing the one that
+    just failed."""
+    os_instance_id = target.get('os_instance_id', '')
+    if not self._shared_storage_watcher_alive(os_instance_id):
+      return False, None
+    try:
+      _, status = self._dispatch_shared_storage(target, target_key, action, script_text, timeout_sec)
+    except LauncherError:
+      return False, None
+    target['connection_mode'] = 'shared_storage'
+    return True, status
 
   def _classify_connection_failure(self, target, stderr):
     """Returns a clearer message for a connection-level SSH failure against
@@ -709,6 +812,14 @@ class SimulatorLauncher(object):
     time.sleep(LAUNCH_STARTUP_GRACE_SEC)
     if proc.poll() is not None:
       _, stderr = proc.communicate()
+      if self._is_connection_level_failure(proc.returncode, stderr):
+        fell_back, status = self._try_shared_storage_fallback(
+            target, target_key, "launch", command, LAUNCH_STARTUP_GRACE_SEC)
+        if fell_back:
+          if status.get("state") == "failed":
+            raise LauncherError(
+                "Launch failed via shared-storage fallback: " + status.get("error", ""))
+          return
       tunnel_message = self._classify_connection_failure(target, stderr)
       if tunnel_message:
         raise LauncherError(tunnel_message, manual_fallback_commands=REVERSE_TUNNEL_FALLBACK_COMMANDS)
@@ -737,6 +848,12 @@ class SimulatorLauncher(object):
     try:
       result = self._run_remote(target, ready_check_command, timeout_sec=SSH_CONNECT_TIMEOUT_SEC + 2)
     except LauncherError:
+      return False
+    if self._is_connection_level_failure(result.returncode, result.stderr):
+      fell_back, status = self._try_shared_storage_fallback(
+          target, target_key, "ready_check", ready_check_command, SSH_CONNECT_TIMEOUT_SEC + 2)
+      if fell_back:
+        return status.get("exit_code") == 0
       return False
     return result.returncode == 0
 
@@ -768,7 +885,16 @@ class SimulatorLauncher(object):
                                        SSH_CONNECT_TIMEOUT_SEC + 5)
       return
     if stop_command:
-      self._run_remote(target, stop_command, timeout_sec=SSH_CONNECT_TIMEOUT_SEC + 5)
+      result = self._run_remote(target, stop_command, timeout_sec=SSH_CONNECT_TIMEOUT_SEC + 5)
+      if self._is_connection_level_failure(result.returncode, result.stderr):
+        # Best-effort as before if there's no fallback to try -- stop() has
+        # never raised on the remote command's own outcome (see this
+        # method's own division of labor: worst case, a leftover process
+        # gets caught by the next launch's own "already running" guard),
+        # so a connection failure with nothing to fall back to still just
+        # falls through to reaping the local ssh Popen below, unchanged.
+        self._try_shared_storage_fallback(target, target_key, "stop", stop_command,
+                                           SSH_CONNECT_TIMEOUT_SEC + 5)
     proc = self._launch_procs.pop(target_key, None)
     if proc is not None:
       try:
@@ -884,7 +1010,11 @@ class SimulatorLauncher(object):
           SSH_CONNECT_TIMEOUT_SEC + 5)
       return status.get("exit_code") == 0
     result = self._run_remote(target, check_command, timeout_sec=SSH_CONNECT_TIMEOUT_SEC + 5)
-    if self._is_connection_level_failure(result):
+    if self._is_connection_level_failure(result.returncode, result.stderr):
+      fell_back, status = self._try_shared_storage_fallback(
+          target, target_key, "check_installed", check_command, SSH_CONNECT_TIMEOUT_SEC + 5)
+      if fell_back:
+        return status.get("exit_code") == 0
       tunnel_message = self._classify_connection_failure(target, result.stderr)
       if tunnel_message:
         raise LauncherError(tunnel_message, manual_fallback_commands=REVERSE_TUNNEL_FALLBACK_COMMANDS)
@@ -924,7 +1054,22 @@ class SimulatorLauncher(object):
             (status.get("error") or "").strip())
       return
     result = self._run_remote(target, install_command, timeout_sec=INSTALL_TIMEOUT_SEC)
-    if self._is_connection_level_failure(result):
+    if self._is_connection_level_failure(result.returncode, result.stderr):
+      fell_back, status = self._try_shared_storage_fallback(
+          target, target_key, "install", install_command, INSTALL_TIMEOUT_SEC)
+      if fell_back:
+        if status.get("exit_code") != 0:
+          error_lower = (status.get("error") or "").lower()
+          if ("a terminal is required to read the password" in error_lower
+              or "sudo: no tty present" in error_lower):
+            raise LauncherError(
+                "Install failed: sudo needs a password, but Install runs non-interactively "
+                "with no way to prompt for one.",
+                manual_fallback_commands=SUDO_NOPASSWD_FALLBACK_COMMANDS)
+          raise LauncherError(
+              "Install command exited " + str(status.get("exit_code")) + ": " +
+              (status.get("error") or "").strip())
+        return
       tunnel_message = self._classify_connection_failure(target, result.stderr)
       if tunnel_message:
         raise LauncherError(tunnel_message, manual_fallback_commands=REVERSE_TUNNEL_FALLBACK_COMMANDS)
