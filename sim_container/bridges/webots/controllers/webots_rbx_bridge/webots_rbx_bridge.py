@@ -207,7 +207,7 @@ class WebotsRbxBridge:
   def heartbeatLoop(self):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(('127.0.0.1', self.heartbeat_port))
+    srv.bind(('0.0.0.0', self.heartbeat_port))  # 0.0.0.0: direct-LAN reachable, see sim_bridge_node.py's own bind comment
     srv.listen(1)
     while True:
       try:
@@ -228,7 +228,7 @@ class WebotsRbxBridge:
   def bridgeServerLoop(self):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(('127.0.0.1', self.bridge_port))
+    srv.bind(('0.0.0.0', self.bridge_port))  # 0.0.0.0: direct-LAN reachable, see sim_bridge_node.py's own bind comment
     srv.listen(1)
     while True:
       conn, _ = srv.accept()

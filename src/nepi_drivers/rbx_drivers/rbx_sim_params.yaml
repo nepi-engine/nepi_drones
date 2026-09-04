@@ -21,3 +21,18 @@ driver:
           - SIMULATOR
         default: SIMULATOR
         value: SIMULATOR
+      # The dev VM's real address, for a direct LAN connection when the VM
+      # and this device share a physical network -- no reverse SSH tunnel
+      # needed for the heartbeat/bridge TCP traffic itself in that case (see
+      # rbx_sim_discovery.py's own sim_addr_list comment for the full
+      # reasoning). Defaults to the loopback-via-reverse-tunnel convention
+      # every existing single-VM setup already relies on, so an unattended
+      # device with nothing else configured behaves exactly as before.
+      # sim_connector_app_node.py pushes the currently-selected OS
+      # instance's own host here automatically on select() when it differs
+      # from loopback -- see that method's own comment.
+      sim_host:
+        type: String
+        options: []
+        default: "127.0.0.1"
+        value: "127.0.0.1"

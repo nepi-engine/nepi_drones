@@ -45,10 +45,31 @@ class SimDiscovery:
   # The generic-rover Gazebo simulation runs on the dev VM, whose sim stack
   # (sim_rover_gazebo / sim_rover_gazebo_multi in sim_rover_dev_env.sh)
   # starts a tiny plain-TCP heartbeat listener (sim_heartbeat_listener.py)
-  # per robot, forwarded to this device's own loopback by the existing
-  # reverse SSH tunnel (nepi_tunnel). The two machines have separate ROS
-  # masters, so the sim's /sim/heartbeat ROS topic is invisible here -- the
-  # raw heartbeat TCP ports are the liveness signal.
+  # per robot. The two machines have separate ROS masters, so the sim's
+  # /sim/heartbeat ROS topic is invisible here -- the raw heartbeat TCP
+  # ports are the liveness signal.
+  #
+  # Address is now the DISCOVERY_DICT OPTIONS 'sim_host' value (see
+  # rbx_sim_params.yaml), not a hardcoded constant -- requested live
+  # (2026-09-04): "this should automatically work if the vm host computer
+  # has an ethernet connection to the nepi device, as packets can just be
+  # sent through there." Two real cases, same code path:
+  #   - VM and device on a shared physical LAN (the common case this was
+  #     requested for) -- sim_host is that VM's own real, directly routable
+  #     IP, set automatically once by sim_connector_app_node.py when an OS
+  #     instance is selected (see OsInstanceRegistry.select's own comment),
+  #     and packets flow over the real network with no tunnel involved at
+  #     all -- confirmed this same day that sim_bridge_node.py's own TCP
+  #     server (the bridge port these heartbeat probes lead to a rbx node
+  #     for) binds 0.0.0.0, not 127.0.0.1, precisely so a direct connection
+  #     like this can actually complete.
+  #   - VM reachable only via the reverse SSH tunnel (an operator's laptop
+  #     behind NAT, no direct route) -- sim_host stays the '127.0.0.1'
+  #     default, and nepi_tunnel's own port forwarding makes the VM's ports
+  #     answer on the device's own loopback exactly as it always has.
+  # Still a list (not a single value) for the same reason it always was: a
+  # future multi-VM setup could probe more than one address per cycle; only
+  # ONE entry is populated today.
   sim_addr_list = ['127.0.0.1']
   # Robot slots (Phase 4): one (heartbeat_port, bridge_port) pair plus
   # VM-side identity per simulated robot. Each slot whose heartbeat answers
@@ -133,6 +154,12 @@ class SimDiscovery:
     except Exception as e:
       self.logger.log_warn("Failed to load options " + str(e))
       return None
+    # sim_host is a later addition (see this class's own sim_addr_list
+    # comment) -- .get() with the loopback default so a driver config that
+    # predates this option (or a malformed/missing OPTIONS entry) still
+    # behaves exactly as before rather than raising.
+    sim_host = drv_dict['DISCOVERY_DICT']['OPTIONS'].get('sim_host', {}).get('value', '127.0.0.1')
+    self.sim_addr_list = [sim_host] if sim_host else ['127.0.0.1']
 
     # Retry behavior
     self.retry = retry_enabled

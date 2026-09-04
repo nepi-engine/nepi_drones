@@ -122,7 +122,7 @@ from std_msgs.msg import Bool, Empty, String, Float32
 from sensor_msgs.msg import Image
 from geographic_msgs.msg import GeoPoint
 
-from nepi_interfaces.msg import AxisControls, DeviceRBXStatus, NavPose
+from nepi_interfaces.msg import AxisControls, DeviceRBXStatus, NavPose, Setting
 
 from nepi_api.messages_if import MsgIF
 
@@ -651,6 +651,17 @@ class NepiSimConnectorApp:
       except LauncherError as e:
         self.msg_if.pub_warn("Simulator auto-launch disabled (config at " +
                              launcher_config_path + " unusable): " + str(e))
+
+    ##############################
+    # Pushes the currently-selected OS instance's own real host onto the
+    # separate RBX_SIM driver's own 'sim_host' discovery option (see
+    # rbx_sim_discovery.py/rbx_sim_params.yaml) -- see
+    # pushSimHostToDiscovery's own docstring below for the full reasoning.
+    # Created here, before reapplySelectedOsInstance's first call a few
+    # lines down, since that call already needs it.
+    self.rbx_sim_settings_update_pub = nepi_sdk.create_publisher(
+        nepi_sdk.create_namespace(self.base_namespace, 'rbx_sim_discovery/settings/update_setting'),
+        Setting, queue_size = 1)
 
     ##############################
     # Multi-OS-instance deploy-target registry (see
@@ -2887,6 +2898,7 @@ class NepiSimConnectorApp:
     self.os_instance_last_error = ''
     self.msg_if.pub_info("Selected OS instance '" + instance_id +
                          "' as the sim-connector deploy target")
+    self.pushSimHostToDiscovery(instance_id)
     # The selected instance's host/ssh_user/ssh_port now apply to every
     # launch target -- republish SimLauncherStatus too so the existing
     # Simulator dropdown's install-check state naturally re-evaluates
@@ -2895,6 +2907,42 @@ class NepiSimConnectorApp:
     # just avoids waiting for that tick before the RUI reflects the change).
     self.publishOsInstancesStatus()
     self.publishLauncherStatus()
+
+  def pushSimHostToDiscovery(self, instance_id):
+    """Pushes the given OS instance's own real host onto the separate
+    RBX_SIM driver's 'sim_host' discovery option (rbx_sim_discovery.py),
+    so its heartbeat/bridge TCP probes dial that address directly instead
+    of always assuming loopback-via-reverse-tunnel. Requested live
+    (2026-09-04): "this is something that should automatically work if
+    the vm host computer has an ethernet connection to the nepi device,
+    as packets can just be sent through there" -- this is the one piece
+    that makes it AUTOMATIC rather than a manual setting an operator has
+    to remember to update to match whichever instance is selected.
+
+    A shared_storage instance has no meaningful 'host' (see
+    OsInstanceRegistry.CONNECTION_MODES' own comment -- that transport
+    never uses host/ssh_user/ssh_port at all) and a not-yet-verified
+    instance's host may be blank -- both cases are skipped rather than
+    pushing an empty/garbage value that would break a working default.
+    Best-effort: a driver that isn't running yet (RBX_SIM disabled, or
+    this device has no simulator_launch_targets.yaml at all) simply has
+    no subscriber for this topic, which is a silent no-op for a plain ROS
+    publish, not an error -- nothing here needs to know whether that
+    driver happens to be enabled."""
+    try:
+      instance = self.os_instance_registry.get_instance(instance_id)
+    except LauncherError:
+      return
+    if instance.get('connection_mode', DEFAULT_CONNECTION_MODE) == 'shared_storage':
+      return
+    host = instance.get('host', '')
+    if not host:
+      return
+    msg = Setting()
+    msg.type_str = 'String'
+    msg.name_str = 'sim_host'
+    msg.value_str = host
+    self.rbx_sim_settings_update_pub.publish(msg)
 
   def reapplySelectedOsInstance(self, context):
     """Re-applies the registry's persisted 'selected' OS instance onto
@@ -2917,6 +2965,8 @@ class NepiSimConnectorApp:
     except LauncherError as e:
       self.msg_if.pub_warn("Failed to re-apply selected OS instance after " +
                            context + ": " + str(e))
+      return
+    self.pushSimHostToDiscovery(self.os_instance_registry.selected_instance_id)
 
   def removeOsInstanceCb(self, msg):
     instance_id = str(msg.data).strip()

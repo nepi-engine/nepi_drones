@@ -27,7 +27,7 @@ def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(('127.0.0.1', port))
+    srv.bind(('0.0.0.0', port))  # 0.0.0.0: direct-LAN reachable, see sim_bridge_node.py's own bind comment
     srv.listen(1)
     print(f"gz_reset_listener listening on 127.0.0.1:{port}", flush=True)
     while True:

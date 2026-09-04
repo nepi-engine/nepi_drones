@@ -480,7 +480,7 @@ class CameraRigControllerArdupilot:
     # unblocks recv with EOF, and the 7 Hz image send loop independently
     # detects a dead client via its own sendall failure.
     srv.settimeout(None)
-    srv.bind(('127.0.0.1', BRIDGE_PORT))
+    srv.bind(('0.0.0.0', BRIDGE_PORT))  # 0.0.0.0: direct-LAN reachable, see sim_bridge_node.py's own bind comment
     srv.listen(1)
     while not rospy.is_shutdown():
       try:

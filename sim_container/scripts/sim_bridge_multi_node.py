@@ -176,7 +176,7 @@ class RobotBridge:
     # disconnect still unblocks recv with EOF, and a half-open client is
     # caught by the telemetry push failing.
     srv.settimeout(None)
-    srv.bind(('127.0.0.1', self.bridge_port))
+    srv.bind(('0.0.0.0', self.bridge_port))  # 0.0.0.0: direct-LAN reachable, see sim_bridge_node.py's own bind comment
     srv.listen(1)
     while not rospy.is_shutdown():
       try:

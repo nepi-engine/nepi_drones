@@ -714,7 +714,19 @@ class SimBridgeNode:
     # and block instead; a real disconnect still unblocks recv with EOF, and
     # a half-open client is caught by the 10 Hz telemetry push failing.
     srv.settimeout(None)
-    srv.bind(('127.0.0.1', BRIDGE_PORT))
+    # 0.0.0.0, not 127.0.0.1 -- binding to loopback only structurally forced
+    # every connection through the reverse SSH tunnel's port forwarding,
+    # even when this VM and the NEPI device share a real physical LAN and
+    # could reach this port directly (requested live 2026-09-04: "packets
+    # can just be sent through there" when there's an ethernet connection).
+    # Binding wide doesn't remove the tunnel path -- 0.0.0.0 still answers
+    # on 127.0.0.1 too, so a laptop reachable only via the reverse tunnel
+    # keeps working exactly as before; it just also accepts a direct
+    # connection to this VM's real interface when one exists. See
+    # rbx_sim_discovery.py's own sim_host discovery option, which is the
+    # other half of this: the device now dials whichever address that
+    # option names instead of always assuming loopback-via-tunnel.
+    srv.bind(('0.0.0.0', BRIDGE_PORT))
     srv.listen(1)
     while not rospy.is_shutdown():
       try:

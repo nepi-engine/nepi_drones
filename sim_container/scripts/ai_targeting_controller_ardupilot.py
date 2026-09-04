@@ -223,7 +223,7 @@ class AiTargetingControllerArdupilot:
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.settimeout(None)
     try:
-      srv.bind(('127.0.0.1', TEARDOWN_PORT))
+      srv.bind(('0.0.0.0', TEARDOWN_PORT))  # 0.0.0.0: direct-LAN reachable, see sim_bridge_node.py's own bind comment
       srv.listen(1)
     except Exception as e:
       rospy.logerr(PKG_NAME + ": Could not bind teardown listener on 127.0.0.1:" +
@@ -369,7 +369,7 @@ class AiTargetingControllerArdupilot:
     # with EOF, and the send loop independently detects a dead client via its
     # own sendall failure (same reasoning as camera_rig_controller_ardupilot.py).
     srv.settimeout(None)
-    srv.bind(('127.0.0.1', BRIDGE_PORT))
+    srv.bind(('0.0.0.0', BRIDGE_PORT))  # 0.0.0.0: direct-LAN reachable, see sim_bridge_node.py's own bind comment
     srv.listen(1)
     while not rospy.is_shutdown():
       try:

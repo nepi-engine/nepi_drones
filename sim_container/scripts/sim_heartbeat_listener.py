@@ -130,7 +130,7 @@ def main():
     threading.Thread(target=_livenessLoop, daemon=True).start()
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(('127.0.0.1', port))
+    srv.bind(('0.0.0.0', port))  # 0.0.0.0: direct-LAN reachable, see sim_bridge_node.py's own bind comment
     # A generous backlog (not the original 1) -- rbx_sim_discovery.py's own
     # probe cadence plus the reverse tunnel's connection setup/teardown
     # timing means more than one probe can land back-to-back; a backlog of
