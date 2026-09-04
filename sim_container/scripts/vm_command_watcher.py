@@ -35,32 +35,73 @@
 # vm_commands/<instance_id>/, i.e. the SAME nepi_storage tree
 # os_instance_registry.py's own OS_INSTANCES_STORAGE_DIR already lives
 # under -- see that module's docstring for why instance data belongs in the
-# read/write database tree, not the checked-in config tree):
-#   - Device writes  cmd_<request_id>.json    {action, target_key, script,
-#                                               timeout_sec}
-#   - This watcher picks up any cmd_*.json it finds, deletes it (so it's
-#     processed exactly once), and writes/updates
+# read/write database tree, not the checked-in config tree). Two distinct
+# file shapes, for two different needs:
+#
+#   1. deploy_state.yaml -- ONE persistent file, the real deploy/kill path
+#      (requested live 2026-09-04: "all that the user will have is ssh from
+#      a linux os to the nepi device [never the other direction]...
+#      installation will already be dealt with in a setup script. the
+#      deploy and kill commands... need to be dealt with 0s and 1s in nepi
+#      storage" -- a real deployment has NO device-to-VM network path at
+#      all, reverse-tunnel included, so this is not a fallback transport,
+#      it is THE transport). Device writes:
+#        control: {desired_target: <target_key, '' to stop whatever is
+#                   running>, last_updated: <epoch seconds>}
+#        target:  {launch_command, stop_command, ready_check_command}
+#                 (exact text simulator_launch_targets.yaml already authors
+#                 for the currently-selected target, after device_bridge_
+#                 host/port substitution -- only meaningful when
+#                 control.desired_target is non-empty)
+#      This watcher polls it every tick, and whenever control.last_updated
+#      moves and control.desired_target differs from whatever is currently
+#      running, stops the old one (using ITS OWN remembered stop_command --
+#      see _stopDeployTarget's own comment for why that can't just be
+#      re-read from the file) and starts the new one. Writes back:
+#        status: {running_target, state (idle|launching|running|failed|
+#                  exited), ready, pid, last_error, service_last_seen}
+#      ready is populated by periodically re-running target.ready_check_command
+#      once state == "running" -- polled by the device the same way it already
+#      polls a target's own ready_check_command over the SSH path, just
+#      reading a field instead of running a command itself.
+#
+#   2. cmd_<request_id>.json / status_<request_id>.json -- one-shot, request-
+#      scoped actions that are NOT part of the continuous "should this be
+#      running" state: install_command and check_installed_command. Install
+#      itself is expected to normally run through a separate, one-time setup
+#      script an operator runs by hand on this machine (not triggered by the
+#      device at all) -- this path still exists for check_installed's own
+#      background sweep (so the RUI can show real installed/not_installed
+#      status) and as a manual escape hatch, not as the primary deploy path.
+#        - Device writes  cmd_<request_id>.json    {action, target_key, script,
+#                                                     timeout_sec}
+#        - This watcher picks up any cmd_*.json it finds, deletes it (so it's
+#          processed exactly once), and writes/updates
 #                     status_<request_id>.json {target_key, action, state,
 #                                                pid, exit_code, error,
 #                                                updated_at}
-#   - This watcher also writes watcher_heartbeat.json every
-#     HEARTBEAT_INTERVAL_SEC, purely so the device side can tell "a watcher
-#     is actually alive and polling this mailbox" apart from "nothing has
-#     ever run here" -- the shared_storage equivalent of an SSH probe.
 #
-# "script" is the EXACT text simulator_launch_targets.yaml already authors
-# for launch_command/stop_command/install_command/check_installed_command
-# (a `bash -lc '<script>'` string, after device_bridge_host/port
-# substitution) -- this watcher strips that same wrapper and stages the
-# body to a local temp file before running it, exactly like
-# simulator_launcher.py's own _stage_launch_script does for the SSH path
-# (see that method's docstring for why: a very long inline `bash -c` string
-# handed to a fresh process is intermittently unreliable, a file is not).
-# Nothing about the authored commands themselves needs to differ between
-# the SSH and shared_storage transports.
+#   Both share  watcher_heartbeat.json, written every HEARTBEAT_INTERVAL_SEC,
+#   purely so the device side can tell "a watcher is actually alive and
+#   polling this mailbox" apart from "nothing has ever run here" -- the
+#   shared_storage equivalent of an SSH probe.
+#
+# Command/script text is the EXACT text simulator_launch_targets.yaml already
+# authors for launch_command/stop_command/install_command/
+# check_installed_command/ready_check_command (a `bash -lc '<script>'`
+# string, after device_bridge_host/port substitution) -- this watcher strips
+# that same wrapper and stages the body to a local temp file before running
+# it, exactly like simulator_launcher.py's own _stage_launch_script does for
+# the SSH path (see that method's docstring for why: a very long inline
+# `bash -c` string handed to a fresh process is intermittently unreliable, a
+# file is not). Nothing about the authored commands themselves needs to
+# differ between the SSH and shared_storage transports.
 #
 # Deliberately zero nepi_sdk/rospy dependency -- this runs on an arbitrary
-# operator machine that may not have ROS installed at all, only Python 3.
+# operator machine that may not have ROS installed at all, only Python 3
+# plus PyYAML (already a dependency of os_instance_registry.py/
+# simulator_launcher.py on the device side, so not a new addition to this
+# app's own footprint).
 #
 # Single-mailbox-at-a-time by design, not per-request-concurrent: this
 # app's own existing convention is that only one simulator ever runs at a
@@ -79,9 +120,13 @@ import os
 import subprocess
 import time
 
+import yaml
+
 POLL_INTERVAL_SEC = 1.0
 HEARTBEAT_INTERVAL_SEC = 5.0
 LAUNCH_STARTUP_GRACE_SEC = 5
+DEPLOY_STATE_FILENAME = 'deploy_state.yaml'
+READY_CHECK_INTERVAL_SEC = 3.0
 
 # Mirrors simulator_launcher.py's own _LAUNCH_SCRIPT_WRAPPER_PREFIX/SUFFIX --
 # duplicated, not imported, so this script has zero dependency on the app's
@@ -126,12 +171,25 @@ class Watcher(object):
     # own self._launch_procs.
     self.launch_procs = {}
     self.processed_request_ids = set()
+    # deploy_state.yaml's own tracked state -- see _pollDeployState's own
+    # comment for why deploy_running_stop_command is remembered here rather
+    # than re-read from the file at stop time (the file's own 'target'
+    # section may already describe a DIFFERENT, newly-desired target by
+    # then).
+    self.deploy_proc = None
+    self.deploy_running_target = ''
+    self.deploy_running_stop_command = ''
+    self.deploy_last_seen_update = None
+    self.deploy_last_ready_check = 0.0
 
   def _status_path(self, request_id):
     return os.path.join(self.mailbox, 'status_' + request_id + '.json')
 
   def _heartbeat_path(self):
     return os.path.join(self.mailbox, 'watcher_heartbeat.json')
+
+  def _deploy_state_path(self):
+    return os.path.join(self.mailbox, DEPLOY_STATE_FILENAME)
 
   def run(self):
     print('vm_command_watcher: watching ' + self.mailbox)
@@ -144,6 +202,7 @@ class Watcher(object):
         last_heartbeat = now
       self._refreshLaunchStates()
       self._checkForCommands()
+      self._pollDeployState()
       time.sleep(POLL_INTERVAL_SEC)
 
   def _refreshLaunchStates(self):
@@ -260,6 +319,147 @@ class Watcher(object):
         'error': error,
         'updated_at': time.time(),
     })
+
+  #**********************
+  # deploy_state.yaml -- the real deploy/kill path. See this file's own
+  # module docstring for the full protocol; the short version is: one
+  # persistent file per instance, control.desired_target says what SHOULD
+  # be running, status.* says what actually is.
+
+  def _readDeployState(self):
+    try:
+      with open(self._deploy_state_path(), 'r') as f:
+        return yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+      return {}
+
+  def _pollDeployState(self):
+    state = self._readDeployState()
+    if not state:
+      return
+    control = state.get('control') or {}
+    target = state.get('target') or {}
+    desired_target_key = (control.get('desired_target') or '').strip()
+    last_updated = control.get('last_updated')
+
+    # Reap a process that exited on its own (crash, or its own natural
+    # end) even with no new command -- mirrors _refreshLaunchStates' own
+    # reasoning for the cmd_id/status_id path.
+    if self.deploy_proc is not None and self.deploy_proc.poll() is not None:
+      rc = self.deploy_proc.returncode
+      _, stderr = self.deploy_proc.communicate()
+      self._writeDeployStatus(self.deploy_running_target,
+                               'exited' if rc == 0 else 'failed',
+                               error=('' if rc == 0 else (stderr or '').strip()))
+      self.deploy_proc = None
+      self.deploy_running_target = ''
+      self.deploy_running_stop_command = ''
+
+    command_is_new = (last_updated != self.deploy_last_seen_update)
+    if command_is_new:
+      self.deploy_last_seen_update = last_updated
+      if desired_target_key != self.deploy_running_target:
+        # Stop whatever's currently running FIRST, using the stop_command
+        # remembered from when THAT target was launched -- not target
+        # above, which by now already describes the NEWLY-desired target
+        # (or is empty, if the device is just asking to stop).
+        if self.deploy_proc is not None or self.deploy_running_target:
+          self._stopDeployTarget()
+        if desired_target_key:
+          self._startDeployTarget(desired_target_key, target)
+        else:
+          self._writeDeployStatus('', 'idle')
+
+    # Periodic readiness probe once something is actually running -- lets
+    # the device poll is_ready() by reading status.ready instead of
+    # dispatching its own one-shot ready_check request.
+    if self.deploy_proc is not None:
+      self._maybeCheckDeployReady(target)
+
+  def _stopDeployTarget(self):
+    stop_command = self.deploy_running_stop_command
+    if stop_command:
+      script_path = os.path.join(self.work_dir, 'nepi_deploy_stop.sh')
+      try:
+        with open(script_path, 'w') as f:
+          f.write(_strip_wrapper(stop_command))
+        subprocess.run(['bash', '-l', script_path], timeout=15)
+      except Exception:
+        pass
+    if self.deploy_proc is not None:
+      try:
+        self.deploy_proc.wait(timeout=10)
+      except subprocess.TimeoutExpired:
+        self.deploy_proc.kill()
+        self.deploy_proc.wait()
+    self.deploy_proc = None
+    self.deploy_running_target = ''
+    self.deploy_running_stop_command = ''
+
+  def _startDeployTarget(self, target_key, target):
+    launch_command = target.get('launch_command', '')
+    if not launch_command:
+      self._writeDeployStatus(target_key, 'failed', error='No launch_command provided')
+      return
+    script_path = os.path.join(self.work_dir, 'nepi_deploy_launch_' + target_key + '.sh')
+    try:
+      with open(script_path, 'w') as f:
+        f.write(_strip_wrapper(launch_command))
+      proc = subprocess.Popen(['bash', '-l', script_path],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    except Exception as e:
+      self._writeDeployStatus(target_key, 'failed', error=str(e))
+      return
+    self.deploy_proc = proc
+    self.deploy_running_target = target_key
+    self.deploy_running_stop_command = target.get('stop_command', '')
+    self.deploy_last_ready_check = 0.0
+    self._writeDeployStatus(target_key, 'launching', pid=proc.pid)
+    time.sleep(LAUNCH_STARTUP_GRACE_SEC)
+    if proc.poll() is not None:
+      _, stderr = proc.communicate()
+      self._writeDeployStatus(target_key, 'failed', error=(stderr or '').strip())
+      self.deploy_proc = None
+      self.deploy_running_target = ''
+      self.deploy_running_stop_command = ''
+    else:
+      self._writeDeployStatus(target_key, 'running', pid=proc.pid)
+
+  def _maybeCheckDeployReady(self, target):
+    now = time.time()
+    if now - self.deploy_last_ready_check < READY_CHECK_INTERVAL_SEC:
+      return
+    self.deploy_last_ready_check = now
+    ready_check_command = target.get('ready_check_command', '')
+    ready = True if not ready_check_command else False
+    if ready_check_command:
+      script_path = os.path.join(self.work_dir, 'nepi_deploy_ready_check.sh')
+      try:
+        with open(script_path, 'w') as f:
+          f.write(_strip_wrapper(ready_check_command))
+        result = subprocess.run(['bash', '-l', script_path], capture_output=True, timeout=10)
+        ready = (result.returncode == 0)
+      except Exception:
+        ready = False
+    self._writeDeployStatus(self.deploy_running_target, 'running', ready=ready,
+                             pid=(self.deploy_proc.pid if self.deploy_proc else 0))
+
+  def _writeDeployStatus(self, running_target, state, pid=0, error='', ready=None):
+    state_doc = self._readDeployState()
+    status = state_doc.get('status') or {}
+    status['running_target'] = running_target
+    status['state'] = state
+    status['pid'] = pid
+    status['last_error'] = error
+    status['service_last_seen'] = time.time()
+    if ready is not None:
+      status['ready'] = ready
+    state_doc['status'] = status
+    path = self._deploy_state_path()
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+      yaml.safe_dump(state_doc, f, default_flow_style=False, sort_keys=False)
+    os.replace(tmp, path)
 
 
 def main():

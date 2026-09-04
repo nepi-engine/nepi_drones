@@ -93,6 +93,16 @@ SHARED_STORAGE_POLL_INTERVAL_SEC = 1.0
 # operator-initiated Test Connection, just reused here for an AUTOMATIC,
 # no-operator-action fallback check.
 WATCHER_HEARTBEAT_STALE_AFTER_SEC = 20
+# Mirrors vm_command_watcher.py's own DEPLOY_STATE_FILENAME (duplicated, not
+# imported -- same reasoning as every other constant this file already
+# shares with that module's own docstring). This is the REAL deploy/kill
+# transport, not a fallback -- see launch()/stop()/is_ready()'s own shared_
+# storage branches. Requested live (2026-09-04): a real deployment gives the
+# device no network path to the VM at all (no forward SSH, no reverse
+# tunnel -- "all that the user will have is ssh from a linux os to the nepi
+# device"), so deploy/kill has to go through nepi_storage as a plain flag,
+# not any request/response protocol that assumes a channel back.
+DEPLOY_STATE_FILENAME = 'deploy_state.yaml'
 
 
 class LauncherError(Exception):
@@ -501,6 +511,83 @@ class SimulatorLauncher(object):
         "s -- is vm_command_watcher.py running on that machine and pointed at "
         "the same nepi_storage mount this device uses?")
 
+  #**********************
+  # deploy_state.yaml -- the REAL deploy/kill transport (see
+  # DEPLOY_STATE_FILENAME's own comment for why this isn't just the
+  # shared_storage fallback's request/response protocol reused: deploy/kill
+  # is not request-scoped, it is "what should be running right now",
+  # continuously true until told otherwise, which a single persistent
+  # 0/empty-or-target_key flag expresses far more simply than a stream of
+  # one-shot launch/stop requests would). See vm_command_watcher.py's own
+  # module docstring for the full protocol this reads/writes.
+
+  def _deploy_state_path(self, os_instance_id):
+    return os.path.join(VM_COMMANDS_STORAGE_DIR, os_instance_id, DEPLOY_STATE_FILENAME)
+
+  def _read_deploy_state(self, os_instance_id):
+    try:
+      with open(self._deploy_state_path(os_instance_id), 'r') as f:
+        return yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+      return {}
+
+  def _write_deploy_desired(self, os_instance_id, target_key, launch_command='',
+                             stop_command='', ready_check_command=''):
+    """Sets what SHOULD be running -- target_key (with its commands) to
+    deploy it, '' to kill whatever's running. The watcher does the actual
+    work asynchronously; callers that need to know the outcome poll
+    _read_deploy_state's own 'status' section afterward (see launch()'s own
+    polling loop)."""
+    path = self._deploy_state_path(os_instance_id)
+    try:
+      os.makedirs(os.path.dirname(path), exist_ok=True)
+    except OSError as e:
+      raise LauncherError("Could not reach the shared-storage mailbox for OS instance '" +
+                           os_instance_id + "': " + str(e))
+    doc = self._read_deploy_state(os_instance_id)
+    doc['control'] = {'desired_target': target_key, 'last_updated': time.time()}
+    doc['target'] = {
+        'launch_command': launch_command,
+        'stop_command': stop_command,
+        'ready_check_command': ready_check_command,
+    }
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+      yaml.safe_dump(doc, f, default_flow_style=False, sort_keys=False)
+    os.replace(tmp, path)
+
+  def _launch_via_deploy_state(self, target, target_key, command, timeout_sec):
+    """Requests target_key as the desired deploy state, then polls
+    status.running_target/status.state until the watcher reports success,
+    failure, or nothing at all within timeout_sec (+ its own poll grace).
+    Returns (True, status_dict) once the watcher reports THIS target_key as
+    either 'running' (success) or 'failed' (the caller decides what a
+    failure means, same division of responsibility every other shared-
+    storage dispatch here already has), or (False, None) if the watcher
+    never even acknowledges the request -- distinguishing "ran and failed"
+    from "might not have run at all" the same way _dispatch_shared_storage's
+    own docstring already does for the request/response protocol."""
+    os_instance_id = target.get('os_instance_id', '')
+    if not os_instance_id:
+      raise LauncherError(
+          "'" + target.get('display_name', target_key) + "' is set to the shared_storage "
+          "connection mode but has no os_instance_id -- select a shared_storage OS "
+          "instance for it first.")
+    self._write_deploy_desired(os_instance_id, target_key, launch_command=command,
+                               stop_command=target.get('stop_command', ''),
+                               ready_check_command=target.get('ready_check_command', ''))
+    deadline = time.time() + timeout_sec + SHARED_STORAGE_POLL_GRACE_SEC
+    while time.time() < deadline:
+      status = self._read_deploy_state(os_instance_id).get('status', {})
+      if status.get('running_target') == target_key:
+        state = status.get('state')
+        if state == 'failed':
+          return True, status
+        if state == 'running':
+          return True, status
+      time.sleep(SHARED_STORAGE_POLL_INTERVAL_SEC)
+    return False, None
+
   def push_dimensions(self, target, model_name, dimensions_yaml_text, sdf_override_text):
     """Pushes one model's editable geometry to the VM ahead of a launch --
     see sim_connector_app_node.py's device-side dimensions store for the
@@ -719,10 +806,28 @@ class SimulatorLauncher(object):
     resets it) rather than reverted once SSH recovers -- staying on a
     transport that's confirmed working is the point ("so we don't have to
     worry about reverse ssh"), not a reason to keep re-testing the one that
-    just failed."""
+    just failed.
+
+    A "launch" action goes through _launch_via_deploy_state instead of
+    _dispatch_shared_storage -- that's the real, primary deploy transport
+    now (see DEPLOY_STATE_FILENAME's own comment), not just this fallback's
+    own concern, so a launch that falls back here behaves identically to
+    one that started in shared_storage mode from the very beginning. Every
+    other action (stop/install/check_installed/ready_check) stays on the
+    original one-shot request/response protocol -- a "stop" here in
+    particular is recovering an SSH-launched process the watcher never
+    tracked as its own, so running stop_command directly (rather than
+    flipping a desired_target the watcher never set) is the correct
+    behavior for this specific scenario, not an oversight."""
     os_instance_id = target.get('os_instance_id', '')
     if not self._shared_storage_watcher_alive(os_instance_id):
       return False, None
+    if action == 'launch':
+      acked, status = self._launch_via_deploy_state(target, target_key, script_text, timeout_sec)
+      if not acked:
+        return False, None
+      target['connection_mode'] = 'shared_storage'
+      return True, status
     try:
       _, status = self._dispatch_shared_storage(target, target_key, action, script_text, timeout_sec)
     except LauncherError:
@@ -796,15 +901,20 @@ class SimulatorLauncher(object):
       # owns the actual launched process; this side only needs to know it
       # started (or didn't) before returning, exactly like the SSH path's
       # own startup-grace-period check just below, just over a different
-      # transport. See _dispatch_shared_storage's own docstring for why a
-      # 'failed' status here (as opposed to no response at all) still
-      # raises, matching the SSH path's own "exited within the startup
-      # grace period" failure.
-      _, status = self._dispatch_shared_storage(
-          target, target_key, "launch", command, LAUNCH_STARTUP_GRACE_SEC)
+      # transport (deploy_state.yaml, see _launch_via_deploy_state's own
+      # docstring -- this is the primary, always-on deploy path for a real
+      # deployment, not a fallback).
+      acked, status = self._launch_via_deploy_state(
+          target, target_key, command, LAUNCH_STARTUP_GRACE_SEC)
+      if not acked:
+        raise LauncherError(
+            "No response from the shared-storage watcher for '" +
+            target.get("display_name", target_key) + "' -- is vm_command_watcher.py "
+            "running on that machine and pointed at the same nepi_storage mount "
+            "this device uses?")
       if status.get("state") == "failed":
         raise LauncherError(
-            "Launch failed via shared storage: " + status.get("error", ""))
+            "Launch failed via shared storage: " + status.get("last_error", ""))
       return
     remote_script_path = self._stage_launch_script(target, target_key, command)
     ssh_cmd = self._ssh_cmd(target, "bash -l " + remote_script_path)
@@ -818,7 +928,7 @@ class SimulatorLauncher(object):
         if fell_back:
           if status.get("state") == "failed":
             raise LauncherError(
-                "Launch failed via shared-storage fallback: " + status.get("error", ""))
+                "Launch failed via shared-storage fallback: " + status.get("last_error", ""))
           return
       tunnel_message = self._classify_connection_failure(target, stderr)
       if tunnel_message:
@@ -838,13 +948,17 @@ class SimulatorLauncher(object):
     if not ready_check_command:
       return True
     if target.get("connection_mode") == "shared_storage":
-      try:
-        _, status = self._dispatch_shared_storage(
-            target, target_key, "ready_check", ready_check_command,
-            SSH_CONNECT_TIMEOUT_SEC + 2)
-      except LauncherError:
+      # Reads status.ready straight out of deploy_state.yaml rather than
+      # dispatching a fresh one-shot ready_check request -- the watcher
+      # already owns periodically re-running ready_check_command for
+      # whatever IT currently has running (see vm_command_watcher.py's own
+      # _maybeCheckDeployReady), since it's the one that knows what's
+      # actually running; this is just reading that same answer back.
+      os_instance_id = target.get('os_instance_id', '')
+      status = self._read_deploy_state(os_instance_id).get('status', {})
+      if status.get('running_target') != target_key:
         return False
-      return status.get("exit_code") == 0
+      return bool(status.get('ready', False))
     try:
       result = self._run_remote(target, ready_check_command, timeout_sec=SSH_CONNECT_TIMEOUT_SEC + 2)
     except LauncherError:
@@ -875,14 +989,19 @@ class SimulatorLauncher(object):
 
     For a shared_storage target there is no local connection to reap (the
     watcher on the other end owns the actual launched process, not this
-    launcher -- see _dispatch_shared_storage's own docstring); running
-    stop_command through it is the whole job."""
+    launcher). Sets desired_target to '' in deploy_state.yaml -- the
+    watcher runs THIS target's own remembered stop_command itself (see
+    vm_command_watcher.py's own _stopDeployTarget) and is the one place
+    that actually knows what's running, so there is nothing further for
+    this method to do; best-effort and fire-and-forget, matching this
+    method's own SSH-path semantics below (never raises on the remote
+    outcome)."""
     target = self.get_target(target_key)
     stop_command = target.get("stop_command")
     if target.get("connection_mode") == "shared_storage":
-      if stop_command:
-        self._dispatch_shared_storage(target, target_key, "stop", stop_command,
-                                       SSH_CONNECT_TIMEOUT_SEC + 5)
+      os_instance_id = target.get('os_instance_id', '')
+      if os_instance_id:
+        self._write_deploy_desired(os_instance_id, '')
       return
     if stop_command:
       result = self._run_remote(target, stop_command, timeout_sec=SSH_CONNECT_TIMEOUT_SEC + 5)
