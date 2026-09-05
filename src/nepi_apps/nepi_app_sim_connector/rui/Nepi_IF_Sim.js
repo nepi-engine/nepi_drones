@@ -2747,31 +2747,19 @@ class NepiIFSim extends Component {
     const show_data = (this.props.show_data !== undefined) ? this.props.show_data : true
     const show_controls = (this.props.show_controls !== undefined) ? this.props.show_controls : true
 
-    // Split into two half-width Columns, matching every other NEPI panel's
-    // own convention (System -> Device Manager's NepiSystemDevice.js splits
-    // its own content into two <Column> siblings the exact same way --
-    // Columns/Column's shared flex:1 style only actually halves the width
-    // when there are two sibling Columns to split; a single Column just
-    // fills 100%, which is what every section here rendered at before this
-    // change). Requested live (2026-09-04): "most of the other nepi
-    // windows are like this too, while sim connector takes the whole
-    // horizontal width per section."
-    //
-    // Left: pick-and-deploy plus live data. Right: Robot Config Settings,
-    // Environment Config Settings, then Sim Control Settings
-    // (NepiIFSimControls) at the bottom. Moved to the top of the right
-    // column and back out of this one same-day (2026-09-04), then moved
-    // right back here a few messages later: "the new rui is actually much
-    // more cramped - its not very clean. move it back to the previous
-    // locations, but with the same features that ive set right now." --
-    // i.e. keep every feature/behavior change made since (compact toggles,
-    // no title on this section, capped camera viewer size, the
-    // deploy/edit/view dropdown split, obstacle overlay/labels, etc.), just
-    // put Robot/Environment Config Settings and Sim Control Settings back
-    // where they originally were (this column's own top-to-bottom order,
-    // Sim Control Settings last) instead of the brief top-of-right-column
-    // rearrangement.
-    const leftColumn = (
+    // Single vertical stack, full width -- a same-day two-column split
+    // (matching Device Manager's own layout) was tried and explicitly
+    // walked back: "the rui is still messed up - dont have left or right
+    // columns - go abck to the old formatting of all vertical - just with
+    // the same settinsg i told you to remove or add." Every feature/
+    // behavior change made along the way (compact toggles, no title on Sim
+    // Control Settings, capped camera viewer size, the deploy/edit/view
+    // dropdown split for environment configs, obstacle overlay/labels,
+    // Custom Obstacles removed from the pickers, etc.) stays -- only the
+    // two-column wrapper and its divider are gone. Content order top to
+    // bottom: pick-and-deploy, live data, Robot Config Settings,
+    // Environment Config Settings, then Sim Control Settings last.
+    const topContent = (
       <React.Fragment>
         {(show_selectors === true) ?
           <React.Fragment>
@@ -2832,7 +2820,7 @@ class NepiIFSim extends Component {
       </React.Fragment>
     )
 
-    const rightColumn = (
+    const bottomContent = (
       <React.Fragment>
         {(show_selectors === true) ?
           <React.Fragment>
@@ -2866,16 +2854,11 @@ class NepiIFSim extends Component {
       </React.Fragment>
     )
 
-    // Divider between the two Columns -- requested live (2026-09-04):
-    // "since they're side by side but nothing is blocking one from the
-    // other." borderLeft on the right Column only (Column's own style prop
-    // merges into its root div), matching Section's own border color/width
-    // so it reads as part of the same visual language, not a one-off line.
     const content = (
-      <Columns>
-        <Column>{leftColumn}</Column>
-        <Column style={{ borderLeft: `1px solid ${Styles.vars.colors.grey1}`, paddingLeft: Styles.vars.spacing.regular }}>{rightColumn}</Column>
-      </Columns>
+      <React.Fragment>
+        {topContent}
+        {bottomContent}
+      </React.Fragment>
     )
 
     if (make_section === false) {
