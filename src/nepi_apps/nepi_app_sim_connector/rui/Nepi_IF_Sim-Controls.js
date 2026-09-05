@@ -33,6 +33,18 @@ import { setElementStyleModified, clearElementStyleModified } from "./Utilities"
 
 import NepiIFImageViewer from "./Nepi_IF_ImageViewer"
 
+// generic_rover/model.sdf's own hard-coded camera_link_chase mount point
+// (body-frame, relative to the rover's own origin) -- scene_offset_x/y/z
+// is a DELTA from this point (requested live 2026-09-04, see
+// computeLockedSceneYawTilt's own comment), not an absolute coordinate.
+// Single source of truth is rbx_sim_node.py's own FACTORY_SCENE_OFFSET_X/
+// Y/Z -- duplicated here as literals for the same reason
+// FACTORY_SCENE_TILT_DEG already is server-side (this file can't import
+// that class).
+const FACTORY_SCENE_OFFSET_X = -2.5
+const FACTORY_SCENE_OFFSET_Y = 0.0
+const FACTORY_SCENE_OFFSET_Z = 1.65
+
 @inject("ros")
 @observer
 
@@ -1218,13 +1230,28 @@ class NepiIFSimControls extends Component {
   // camera's height to ground level -- positive tilts the camera downward,
   // matching camera_link_chase's own factory tilt (positive, "downward
   // look" per that pose's own long-standing comment).
+  //
+  // scene_offset_x/y/z is now a DELTA from the factory chase-cam mount
+  // point, not an absolute robot-frame coordinate (requested live
+  // 2026-09-04: "for the scene view cam, the 0 0 0 point should be set to
+  // wherever the cam is by default, not where the center of the robot is,
+  // so its easier for viewers to refer off that" -- see
+  // rbx_sim_node.py's own FACTORY_SCENE_OFFSET_X/Y/Z comment). This still
+  // needs the camera's REAL absolute position to aim at the robot's
+  // origin, so it adds the same three constants back in before the
+  // atan2 math below -- everywhere else in this component keeps reading/
+  // writing the delta (this is the one place that needs the absolute
+  // pose, same as sim_bridge_node.py's own respawnRoverWithCameraOffsets).
   computeLockedSceneYawTilt() {
-    const x = parseFloat(this.state.scene_offset_x)
-    const y = parseFloat(this.state.scene_offset_y)
-    const z = parseFloat(this.state.scene_offset_z)
-    if (isNaN(x) || isNaN(y) || isNaN(z)) {
+    const deltaX = parseFloat(this.state.scene_offset_x)
+    const deltaY = parseFloat(this.state.scene_offset_y)
+    const deltaZ = parseFloat(this.state.scene_offset_z)
+    if (isNaN(deltaX) || isNaN(deltaY) || isNaN(deltaZ)) {
       return null
     }
+    const x = deltaX + FACTORY_SCENE_OFFSET_X
+    const y = deltaY + FACTORY_SCENE_OFFSET_Y
+    const z = deltaZ + FACTORY_SCENE_OFFSET_Z
     const yawRad = Math.atan2(-y, -x)
     const horizontalDist = Math.sqrt(x * x + y * y)
     const tiltRad = Math.atan2(z, horizontalDist)

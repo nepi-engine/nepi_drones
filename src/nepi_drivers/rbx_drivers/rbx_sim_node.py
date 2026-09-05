@@ -186,6 +186,20 @@ class SimNode:
   # needed for camera_offset_tilt's own factory value (just "0.0" below).
   FACTORY_SCENE_TILT_DEG = math.degrees(0.5404195)
 
+  # generic_rover/model.sdf's own hard-coded camera_link_chase POSITION
+  # (body-frame, relative to the rover's own origin) -- requested live
+  # (2026-09-04): "for the scene view cam, the 0 0 0 point should be set
+  # to wherever the cam is by default, not where the center of the robot
+  # is, so its easier for viewers to refer off that." scene_offset_x/y/z
+  # is now a DELTA from this factory mount point, not an absolute
+  # robot-frame coordinate -- FACTORY_SETTINGS below is "0.0" for all
+  # three (no delta = stock position), and sim_bridge_node.py's own
+  # respawnRoverWithCameraOffsets adds these same three constants back in
+  # before writing the actual SDF pose (see that function's own comment).
+  FACTORY_SCENE_OFFSET_X = -2.5
+  FACTORY_SCENE_OFFSET_Y = 0.0
+  FACTORY_SCENE_OFFSET_Z = 1.65
+
   CAP_SETTINGS = dict(
     max_linear_speed_mps = {"type":"Float","name":"max_linear_speed_mps","options":["0.05","5.0"]},
     max_angular_rate_dps = {"type":"Float","name":"max_angular_rate_dps","options":["5.0","180.0"]},
@@ -216,10 +230,13 @@ class SimNode:
     camera_offset_z = {"type":"Float","name":"camera_offset_z","value":"0.65"},
     camera_offset_yaw = {"type":"Float","name":"camera_offset_yaw","value":"0.0"},
     camera_offset_tilt = {"type":"Float","name":"camera_offset_tilt","value":"0.0"},
-    # Reproduces generic_rover/model.sdf's hard-coded camera_link_chase pose.
-    scene_offset_x = {"type":"Float","name":"scene_offset_x","value":"-2.5"},
+    # Zero delta from generic_rover/model.sdf's own hard-coded
+    # camera_link_chase mount point (FACTORY_SCENE_OFFSET_X/Y/Z) -- see that
+    # constant's own comment for why this is 0.0 now instead of the
+    # absolute -2.5/0.0/1.65 pose.
+    scene_offset_x = {"type":"Float","name":"scene_offset_x","value":"0.0"},
     scene_offset_y = {"type":"Float","name":"scene_offset_y","value":"0.0"},
-    scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"1.65"},
+    scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"0.0"},
     scene_offset_yaw = {"type":"Float","name":"scene_offset_yaw","value":"0.0"},
     scene_offset_tilt = {"type":"Float","name":"scene_offset_tilt","value":str(FACTORY_SCENE_TILT_DEG)},
     # Both default to enabled: a robot config that never touches these

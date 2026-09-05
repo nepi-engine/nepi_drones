@@ -216,7 +216,24 @@ ROVER_MODEL_SDF_PATH = os.path.join(
 # that value in degrees -- duplicated here as a literal only because this
 # file cannot import that class); camera_link's factory tilt is 0 (no
 # rotation in the stock model at all).
-FACTORY_CAMERA_OFFSETS = (0.2, 0.0, 0.65, 0.0, 0.0, -2.5, 0.0, 1.65, 0.0, math.degrees(0.5404195))
+#
+# scene_offset_x/y/z's own three values changed (2026-09-04) from the
+# absolute mount pose (-2.5, 0.0, 1.65) to 0.0/0.0/0.0 -- requested live:
+# "for the scene view cam, the 0 0 0 point should be set to wherever the
+# cam is by default, not where the center of the robot is, so its easier
+# for viewers to refer off that." scene_offset_x/y/z is now a DELTA from
+# the factory mount point (FACTORY_SCENE_OFFSET_X/Y/Z below, added back in
+# by respawnRoverWithCameraOffsets before writing the actual SDF pose),
+# not an absolute rover-frame coordinate -- see rbx_sim_node.py's own
+# matching FACTORY_SCENE_OFFSET_X/Y/Z comment, the single source of truth
+# for these three values (duplicated here as literals for the same reason
+# FACTORY_SCENE_TILT_DEG already is: this file cannot import that class).
+# camera_offset_x/y/z (robot view) is untouched -- only the scene/chase
+# camera's reference point changed.
+FACTORY_CAMERA_OFFSETS = (0.2, 0.0, 0.65, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, math.degrees(0.5404195))
+FACTORY_SCENE_OFFSET_X = -2.5
+FACTORY_SCENE_OFFSET_Y = 0.0
+FACTORY_SCENE_OFFSET_Z = 1.65
 # Matches a <link name="LINKNAME"> immediately followed by its own <pose>
 # element, capturing everything up to (group 1) and including "</pose>"
 # (implicitly, via the non-capturing replacement below) -- unlike the
@@ -297,12 +314,15 @@ class SimBridgeNode:
     # "Tried to advertise a service that is already advertised" errors and,
     # observed live, both camera topics ending up with zero active
     # publishers. Starting this at the actual factory values (verified to
-    # exactly match both rbx_sim_node.py's own FACTORY_SETTINGS and
-    # generic_rover/model.sdf's hard-coded camera_link/camera_link_chase
-    # poses) means an UNCUSTOMIZED deploy -- the common case -- now legitimately
-    # skips this first respawn entirely. A deploy with genuinely customized
-    # offsets still respawns once, which is correct: that respawn is real
-    # work this mechanism exists to do.
+    # exactly match rbx_sim_node.py's own FACTORY_SETTINGS -- scene_offset_x/
+    # y/z is 0.0 in both now, meaning "no delta from the factory
+    # camera_link_chase mount point", not a byte-identical pose string
+    # anymore since FACTORY_SCENE_OFFSET_X/Y/Z's own comment; camera_link's
+    # own values are still the real absolute pose, unaffected by that
+    # change) means an UNCUSTOMIZED deploy -- the common case -- now
+    # legitimately skips this first respawn entirely. A deploy with
+    # genuinely customized offsets still respawns once, which is correct:
+    # that respawn is real work this mechanism exists to do.
     try:
       with open(ROVER_MODEL_SDF_PATH, 'r') as f:
         self.rover_sdf_template = f.read()
@@ -622,6 +642,16 @@ class SimBridgeNode:
       return
     (off_x, off_y, off_z, off_yaw_deg, off_tilt_deg,
      scene_x, scene_y, scene_z, scene_yaw_deg, scene_tilt_deg) = offsets
+
+    # scene_x/y/z arrive as a DELTA from the factory chase-cam mount point,
+    # not an absolute rover-frame coordinate -- see FACTORY_SCENE_OFFSET_X/Y/Z's
+    # own comment. Add the mount point back in here, the one place that
+    # actually needs the real absolute pose (the SDF <pose> element itself);
+    # everywhere else in this app (Settings, the RUI) keeps working in the
+    # delta.
+    scene_x = scene_x + FACTORY_SCENE_OFFSET_X
+    scene_y = scene_y + FACTORY_SCENE_OFFSET_Y
+    scene_z = scene_z + FACTORY_SCENE_OFFSET_Z
 
     sdf = self.rover_sdf_template
     sdf, n1 = CAMERA_LINK_POSE_RE['camera_link'].subn(
