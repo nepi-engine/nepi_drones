@@ -1406,12 +1406,31 @@ class NepiIFSimControls extends Component {
   // camera (the Webots drivers) -- NepiIFImageViewer already renders a
   // blank/waiting state for a topic with no publisher, an honest reflection
   // of "this robot has no scene camera," not a bug.
+  // NepiIFImageViewer's own <canvas> is CSS width:100%/height:auto (see
+  // that shared component's own styles.canvas) -- it fills whatever
+  // container it's given, at the STREAM's native aspect ratio, with no
+  // width-limiting prop of its own to opt out of that. Left unconstrained,
+  // two of these next to each other grew as wide/tall as their Column
+  // happened to be once a real camera stream started flowing (invisible
+  // before that, since nothing renders for a topic with no publisher yet),
+  // crowding everything else in this panel -- requested live (2026-09-04):
+  // "when the camera topics come in for sim connector, it requires a good
+  // amount of space so it messes with the formatting of some buttons and
+  // other things... make the view windows smaller so it doesnt take up
+  // more than half the scren for both of them combined." Fixed by capping
+  // each viewer's own OWN wrapping div at a fixed maxWidth here (Sim
+  // Connector's own call site only -- NOT a change to the shared
+  // NepiIFImageViewer component, which plenty of other device panels
+  // still want filling their own full container width) plus a visible gap
+  // between the two so neither reads as touching/overlapping the other or
+  // the controls below.
   renderCommonImageViewer() {
     const live = this.isRbxLive()
     if (!live) {
       return null
     }
     const appNamespace = this.props.namespace.split('/sim')[0]
+    const viewerMaxWidth = "220px"
     return (
       <React.Fragment>
 
@@ -1430,11 +1449,13 @@ class NepiIFSimControls extends Component {
                 <Option value={"robot_depth"}>{"Depth"}</Option>
               </Select>
             </Label>
-            <NepiIFImageViewer
-              id={"simConnectorRobotViewViewer"}
-              image_topic={appNamespace + "/" + this.state.robot_view_mode}
-              title={""}
-            />
+            <div style={{ maxWidth: viewerMaxWidth, marginTop: Styles.vars.spacing.small, marginBottom: Styles.vars.spacing.regular }}>
+              <NepiIFImageViewer
+                id={"simConnectorRobotViewViewer"}
+                image_topic={appNamespace + "/" + this.state.robot_view_mode}
+                title={""}
+              />
+            </div>
           </Column>
           <Column>
             <Label title={"Scene View"}>
@@ -1446,11 +1467,13 @@ class NepiIFSimControls extends Component {
                 <Option value={"scene_depth"}>{"Depth"}</Option>
               </Select>
             </Label>
-            <NepiIFImageViewer
-              id={"simConnectorSceneViewViewer"}
-              image_topic={appNamespace + "/" + this.state.scene_view_mode}
-              title={""}
-            />
+            <div style={{ maxWidth: viewerMaxWidth, marginTop: Styles.vars.spacing.small, marginBottom: Styles.vars.spacing.regular }}>
+              <NepiIFImageViewer
+                id={"simConnectorSceneViewViewer"}
+                image_topic={appNamespace + "/" + this.state.scene_view_mode}
+                title={""}
+              />
+            </div>
           </Column>
         </Columns>
 
