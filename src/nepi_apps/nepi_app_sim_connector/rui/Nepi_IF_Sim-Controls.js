@@ -1425,15 +1425,18 @@ class NepiIFSimControls extends Component {
   // single full-width vertical column, that same fixed width read as a
   // tiny, oddly-cramped square sitting under a full-width "Robot View"/
   // "Scene View" Select dropdown -- reported live (2026-09-04): "the
-  // camera views still seem cramped for some reason." Fixed with a
-  // percentage-based cap on the OUTER wrapper (both label+select+image
-  // together, not just the image) instead of a fixed pixel width: the
-  // whole two-viewer row is capped at 50% of the page (still matching "no
-  // more than half the screen combined", now literally, since this page
-  // really is full width), and each viewer's own Column naturally takes
-  // half of THAT -- so the Select and its image line up at the same
-  // width and both scale proportionally with the page instead of one
-  // being a small fixed box under a full-width control.
+  // camera views still seem cramped for some reason." Second fix (a 50%
+  // maxWidth on the OUTER two-viewer wrapper) overcorrected the other way
+  // -- reported live: "now they're both on the left side - make them take
+  // up their whole part horizontally instead of leaving some space on the
+  // right. the buttons are all cramped for the image viewer because of
+  // this" (a 50%-wide box split into two ~25% Columns left the Select
+  // dropdowns themselves cramped, with unused space on the right of the
+  // page). No width cap at all now -- Robot View and Scene View each get
+  // their own full Column (half the page each, Columns' own default
+  // equal-width split), same as every other side-by-side pair in this
+  // file, so the Select and its image both use their whole half with no
+  // dead space and no cramped controls.
   renderCommonImageViewer() {
     const live = this.isRbxLive()
     if (!live) {
@@ -1447,46 +1450,44 @@ class NepiIFSimControls extends Component {
 
         <Label title={"Camera Viewer"} labelStyle={{ fontWeight: 'bold' }}/>
 
-        <div style={{ maxWidth: "50%" }}>
-          <Columns>
-            <Column>
-              <Label title={"Robot View"}>
-                <Select
-                  onChange={(event) => this.setState({ robot_view_mode: event.target.value })}
-                  value={this.state.robot_view_mode}
-                >
-                  <Option value={"robot_color"}>{"Color"}</Option>
-                  <Option value={"robot_depth"}>{"Depth"}</Option>
-                </Select>
-              </Label>
-              <div style={{ marginTop: Styles.vars.spacing.small, marginBottom: Styles.vars.spacing.regular }}>
-                <NepiIFImageViewer
-                  id={"simConnectorRobotViewViewer"}
-                  image_topic={appNamespace + "/" + this.state.robot_view_mode}
-                  title={""}
-                />
-              </div>
-            </Column>
-            <Column>
-              <Label title={"Scene View"}>
-                <Select
-                  onChange={(event) => this.setState({ scene_view_mode: event.target.value })}
-                  value={this.state.scene_view_mode}
-                >
-                  <Option value={"scene_color"}>{"Color"}</Option>
-                  <Option value={"scene_depth"}>{"Depth"}</Option>
-                </Select>
-              </Label>
-              <div style={{ marginTop: Styles.vars.spacing.small, marginBottom: Styles.vars.spacing.regular }}>
-                <NepiIFImageViewer
-                  id={"simConnectorSceneViewViewer"}
-                  image_topic={appNamespace + "/" + this.state.scene_view_mode}
-                  title={""}
-                />
-              </div>
-            </Column>
-          </Columns>
-        </div>
+        <Columns>
+          <Column>
+            <Label title={"Robot View"}>
+              <Select
+                onChange={(event) => this.setState({ robot_view_mode: event.target.value })}
+                value={this.state.robot_view_mode}
+              >
+                <Option value={"robot_color"}>{"Color"}</Option>
+                <Option value={"robot_depth"}>{"Depth"}</Option>
+              </Select>
+            </Label>
+            <div style={{ marginTop: Styles.vars.spacing.small, marginBottom: Styles.vars.spacing.regular }}>
+              <NepiIFImageViewer
+                id={"simConnectorRobotViewViewer"}
+                image_topic={appNamespace + "/" + this.state.robot_view_mode}
+                title={""}
+              />
+            </div>
+          </Column>
+          <Column>
+            <Label title={"Scene View"}>
+              <Select
+                onChange={(event) => this.setState({ scene_view_mode: event.target.value })}
+                value={this.state.scene_view_mode}
+              >
+                <Option value={"scene_color"}>{"Color"}</Option>
+                <Option value={"scene_depth"}>{"Depth"}</Option>
+              </Select>
+            </Label>
+            <div style={{ marginTop: Styles.vars.spacing.small, marginBottom: Styles.vars.spacing.regular }}>
+              <NepiIFImageViewer
+                id={"simConnectorSceneViewViewer"}
+                image_topic={appNamespace + "/" + this.state.scene_view_mode}
+                title={""}
+              />
+            </div>
+          </Column>
+        </Columns>
 
       </React.Fragment>
     )
