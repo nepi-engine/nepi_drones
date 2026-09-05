@@ -2757,16 +2757,20 @@ class NepiIFSim extends Component {
     // windows are like this too, while sim connector takes the whole
     // horizontal width per section."
     //
-    // Left: pick-and-deploy plus live data up top (unchanged), Robot Config
-    // Settings below it. Right: Sim Control Settings (NepiIFSimControls)
-    // up top, Environment Config Settings below it. Re-requested live
-    // (2026-09-04): "keep the main settings in the left side front as it
-    // as, and the sim control settings that are currently at the bottom on
-    // the top right side. then, put the robot config settings under the
-    // main on the left, and the environment on the right of that under the
-    // sim control settings." -- NepiIFSimControls moved out of the deploy
-    // Column entirely, so it's the first thing in the config Column, not
-    // the last.
+    // Left: pick-and-deploy plus live data. Right: Robot Config Settings,
+    // Environment Config Settings, then Sim Control Settings
+    // (NepiIFSimControls) at the bottom. Moved to the top of the right
+    // column and back out of this one same-day (2026-09-04), then moved
+    // right back here a few messages later: "the new rui is actually much
+    // more cramped - its not very clean. move it back to the previous
+    // locations, but with the same features that ive set right now." --
+    // i.e. keep every feature/behavior change made since (compact toggles,
+    // no title on this section, capped camera viewer size, the
+    // deploy/edit/view dropdown split, obstacle overlay/labels, etc.), just
+    // put Robot/Environment Config Settings and Sim Control Settings back
+    // where they originally were (this column's own top-to-bottom order,
+    // Sim Control Settings last) instead of the brief top-of-right-column
+    // rearrangement.
     const leftColumn = (
       <React.Fragment>
         {(show_selectors === true) ?
@@ -2825,13 +2829,18 @@ class NepiIFSim extends Component {
         {(show_data === true) ?
           this.renderData()
         : null}
-
-        {(show_selectors === true) ? this.renderRobotConfigSettings() : null}
       </React.Fragment>
     )
 
     const rightColumn = (
       <React.Fragment>
+        {(show_selectors === true) ?
+          <React.Fragment>
+            {this.renderRobotConfigSettings()}
+            {this.renderEnvironmentConfigSettings()}
+          </React.Fragment>
+        : null}
+
         {/* Always mounted, even when show_controls is false: NepiIFSimControls
             renders two logically separate groups internally -- live control
             (motor sliders, goto SEND buttons, home/stop actions, the live
@@ -2854,8 +2863,6 @@ class NepiIFSim extends Component {
           make_section={false}
           show_live_controls={show_controls}
         />
-
-        {(show_selectors === true) ? this.renderEnvironmentConfigSettings() : null}
       </React.Fragment>
     )
 
