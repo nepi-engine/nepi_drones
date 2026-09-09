@@ -1419,9 +1419,21 @@ class NepiIFSimControls extends Component {
     const live = this.isRbxLive()
     const settings = this.state.rbxSettingsNamesList
     const values = this.state.rbxSettingsValuesDict
-    const camera_controls_enabled = !live || !settings.includes("camera_controls_enabled")
+    // Same settingsKnown guard as renderRobotCapabilityControls, and the
+    // same bug this file already fixed there once (2026-09-09) --
+    // updateRbxSettingsListener clears rbxSettingsNamesList to [] the
+    // instant rbx_namespace re-points at a new device, refilling only once
+    // that device's first SettingsStatus arrives. This method was missed in
+    // that same pass: checking `live` alone made it read that empty window
+    // as "this driver declares no camera_offset_x", hiding the whole
+    // section -- reported live (2026-09-09): "the rest of the robot
+    // capabilities like the camera offset stuff is also hidden once the
+    // image topics come in" (same image-topics-arrive-around-the-same-
+    // moment race as the earlier report).
+    const settingsKnown = live && settings.length > 0
+    const camera_controls_enabled = !settingsKnown || !settings.includes("camera_controls_enabled")
       || values["camera_controls_enabled"] !== "FALSE"
-    if ((live && !settings.includes(namePrefix + "_x")) || !camera_controls_enabled) {
+    if ((settingsKnown && !settings.includes(namePrefix + "_x")) || !camera_controls_enabled) {
       return null
     }
     const isScene = (namePrefix === "scene_offset")

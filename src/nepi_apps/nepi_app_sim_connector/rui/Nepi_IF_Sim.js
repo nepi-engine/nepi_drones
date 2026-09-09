@@ -1022,8 +1022,17 @@ class NepiIFSim extends Component {
       return
     }
     this.setState({ environment_deploy_selected_name: name })
-    if (this.simControlsRef.current) {
-      this.simControlsRef.current.setEnvironmentSetting(name)
+    // .wrappedInstance, not the ref itself -- see the ref mount site's own
+    // long comment (2026-09-09) for why: NepiIFSimControls is wrapped in
+    // mobx-react 5.4.2's inject("ros"), whose Injector always attaches ITS
+    // OWN internal ref to the wrapped component and stashes the real
+    // instance on wrappedInstance -- there is no wrappedComponentRef support
+    // in this mobx-react version at all (checked the installed source
+    // directly), so a plain ref here correctly resolves to the Injector,
+    // never to NepiIFSimControls itself.
+    const inner = this.simControlsRef.current && this.simControlsRef.current.wrappedInstance
+    if (inner) {
+      inner.setEnvironmentSetting(name)
     }
   }
 
@@ -2721,8 +2730,12 @@ class NepiIFSim extends Component {
                 // reach the live device, rather than a silent no-op, since
                 // this exact "nothing visibly happens" complaint is what
                 // sent debugging it in circles the first time.
-                if (this.simControlsRef.current) {
-                  this.simControlsRef.current.pushCameraFovLive(event.target.value)
+                // .wrappedInstance -- see onDeployEnvironmentConfig's own
+                // comment for why (mobx-react 5.4.2's inject() Injector, not
+                // an unmounted ref).
+                const inner = this.simControlsRef.current && this.simControlsRef.current.wrappedInstance
+                if (inner) {
+                  inner.pushCameraFovLive(event.target.value)
                 } else {
                   console.warn("Set Horizontal FOV: NepiIFSimControls ref not mounted yet, could not push live")
                 }
@@ -2768,26 +2781,43 @@ class NepiIFSim extends Component {
     // offsets do": that early return unmounted EVERYTHING below it,
     // including bottomContent's <NepiIFSimControls ref={this.simControlsRef}>,
     // whose own mount comment explicitly says it should be "Always mounted,
-    // even when show_controls is false" -- status_msg going null (this
-    // component's own SimStatus, reset by updateStatusListener on every
-    // resubscribe, e.g. right after a fresh Deploy) took that panel down
-    // with it for no reason, since NepiIFSimControls tracks its own,
-    // separate capabilities/status entirely and never reads THIS
-    // component's status_msg at all. A genuine, independently-justified
-    // robustness fix regardless of the exact live-update reports -- but
-    // NOT confirmed as their root cause: renderData() (which hosts the FOV
-    // quick-edit box that reaches across this same ref) already had its own
-    // status_msg guard, so that box was never actually clickable during the
-    // exact window this used to unmount NepiIFSimControls in either;
-    // whatever else is stopping pushCameraFovLive/setEnvironmentSetting
-    // from reaching a live device still needs verifying against the actual
-    // deployed RUI bundle, which requires device access this session
-    // couldn't get (see docs/SIM_VM_CONNECTION_SETUP.md's own troubleshooting
-    // if SSH from the sim VM to the device is refused again).
+    // even when show_controls is false" --
+    // status_msg going null (this component's own SimStatus, reset by
+    // updateStatusListener on every resubscribe, e.g. right after a fresh
+    // Deploy) took that panel down with it for no reason, since
+    // NepiIFSimControls tracks its own, separate capabilities/status
+    // entirely and never reads THIS component's status_msg at all. A
+    // genuine, independently-justified robustness fix regardless of the
+    // exact live-update reports.
+    //
     // Every render* method below already null-guards its own status_msg
     // access, so removing this blanket gate is safe: those sections still
     // render nothing until real status arrives, but the ref-bearing panel
     // beneath them no longer unmounts along with them.
+    //
+    // Staying mounted was necessary but NOT sufficient, though -- the
+    // actual blocker for that same "fov/environment doesn't work live"
+    // symptom (found live 2026-09-09, via the browser's own console:
+    // "this.simControlsRef.current.setEnvironmentSetting is not a
+    // function") is how mobx-react 5.4.2's inject("ros") handles refs.
+    // Checked the installed source directly (node_modules/mobx-react/
+    // index.js's createStoreInjector): the Injector component it generates
+    // ALWAYS attaches its own internal ref to the wrapped component
+    // (newProps.ref = this.storeRef) and stashes the real instance on
+    // this.wrappedInstance -- there is no wrappedComponentRef support in
+    // this version at all (a first attempt at fixing this assumed the
+    // newer mobx-react API and made things worse: since
+    // wrappedComponentRef isn't a real React ref prop in 5.4.2, React never
+    // populated it, so simControlsRef.current went from "wrong object" to
+    // permanently null). So: plain `ref` here is correct after all -- it
+    // resolves to the INJECTOR, and every reader (onDeployEnvironmentConfig,
+    // the FOV box's onKeyDown) must go one hop further, through
+    // simControlsRef.current.wrappedInstance, to reach the actual
+    // NepiIFSimControls instance and its setEnvironmentSetting/
+    // pushCameraFovLive methods. observer() itself does not add another
+    // wrapping layer on top of that for a real ES6 class component (it
+    // patches the prototype in place and returns the same class), so this
+    // is the only extra hop needed.
 
     // Section visibility resolves prop-overrides-default, the same defaulting
     // the connect-app IF components use for their show_* props.
