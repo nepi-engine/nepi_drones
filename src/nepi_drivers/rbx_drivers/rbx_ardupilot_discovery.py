@@ -21,6 +21,8 @@ import subprocess
 import time
 import serial
 import socket
+import select
+import threading
 
 from nepi_sdk import nepi_sdk
 from nepi_sdk import nepi_utils
@@ -30,6 +32,234 @@ from nepi_sdk import nepi_serial
 
 PKG_NAME = 'RBX_ARDUPILOT' # Use in display menus
 FILE_TYPE = 'DISCOVERY'
+
+
+class SitlMavlinkRelay:
+  """Device-side half of the VM<->device MAVLink TCP relay used only when
+  connection_type == 'SITL' -- see mavlink_relay_vm.py (in nepi_drones'
+  sim_container/scripts/) for the VM-side half and the full root-cause
+  writeup of why this exists: the reverse SSH tunnel that used to make the
+  VM's real SITL MAVLink port transparently reachable at 127.0.0.1:5771 on
+  THIS device is gone now that every sim_connector bridge dials OUT from
+  the VM to the device instead. Confirmed live (2026-09-08): with nothing
+  forwarding it anymore, this class's own module (rbx_ardupilot_discovery)
+  logged "Did not find TCP device on ip address: 127.0.0.1 port: 5771" in
+  an endless loop the entire time a real quadcopter sim was up and running
+  fine on the VM -- no RBX device ever registered for it, so nothing
+  Settings-related, no images, nothing worked for that target at all.
+
+  Listens on DEVICE_LISTEN_PORT for mavlink_relay_vm.py to dial in (the
+  same "VM dials device" direction every other bridge here already uses),
+  and re-exposes whatever it forwards as a plain local TCP server on
+  127.0.0.1:SITL_LOCAL_PORT -- exactly the address sitl_addr_list/
+  sitl_tcp_port_list and launchSitlDeviceNode's own fcu_url already
+  expect, so neither this file's own probe nor mavros's real persistent
+  connection needed to change at all.
+
+  One VM connection and one local (discovery-probe-or-mavros) connection
+  relayed at a time, matching the one dedicated --out port SITL itself
+  already uses for this consumer (see sitl_tcp_port_list's own comment for
+  why only one canonical port is used here). A local connection accepted
+  before the VM has dialed in just blocks harmlessly reading zero bytes
+  until its own peer times out and closes (checkForTcpDevice's 2s socket
+  timeout, or mavros's own retry) -- never delivers data until a real VM
+  link exists, so a merely-accepted-but-silent socket still correctly
+  reads as "absent" exactly like checkForTcpDevice's own comment already
+  requires (the same false-positive a reverse-tunnel's sshd end always
+  risked).
+  """
+  DEVICE_LISTEN_PORT = 9031
+  SITL_LOCAL_PORT = 5771
+
+  _started = False
+  _start_lock = threading.Lock()
+  _vm_conn = None
+  _vm_conn_lock = threading.Lock()
+  # Guards against exactly the crash confirmed live (2026-09-08): a fresh
+  # local connection (e.g. checkForTcpDevice's own probe, which can still
+  # overlap mavros's own connection attempt for a moment right at the
+  # "not yet active" -> "active" transition) used to get its own relay
+  # thread spawned unconditionally, so TWO local connections could pump
+  # against the SAME shared vm_conn socket from two threads at once with
+  # no coordination -- interleaved reads/writes on one socket from two
+  # threads, and one thread's own `finally: local_conn.close()` closing
+  # vm_conn out from under the other. Surfaced as mavros's own tcp0 link
+  # dying with "Connection reset by peer" / "terminate called ... Resource
+  # deadlock avoided" shortly after every launch attempt. Only one local
+  # connection is ever relayed at a time now -- a second one arriving while
+  # the first is still active is closed immediately instead of started.
+  _local_active_lock = threading.Lock()
+
+  @classmethod
+  def ensure_started(cls, logger):
+    with cls._start_lock:
+      if cls._started:
+        return
+      cls._started = True
+      threading.Thread(target=cls._vmAcceptLoop, args=(logger,), daemon=True).start()
+      threading.Thread(target=cls._localAcceptLoop, args=(logger,), daemon=True).start()
+
+  @classmethod
+  def _vmAcceptLoop(cls, logger):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # Explicit, not inherited -- nepi_sdk/rospy sets a process-global
+    # socket.setdefaulttimeout(60) (same gotcha sim_bridge_node.py's own
+    # bridgeServerLoop already documents), which every plain socket.socket()
+    # call in this SAME process silently inherits. Confirmed live
+    # (2026-09-08): without this, srv.accept() raised socket.timeout after
+    # exactly 60s with no VM connection yet, and since that exception
+    # wasn't caught, it killed this entire thread permanently -- the VM's
+    # mavlink_relay_vm.py then had nothing left to dial into for the rest
+    # of drivers_mgr's life, with no error visible anywhere except this
+    # thread's own now-silent death.
+    srv.settimeout(None)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+      srv.bind(('0.0.0.0', cls.DEVICE_LISTEN_PORT))
+      srv.listen(1)
+    except Exception as e:
+      logger.log_warn("SitlMavlinkRelay: could not bind VM-facing port %d: %s" %
+                       (cls.DEVICE_LISTEN_PORT, str(e)))
+      return
+    logger.log_info("SitlMavlinkRelay: listening for the VM's mavlink_relay_vm.py on port %d" %
+                     cls.DEVICE_LISTEN_PORT)
+    while True:
+      try:
+        conn, addr = srv.accept()
+      except Exception as e:
+        # Self-healing, not fatal -- see this method's own settimeout(None)
+        # comment for why a bare accept() here used to die permanently
+        # instead of just logging and continuing.
+        logger.log_warn("SitlMavlinkRelay: VM-facing accept() error (continuing): " + str(e))
+        time.sleep(1.0)
+        continue
+      conn.settimeout(None)
+      logger.log_info("SitlMavlinkRelay: VM connected from " + str(addr))
+      with cls._vm_conn_lock:
+        old = cls._vm_conn
+        cls._vm_conn = conn
+      if old is not None:
+        try:
+          old.close()
+        except Exception:
+          pass
+
+  @classmethod
+  def _localAcceptLoop(cls, logger):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.settimeout(None)  # see _vmAcceptLoop's own comment for why
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+      srv.bind(('127.0.0.1', cls.SITL_LOCAL_PORT))
+      srv.listen(1)
+    except Exception as e:
+      logger.log_warn("SitlMavlinkRelay: could not bind local port %d: %s" %
+                       (cls.SITL_LOCAL_PORT, str(e)))
+      return
+    logger.log_info("SitlMavlinkRelay: listening for local clients on 127.0.0.1:%d" %
+                     cls.SITL_LOCAL_PORT)
+    while True:
+      try:
+        conn, addr = srv.accept()
+      except Exception as e:
+        logger.log_warn("SitlMavlinkRelay: local accept() error (continuing): " + str(e))
+        time.sleep(1.0)
+        continue
+      conn.settimeout(None)
+      threading.Thread(target=cls._relayLocalConn, args=(conn, logger), daemon=True).start()
+
+  @classmethod
+  def _relayLocalConn(cls, local_conn, logger):
+    # Exclusive, non-blocking -- see _local_active_lock's own comment for
+    # the crash this prevents. A second local connection arriving while
+    # one is already being relayed is closed immediately rather than ever
+    # touching vm_conn: it's either a redundant probe (harmless to drop --
+    # checkForTcpDevice tries again in ~2s regardless) or, in the very rare
+    # case it's actually mavros reconnecting while a stale probe hadn't
+    # finished yet, mavros itself retries its own connection on failure.
+    if not cls._local_active_lock.acquire(blocking=False):
+      try:
+        local_conn.close()
+      except Exception:
+        pass
+      return
+    try:
+      with cls._vm_conn_lock:
+        vm_conn = cls._vm_conn
+      if vm_conn is None:
+        # No VM side yet -- block harmlessly until the local peer's own
+        # timeout gives up and closes (see this class's own docstring for
+        # why never delivering data here is the correct behavior, not a
+        # bug).
+        try:
+          local_conn.recv(1)
+        except Exception:
+          pass
+        return
+      vm_conn_failed = cls._pump(local_conn, vm_conn)
+      # Only tear down vm_conn when IT actually failed -- confirmed live
+      # (2026-09-08) as the real cause of mavros's own "Connection reset by
+      # peer" / "Resource deadlock avoided" crash, which the exclusivity
+      # lock above did NOT fix on its own: checkForTcpDevice's own probe
+      # connects, reads one byte, then closes itself every ~2s BY DESIGN
+      # (see that method's own comment) -- that is the LOCAL side ending
+      # normally, not vm_conn failing, but the previous version of this
+      # method treated ANY pump() return as "vm_conn is dead" regardless of
+      # which side actually closed, so every single routine probe cycle
+      # destroyed the one shared vm_conn -- including out from under
+      # mavros's own, completely unrelated, still-healthy connection,
+      # forcing mavlink_relay_vm.py's own reconnect and handing mavros a
+      # mid-stream reset. _pump now reports which side actually died so
+      # only a genuine vm_conn failure clears it here.
+      if vm_conn_failed:
+        with cls._vm_conn_lock:
+          if cls._vm_conn is vm_conn:
+            cls._vm_conn = None
+        try:
+          vm_conn.close()
+        except Exception:
+          pass
+    except Exception as e:
+      logger.log_warn("SitlMavlinkRelay: local relay error: " + str(e))
+    finally:
+      try:
+        local_conn.close()
+      except Exception:
+        pass
+      cls._local_active_lock.release()
+
+  @staticmethod
+  def _pump(a, b):
+    # Returns True only if `b` (vm_conn, by this class's own calling
+    # convention -- a is always the local connection) is the side that
+    # actually failed; False if only `a` (the local side) closed/errored.
+    # See _relayLocalConn's own comment for why this distinction is the
+    # actual fix -- a plain "did pump() return" signal can't tell a normal,
+    # expected local-side close (e.g. a probe) apart from a real vm_conn
+    # failure, and conflating them was killing vm_conn (and anything else
+    # relaying through it) on every routine probe cycle.
+    a.setblocking(False)
+    b.setblocking(False)
+    while True:
+      r, _, x = select.select([a, b], [], [a, b], 5.0)
+      if b in x:
+        return True
+      if a in x:
+        return False
+      for s in r:
+        try:
+          data = s.recv(4096)
+        except BlockingIOError:
+          continue
+        except Exception:
+          return s is b
+        if not data:
+          return s is b
+        dst = b if s is a else a
+        try:
+          dst.sendall(data)
+        except Exception:
+          return dst is b
 
 
 #########################################
@@ -167,6 +397,13 @@ class ArdupilotDiscovery:
                   self.active_paths_list.append(path_str)
     # RUN SITL PROCESS (ArduPilot Software-In-The-Loop over TCP)
     elif connection_type == 'SITL':
+      # Idempotent -- see SitlMavlinkRelay's own docstring for why this is
+      # needed at all now (the reverse SSH tunnel that used to make the
+      # VM's real SITL MAVLink port transparently reachable at
+      # 127.0.0.1:5771 on this device is gone). Safe to call every
+      # discoveryFunction tick: only actually starts its two listener
+      # threads once.
+      SitlMavlinkRelay.ensure_started(self.logger)
       for ip_addr_str in self.sitl_addr_list:
         for ip_port_str in self.sitl_tcp_port_list:
           path_str = "SITL_" + ip_addr_str + "_" + ip_port_str
@@ -320,7 +557,35 @@ class ArdupilotDiscovery:
     nepi_sdk.set_param(dict_param_name, self.drv_dict)
 
     self.logger.log_info("Starting ardupilot rbx node: " + ardu_node_name)
-    [success, msg, ardu_subproc] = nepi_drvs.launchDriverNode(file_name, ardu_node_name)
+    # LD_PRELOAD needed here, not a general drivers_mgr/launchDriverNode fix --
+    # confirmed live (2026-09-08): rbx_ardupilot_node.py crashed on its own
+    # `from nepi_api.device_if_rbx import RBXRobotIF` (-> nepi_pc -> `import
+    # open3d`) with "libgomp.so.1: cannot allocate memory in static TLS
+    # block" every single time it was launched this way, while the EXACT
+    # SAME import in a plain `python3 -c` shell succeeded fine -- narrowed
+    # to import ORDER: this script's own `import cv2` (line ~28, well before
+    # device_if_rbx) already claims libgomp's static TLS slot via OpenCV's
+    # own OpenMP/BLAS backend on this aarch64 build, leaving none for
+    # open3d's own later, separate use of the same library. Preloading
+    # libgomp before the interpreter even starts guarantees it gets the
+    # first (and only, since it's the same library either way) claim,
+    # regardless of which importer asks for it first. subprocess.Popen
+    # inside launchDriverNode has no env= override, so it inherits
+    # os.environ as-is -- set LD_PRELOAD here, restore it right after the
+    # spawn call returns (the child already captured its own env copy at
+    # fork/exec time) so this doesn't leak into unrelated drivers_mgr spawns
+    # (mavros's own launch just above, or any other driver type) that never
+    # needed it and shouldn't carry it silently forever.
+    ld_preload_key = 'LD_PRELOAD'
+    prev_ld_preload = os.environ.get(ld_preload_key)
+    os.environ[ld_preload_key] = '/lib/aarch64-linux-gnu/libgomp.so.1'
+    try:
+      [success, msg, ardu_subproc] = nepi_drvs.launchDriverNode(file_name, ardu_node_name)
+    finally:
+      if prev_ld_preload is None:
+        os.environ.pop(ld_preload_key, None)
+      else:
+        os.environ[ld_preload_key] = prev_ld_preload
 
     # Process launch results
     self.launch_time_dict[launch_id] = nepi_sdk.get_time()

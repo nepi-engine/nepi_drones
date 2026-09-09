@@ -25,6 +25,7 @@ import tf
 import random
 import sys
 import socket
+import select
 import cv2
 import copy
 import base64
@@ -57,6 +58,170 @@ FILE_TYPE = 'NODE'
 
 
 #########################################
+# Camera bridge device-side relay
+#########################################
+
+class CameraBridgeDeviceRelay:
+  """Device-side half of a plain TCP relay for the camera bridge port --
+  see ArdupilotNode.__init__'s own comment (right where this gets started)
+  for the full root-cause writeup, and rbx_ardupilot_discovery.py's
+  SitlMavlinkRelay for the identically-shaped fix already proven live for
+  the MAVLink port. Listens on DEVICE_LISTEN_PORT for
+  camera_bridge_relay_vm.py to dial in (VM dials device, same direction
+  every other bridge in this app uses), and re-exposes whatever it
+  forwards as a plain local TCP server on 127.0.0.1:CAMERA_LOCAL_PORT --
+  exactly the address ArdupilotNode.CAMERA_BRIDGE_HOST/PORT already
+  expects, so cameraBridgeLoop needed no changes at all.
+
+  One VM connection and one local (this node's own cameraBridgeLoop)
+  connection relayed at a time -- ArdupilotNode only ever opens one camera
+  bridge client connection, so no probe-vs-real-connection contention like
+  SitlMavlinkRelay has to handle; the exclusivity lock and "only tear down
+  vm_conn on a genuine vm-side failure" logic are kept anyway, both because
+  they're already correct and proven, and because a stale local connection
+  lingering during a reconnect could otherwise still race a fresh one.
+  """
+  DEVICE_LISTEN_PORT = 9032
+  CAMERA_LOCAL_PORT = 9026
+
+  _started = False
+  _start_lock = threading.Lock()
+  _vm_conn = None
+  _vm_conn_lock = threading.Lock()
+  _local_active_lock = threading.Lock()
+
+  @classmethod
+  def ensure_started(cls, msg_if):
+    with cls._start_lock:
+      if cls._started:
+        return
+      cls._started = True
+      threading.Thread(target=cls._vmAcceptLoop, args=(msg_if,), daemon=True).start()
+      threading.Thread(target=cls._localAcceptLoop, args=(msg_if,), daemon=True).start()
+
+  @classmethod
+  def _vmAcceptLoop(cls, msg_if):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.settimeout(None)  # see SitlMavlinkRelay's own comment: rospy sets a
+                          # process-global socket.setdefaulttimeout(60)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+      srv.bind(('0.0.0.0', cls.DEVICE_LISTEN_PORT))
+      srv.listen(1)
+    except Exception as e:
+      msg_if.pub_warn("CameraBridgeDeviceRelay: could not bind VM-facing port %d: %s" %
+                       (cls.DEVICE_LISTEN_PORT, str(e)))
+      return
+    msg_if.pub_info("CameraBridgeDeviceRelay: listening for the VM's "
+                     "camera_bridge_relay_vm.py on port %d" % cls.DEVICE_LISTEN_PORT)
+    while True:
+      try:
+        conn, addr = srv.accept()
+      except Exception as e:
+        msg_if.pub_warn("CameraBridgeDeviceRelay: VM-facing accept() error (continuing): " + str(e))
+        time.sleep(1.0)
+        continue
+      conn.settimeout(None)
+      msg_if.pub_info("CameraBridgeDeviceRelay: VM connected from " + str(addr))
+      with cls._vm_conn_lock:
+        old = cls._vm_conn
+        cls._vm_conn = conn
+      if old is not None:
+        try:
+          old.close()
+        except Exception:
+          pass
+
+  @classmethod
+  def _localAcceptLoop(cls, msg_if):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.settimeout(None)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+      srv.bind(('127.0.0.1', cls.CAMERA_LOCAL_PORT))
+      srv.listen(1)
+    except Exception as e:
+      msg_if.pub_warn("CameraBridgeDeviceRelay: could not bind local port %d: %s" %
+                       (cls.CAMERA_LOCAL_PORT, str(e)))
+      return
+    msg_if.pub_info("CameraBridgeDeviceRelay: listening for local clients on 127.0.0.1:%d" %
+                     cls.CAMERA_LOCAL_PORT)
+    while True:
+      try:
+        conn, addr = srv.accept()
+      except Exception as e:
+        msg_if.pub_warn("CameraBridgeDeviceRelay: local accept() error (continuing): " + str(e))
+        time.sleep(1.0)
+        continue
+      conn.settimeout(None)
+      threading.Thread(target=cls._relayLocalConn, args=(conn, msg_if), daemon=True).start()
+
+  @classmethod
+  def _relayLocalConn(cls, local_conn, msg_if):
+    if not cls._local_active_lock.acquire(blocking=False):
+      try:
+        local_conn.close()
+      except Exception:
+        pass
+      return
+    try:
+      with cls._vm_conn_lock:
+        vm_conn = cls._vm_conn
+      if vm_conn is None:
+        try:
+          local_conn.recv(1)
+        except Exception:
+          pass
+        return
+      vm_conn_failed = cls._pump(local_conn, vm_conn)
+      if vm_conn_failed:
+        with cls._vm_conn_lock:
+          if cls._vm_conn is vm_conn:
+            cls._vm_conn = None
+        try:
+          vm_conn.close()
+        except Exception:
+          pass
+    except Exception as e:
+      msg_if.pub_warn("CameraBridgeDeviceRelay: local relay error: " + str(e))
+    finally:
+      try:
+        local_conn.close()
+      except Exception:
+        pass
+      cls._local_active_lock.release()
+
+  @staticmethod
+  def _pump(a, b):
+    # Returns True only if `b` (vm_conn) is the side that actually failed --
+    # see SitlMavlinkRelay._pump's own comment for why this distinction
+    # matters (conflating "local side closed" with "vm_conn is dead" was
+    # the real bug that took several iterations to find there).
+    a.setblocking(False)
+    b.setblocking(False)
+    while True:
+      r, _, x = select.select([a, b], [], [a, b], 5.0)
+      if b in x:
+        return True
+      if a in x:
+        return False
+      for s in r:
+        try:
+          data = s.recv(65536)
+        except BlockingIOError:
+          continue
+        except Exception:
+          return s is b
+        if not data:
+          return s is b
+        dst = b if s is a else a
+        try:
+          dst.sendall(data)
+        except Exception:
+          return dst is b
+
+
+#########################################
 # Node Class
 #########################################
 
@@ -82,6 +247,27 @@ class ArdupilotNode:
   # see CAMERA_PUB_ATTR/DEPTH_MAP_CAMERAS below.
   CAMERA_SETTING_NAMES = ("camera_offset_x", "camera_offset_y", "camera_offset_z",
                           "scene_offset_x", "scene_offset_y", "scene_offset_z")
+
+  # Live environment model spawn/despawn -- same "type":"environment" wire
+  # message and same Setting-value ("FLAT_GROUND" / uppercased scanned model
+  # name) convention as rbx_sim_node.py's own ENVIRONMENT_SETTING_NAMES;
+  # reuses the SAME camera bridge connection (CAMERA_BRIDGE_HOST/PORT) rather
+  # than opening a third channel, since sim_connector_bridge_gazebo_
+  # quadcopter.py's own copy of this concept was never wired to anything
+  # (its own "environment_option" handler was a no-op stub) and
+  # camera_rig_controller_ardupilot.py already owns a working, SITL-scoped
+  # JSON channel to the VM. Added 2026-09-08, requested live: "changing the
+  # environment also doesnt do anything" -- has_environment_controls being
+  # false for this driver's own flight_robot_4_motor profile only ever
+  # meant the OTHER (toggle-buttons) environment UI never renders; the
+  # dropdown-driven live Setting this app's own Sim Connector RUI uses is
+  # unconditional and was reaching this driver's settingUpdateFunction the
+  # whole time -- just landing on an unsupported/no-op setting name.
+  ENVIRONMENT_SETTING_NAMES = ("environment",)
+  # Populated dynamically from the VM's own "environment_options" line (see
+  # processCameraBridgeLine) -- starts with only the one value that's
+  # always valid regardless of what the VM has scanned.
+  ENVIRONMENT_VALUE_TO_MODEL = {"FLAT_GROUND": None}
 
   # Sim Connector "customize the capabilities that are open" toggles -- same
   # mechanism and same three names as rbx_sim_node.py's own
@@ -115,7 +301,11 @@ class ArdupilotNode:
     teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","options":["TRUE","FALSE"]},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]},
     # No fixed options -- the candidate topic set is per-deployment.
-    enabled_image_sources = {"type":"String","name":"enabled_image_sources"}
+    enabled_image_sources = {"type":"String","name":"enabled_image_sources"},
+    # Static default here; replaced wholesale once a real "environment_options"
+    # line arrives from the VM (see processCameraBridgeLine) -- same pattern
+    # rbx_sim_node.py's own CAP_SETTINGS['environment'] uses.
+    environment = {"type":"Discrete","name":"environment","options":["FLAT_GROUND"]}
   )
 
   FACTORY_SETTINGS = dict(
@@ -124,25 +314,30 @@ class ArdupilotNode:
     motor_count = {"type":"Int","name":"motor_count","value":"4"},
     motor_test_max_throttle_percent = {"type":"Float","name":"motor_test_max_throttle_percent","value":"20"},
     motor_test_timeout_s = {"type":"Float","name":"motor_test_timeout_s","value":"30"},
-    # Matches camera_rig_controller_ardupilot.py's own defaults -- robot view
-    # is forward and slightly below the body, a nose/belly-mounted
-    # inspection-camera convention (distinct from the rover's flat
-    # camera_link mount point since this is a multirotor, not a ground
-    # vehicle); scene view is behind and above, a chase-cam convention
-    # scaled down from the rover's own scene_offset_* defaults.
-    camera_offset_x = {"type":"Float","name":"camera_offset_x","value":"0.15"},
+    # Delta-from-mount-point convention (2026-09-08, see
+    # camera_rig_controller_ardupilot.py's own FACTORY_OFFSET_X/Y/Z comment
+    # for the full writeup) -- these are always 0.0 here, matching the
+    # rover's own camera_offset_x/y/z FACTORY_SETTINGS, since the real
+    # mount point (robot view: directly on top of the body; scene view:
+    # behind and above, chase-cam style) is applied on the VM side, not
+    # here. "0" therefore always means "stock/factory position" to an
+    # operator, never a raw Gazebo-frame coordinate.
+    camera_offset_x = {"type":"Float","name":"camera_offset_x","value":"0.0"},
     camera_offset_y = {"type":"Float","name":"camera_offset_y","value":"0.0"},
-    camera_offset_z = {"type":"Float","name":"camera_offset_z","value":"-0.1"},
-    scene_offset_x = {"type":"Float","name":"scene_offset_x","value":"-2.0"},
+    camera_offset_z = {"type":"Float","name":"camera_offset_z","value":"0.0"},
+    scene_offset_x = {"type":"Float","name":"scene_offset_x","value":"0.0"},
     scene_offset_y = {"type":"Float","name":"scene_offset_y","value":"0.0"},
-    scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"1.0"},
+    scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"0.0"},
     # All default to enabled: a robot config that never touches these
     # settings behaves exactly as it did before this feature existed.
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","value":"TRUE"},
     teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","value":"TRUE"},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","value":"TRUE"},
     # Empty = unrestricted -- see the CAPABILITY_SETTING_NAMES comment above.
-    enabled_image_sources = {"type":"String","name":"enabled_image_sources","value":""}
+    enabled_image_sources = {"type":"String","name":"enabled_image_sources","value":""},
+    # FLAT_GROUND ("nothing spawned") is always valid regardless of what the
+    # VM has scanned -- see ENVIRONMENT_VALUE_TO_MODEL's own comment.
+    environment = {"type":"Discrete","name":"environment","value":"FLAT_GROUND"}
   )
 
   FACTORY_SETTINGS_OVERRIDES = dict()
@@ -541,6 +736,25 @@ class ArdupilotNode:
     # tracked and watched from a separate thread rather than trusted to
     # self-detect from inside cameraBridgeLoop.
     self.camera_last_frame_time = 0.0
+    # Device-side half of a plain TCP relay making camera_rig_controller_
+    # ardupilot.py's own bridge server (127.0.0.1:9026 on the VM) reachable
+    # at 127.0.0.1:9026 on THIS device again, without a reverse SSH tunnel --
+    # same root cause and same fix shape as SitlMavlinkRelay
+    # (rbx_ardupilot_discovery.py) for the MAVLink port: confirmed live
+    # (2026-09-08) that port 9026 was flatly refused from this device
+    # (`Connection refused`), meaning cameraBridgeLoop below had never once
+    # actually connected since the reverse-SSH-tunnel setup was replaced
+    # with every bridge dialing OUT from the VM to the device instead -- no
+    # image data (or, once added, environment commands) could ever have
+    # reached this node regardless of anything else. See
+    # camera_bridge_relay_vm.py (VM side, dials into the real
+    # camera_rig_controller_ardupilot.py server and out to this device) for
+    # the other half. Idempotent and safe to start unconditionally: SITL is
+    # the only connection_path that ever runs this node with a camera
+    # bridge in the first place (real-hardware paths never reach
+    # cameraBridgeLoop's own connect target either, both just harmlessly
+    # retry forever).
+    CameraBridgeDeviceRelay.ensure_started(self.msg_if)
     self.camera_bridge_thread = threading.Thread(target = self.cameraBridgeLoop)
     self.camera_bridge_thread.daemon = True
     self.camera_bridge_thread.start()
@@ -744,6 +958,8 @@ class ArdupilotNode:
         msg = ( self.node_name  + " UPDATED SETTINGS " + setting_str)
         if setting_name in self.CAMERA_SETTING_NAMES:
           self.sendCameraSettings()
+        if setting_name in self.ENVIRONMENT_SETTING_NAMES:
+          self.setEnvironmentAction(setting['value'])
     else:
       msg = (self.node_name  + " Setting data" + setting_str + " is not valid")
     return success, msg
@@ -1110,8 +1326,38 @@ class ArdupilotNode:
     body_x = max(-1.0, min(1.0, linear_x)) * max_lin
     body_y = max(-1.0, min(1.0, linear_y)) * max_lin
     yaw_rad = math.radians(self.navpose_dict['yaw_deg'])
-    enu_x = body_x * math.cos(yaw_rad) - body_y * math.sin(yaw_rad)
-    enu_y = body_x * math.sin(yaw_rad) + body_y * math.cos(yaw_rad)
+    # Confirmed live (2026-09-08) with two isolated, single-axis burst
+    # tests at yaw ~= 0 (pure body_x=1,body_y=0 for 3s, then separately
+    # pure body_x=0,body_y=1 for 3s, vehicle re-teleported to the origin
+    # between the two so neither test's drift contaminated the other):
+    # a pure "forward" command produced pure WORLD -Y Gazebo movement (not
+    # +X), and a pure "right" command produced pure WORLD -X movement (not
+    # -Y) -- i.e. actual_world = (published_y, -published_x), a
+    # consistent -90 degree rotation between whatever mavros's
+    # setpoint_velocity/cmd_vel_unstamped plugin treats as its own local
+    # ENU frame and the frame Gazebo's world_states/get_model_state
+    # actually reports -- NOT a bug in the body->world rotation math
+    # itself (which was already correct: forward=(cos,sin), right=
+    # (sin,-cos) is the right-handed pair a right-positive body_y needs).
+    # This is a fixed, yaw-independent misalignment between mavros's own
+    # frame and Gazebo's world frame for this particular ardupilot_gazebo
+    # model/world (unrelated to, and in addition to, the vehicle's own
+    # yaw -- which is what yaw_rad below still correctly rotates by).
+    # Compensated by publishing the correctly-rotated body->world vector
+    # pre-rotated by the inverse of that same -90 degree misalignment
+    # (i.e. +90 degrees: (x,y) -> (-y,x)) so that mavros's own -90 degree
+    # offset cancels it out exactly, leaving the real Gazebo-world result
+    # matching the intended forward/right semantics -- re-verified against
+    # both burst tests after this change (forward -> +X, right -> -Y).
+    # A previous attempt at this same class of fix (2026-09-08, same day,
+    # earlier in this investigation) only flipped the sign of the body_y
+    # cross-term without adding this rotation, which does correctly fix a
+    # PURE body_y command's sign but still leaves pure body_x commands
+    # landing on the wrong world axis entirely -- confirmed insufficient
+    # by the pure-forward burst test above, which that earlier fix alone
+    # cannot explain or correct.
+    enu_x = body_y * math.cos(yaw_rad) - body_x * math.sin(yaw_rad)
+    enu_y = body_x * math.cos(yaw_rad) + body_y * math.sin(yaw_rad)
     with self.teleop_lock:
       self.teleop_linear_enu = [enu_x, enu_y, max(-1.0, min(1.0, linear_z)) * max_lin]
       self.teleop_angular_z = max(-1.0, min(1.0, angular_z)) * max_ang
@@ -1957,6 +2203,12 @@ class ArdupilotNode:
       # keeps whatever settings it last had, so an explicit push avoids
       # relying on both sides coincidentally matching factory defaults.
       self.sendCameraSettings()
+      # Same resync for environment -- a fresh connect (this node restarted,
+      # or the VM stack itself did) must not silently leave whatever
+      # environment model the VM's own environment_models.py last happened
+      # to have spawned; re-assert this node's own current Setting value
+      # instead.
+      self.setEnvironmentAction(self.settings_dict['environment']['value'])
       buf = b''
       while not nepi_sdk.is_shutdown():
         try:
@@ -1992,8 +2244,36 @@ class ArdupilotNode:
       return
     if msg.get('type') == 'image':
       self.processCameraImageLine(msg)
+    elif msg.get('type') == 'environment_options':
+      # Same "learn what's scanned/available on the VM" resync rbx_sim_node.py's
+      # own processEnvironmentOptionsLine does -- see ENVIRONMENT_VALUE_TO_MODEL's
+      # own comment. Best-effort, non-blocking: an operator picking an
+      # environment before this arrives just gets a harmless no-op from the
+      # driver's own Discrete-setting validation, same safety net every other
+      # Setting here already relies on.
+      model_names = [str(n) for n in msg.get('options', [])]
+      self.CAP_SETTINGS['environment']['options'] = ["FLAT_GROUND"] + [n.upper() for n in model_names]
+      self.ENVIRONMENT_VALUE_TO_MODEL.update({n.upper(): n for n in model_names})
     else:
       self.msg_if.pub_warn("Unrecognized camera bridge line type: " + str(msg.get('type')))
+
+  def setEnvironmentAction(self, environment_value):
+    # Fire-and-forget over the camera bridge, same pattern rbx_sim_node.py's
+    # own setEnvironmentAction uses over ITS bridge -- the VM side
+    # (camera_rig_controller_ardupilot.py) owns the actual Gazebo spawn/
+    # delete calls via environment_models.py. environment_value is a
+    # Discrete option string (FLAT_GROUND, an uppercased scanned model name,
+    # or AERIAL_OBSTACLE_COURSE once environment_options has reported it);
+    # ENVIRONMENT_VALUE_TO_MODEL maps it to the real model directory name to
+    # spawn, or None for "nothing spawned" (FLAT_GROUND).
+    with self.camera_sock_lock:
+      connected = self.camera_sock is not None
+    if not connected:
+      return False
+    model_name = self.ENVIRONMENT_VALUE_TO_MODEL.get(environment_value)
+    self.sendLineToCameraBridge({'type': 'environment', 'model_name': model_name},
+                                "Environment set to " + environment_value)
+    return True
 
   # "camera" (added alongside camera_rig_controller_ardupilot.py's six-topic
   # split) picks which of the six publishers a frame goes to; an older

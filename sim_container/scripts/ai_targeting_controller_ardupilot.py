@@ -90,6 +90,9 @@ MODEL_STATE_TOPIC = '/gazebo/set_model_state'
 SPAWN_MODEL_SERVICE = '/gazebo/spawn_sdf_model'
 DELETE_MODEL_SERVICE = '/gazebo/delete_model'
 GAZEBO_SERVICE_WAIT_SEC = 5
+# See spawnTargetModelRetryLoop's own comment for why this is a loop, not a
+# single attempt.
+SPAWN_RETRY_INTERVAL_SEC = 3.0
 
 SDF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         '..', 'models', 'sim_target_chair', 'model.sdf')
@@ -150,7 +153,26 @@ class AiTargetingControllerArdupilot:
     self.client_lock = threading.Lock()
     self.client_conn = None
 
-    self.spawnTargetModel()
+    # Backgrounded with retries, not a single blocking attempt -- confirmed
+    # live (2026-09-08) as a real, reproducible startup race: this node can
+    # (and, in the exact launch_command ordering used by the sim_connector
+    # app, reliably does) start running before gzserver's own
+    # /gazebo/spawn_sdf_model service plugin has finished initializing,
+    # even though /gazebo/model_states (what launch_command's own gz_wait
+    # loop checks for) is already up by then. The one-shot version of this
+    # call just logged "spawn service call failed: timeout exceeded" and
+    # gave up permanently -- sim_target_chair never existed for the rest of
+    # this node's life, silently breaking the entire follow-mission demo
+    # with no further symptom anywhere else (the circling-position logic
+    # and the bridge server both still ran normally, "chair" just never
+    # visually or physically existed in the world). Same "keep retrying in
+    # the background instead of giving up permanently" fix already proven
+    # for the identical class of startup race in this app (see
+    # sim_ai_targeting_bridge_script.py's own trigger_remote_sim_launch/
+    # imageRelayThread comments).
+    self.spawn_thread = threading.Thread(target = self.spawnTargetModelRetryLoop)
+    self.spawn_thread.daemon = True
+    self.spawn_thread.start()
 
     self.state_pub = rospy.Publisher(MODEL_STATE_TOPIC, ModelState, queue_size = 1)
     self.model_states_sub = rospy.Subscriber(MODEL_STATES_TOPIC, ModelStates, self.modelStatesCb)
@@ -177,13 +199,21 @@ class AiTargetingControllerArdupilot:
     bridge server thread."""
     rospy.spin()
 
+  def spawnTargetModelRetryLoop(self):
+    while not rospy.is_shutdown():
+      if self.spawnTargetModel():
+        return
+      time.sleep(SPAWN_RETRY_INTERVAL_SEC)
+
   def spawnTargetModel(self):
+    """Returns True once the model is confirmed spawned (or already
+    present), False if this attempt should be retried."""
     try:
       with open(SDF_PATH, 'r') as f:
         target_sdf = f.read()
     except Exception as e:
       rospy.logerr(PKG_NAME + ": Failed to read target SDF at " + SDF_PATH + ": " + str(e))
-      return
+      return False
     try:
       rospy.wait_for_service(SPAWN_MODEL_SERVICE, timeout = GAZEBO_SERVICE_WAIT_SEC)
       spawn = rospy.ServiceProxy(SPAWN_MODEL_SERVICE, SpawnModel)
@@ -194,14 +224,19 @@ class AiTargetingControllerArdupilot:
       resp = spawn(TARGET_MODEL_NAME, target_sdf, '', initial_pose, 'world')
       if resp.success:
         rospy.loginfo(PKG_NAME + ": Target model spawned")
-      else:
+        return True
+      if 'already exist' in resp.status_message.lower():
         # Already-spawned from a prior run of this node is the common case
         # (Gazebo keeps running across node restarts) -- not fatal, the
         # existing model is reused as-is.
-        rospy.loginfo(PKG_NAME + ": Target model spawn skipped/failed (may already exist): " +
+        rospy.loginfo(PKG_NAME + ": Target model already exists, reusing: " +
                       resp.status_message)
+        return True
+      rospy.logwarn(PKG_NAME + ": Target model spawn failed, will retry: " + resp.status_message)
+      return False
     except Exception as e:
-      rospy.logwarn(PKG_NAME + ": Target model spawn service call failed: " + str(e))
+      rospy.logwarn(PKG_NAME + ": Target model spawn service call failed, will retry: " + str(e))
+      return False
 
   def despawnTargetModel(self):
     try:

@@ -307,35 +307,40 @@ launch_targets:
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/sim_bridge_node.py < /dev/null > /tmp/sim_bridge_node.log 2>&1 & BRIDGE_PID=$!;
       wait $HB_PID $CAM_PID $BRIDGE_PID
       '
-    # Kills ONLY this launch's own process group, never Gazebo generally.
-    # An earlier version ran `pkill -x gzserver; pkill -x gzclient`, which
-    # would have torn down every unrelated Gazebo on the host -- including a
-    # live ArduPilot SITL session that was in fact running alongside it during
-    # testing. Process-group scoping is what makes stop precise: the pidfile
-    # holds the launching shell's PGID, and all of its children share it, so
-    # `kill -- -PGID` reaches the gazebo wrapper, gzserver, gzclient and the
-    # bridge, and reaches nothing else.
+    # Kills this launch's own process group PLUS an explicit, scoped
+    # gzserver/gzclient pkill -- the pgid kill alone is NOT sufficient,
+    # confirmed live (2026-09-08) with `ps -eo pid,ppid,pgid,sid,cmd`: `rosrun
+    # gazebo_ros gazebo` execs /opt/ros/noetic/lib/gazebo_ros/gazebo, a shell
+    # wrapper that starts gzserver/gzclient in a NEW session (their sid/pgid
+    # matched each other but NOT the launching bash -l script's own tracked
+    # pgid, and their ppid pointed at an unrelated ancestor, not this
+    # script). The user hit this directly: Stop appeared to work (it clears
+    # the RUI/robots list and removes its own pgid file), but gzserver/
+    # gzclient kept running, so the next launch's own `pgrep -x gzserver`
+    # guard refused every subsequent Deploy click with "already running"
+    # until the orphan was killed by hand. An earlier version of this command
+    # ran unscoped `pkill -x gzserver; pkill -x gzclient`, removed because it
+    # would tear down an unrelated Gazebo (e.g. a live ArduPilot SITL session
+    # on the same host) too -- kept scoped THIS time: gzserver is matched by
+    # this target's own world file (so a different target's/an unrelated
+    # manual Gazebo's gzserver, running a different world, survives), while
+    # gzclient is killed unscoped, same tradeoff kill_all_gazebo's own
+    # docstring already accepts -- there is realistically only ever one
+    # gzclient paired with whichever one gzserver the launch guard already
+    # limits the host to.
     #
-    # Those exiting makes the `wait` above return, which ends the launch
-    # script naturally and closes its ssh session on its own -- no separate
-    # teardown of that session needed. Does not touch roscore: if
-    # launch_command found one already running, it isn't ours to kill; if
-    # launch_command started its own, it is in this same process group and so
-    # goes down with it.
+    # Does not touch roscore: if launch_command found one already running,
+    # it isn't ours to kill; if launch_command started its own, it is in
+    # this same process group and so goes down with the pgid kill.
     #
     # "[s]im_connector_bridge_gazebo.py" (not "sim_connector_bridge_gazebo.py")
     # is deliberate, not a typo -- found while debugging gazebo_quadcopter's
     # own stop_command below: a plain `pkill -f pattern` always self-matches
     # this SAME bash -lc invocation (its own argv literally contains the
     # pattern text), killing this script before the trailing `; true` even
-    # runs. Silently harmless here specifically because the pgid kill just
-    # above is already the complete cleanup for this target (confirmed via
-    # `ps aux` before/after every stop this session) -- there is nothing
-    # left for this fallback pkill to catch regardless of whether it runs --
-    # but bracket-escaped anyway now that the bug is understood, rather than
-    # leaving a latent footgun for whoever next relies on this line actually
-    # executing.
-    stop_command: "bash -lc 'f=/tmp/sim_connector_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; pkill -f [s]im_bridge_node.py 2>/dev/null; pkill -f [s]im_heartbeat_listener.py 2>/dev/null; pkill -f [c]amera_rig_controller.py 2>/dev/null; true'"
+    # runs. Same reasoning applied to the new gzserver pkill below
+    # ("[g]zserver", not "gzserver").
+    stop_command: "bash -lc 'f=/tmp/sim_connector_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; pkill -f [s]im_bridge_node.py 2>/dev/null; pkill -f [s]im_heartbeat_listener.py 2>/dev/null; pkill -f [c]amera_rig_controller.py 2>/dev/null; pkill -f \"[g]zserver .*generic_rover\\.world\" 2>/dev/null; pkill -x gzclient 2>/dev/null; true'"
     # Verifies THIS target's own world is up, not just that some gazebo is.
     # Two earlier versions were both false-positive-prone: process existence
     # alone missed gzserver spinning on "No ROS master", and a bare
@@ -649,7 +654,10 @@ launch_targets:
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/camera_rig_controller_ardupilot.py < /dev/null > /tmp/sim_connector_quadcopter_camera_rig_launch.log 2>&1 & CAM_PID=$!;
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/ai_targeting_controller_ardupilot.py < /dev/null > /tmp/sim_connector_quadcopter_ai_targeting_launch.log 2>&1 & AI_TARGET_PID=$!;
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/gazebo/sim_connector_bridge_gazebo_quadcopter.py --host {device_bridge_host} --port {device_bridge_port} --mavlink tcp:127.0.0.1:5772 < /dev/null > /tmp/sim_connector_quadcopter_bridge_launch.log 2>&1 & BRIDGE_PID=$!;
-      wait $SITL_PID $GZ_PID $CAM_PID $AI_TARGET_PID $BRIDGE_PID
+      python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/mavlink_relay_vm.py --device-host {device_bridge_host} < /dev/null > /tmp/sim_connector_quadcopter_mavlink_relay_launch.log 2>&1 & MAVRELAY_PID=$!;
+      python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/camera_bridge_relay_vm.py --device-host {device_bridge_host} < /dev/null > /tmp/sim_connector_quadcopter_camera_bridge_relay_launch.log 2>&1 & CAMRELAY_PID=$!;
+      python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/ai_targeting_relay_vm.py --device-host {device_bridge_host} < /dev/null > /tmp/sim_connector_quadcopter_ai_targeting_relay_launch.log 2>&1 & AITARGETRELAY_PID=$!;
+      wait $SITL_PID $GZ_PID $CAM_PID $AI_TARGET_PID $BRIDGE_PID $MAVRELAY_PID $CAMRELAY_PID $AITARGETRELAY_PID
       '
     # Same "Use Existing" override as gazebo_rover's own attach_launch_command
     # -- skips ONLY the gzserver refuse-guard and the `rosrun gazebo_ros
@@ -680,7 +688,10 @@ launch_targets:
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/ai_targeting_controller_ardupilot.py < /dev/null > /tmp/sim_connector_quadcopter_ai_targeting_launch.log 2>&1 & AI_TARGET_PID=$!;
       sim_vehicle.py -v ArduCopter -f gazebo-iris --out=tcpin:0.0.0.0:5771 --out=tcpin:0.0.0.0:5772 --mavproxy-args="--daemon" < /dev/null > /tmp/sim_connector_quadcopter_sitl_launch.log 2>&1 & SITL_PID=$!;
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/gazebo/sim_connector_bridge_gazebo_quadcopter.py --host {device_bridge_host} --port {device_bridge_port} --mavlink tcp:127.0.0.1:5772 < /dev/null > /tmp/sim_connector_quadcopter_bridge_launch.log 2>&1 & BRIDGE_PID=$!;
-      wait $CAM_PID $AI_TARGET_PID $SITL_PID $BRIDGE_PID
+      python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/mavlink_relay_vm.py --device-host {device_bridge_host} < /dev/null > /tmp/sim_connector_quadcopter_mavlink_relay_launch.log 2>&1 & MAVRELAY_PID=$!;
+      python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/camera_bridge_relay_vm.py --device-host {device_bridge_host} < /dev/null > /tmp/sim_connector_quadcopter_camera_bridge_relay_launch.log 2>&1 & CAMRELAY_PID=$!;
+      python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/ai_targeting_relay_vm.py --device-host {device_bridge_host} < /dev/null > /tmp/sim_connector_quadcopter_ai_targeting_relay_launch.log 2>&1 & AITARGETRELAY_PID=$!;
+      wait $CAM_PID $AI_TARGET_PID $SITL_PID $BRIDGE_PID $MAVRELAY_PID $CAMRELAY_PID $AITARGETRELAY_PID
       '
     # Belt-and-suspenders like gazebo_rover's own stop_command: the pgid kill
     # is the primary mechanism, but sim_vehicle.py is a much more complex
@@ -708,7 +719,13 @@ launch_targets:
     # which is exactly what made the NEXT launch attempt fail in a way that
     # looked like "launching doesn't launch the SITL" (the fresh
     # sim_vehicle.py's own MAVProxy can't bind those ports).
-    stop_command: "bash -lc 'f=/tmp/sim_connector_quadcopter_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; rm -f /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo; pkill -f \"[s]im_vehicle.py -v ArduCopter\" 2>/dev/null; pkill -9 -f \"[m]avproxy.py\" 2>/dev/null; pkill -f \"[a]rducopter -S\" 2>/dev/null; pkill -f [c]amera_rig_controller_ardupilot.py 2>/dev/null; pkill -f [a]i_targeting_controller_ardupilot.py 2>/dev/null; pkill -f [s]im_connector_bridge_gazebo_quadcopter.py 2>/dev/null; pkill -f [g]z_reset_listener.py 2>/dev/null; sleep 1; if timeout 1 bash -c \"cat < /dev/null > /dev/tcp/127.0.0.1/5771\" 2>/dev/null; then echo \"WARNING: port 5771 still bound after stop -- a MAVProxy/ArduCopter orphan may have survived\" >&2; fi; true'"
+    #
+    # gzserver/gzclient need their own explicit, scoped pkill too, same fix
+    # and same reasoning as gazebo_rover's own stop_command (confirmed live
+    # 2026-09-08 that `rosrun gazebo_ros gazebo` always starts them in a new
+    # session, immune to any pgid kill regardless of target) -- scoped by
+    # this target's own world file so an unrelated Gazebo survives.
+    stop_command: "bash -lc 'f=/tmp/sim_connector_quadcopter_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; rm -f /tmp/sim_connector_quadcopter_mavproxy_stdin.fifo; pkill -f \"[s]im_vehicle.py -v ArduCopter\" 2>/dev/null; pkill -9 -f \"[m]avproxy.py\" 2>/dev/null; pkill -f \"[a]rducopter -S\" 2>/dev/null; pkill -f [c]amera_rig_controller_ardupilot.py 2>/dev/null; pkill -f [a]i_targeting_controller_ardupilot.py 2>/dev/null; pkill -f [s]im_connector_bridge_gazebo_quadcopter.py 2>/dev/null; pkill -f [m]avlink_relay_vm.py 2>/dev/null; pkill -f [c]amera_bridge_relay_vm.py 2>/dev/null; pkill -f [a]i_targeting_relay_vm.py 2>/dev/null; pkill -f [g]z_reset_listener.py 2>/dev/null; pkill -f \"[g]zserver .*iris_arducopter_cmac\\.world\" 2>/dev/null; pkill -x gzclient 2>/dev/null; sleep 1; if timeout 1 bash -c \"cat < /dev/null > /dev/tcp/127.0.0.1/5771\" 2>/dev/null; then echo \"WARNING: port 5771 still bound after stop -- a MAVProxy/ArduCopter orphan may have survived\" >&2; fi; true'"
     # Same "prove THIS target's own world is up" bar as gazebo_rover's own
     # ready_check_command -- /camera_rig/camera/image_raw having a real
     # publisher proves camera_rig_controller_ardupilot.py connected to a

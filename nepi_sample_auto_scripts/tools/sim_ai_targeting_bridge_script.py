@@ -55,6 +55,7 @@
 
 import rospy
 import json
+import select
 import socket
 import threading
 import time
@@ -165,6 +166,166 @@ def trigger_remote_sim_launch(msg_if):
                    "manually")
 
 
+class AiTargetingDeviceRelay:
+  """Device-side half of a plain TCP relay making ai_targeting_controller_
+  ardupilot.py's own bridge server (127.0.0.1:9027 on the VM) reachable at
+  127.0.0.1:9027 on THIS device again, WITHOUT a reverse SSH tunnel -- same
+  root cause and same fix shape as CameraBridgeDeviceRelay
+  (rbx_ardupilot_node.py) and SitlMavlinkRelay (rbx_ardupilot_discovery.py),
+  both already confirmed live (2026-09-08). This module's own BRIDGE_HOST/
+  PORT comment ("forwarded over the existing reverse SSH tunnel") describes
+  exactly the setup that no longer exists now that every sim_connector
+  bridge dials OUT from the VM to the device instead -- confirmed live that
+  port 9027 was flatly refused from this device before this fix, meaning
+  bridgeLoop below had never once actually connected, so
+  drone_follow_object_mission_script.py's target_localizations feed (and
+  the RUI's own Peripheral Status check for it) could never have worked
+  regardless of anything else.
+
+  See ai_targeting_relay_vm.py (in nepi_drones' sim_container/scripts/) for
+  the VM-side half. Listens on DEVICE_LISTEN_PORT for that script to dial
+  in, and re-exposes whatever it forwards as a plain local TCP server on
+  127.0.0.1:BRIDGE_LOCAL_PORT -- exactly what bridgeLoop below already
+  expects, so it needed no changes to its own connect logic at all.
+  """
+  DEVICE_LISTEN_PORT = 9033
+  BRIDGE_LOCAL_PORT = 9027
+
+  _started = False
+  _start_lock = threading.Lock()
+  _vm_conn = None
+  _vm_conn_lock = threading.Lock()
+  _local_active_lock = threading.Lock()
+
+  @classmethod
+  def ensure_started(cls, msg_if):
+    with cls._start_lock:
+      if cls._started:
+        return
+      cls._started = True
+      threading.Thread(target=cls._vmAcceptLoop, args=(msg_if,), daemon=True).start()
+      threading.Thread(target=cls._localAcceptLoop, args=(msg_if,), daemon=True).start()
+
+  @classmethod
+  def _vmAcceptLoop(cls, msg_if):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.settimeout(None)  # rospy sets a process-global socket.setdefaulttimeout(60)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+      srv.bind(('0.0.0.0', cls.DEVICE_LISTEN_PORT))
+      srv.listen(1)
+    except Exception as e:
+      msg_if.pub_warn("AiTargetingDeviceRelay: could not bind VM-facing port %d: %s" %
+                       (cls.DEVICE_LISTEN_PORT, str(e)))
+      return
+    msg_if.pub_info("AiTargetingDeviceRelay: listening for the VM's "
+                     "ai_targeting_relay_vm.py on port %d" % cls.DEVICE_LISTEN_PORT)
+    while True:
+      try:
+        conn, addr = srv.accept()
+      except Exception as e:
+        msg_if.pub_warn("AiTargetingDeviceRelay: VM-facing accept() error (continuing): " + str(e))
+        time.sleep(1.0)
+        continue
+      conn.settimeout(None)
+      msg_if.pub_info("AiTargetingDeviceRelay: VM connected from " + str(addr))
+      with cls._vm_conn_lock:
+        old = cls._vm_conn
+        cls._vm_conn = conn
+      if old is not None:
+        try:
+          old.close()
+        except Exception:
+          pass
+
+  @classmethod
+  def _localAcceptLoop(cls, msg_if):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.settimeout(None)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+      srv.bind(('127.0.0.1', cls.BRIDGE_LOCAL_PORT))
+      srv.listen(1)
+    except Exception as e:
+      msg_if.pub_warn("AiTargetingDeviceRelay: could not bind local port %d: %s" %
+                       (cls.BRIDGE_LOCAL_PORT, str(e)))
+      return
+    msg_if.pub_info("AiTargetingDeviceRelay: listening for local clients on 127.0.0.1:%d" %
+                     cls.BRIDGE_LOCAL_PORT)
+    while True:
+      try:
+        conn, addr = srv.accept()
+      except Exception as e:
+        msg_if.pub_warn("AiTargetingDeviceRelay: local accept() error (continuing): " + str(e))
+        time.sleep(1.0)
+        continue
+      conn.settimeout(None)
+      threading.Thread(target=cls._relayLocalConn, args=(conn, msg_if), daemon=True).start()
+
+  @classmethod
+  def _relayLocalConn(cls, local_conn, msg_if):
+    if not cls._local_active_lock.acquire(blocking=False):
+      try:
+        local_conn.close()
+      except Exception:
+        pass
+      return
+    try:
+      with cls._vm_conn_lock:
+        vm_conn = cls._vm_conn
+      if vm_conn is None:
+        try:
+          local_conn.recv(1)
+        except Exception:
+          pass
+        return
+      vm_conn_failed = cls._pump(local_conn, vm_conn)
+      if vm_conn_failed:
+        with cls._vm_conn_lock:
+          if cls._vm_conn is vm_conn:
+            cls._vm_conn = None
+        try:
+          vm_conn.close()
+        except Exception:
+          pass
+    except Exception as e:
+      msg_if.pub_warn("AiTargetingDeviceRelay: local relay error: " + str(e))
+    finally:
+      try:
+        local_conn.close()
+      except Exception:
+        pass
+      cls._local_active_lock.release()
+
+  @staticmethod
+  def _pump(a, b):
+    # Returns True only if `b` (vm_conn) is the side that actually failed --
+    # see SitlMavlinkRelay._pump's own comment (rbx_ardupilot_discovery.py)
+    # for why this distinction matters.
+    a.setblocking(False)
+    b.setblocking(False)
+    while True:
+      r, _, x = select.select([a, b], [], [a, b], 5.0)
+      if b in x:
+        return True
+      if a in x:
+        return False
+      for s in r:
+        try:
+          data = s.recv(65536)
+        except BlockingIOError:
+          continue
+        except Exception:
+          return s is b
+        if not data:
+          return s is b
+        dst = b if s is a else a
+        try:
+          dst.sendall(data)
+        except Exception:
+          return dst is b
+
+
 class sim_ai_targeting_bridge(object):
 
   DEFAULT_NODE_NAME = "sim_ai_targeting_bridge"
@@ -215,6 +376,12 @@ class sim_ai_targeting_bridge(object):
     self.image_relay_thread = threading.Thread(target = self.imageRelayThread)
     self.image_relay_thread.daemon = True
     self.image_relay_thread.start()
+
+    # Device-side half of the VM<->device relay for BRIDGE_PORT -- see
+    # AiTargetingDeviceRelay's own docstring for the full root-cause
+    # writeup (same reverse-SSH-tunnel assumption already found and fixed
+    # for the MAVLink and camera bridge ports).
+    AiTargetingDeviceRelay.ensure_started(self.msg_if)
 
     self.bridge_thread = threading.Thread(target = self.bridgeLoop)
     self.bridge_thread.daemon = True

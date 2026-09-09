@@ -92,6 +92,8 @@ from sensor_msgs.msg import Image
 from gazebo_msgs.msg import ModelState, ModelStates
 from cv_bridge import CvBridge
 
+import environment_models
+
 PKG_NAME = 'CAMERA_RIG_CONTROLLER_ARDUPILOT'
 NODE_NAME = 'camera_rig_controller_ardupilot'
 
@@ -144,18 +146,41 @@ BRIDGE_PORT = 9026
 # eye -- both sides fall back to the same values before the first
 # camera_settings line arrives, e.g. right after a (re)connect).
 #
-# Robot view (nose cam): forward and slightly below the body, a
-# nose/belly-mounted inspection-camera convention, distinct from the rover's
-# flat mount point since this is a multirotor.
-DEFAULT_OFFSET_X = 0.15
+# Delta-from-mount-point convention (added 2026-09-08, requested live: "put
+# the robot camera on top of the drone, not under. directly on top. make
+# sure those are each the 0 0 0 values, both robot and scene camera views")
+# -- matches the SAME convention the rover's own FACTORY_SCENE_OFFSET_X/Y/Z
+# and FACTORY_CAMERA_OFFSET_X/Y/Z already use (see rbx_sim_node.py/
+# sim_bridge_node.py): DEFAULT_OFFSET_*/DEFAULT_SCENE_OFFSET_* below are now
+# the actual mount points (added back in controlCb), while offset_x/y/z and
+# scene_offset_x/y/z themselves are a DELTA from that point, so "0" always
+# means "stock/factory position" for an operator, never a raw Gazebo-frame
+# coordinate. Before this, "0 0 0" for the robot view was the drone's own
+# body origin (inside the airframe, not where the camera actually sat) --
+# confusing for exactly the same reason the rover's own camera offset was
+# before its matching fix.
+#
+# Robot view (nose cam): directly on top of the body, centered (x=0, y=0) --
+# was forward-and-below (a nose/belly mount); moved per the same live
+# request above. z=0.15 clears a typical small-quad body's own top plate/
+# GPS mast without the render clipping into the airframe mesh.
+FACTORY_OFFSET_X = 0.0
+FACTORY_OFFSET_Y = 0.0
+FACTORY_OFFSET_Z = 0.15
+DEFAULT_OFFSET_X = 0.0
 DEFAULT_OFFSET_Y = 0.0
-DEFAULT_OFFSET_Z = -0.1
+DEFAULT_OFFSET_Z = 0.0
 # Scene view (chase cam): behind and above the body -- same general chase-cam
 # convention as the rover's own scene_offset_* defaults, scaled down since a
 # quadcopter's own body/prop footprint is much smaller than the rover's.
-DEFAULT_SCENE_OFFSET_X = -2.0
+# Absolute position unchanged by this fix, only now expressed as the mount
+# point a "0" delta resolves to, matching the robot view's own convention.
+FACTORY_SCENE_OFFSET_X = -2.0
+FACTORY_SCENE_OFFSET_Y = 0.0
+FACTORY_SCENE_OFFSET_Z = 1.0
+DEFAULT_SCENE_OFFSET_X = 0.0
 DEFAULT_SCENE_OFFSET_Y = 0.0
-DEFAULT_SCENE_OFFSET_Z = 1.0
+DEFAULT_SCENE_OFFSET_Z = 0.0
 
 
 class CameraRigControllerArdupilot:
@@ -189,6 +214,16 @@ class CameraRigControllerArdupilot:
 
     self.client_lock = threading.Lock()
     self.client_conn = None
+
+    # Live environment model spawn/despawn -- same environment_models.py
+    # module and same "type":"environment"/"environment_options" wire
+    # messages sim_bridge_node.py already uses for the rover, reusing THIS
+    # bridge connection rather than opening a new one (see
+    # rbx_ardupilot_node.py's own ENVIRONMENT_SETTING_NAMES comment for the
+    # full "why not the same architecture as the rover" answer). Added
+    # 2026-09-08, requested live: "changing the environment also doesnt do
+    # anything" for the quadcopter.
+    self.env_spawner = environment_models.EnvironmentModelSpawner(log_prefix = PKG_NAME)
 
     self.state_pub = rospy.Publisher(MODEL_STATE_TOPIC, ModelState, queue_size = 1)
 
@@ -306,12 +341,16 @@ class CameraRigControllerArdupilot:
       drone_yaw = self.drone_yaw
 
     with self.settings_lock:
-      off_x = self.offset_x
-      off_y = self.offset_y
-      off_z = self.offset_z
-      scene_off_x = self.scene_offset_x
-      scene_off_y = self.scene_offset_y
-      scene_off_z = self.scene_offset_z
+      # Add the factory mount point back here, the one place that actually
+      # needs the real body-frame offset (driveRig's own pose math) --
+      # everywhere else (Settings, the RUI) keeps working in the delta. See
+      # FACTORY_OFFSET_X/Y/Z's own comment.
+      off_x = FACTORY_OFFSET_X + self.offset_x
+      off_y = FACTORY_OFFSET_Y + self.offset_y
+      off_z = FACTORY_OFFSET_Z + self.offset_z
+      scene_off_x = FACTORY_SCENE_OFFSET_X + self.scene_offset_x
+      scene_off_y = FACTORY_SCENE_OFFSET_Y + self.scene_offset_y
+      scene_off_z = FACTORY_SCENE_OFFSET_Z + self.scene_offset_z
 
     self.driveRig(ROBOT_VIEW_MODEL_NAME, drone_x, drone_y, drone_z, drone_yaw,
                   off_x, off_y, off_z, is_scene_view = False)
@@ -491,6 +530,11 @@ class CameraRigControllerArdupilot:
       rospy.loginfo(PKG_NAME + ": Bridge client connected")
       with self.client_lock:
         self.client_conn = conn
+      # Tell the device which environment models exist on this VM right
+      # away, same "push state on connect" instinct as sim_bridge_node.py's
+      # own copy of this exact line.
+      self.sendLineToClient({'type': 'environment_options',
+                            'options': environment_models.list_environment_models()})
       self.serveClient(conn)
       with self.client_lock:
         if self.client_conn is conn:
@@ -524,6 +568,8 @@ class CameraRigControllerArdupilot:
           continue
         if cmd.get('type') == 'camera_settings':
           self.applyCameraSettings(cmd)
+        elif cmd.get('type') == 'environment':
+          self.env_spawner.set_active_model(cmd.get('model_name'))
         else:
           rospy.logwarn_throttle(5.0, PKG_NAME + ": Unrecognized bridge line type: " +
                                  str(cmd.get('type')))
