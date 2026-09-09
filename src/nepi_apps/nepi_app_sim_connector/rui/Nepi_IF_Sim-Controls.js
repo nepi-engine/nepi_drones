@@ -45,6 +45,54 @@ const FACTORY_SCENE_OFFSET_X = -2.5
 const FACTORY_SCENE_OFFSET_Y = 0.0
 const FACTORY_SCENE_OFFSET_Z = 1.65
 
+// Fallback Control 'type' for a Setting name, used only until the connected
+// driver's own SettingsStatus has actually reported one (rbxSettingsTypesDict
+// stays authoritative the instant it does -- see sendControlUpdate). Every
+// name below is declared identically by every current RBX sim driver
+// (rbx_sim_node.py, rbx_ardupilot_node.py, rbx_webots_node.py,
+// rbx_webots_quadcopter_node.py, confirmed by direct inspection), so this is
+// accurate, not a guess -- same "known preview default" reasoning
+// renderRobotCapabilityControls's own settingsKnown guard already uses.
+const FALLBACK_SETTING_TYPES = {
+  autonomous_movement_enabled: "Selection",
+  camera_controls_enabled: "Selection",
+  environment: "Selection",
+  enabled_image_sources: "String",
+  camera_offset_x: "Float", camera_offset_y: "Float", camera_offset_z: "Float",
+  camera_offset_yaw: "Float", camera_offset_tilt: "Float",
+  scene_offset_x: "Float", scene_offset_y: "Float", scene_offset_z: "Float",
+  scene_offset_yaw: "Float", scene_offset_tilt: "Float",
+  camera_fov_deg: "Float",
+}
+
+// Reads a nepi_interfaces/Control's CURRENT value out of whichever set_*
+// field its own 'type' selects. The real, live message (confirmed via
+// rosmsg on the device 2026-09-09 -- see rbxSettingsListener's own comment)
+// carries every type's field on every Control regardless of that Control's
+// own type, at message-default (0/''/false), so this must dispatch on
+// ctrl.type rather than checking which fields are merely present.
+function extractControlValue(ctrl) {
+  if (ctrl == null) { return '' }
+  const type = ctrl.type
+  if (type === "Int") { return String(ctrl.set_int) }
+  if (type === "Float" || type === "FloatSlider" || type === "FloatSliders") {
+    return String(ctrl.set_float)
+  }
+  if (type === "Selections" || type === "Toggles") {
+    return (ctrl.set_strings || []).join(',')
+  }
+  if (type === "Bool" || type === "Toggle" || type === "Trigger") {
+    return ctrl.set_bool ? "TRUE" : "FALSE"
+  }
+  if (type === "Menu") {
+    const options = ctrl.string_options || ctrl.options || []
+    const index = ctrl.set_index
+    return (index >= 0 && index < options.length) ? options[index] : String(index)
+  }
+  // Selection, Discrete (legacy alias), String, and any other type.
+  return (ctrl.set_string !== undefined) ? ctrl.set_string : ''
+}
+
 @inject("ros")
 @observer
 
@@ -157,6 +205,11 @@ class NepiIFSimControls extends Component {
       rbxSettingsListener: null,
       rbxSettingsNamesList: [],
       rbxSettingsValuesDict: {},
+      // Control 'type' string per Setting name, as actually reported by the
+      // connected driver -- see sendControlUpdate's own comment for why this
+      // is now the authoritative source for what type to publish an update
+      // as, rather than each call site guessing.
+      rbxSettingsTypesDict: {},
 
       // Edit buffers for the camera/scene offset triples and the movement
       // limit Settings, same pattern as NepiDeviceRBX.js's own offsetNames
@@ -212,6 +265,7 @@ class NepiIFSimControls extends Component {
     this.queryCapabilities = this.queryCapabilities.bind(this)
     this.updateRbxSettingsListener = this.updateRbxSettingsListener.bind(this)
     this.rbxSettingsListener = this.rbxSettingsListener.bind(this)
+    this.sendControlUpdate = this.sendControlUpdate.bind(this)
 
     this.onUpdateInput = this.onUpdateInput.bind(this)
     this.publishMotorRatio = this.publishMotorRatio.bind(this)
@@ -381,15 +435,42 @@ class NepiIFSimControls extends Component {
   // values (so the checkboxes reflect the device's real state, including a
   // change made from the RBX panel itself -- this is a two-way Setting, not a
   // one-shot config write).
+  // message is a nepi_interfaces/ControlsStatus (confirmed live 2026-09-09 via
+  // rosmsg on the device -- name/display_name/description/config_topic/
+  // show_controls/has_show_control/hidden/controls_name_list/
+  // controls_type_list/controls_msg_list/controls_hidden_list). This used to
+  // read message.settings_list and settings[i].name_str/.value_str, neither
+  // of which exist on the real message at all -- meaning
+  // rbxSettingsNamesList/rbxSettingsValuesDict had never actually been
+  // populated from live device data, for any device, independent of the
+  // separate settingsKnown race fixed earlier the same day. Found while
+  // re-diagnosing "most of the changes didnt get pushed - the robot
+  // capabilities part or whatever still just disappears, fov doesnt wrok,
+  // changing the dropdown doesnt work" (2026-09-09): that race-condition fix
+  // was correct as far as it went, but with the names list never filling in
+  // at all, every settings.includes(...) check below was permanently false
+  // once live, which is indistinguishable from every driver declaring none
+  // of these Settings. controls_msg_list carries one nepi_interfaces/Control
+  // per name, in the same order as controls_name_list; extractControlValue
+  // reads each one's CURRENT value out of whichever set_* field its own
+  // type selects (Control carries every type's field on every entry, at
+  // message-default, not just the one its type uses).
   rbxSettingsListener(message) {
-    const settings = (message.settings_list !== undefined) ? message.settings_list : []
+    const names = (message.controls_name_list !== undefined) ? message.controls_name_list : []
+    const msgs = (message.controls_msg_list !== undefined) ? message.controls_msg_list : []
     var namesList = []
     var valuesDict = {}
-    for (let ind = 0; ind < settings.length; ind++) {
-      namesList.push(settings[ind].name_str)
-      valuesDict[settings[ind].name_str] = settings[ind].value_str
+    var typesDict = {}
+    for (let ind = 0; ind < names.length; ind++) {
+      const name = names[ind]
+      const ctrl = msgs[ind]
+      namesList.push(name)
+      valuesDict[name] = extractControlValue(ctrl)
+      if (ctrl != null && ctrl.type !== undefined) {
+        typesDict[name] = ctrl.type
+      }
     }
-    this.setState({ rbxSettingsNamesList: namesList, rbxSettingsValuesDict: valuesDict })
+    this.setState({ rbxSettingsNamesList: namesList, rbxSettingsValuesDict: valuesDict, rbxSettingsTypesDict: typesDict })
 
     // Seed/resync each edit buffer only when the DEVICE's own value changed
     // (or on first sight), never on every status tick -- otherwise a status
@@ -423,7 +504,7 @@ class NepiIFSimControls extends Component {
         // final Setting value (setEnvironmentSetting does the display-name
         // -> Setting-value translation up front), so this is a direct
         // resend, no re-translation needed.
-        this.props.ros.updateSetting(this.state.rbx_namespace + "/settings", "environment", "Discrete", pending)
+        this.sendControlUpdate(this.state.rbx_namespace + "/settings", "environment", "Discrete", pending)
       } else if (valuesDict["environment"] !== this.state.rbxSettingsValuesDict["environment"]) {
         // No display purpose left for this (see setEnvironmentSetting's own
         // comment -- nothing renders a dropdown driven by it anymore), just
@@ -443,7 +524,7 @@ class NepiIFSimControls extends Component {
   updateRbxSettingsListener(rbxNamespace) {
     if (this.state.rbxSettingsListener) {
       this.state.rbxSettingsListener.unsubscribe()
-      this.setState({ rbxSettingsListener: null, rbxSettingsNamesList: [] })
+      this.setState({ rbxSettingsListener: null, rbxSettingsNamesList: [], rbxSettingsTypesDict: {} })
     }
     if (rbxNamespace !== null && rbxNamespace !== '' && rbxNamespace !== 'None') {
       var listener = this.props.ros.setupSettingsStatusListener(
@@ -979,12 +1060,11 @@ class NepiIFSimControls extends Component {
       return null
     }
 
-    const { updateSetting } = this.props.ros
     const setToggle = (name, checked) => {
       if (!live) {
         return
       }
-      updateSetting(this.state.rbx_namespace + "/settings", name, "Discrete", checked ? "TRUE" : "FALSE")
+      this.sendControlUpdate(this.state.rbx_namespace + "/settings", name, "Discrete", checked ? "TRUE" : "FALSE")
     }
 
     return (
@@ -1158,7 +1238,6 @@ class NepiIFSimControls extends Component {
       return null
     }
 
-    const { updateSetting } = this.props.ros
     const currentRaw = this.state.rbxSettingsValuesDict["enabled_image_sources"]
     const current = (currentRaw !== undefined) ? String(currentRaw) : ''
     // Empty Setting means "unrestricted" (every candidate implicitly
@@ -1173,7 +1252,7 @@ class NepiIFSimControls extends Component {
       const next = checked
         ? enabled.concat(topic).filter((t, i, arr) => arr.indexOf(t) === i)
         : enabled.filter((t) => t !== topic)
-      updateSetting(rbx_ns + "/settings", "enabled_image_sources", "String", next.join(','))
+      this.sendControlUpdate(rbx_ns + "/settings", "enabled_image_sources", "String", next.join(','))
     }
 
     return (
@@ -1204,8 +1283,7 @@ class NepiIFSimControls extends Component {
       // Preview mode (no live device yet): nothing to send it to. Still
       // clears the modified-style below so the input doesn't look stuck.
       if (!isNaN(value) && this.isRbxLive()) {
-        const { updateSetting } = this.props.ros
-        updateSetting(this.state.rbx_namespace + "/settings", settingName, "Float", String(value))
+        this.sendControlUpdate(this.state.rbx_namespace + "/settings", settingName, "Float", String(value))
       }
       const el = document.getElementById(event.target.id)
       if (el) {
@@ -1238,8 +1316,7 @@ class NepiIFSimControls extends Component {
                     this.state.rbx_namespace + "'), FOV not pushed -- deploy a simulator first")
       return
     }
-    const { updateSetting } = this.props.ros
-    updateSetting(this.state.rbx_namespace + "/settings", "camera_fov_deg", "Float", String(value))
+    this.sendControlUpdate(this.state.rbx_namespace + "/settings", "camera_fov_deg", "Float", String(value))
   }
 
 
@@ -1307,9 +1384,8 @@ class NepiIFSimControls extends Component {
     }
     this.setState(computed)
     if (this.isRbxLive()) {
-      const { updateSetting } = this.props.ros
-      updateSetting(this.state.rbx_namespace + "/settings", "scene_offset_yaw", "Float", String(computed.scene_offset_yaw))
-      updateSetting(this.state.rbx_namespace + "/settings", "scene_offset_tilt", "Float", String(computed.scene_offset_tilt))
+      this.sendControlUpdate(this.state.rbx_namespace + "/settings", "scene_offset_yaw", "Float", String(computed.scene_offset_yaw))
+      this.sendControlUpdate(this.state.rbx_namespace + "/settings", "scene_offset_tilt", "Float", String(computed.scene_offset_tilt))
     }
   }
 
@@ -1435,7 +1511,6 @@ class NepiIFSimControls extends Component {
   // nothing here rather than needing to be special-cased in this file too.
   setEnvironmentSetting(value) {
     const live = this.isRbxLive()
-    const { updateSetting } = this.props.ros
     const settingValue = (value === "Flat" || value === "Flat Ground")
       ? "FLAT_GROUND"
       : value.toUpperCase().replace(/[^A-Z0-9]+/g, "_")
@@ -1470,7 +1545,88 @@ class NepiIFSimControls extends Component {
       // sends it for real the moment this device goes live.
       return
     }
-    updateSetting(this.state.rbx_namespace + "/settings", "environment", "Discrete", settingValue)
+    this.sendControlUpdate(this.state.rbx_namespace + "/settings", "environment", "Discrete", settingValue)
+  }
+
+  // Publishes one nepi_interfaces/UpdateControl directly on
+  // settingsNamespace + "/update_setting", bypassing
+  // this.props.ros.updateSetting -- same 4-argument shape
+  // (settingsNamespace, name, typeHint, value) every call site above already
+  // used against that function, so no call site needed to change its
+  // arguments, only which function it calls.
+  //
+  // ROOT CAUSE (found live 2026-09-09, re-diagnosing "most of the changes
+  // didnt get pushed - the robot capabilities part or whatever still just
+  // disappears, fov doesnt wrok, changing the dropdown doesnt work"):
+  // this.props.ros.updateSetting is UNDEFINED in this workspace's checked-out
+  // Store.js. It used to publish a name_str/type_str/value_str-shaped
+  // nepi_interfaces/Setting; that implementation is now commented out there
+  // (retired when the platform migrated Settings onto the typed
+  // Control/UpdateControl protocol -- see Nepi_IF_Settings.js/
+  // Nepi_IF_Control.js, which already use the new shape), with nothing
+  // wired back in to replace it. Calling an undefined function threw on
+  // every one of: the environment-dropdown pick (onDeployEnvironmentConfig
+  // -> setEnvironmentSetting), every Robot Capability toggle
+  // (autonomous_movement_enabled/camera_controls_enabled), every camera/
+  // scene-offset Enter-key edit, and the FOV push -- silently, since none of
+  // those onClick/onKeyDown handlers ever surfaced the exception. One bug
+  // explains all four reported symptoms; none of them were actually a
+  // wiring or architecture problem in this app.
+  //
+  // this.props.ros.publishMessage -- the untouched generic publisher every
+  // other send*/update* method in Store.js is itself built on -- still
+  // works, so this method builds the same nepi_interfaces/UpdateControl
+  // payload Store.js's own retired, commented-out replacement already
+  // sketched, confirmed field-for-field against the device's real, live
+  // UpdateControl.msg (name/display_name/description/type/set_index/
+  // set_string/set_strings/set_int/set_float/set_floats/set_bool -- fetched
+  // directly off the device via rosmsg, since the locally checked-out
+  // nepi_interfaces/msg/UpdateControl.msg is ALSO stale, still the older
+  // plain string[] value shape -- the JS and Python layers of this platform
+  // drifted independently, and neither checked-out copy alone told the
+  // whole story), and publishes straight to it, no Store.js change needed.
+  sendControlUpdate(settingsNamespace, name, typeHint, value) {
+    // Prefer the type the connected driver's own SettingsStatus actually
+    // reported for this Setting -- authoritative, and immune to this file's
+    // own typeHint guesses (mostly the retired "Discrete" spelling) going
+    // stale if a driver's declared type ever changes.
+    const liveType = this.state.rbxSettingsTypesDict[name]
+    const type = (liveType !== undefined) ? liveType
+      : (FALLBACK_SETTING_TYPES[name] !== undefined) ? FALLBACK_SETTING_TYPES[name]
+      : ((typeHint === "Discrete") ? "Selection" : typeHint)
+
+    const data = {
+      name: name,
+      display_name: "",
+      description: "",
+      type: type,
+      set_index: 0,
+      set_string: "",
+      set_strings: [],
+      set_int: 0,
+      set_float: 0.0,
+      set_floats: [],
+      set_bool: false,
+    }
+    if (type === "Menu") { data.set_index = parseInt(value, 10) || 0 }
+    else if (type === "Selections" || type === "Toggles") {
+      data.set_strings = Array.isArray(value) ? value : String(value).split(',')
+    }
+    else if (type === "Int") { data.set_int = parseInt(value, 10) || 0 }
+    else if (type === "Float" || type === "FloatSlider" || type === "FloatSliders") {
+      data.set_float = parseFloat(value) || 0.0
+    }
+    else if (type === "Bool" || type === "Toggle" || type === "Trigger") {
+      data.set_bool = (value === true || value === "True" || value === "TRUE")
+    }
+    else { data.set_string = String(value) } // Selection, Discrete, String
+
+    this.props.ros.publishMessage({
+      name: settingsNamespace + "/update_setting",
+      messageType: "nepi_interfaces/UpdateControl",
+      data: data,
+      noPrefix: true
+    })
   }
 
   // Live preview of the currently selected_simulator's own robot/scene

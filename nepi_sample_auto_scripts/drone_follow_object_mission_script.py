@@ -304,6 +304,22 @@ SIM_TEARDOWN_HOST = "127.0.0.1"
 SIM_TEARDOWN_PORT = 9029
 SIM_TEARDOWN_TIMEOUT_SEC = 5.0
 
+# Sim target start trigger (added 2026-09-09) -- the symmetric counterpart
+# to SIM_TEARDOWN_PORT above, requested live: "the chair object seems to be
+# around even though the follow object script isnt on. it should only spawn
+# in if that gets selected on." ai_targeting_controller_ardupilot.py now
+# waits for this trigger before spawning the chair at all (previously it
+# spawned unconditionally the instant gazebo_quadcopter launched, so the
+# chair existed for the whole sim session regardless of whether this script
+# ever ran). Sent as the very first action in __init__, before anything
+# that can block (the RBX namespace wait, the AI-targeting topic wait) --
+# "selected" means this script was started, not that it later reaches any
+# particular stage of its own mission. Same best-effort,
+# times-out-quietly-against-real-hardware shape as the teardown call.
+SIM_START_HOST = "127.0.0.1"
+SIM_START_PORT = 9030
+SIM_START_TIMEOUT_SEC = 5.0
+
 #########################################
 # Node Class
 #########################################
@@ -355,6 +371,21 @@ class drone_follow_object_mission(object):
     self.base_namespace = nepi_ros.get_base_namespace()
     self.msg_if = MsgIF(log_name = self.node_name)
     self.msg_if.pub_info("Starting Initialization Processes")
+
+    # Ask the sim to spawn the chair -- see SIM_START_PORT above. First
+    # action in __init__, deliberately before anything below that can block
+    # (the RBX namespace wait, the AI-targeting topic wait) -- this script
+    # being started IS "selected on."
+    try:
+      sock = socket.create_connection((SIM_START_HOST, SIM_START_PORT),
+                                       timeout = SIM_START_TIMEOUT_SEC)
+      sock.settimeout(SIM_START_TIMEOUT_SEC)
+      sock.recv(200)
+      sock.close()
+      self.msg_if.pub_info("Sim target start triggered")
+    except Exception as e:
+      self.msg_if.pub_info("Sim target start not reachable (expected on real hardware): " + str(e))
+
     ##############################
     ##############################
     self.msg_if.pub_info("Waiting for namespace containing: " + RBX_ROBOT_NAME)
