@@ -121,4 +121,4 @@ SIM_VEHICLE_DICT:
       available_camera_view_modes:
       - SCENE_CAMERA
       - ROBOT_CAMERA
-      has_environment_controls: false
+      has_environment_controls: true

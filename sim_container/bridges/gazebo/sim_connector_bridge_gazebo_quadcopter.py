@@ -41,6 +41,13 @@
 # ~/ardupilot_gazebo/models/, not reproducible via this repo's own deploy
 # path), out of scope here.
 #
+# Environment: reuses environment_models.py's shared EnvironmentModelSpawner
+# (same module camera_rig_controller_ardupilot.py and sim_bridge_node.py
+# already use) -- was a no-op stub with has_environment_controls hardcoded
+# false in sim_connector_app_params.yaml (v1 scope note, since removed);
+# flipped true once this handler existed to back it, matching the rover's
+# own has_environment_controls: true.
+#
 # Coordinate/axis conventions (best-effort, worth confirming against a real
 # flight since sign errors here would show up as "moves the wrong way" not
 # a crash): sim_connector_app_node.py's NavPose contract uses ENU
@@ -54,7 +61,9 @@ import argparse
 import base64
 import json
 import math
+import os
 import socket
+import sys
 import threading
 import time
 
@@ -64,6 +73,15 @@ from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 
 from pymavlink import mavutil
+
+# environment_models.py lives in sim_container/scripts/, a sibling of this
+# file's own bridges/gazebo/ directory, not on sys.path by default the way
+# a script run from scripts/ itself gets its own directory added
+# automatically -- added explicitly so the plain `import environment_models`
+# below (same module camera_rig_controller_ardupilot.py and sim_bridge_node.py
+# already use for exactly this) resolves here too.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts"))
+import environment_models
 
 DEFAULT_APP_HOST = "127.0.0.1"
 DEFAULT_APP_PORT = 9030
@@ -144,6 +162,9 @@ class GazeboQuadcopterSimConnectorBridge:
     self.mav_lock = threading.Lock()
     self.master = None
     self.mavlink_conn_str = mavlink_conn_str
+
+    self.env_spawner = environment_models.EnvironmentModelSpawner(
+        log_prefix = "sim_connector_bridge_gazebo_quadcopter")
 
     self.sock = None
     self.sock_lock = threading.Lock()
@@ -376,9 +397,8 @@ class GazeboQuadcopterSimConnectorBridge:
         self.sendLine(sock, {"type": "sensor_topics", "topics": [
             {"topic_name": SCENE_CAMERA_SENSOR_NAME, "msg_type": "sensor_msgs/Image"},
         ]})
-        # has_environment_controls is false for flight_robot_4_motor -- no
-        # environment_options announce needed, matching the app's own
-        # "nothing offered means nothing to show" default.
+        self.sendLine(sock, {"type": "environment_options",
+                             "options": environment_models.list_environment_models()})
         last_announce = now
 
       if now - last_image >= 1.0 / IMAGE_RATE_HZ:
@@ -459,7 +479,7 @@ class GazeboQuadcopterSimConnectorBridge:
     elif msg_type == "camera_settings":
       self.view_mode = msg.get("view_mode", FACTORY_VIEW_MODE)
     elif msg_type == "environment_option":
-      pass  # has_environment_controls is false for this profile
+      self.handleEnvironmentOption(msg)
     elif msg_type == "robot_config":
       rospy.loginfo("sim_connector_bridge_gazebo_quadcopter: robot_config selected: %s",
                     msg.get("config"))
@@ -544,6 +564,21 @@ class GazeboQuadcopterSimConnectorBridge:
         0, master.target_system, master.target_component,
         mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, type_mask,
         lat_int, lon_int, alt_m, 0, 0, 0, 0, 0, 0, yaw_rad, 0)
+
+  def handleEnvironmentOption(self, msg):
+    # Wire format matches setEnvironmentOptionCb's own contract in
+    # device_if_sim.py: {"option": "<name>", "enabled": <bool>}. enabled=True
+    # spawns/switches to that named model (EnvironmentModelSpawner deletes
+    # whatever was previously active first, only one is ever live); enabled=
+    # False only matters when it names the CURRENTLY active model (switching
+    # to a different option already implies deactivating the old one), and
+    # returns to flat ground.
+    option = msg.get("option")
+    enabled = bool(msg.get("enabled", True))
+    if enabled:
+      self.env_spawner.set_active_model(option)
+    elif self.env_spawner.is_spawned(option):
+      self.env_spawner.set_active_model(None)
 
   def handleGoHome(self, master):
     if master is None:
