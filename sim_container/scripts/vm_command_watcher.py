@@ -269,7 +269,12 @@ class Watcher(object):
       launched = self.launch_procs.pop(target_key, None)
       if launched is not None:
         self._writeStatus(launched['request_id'], target_key, 'launch', 'exited')
-    elif action in ('install', 'check_installed', 'ready_check', 'push_dimensions'):
+    elif action in ('install', 'check_installed', 'ready_check', 'push_dimensions', 'kill_all'):
+      # 'kill_all' is simulator_launcher.py's kill_all_gazebo() escape-hatch
+      # fallback -- a one-shot blunt pkill script, same shape as the other
+      # actions here, added (2026-09-08) so that button works over the
+      # shared-storage transport too instead of only over a live reverse
+      # SSH tunnel (see _try_shared_storage_fallback's own docstring).
       self._handleOneShot(request_id, target_key, action, script_path, timeout_sec)
     else:
       self._writeStatus(request_id, target_key, action, 'failed',

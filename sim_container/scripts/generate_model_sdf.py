@@ -446,13 +446,14 @@ def buildRoverSdf(dims):
     </joint>
 
     <!-- Third-person/chase camera, rigidly welded onto the rover at a FIXED
-         body-frame offset (-2.5, 0.0, 1.5), independent of the curated
+         body-frame offset (-2.5, 0.0, 1.65) -- matches FACTORY_SCENE_OFFSET_X/Y/Z
+         in rbx_sim_node.py/sim_bridge_node.py, independent of the curated
          dimensions above -- not re-derived, since it is its own spec value,
          not something computed from chassis/wheel geometry. pitch =
-         atan2(1.5, 2.5) = 0.5404 rad is the fixed tilt that keeps the rover
+         atan2(1.65, 2.5) = 0.5834 rad is the fixed tilt that keeps the rover
          framed from directly behind and above. -->
     <link name="camera_link_chase">
-      <pose>-2.5 0 1.65 0 0.5404195 0</pose>
+      <pose>-2.5 0 1.65 0 0.5833730 0</pose>
       <inertial>
         <mass>0.05</mass>
         <inertia>

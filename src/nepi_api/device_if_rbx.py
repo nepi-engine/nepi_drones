@@ -33,8 +33,16 @@ import copy
 from nepi_sdk import nepi_sdk
 from nepi_sdk import nepi_utils
 from nepi_sdk import nepi_system
-from nepi_sdk import nepi_img
+# nepi_pc (imports open3d) MUST come before nepi_img (imports scipy.sparse.linalg,
+# matplotlib, cv_bridge) -- confirmed live on aarch64/glibc 2.31: those heavier
+# libraries' own native TLS usage exhausts the process's static TLS block, so
+# open3d's OpenMP extension (libgomp.so.1) then fails importing with
+# "cannot allocate memory in static TLS block" -- 100% reproducible in this
+# order, 100% avoided by importing open3d (via nepi_pc) first. This broke
+# EVERY RBXRobotIF-based driver (rbx_sim, rbx_ardupilot, ...) on this
+# platform. Order matters here; do not "clean up" back to alphabetical.
 from nepi_sdk import nepi_pc
+from nepi_sdk import nepi_img
 from nepi_sdk import nepi_nav
 
 

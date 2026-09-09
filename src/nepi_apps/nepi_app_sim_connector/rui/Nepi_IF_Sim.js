@@ -418,8 +418,19 @@ class NepiIFSim extends Component {
       // local/optimistic, since deploying to Gazebo is no longer coupled
       // to select_environment_dimensions_config (nothing server-side
       // tracks "what name is currently deployed" the way it tracks "what's
-      // selected for editing"). See onDeployEnvironmentConfig.
-      environment_deploy_selected_name: '',
+      // selected for editing"). See onDeployEnvironmentConfig. Defaults to
+      // 'Flat', not '' -- requested live (2026-09-08): "the select to
+      // deploy option is useless - default should be flat." An empty-string
+      // default only ever showed a placeholder demanding an extra click
+      // before this control did anything; every other built-in selector in
+      // this file (robot config, robot dimensions) already defaults to a
+      // real named option, never a placeholder. Display-only: this does NOT
+      // also push a live Setting update on mount (would surprise an
+      // operator who refreshes the browser while Obstacle Course is
+      // deliberately spawned, silently despawning it) -- it just means a
+      // brand-new page load shows a real, useful choice instead of forcing
+      // one before Deploy/Kill even become relevant.
+      environment_deploy_selected_name: 'Flat',
       // "Environment Configs" read-only YAML preview dropdown's own state
       // -- deliberately separate from environment_dimensions_config_yaml_text
       // (owned by the Dimensions-editing selector) and from
@@ -1042,12 +1053,12 @@ class NepiIFSim extends Component {
   // happened) -- requested live (2026-08-31). Saving over a built-in name is
   // rejected the same way (deleteDimensionConfigCb-side protection has an
   // exact save-side counterpart, saveDimensionConfigCb).
-  // Shared by the "Save As New Config" button below and by the deploy-time
-  // unsaved-edits prompt (see NepiIFSimLauncher's confirmUnsavedDimensionsOrPrompt,
-  // wired via the onSaveUnsavedDimensionsAs prop) -- both mean the exact
-  // same thing, "save the CURRENTLY EDITED fields under this name and make
-  // it the active one" (see saveDimensionConfigCb's own comment for why
-  // "save" always also means "use").
+  // Called by the "Save As New Config" button below -- means "save the
+  // CURRENTLY EDITED fields under this name and make it the active one"
+  // (see saveDimensionConfigCb's own comment for why "save" always also
+  // means "use"). No longer also called from a deploy-time prompt (removed
+  // 2026-09-08 -- see NepiIFSimLauncher.onDeployClicked's own comment):
+  // this is now the ONLY way an edit ever reaches what gets deployed.
   saveDimensionsAsNamed(role, name) {
     const namespace = this.getSimNamespace()
     if (name === '') {
@@ -1231,9 +1242,11 @@ class NepiIFSim extends Component {
   // environment config in the dropdown also messed with the dimensions and
   // what that shows - it shouldnt do that. those are again separate."
   // environment_deploy_selected_name is local-only state (see that field's
-  // own comment) -- '' means nothing picked here yet, shown as its own
-  // placeholder option rather than letting the browser silently highlight
-  // whichever real name happens to be first.
+  // own comment) -- defaults to 'Flat', not a "(Select to Deploy)"
+  // placeholder (removed 2026-09-08, see that field's own comment for why).
+  // '' still renders a placeholder below if this ever somehow ends up
+  // empty (e.g. every name filtered out), rather than letting the browser
+  // silently highlight whichever real name happens to be first.
   renderEnvironmentConfigSelector() {
     // "Custom Obstacles" excluded here (and from the Environment Configs
     // viewer dropdown / the Dimensions-editing dropdown in
@@ -2694,6 +2707,25 @@ class NepiIFSim extends Component {
                 if (el) {
                   clearElementStyleModified(el)
                 }
+                // Live push FIRST, deliberately ahead of the dimensions-store
+                // save below (2026-09-08, requested live: "changing fov to
+                // 100 and hitting enter doesnt update anything instantly,
+                // make sure that happens") -- pushes camera_fov_deg as a
+                // real RBX Setting on the currently-connected sim_rover
+                // (applies to BOTH the robot and scene camera -- it is one
+                // shared setting, same as generate_model_sdf.py's own single
+                // camera_horizontal_fov_deg field feeds both <horizontal_fov>
+                // entries), which respawns the rover with the new value
+                // baked in (see sim_bridge_node.py's
+                // respawnRoverWithCameraOffsets). Logged when it can't
+                // reach the live device, rather than a silent no-op, since
+                // this exact "nothing visibly happens" complaint is what
+                // sent debugging it in circles the first time.
+                if (this.simControlsRef.current) {
+                  this.simControlsRef.current.pushCameraFovLive(event.target.value)
+                } else {
+                  console.warn("Set Horizontal FOV: NepiIFSimControls ref not mounted yet, could not push live")
+                }
                 this.onSaveDimensionsClicked('robot')
               }}
             />
@@ -2729,17 +2761,33 @@ class NepiIFSim extends Component {
     const namespace = this.getSimNamespace()
     const status_msg = this.state.status_msg
 
-    // No status yet: render nothing, matching the connect-app IF components'
-    // not-ready branch.
-    if (status_msg == null) {
-      return (
-        <Columns>
-          <Column>
-
-          </Column>
-        </Columns>
-      )
-    }
+    // Deliberately NOT an early return-nothing when status_msg is null
+    // anymore (an earlier version did exactly that, matching the connect-
+    // app IF components' own not-ready branch) -- found live (2026-09-08)
+    // while investigating "changing fov/environment doesn't work live like
+    // offsets do": that early return unmounted EVERYTHING below it,
+    // including bottomContent's <NepiIFSimControls ref={this.simControlsRef}>,
+    // whose own mount comment explicitly says it should be "Always mounted,
+    // even when show_controls is false" -- status_msg going null (this
+    // component's own SimStatus, reset by updateStatusListener on every
+    // resubscribe, e.g. right after a fresh Deploy) took that panel down
+    // with it for no reason, since NepiIFSimControls tracks its own,
+    // separate capabilities/status entirely and never reads THIS
+    // component's status_msg at all. A genuine, independently-justified
+    // robustness fix regardless of the exact live-update reports -- but
+    // NOT confirmed as their root cause: renderData() (which hosts the FOV
+    // quick-edit box that reaches across this same ref) already had its own
+    // status_msg guard, so that box was never actually clickable during the
+    // exact window this used to unmount NepiIFSimControls in either;
+    // whatever else is stopping pushCameraFovLive/setEnvironmentSetting
+    // from reaching a live device still needs verifying against the actual
+    // deployed RUI bundle, which requires device access this session
+    // couldn't get (see docs/SIM_VM_CONNECTION_SETUP.md's own troubleshooting
+    // if SSH from the sim VM to the device is refused again).
+    // Every render* method below already null-guards its own status_msg
+    // access, so removing this blanket gate is safe: those sections still
+    // render nothing until real status arrives, but the ref-bearing panel
+    // beneath them no longer unmounts along with them.
 
     // Section visibility resolves prop-overrides-default, the same defaulting
     // the connect-app IF components use for their show_* props.
@@ -2757,8 +2805,11 @@ class NepiIFSim extends Component {
     // dropdown split for environment configs, obstacle overlay/labels,
     // Custom Obstacles removed from the pickers, etc.) stays -- only the
     // two-column wrapper and its divider are gone. Content order top to
-    // bottom: pick-and-deploy, live data, Robot Config Settings,
-    // Environment Config Settings, then Sim Control Settings last.
+    // bottom: pick-and-deploy, live data, NepiIFSimControls (camera viewer,
+    // Robot Capabilities, camera offset/FOV, environment live controls),
+    // then Robot Config Settings and Environment Config Settings last
+    // (2026-09-08: moved below NepiIFSimControls, see that mount's own
+    // comment).
     const topContent = (
       <React.Fragment>
         {(show_selectors === true) ?
@@ -2807,9 +2858,6 @@ class NepiIFSim extends Component {
               selected_target={this.state.selected_launch_target}
               onTargetSelected={this.onLaunchTargetSelected}
               selected_robot_config={this.getSelectedRobotConfig()}
-              unsaved_robot_dimensions={this.state.robot_dimensions_selected_config === ''}
-              unsaved_environment_dimensions={this.state.environment_dimensions_selected_config === ''}
-              onSaveUnsavedDimensionsAs={this.saveDimensionsAsNamed}
             />
           </React.Fragment>
         : null}
@@ -2822,14 +2870,15 @@ class NepiIFSim extends Component {
 
     const bottomContent = (
       <React.Fragment>
-        {(show_selectors === true) ?
-          <React.Fragment>
-            {this.renderRobotConfigSettings()}
-            {this.renderEnvironmentConfigSettings()}
-          </React.Fragment>
-        : null}
-
-        {/* Always mounted, even when show_controls is false: NepiIFSimControls
+        {/* Moved above Robot/Environment Config Settings (2026-09-08,
+            requested live: "the camera viewer section in the sim connector
+            should also be above the robot config settings and environment
+            config settings - same for the robot capabilities and other
+            image viewer settings") -- NepiIFSimControls owns the live
+            camera viewer, Robot Capabilities, and camera offset/FOV
+            controls, all of which are checked far more often during a live
+            session than the dimensions editors below them.
+            Always mounted, even when show_controls is false: NepiIFSimControls
             renders two logically separate groups internally -- live control
             (motor sliders, goto SEND buttons, home/stop actions, the live
             camera viewer) gated on show_live_controls, and configuration
@@ -2851,6 +2900,13 @@ class NepiIFSim extends Component {
           make_section={false}
           show_live_controls={show_controls}
         />
+
+        {(show_selectors === true) ?
+          <React.Fragment>
+            {this.renderRobotConfigSettings()}
+            {this.renderEnvironmentConfigSettings()}
+          </React.Fragment>
+        : null}
       </React.Fragment>
     )
 

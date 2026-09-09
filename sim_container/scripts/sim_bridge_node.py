@@ -20,15 +20,25 @@
 # Runs against this dev VM's own local roscore -- it is a plain ROS node with
 # no nepi_sdk dependency, since the NEPI SDK is not installed on the sim VM.
 # Publishes a liveness heartbeat, relays NEPI-namespace velocity commands
-# to the Gazebo diff-drive plugin's topic, and (Phase 3a) serves the
-# cross-machine command/telemetry bridge on a plain TCP port: the remote NEPI
-# device's rbx_sim_node.py cannot see this VM's ROS graph (separate masters,
-# only raw TCP ports survive the reverse SSH tunnel), so it connects here
-# instead. Protocol is newline-delimited JSON both ways on one persistent
-# connection: commands in ({"linear_x", "angular_z"} -> /nepi/sim/cmd_vel,
-# feeding the existing relay), odometry out (pushed at a fixed rate from the
-# latest /rover/odom -- push, not poll, keeps the client a bare line reader
-# and avoids a tunnel round-trip per sample).
+# to the Gazebo diff-drive plugin's topic, and (Phase 3a) dials out to the
+# remote NEPI device's cross-machine command/telemetry bridge port: the
+# device's rbx_sim_node.py cannot see this VM's ROS graph (separate
+# masters), so this side reaches it over a plain TCP socket instead.
+#
+# 2026-09-08 -- DIRECTION REVERSED: this used to LISTEN (0.0.0.0:BRIDGE_PORT)
+# and rbx_sim_node.py dialed in, forwarded by a reverse SSH tunnel when the
+# VM had no direct route. That requires the VM to accept an unsolicited
+# inbound connection, which a very common real setup -- Windows + WSL2 --
+# blocks by default even with mirrored networking (Windows Firewall's
+# Public-profile default), and per-machine firewall exceptions don't scale.
+# Outbound is never blocked, so this VM now dials the device
+# (DEVICE_HOST:BRIDGE_PORT) and rbx_sim_node.py listens instead -- no
+# tunnel, no firewall config, on any OS. Protocol is unchanged: newline-
+# delimited JSON both ways on one persistent connection: commands in
+# ({"linear_x", "angular_z"} -> /nepi/sim/cmd_vel, feeding the existing
+# relay), odometry out (pushed at a fixed rate from the latest /rover/odom
+# -- push, not poll, keeps the far side a bare line reader and avoids a
+# round-trip per sample).
 #
 # Camera-rover feature addition: two more line shapes on the same socket,
 # distinguished from the above by key presence rather than a mandatory "type"
@@ -96,6 +106,7 @@ import math
 import os
 import re
 import socket
+import subprocess
 import threading
 import time
 
@@ -105,7 +116,7 @@ from std_msgs.msg import Header
 from std_srvs.srv import Empty
 from geometry_msgs.msg import Twist, Pose
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import CompressedImage, Image
 from gazebo_msgs.msg import ModelState
 from gazebo_msgs.srv import SpawnModel, DeleteModel, GetWorldProperties
 
@@ -129,9 +140,18 @@ GAZEBO_CMD_VEL_TOPIC = '/rover/cmd_vel'
 GAZEBO_ODOM_TOPIC = '/rover/odom'
 
 # Command/telemetry bridge port: next free port after the 9022 heartbeat
-# listener in the 902x sim-utility block (9021 gz reset, 9022 heartbeat),
-# clear of the 576x MAVLink ports. Forwarded by nepi_tunnel alongside 9022.
+# port in the 902x sim-utility block (9021 gz reset, 9022 heartbeat), clear
+# of the 576x MAVLink ports. This is now the port rbx_sim_node.py LISTENS
+# on -- see BRIDGE_RECONNECT_INTERVAL_SEC's comment for why.
 BRIDGE_PORT = 9023
+# The NEPI device's own reachable address to dial for the bridge
+# connection -- same env var and default ("nepi", meant to resolve via
+# whatever ~/.ssh/config / /etc/hosts entry the operator's one-time device
+# SSH setup already created) as nepi_tunnel()'s device_host in
+# nepi_sitl_dev_env.sh and sim_heartbeat_listener.py's DEVICE_HOST, reused
+# rather than inventing a second variable for the same machine.
+DEVICE_HOST = os.environ.get('NEPI_DEVICE_SSH_HOST', 'nepi')
+BRIDGE_RECONNECT_INTERVAL_SEC = 2.0
 TELEMETRY_RATE_HZ = 10.0
 
 # camera_rig_controller.py's six always-live compressed topics (color +
@@ -172,6 +192,16 @@ RESET_WORLD_SERVICE = '/gazebo/reset_world'
 # comment for why a fixed sleep wasn't reliable.
 DELETE_CONFIRM_TIMEOUT_SEC = 5.0
 DELETE_CONFIRM_POLL_INTERVAL_SEC = 0.1
+# Poll budget for confirming the OLD model's own camera plugins have
+# actually unadvertised their ROS services (a separate, later signal than
+# DELETE_CONFIRM_TIMEOUT_SEC's own get_world_properties check -- see
+# _waitForOldCameraServicesGone's own comment). Same poll interval as the
+# deletion check above; the timeout is shorter because this is the tail end
+# of an already-confirmed deletion, not a wait for the deletion itself --
+# if the plugins haven't let go within 2s of the model itself being gone,
+# something is genuinely stuck and waiting longer wouldn't help.
+CAMERA_SERVICE_TEARDOWN_TIMEOUT_SEC = 2.0
+OLD_CAMERA_SERVICE_NAMES = ('/rover/camera/set_parameters', '/rover/camera_chase/set_parameters')
 
 # camera_offset_*/scene_offset_* settings (rbx_sim_node.py's own robot-view /
 # scene-view camera offset controls, sent here in a camera_settings line):
@@ -203,6 +233,49 @@ DELETE_CONFIRM_POLL_INTERVAL_SEC = 0.1
 ROVER_MODEL_SDF_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), '..', 'models',
     'generic_rover', 'model.sdf')
+# Same directory-relative-to-this-file convention as ROVER_MODEL_SDF_PATH
+# above, for the world file _recoverDeadGzserver relaunches gzserver
+# against -- see that method's own comment for why gzserver sometimes
+# needs a real restart rather than just another model respawn.
+GAZEBO_WORLD_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'worlds',
+    'generic_rover.world')
+# Raw (uncompressed) camera topics Gazebo's own camera plugins publish
+# directly -- camera_rig_controller.py subscribes to these and republishes
+# the compressed six-topic set this bridge relays over the wire (see the
+# module docstring); checked directly here (not the compressed relay)
+# since a dead sensor is a Gazebo-side problem, independent of whether
+# camera_rig_controller.py itself is still running.
+ROBOT_RAW_IMAGE_TOPIC = '/rover/camera/image_raw'
+SCENE_RAW_IMAGE_TOPIC = '/rover/camera_chase/image_raw'
+# Watchdog constants (see cameraWatchdogCb's own comment for the failure
+# this recovers from -- a camera sensor silently stops publishing some
+# seconds after a respawn, with everything else about it -- model,
+# services -- still looking perfectly healthy, so only "did a frame
+# actually arrive recently" catches it). CAMERA_DEAD_THRESHOLD_SEC is
+# generous relative to the ~15Hz these publish at normally (see
+# generic_rover/model.sdf's own update_rate) so a merely-busy Gazebo isn't
+# mistaken for a dead one. RESPAWN_GRACE_SEC covers a respawn's own brief,
+# normal gap in both topics (delete, wait, spawn) -- confirmed live this
+# alone can be several seconds, well past one CAMERA_WATCHDOG_PERIOD_SEC
+# tick, so the watchdog must not fire mid-respawn.
+CAMERA_WATCHDOG_PERIOD_SEC = 3.0
+# 3.0s, not the original 8.0 -- confirmed live (2026-09-08) against a real
+# ~15Hz stream (frames arriving every ~67ms) that a genuinely dead/degraded
+# camera has to be caught well before 8s of silence feels laggy to whoever's
+# watching the RUI's live feed. 3s is still ~45 missed frames' worth of
+# margin above normal jitter, so a merely-busy Gazebo tick still isn't
+# mistaken for a dead one.
+CAMERA_DEAD_THRESHOLD_SEC = 3.0
+RESPAWN_GRACE_SEC = 12.0
+# Settle time after gzserver's own process exists before trusting its
+# services/models -- same value and reasoning as every existing launch
+# script's own post-boot sleep (nepi_sitl_dev_env.sh, sim_rover_dev_env.sh,
+# simulator_launch_targets.yaml's gazebo_rover launch_command all use 8s
+# here, for the same "process exists" vs "actually finished loading the
+# world and initializing its ROS API plugin" gap).
+GAZEBO_RESTART_SETTLE_SEC = 8.0
+GAZEBO_PROCESS_WAIT_SEC = 15.0
 # Matches generic_rover/model.sdf's own hard-coded camera_link/camera_link_chase
 # poses exactly, and rbx_sim_node.py's own FACTORY_SETTINGS for the same ten
 # values -- see applied_camera_offsets' own comment for why this matters.
@@ -211,11 +284,13 @@ ROVER_MODEL_SDF_PATH = os.path.join(
 # editable." Roll is not one of the ten: it stays fixed at 0 for both
 # cameras, matching generic_rover/model.sdf's own convention, where neither
 # camera has ever had roll. camera_link_chase's own factory tilt reproduces
-# its hard-coded 0.5404195 rad downward-look pitch (see
-# rbx_sim_node.py's FACTORY_SCENE_TILT_DEG, the single source of truth for
-# that value in degrees -- duplicated here as a literal only because this
-# file cannot import that class); camera_link's factory tilt is 0 (no
-# rotation in the stock model at all).
+# its hard-coded downward-look pitch (see rbx_sim_node.py's
+# FACTORY_SCENE_TILT_DEG, the single source of truth for that value in
+# degrees -- duplicated here as a literal only because this file cannot
+# import that class; computed the same way, atan2(FACTORY_SCENE_OFFSET_Z,
+# -FACTORY_SCENE_OFFSET_X), not hardcoded, so the two can't drift apart
+# again the way they did before 2026-09-08); camera_link's factory tilt is
+# 0 (no rotation in the stock model at all).
 #
 # scene_offset_x/y/z's own three values changed (2026-09-04) from the
 # absolute mount pose (-2.5, 0.0, 1.65) to 0.0/0.0/0.0 -- requested live:
@@ -228,18 +303,38 @@ ROVER_MODEL_SDF_PATH = os.path.join(
 # matching FACTORY_SCENE_OFFSET_X/Y/Z comment, the single source of truth
 # for these three values (duplicated here as literals for the same reason
 # FACTORY_SCENE_TILT_DEG already is: this file cannot import that class).
-# camera_offset_x/y/z (robot view) is untouched -- only the scene/chase
-# camera's reference point changed.
-FACTORY_CAMERA_OFFSETS = (0.2, 0.0, 0.65, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, math.degrees(0.5404195))
+# camera_offset_x/y/z (robot view) changed the same way (2026-09-08,
+# requested live: "the 0 0 0 position for the robot view cam offset should
+# also be where it is by default on the rover... make it like what it is
+# for the scene view so its not confusing") -- see rbx_sim_node.py's own
+# matching FACTORY_CAMERA_OFFSET_X/Y/Z comment, the single source of truth.
 FACTORY_SCENE_OFFSET_X = -2.5
 FACTORY_SCENE_OFFSET_Y = 0.0
 FACTORY_SCENE_OFFSET_Z = 1.65
+FACTORY_CAMERA_OFFSET_X = 0.2
+FACTORY_CAMERA_OFFSET_Y = 0.0
+FACTORY_CAMERA_OFFSET_Z = 0.65
+# Shared horizontal FOV for both cameras -- see rbx_sim_node.py's
+# FACTORY_CAMERA_FOV_DEG, the single source of truth (duplicated here as a
+# literal for the same reason as the constants above). Runtime-adjustable
+# (2026-09-08, requested live: "changing fov settings doesn't seem to do
+# anything") via the same respawn mechanism as the pose offsets.
+FACTORY_CAMERA_FOV_DEG = 80.0
+FACTORY_CAMERA_OFFSETS = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                          math.degrees(math.atan2(FACTORY_SCENE_OFFSET_Z, -FACTORY_SCENE_OFFSET_X)),
+                          FACTORY_CAMERA_FOV_DEG)
 # Matches a <link name="LINKNAME"> immediately followed by its own <pose>
 # element, capturing everything up to (group 1) and including "</pose>"
 # (implicitly, via the non-capturing replacement below) -- unlike the
 # previous 6-value version, this no longer preserves any existing rotation:
 # ALL SIX pose components (x y z roll pitch yaw) are now supplied by
 # respawnRoverWithCameraOffsets, roll always 0.0.
+# How long applyCameraSettings waits for more changes before actually
+# respawning -- see camera_respawn_timer's own comment for why this exists.
+# Long enough to absorb a multi-field edit (offset + recomputed yaw/tilt,
+# three separate Setting updates a few hundred ms apart in practice) into
+# one respawn; short enough that a single manual edit still feels immediate.
+CAMERA_RESPAWN_DEBOUNCE_SEC = 0.6
 CAMERA_LINK_POSE_RE = {
   'camera_link': re.compile(
       r'(<link name="camera_link">\s*<pose>)\s*'
@@ -249,6 +344,18 @@ CAMERA_LINK_POSE_RE = {
       r'(<link name="camera_link_chase">\s*<pose>)\s*'
       r'[-0-9.eE]+\s+[-0-9.eE]+\s+[-0-9.eE]+\s+'
       r'[-0-9.eE]+\s+[-0-9.eE]+\s+[-0-9.eE]+\s*(</pose>)'),
+}
+# Same shape as CAMERA_LINK_POSE_RE, for the <horizontal_fov> each camera's
+# own <camera name="..."> block carries -- both rover_camera (robot view)
+# and rover_camera_chase (scene view) get the SAME fov_deg value, matching
+# generate_model_sdf.py's own single shared camera_horizontal_fov_deg field.
+CAMERA_FOV_RE = {
+  'rover_camera': re.compile(
+      r'(<camera name="rover_camera">\s*<horizontal_fov>)'
+      r'[-0-9.eE]+(</horizontal_fov>)'),
+  'rover_camera_chase': re.compile(
+      r'(<camera name="rover_camera_chase">\s*<horizontal_fov>)'
+      r'[-0-9.eE]+(</horizontal_fov>)'),
 }
 GAZEBO_SERVICE_WAIT_SEC = 5.0
 
@@ -284,6 +391,23 @@ class SimBridgeNode:
     self.scene_depth_map_sub = rospy.Subscriber(SCENE_DEPTH_MAP_COMPRESSED_TOPIC, CompressedImage,
                                                 self.sceneDepthMapImageCompressedCb)
     self.model_state_pub = rospy.Publisher(MODEL_STATE_TOPIC, ModelState, queue_size=1)
+
+    # Camera-sensor-death watchdog -- see cameraWatchdogCb's own comment for
+    # what this recovers from. Persistent subscribers (not a repeated
+    # rospy.wait_for_message check) just tracking "when did a frame last
+    # arrive" -- cheap, and avoids creating/tearing down a temporary
+    # subscriber every check cycle. last_respawn_time gates the watchdog
+    # off entirely for RESPAWN_GRACE_SEC after any respawn, since a
+    # respawn's own delete+spawn cycle is a normal, if brief, gap in both
+    # topics that must never be mistaken for the sensors actually dying.
+    self.last_robot_raw_frame_time = time.time()
+    self.last_scene_raw_frame_time = time.time()
+    self.last_respawn_time = 0.0
+    self.robot_raw_sub = rospy.Subscriber(ROBOT_RAW_IMAGE_TOPIC, Image,
+                                          lambda msg: setattr(self, 'last_robot_raw_frame_time', time.time()))
+    self.scene_raw_sub = rospy.Subscriber(SCENE_RAW_IMAGE_TOPIC, Image,
+                                          lambda msg: setattr(self, 'last_scene_raw_frame_time', time.time()))
+    self.camera_watchdog_timer = rospy.Timer(rospy.Duration(CAMERA_WATCHDOG_PERIOD_SEC), self.cameraWatchdogCb)
 
     # Environment model spawn/delete-by-name, generalized from the old
     # single-hardcoded-obstacle_course toggle -- see environment_models.py.
@@ -358,6 +482,38 @@ class SimBridgeNode:
     self.latest_telemetry = None
     self.client_conn = None
     self.client_lock = threading.Lock()
+
+    # Debounces respawnRoverWithCameraOffsets -- see applyCameraSettings's
+    # own comment for why this exists (2026-09-08, confirmed live: rapid
+    # multi-field camera edits, e.g. the RUI's "Lock Scene Camera To Robot"
+    # sending an offset plus a recomputed yaw+tilt as three separate Setting
+    # updates within about a second, raced multiple overlapping
+    # delete+spawn cycles against each other and crashed gzserver outright,
+    # not just the milder "already advertised" duplicate-registration
+    # symptom a single stray extra respawn produces).
+    self.pending_camera_offsets = None
+    self.camera_respawn_timer = None
+    self.camera_respawn_lock = threading.Lock()
+    # Serializes actual respawnRoverWithCameraOffsets EXECUTION, a separate
+    # concern from camera_respawn_lock above (which only serializes
+    # SCHEDULING). Confirmed live (2026-09-08) that the debounce alone isn't
+    # enough: a fresh connect's own initial sendCameraSettings() (resyncing
+    # whatever settings were last persisted -- can differ from this VM's
+    # own FACTORY_CAMERA_OFFSETS sentinel) and an operator's own settings
+    # edit moments later each schedule their OWN timer; the debounce window
+    # (0.6s) is far shorter than one delete+wait-for-services-gone+spawn
+    # cycle actually takes, so the second timer fires and starts a SECOND
+    # respawn while the first is still mid-flight on its own thread -- two
+    # concurrent delete/spawn cycles racing each other is exactly what
+    # produces "already advertised" and, worse, silently dead camera
+    # topics afterward. Held for the full body of
+    # respawnRoverWithCameraOffsets so a second respawn genuinely waits for
+    # the first to finish rather than running alongside it.
+    self.camera_respawn_inflight_lock = threading.Lock()
+    # Guards against _recoverDeadGzserver's own re-applying respawn
+    # detecting ANOTHER dead camera and recursing into a second recovery --
+    # see that check's own comment.
+    self._recovering_gzserver = False
 
     # Idle-hold anchor for holdStill() below -- captured ONCE when cmd_vel
     # first goes to exactly zero, then re-asserted unchanged on every
@@ -615,16 +771,16 @@ class SimBridgeNode:
     self.model_state_pub.publish(state)
 
   def applyCameraSettings(self, cmd):
-    # offset_x/y/z/yaw/tilt (robot view) and scene_offset_x/y/z/yaw/tilt
-    # (scene/chase view) are optional in this wire message: absent on any
-    # deployment still running an older rbx_sim_node.py that predates
-    # yaw/tilt. get() with None sentinels, then bail without touching
-    # anything already applied, rather than defaulting to 0.0 and silently
-    # snapping both cameras to the origin/no-rotation the first time an old
+    # offset_x/y/z/yaw/tilt (robot view), scene_offset_x/y/z/yaw/tilt
+    # (scene/chase view), and fov_deg are optional in this wire message:
+    # absent on any deployment still running an older rbx_sim_node.py that
+    # predates yaw/tilt/fov. get() with None sentinels, then bail without
+    # touching anything already applied, rather than defaulting to 0.0/some
+    # fixed FOV and silently snapping the cameras the first time an old
     # sender's message arrives.
     keys = ('offset_x', 'offset_y', 'offset_z', 'offset_yaw', 'offset_tilt',
             'scene_offset_x', 'scene_offset_y', 'scene_offset_z',
-            'scene_offset_yaw', 'scene_offset_tilt')
+            'scene_offset_yaw', 'scene_offset_tilt', 'fov_deg')
     if any(cmd.get(k) is None for k in keys):
       return
     try:
@@ -634,14 +790,87 @@ class SimBridgeNode:
       return
     if offsets == self.applied_camera_offsets:
       return  # Already live -- e.g. a redundant resend of the same offsets.
-    self.respawnRoverWithCameraOffsets(offsets)
+    # Debounced, not respawned immediately -- see CAMERA_RESPAWN_DEBOUNCE_SEC's
+    # own comment: a multi-field edit (e.g. "Lock Scene Camera To Robot"
+    # sending an offset plus a recomputed yaw+tilt as three separate Setting
+    # updates in quick succession) used to trigger one respawn PER update,
+    # racing overlapping delete+spawn cycles against each other and
+    # crashing gzserver outright (confirmed live 2026-09-08). Each call here
+    # just replaces the pending offsets and restarts the timer, so only the
+    # LAST state in a burst actually respawns, once, after things settle.
+    with self.camera_respawn_lock:
+      self.pending_camera_offsets = offsets
+      if self.camera_respawn_timer is not None:
+        self.camera_respawn_timer.cancel()
+      self.camera_respawn_timer = threading.Timer(
+          CAMERA_RESPAWN_DEBOUNCE_SEC, self.respawnPendingCameraOffsets)
+      self.camera_respawn_timer.daemon = True
+      self.camera_respawn_timer.start()
+
+  def respawnPendingCameraOffsets(self):
+    with self.camera_respawn_lock:
+      offsets = self.pending_camera_offsets
+      self.camera_respawn_timer = None
+    if offsets is not None and offsets != self.applied_camera_offsets:
+      self.respawnRoverWithCameraOffsets(offsets)
+
+  def _waitForOldCameraServicesGone(self):
+    # get_world_properties dropping old_name from its model list (the check
+    # respawnRoverWithCameraOffsets already does before calling this) fires
+    # as soon as Gazebo's OWN bookkeeping removes the model -- confirmed
+    # live (2026-09-08) that this is EARLIER than the model's
+    # libgazebo_ros_openni_kinect.so plugin instances actually deregistering
+    # their own /rover/camera/set_parameters and /rover/camera_chase/
+    # set_parameters services from the ROS master. Spawning the replacement
+    # before that finishes hits "Tried to advertise a service that is
+    # already advertised" for the NEW plugin instances, and (unlike a
+    # cosmetic log warning) that failure silently kills the new camera
+    # topics' own publishers -- confirmed live: both /rover/camera/image_raw
+    # and /rover/camera_chase/image_raw went from a healthy publisher to
+    # zero after exactly this race. Polls the ROS master's own system state
+    # (the actual source of truth for "is this service still registered",
+    # not a proxy for it) rather than sleeping a guessed fixed delay.
+    # Best-effort: proceeds after CAMERA_SERVICE_TEARDOWN_TIMEOUT_SEC even
+    # if a service is still listed, same "don't block forever" reasoning as
+    # the model-deletion poll above -- spawning anyway is still better than
+    # never spawning at all, and this is the rare case, not the common one.
+    master = rospy.get_master()
+    deadline = time.time() + CAMERA_SERVICE_TEARDOWN_TIMEOUT_SEC
+    while time.time() < deadline:
+      try:
+        _, _, services = master.getSystemState()[2]
+        registered = {name for name, _nodes in services}
+      except Exception:
+        break
+      if not any(name in registered for name in OLD_CAMERA_SERVICE_NAMES):
+        return
+      time.sleep(DELETE_CONFIRM_POLL_INTERVAL_SEC)
 
   def respawnRoverWithCameraOffsets(self, offsets):
+    # Thin wrapper: see camera_respawn_inflight_lock's own comment for why
+    # this needs to be a genuine mutex around the whole respawn, not just
+    # the debounce that decides whether to call this at all. A second
+    # caller blocks here until the first respawn (delete, wait for the old
+    # plugins' services to really be gone, spawn) has completely finished,
+    # instead of running concurrently with it on a second Timer thread.
+    with self.camera_respawn_inflight_lock:
+      self._respawnRoverWithCameraOffsetsLocked(offsets)
+
+  def _respawnRoverWithCameraOffsetsLocked(self, offsets):
     if self.rover_sdf_template is None:
       rospy.logwarn(PKG_NAME + ": No rover SDF loaded, cannot apply camera offsets")
       return
+    if offsets == self.applied_camera_offsets:
+      # Re-checked here (applyCameraSettings/respawnPendingCameraOffsets
+      # both already checked this before scheduling/calling in) because a
+      # call queued up waiting on camera_respawn_inflight_lock can go stale
+      # while it waits: the respawn that just finished ahead of it may have
+      # already applied these exact same offsets. Without this, a blocked
+      # duplicate call still ran a full, pointless second respawn the
+      # instant the lock freed up.
+      return
     (off_x, off_y, off_z, off_yaw_deg, off_tilt_deg,
-     scene_x, scene_y, scene_z, scene_yaw_deg, scene_tilt_deg) = offsets
+     scene_x, scene_y, scene_z, scene_yaw_deg, scene_tilt_deg, fov_deg) = offsets
 
     # scene_x/y/z arrive as a DELTA from the factory chase-cam mount point,
     # not an absolute rover-frame coordinate -- see FACTORY_SCENE_OFFSET_X/Y/Z's
@@ -652,6 +881,11 @@ class SimBridgeNode:
     scene_x = scene_x + FACTORY_SCENE_OFFSET_X
     scene_y = scene_y + FACTORY_SCENE_OFFSET_Y
     scene_z = scene_z + FACTORY_SCENE_OFFSET_Z
+    # off_x/y/z (robot view) is the same delta-from-mount-point convention
+    # now -- see FACTORY_CAMERA_OFFSET_X/Y/Z's own comment.
+    off_x = off_x + FACTORY_CAMERA_OFFSET_X
+    off_y = off_y + FACTORY_CAMERA_OFFSET_Y
+    off_z = off_z + FACTORY_CAMERA_OFFSET_Z
 
     sdf = self.rover_sdf_template
     sdf, n1 = CAMERA_LINK_POSE_RE['camera_link'].subn(
@@ -660,14 +894,22 @@ class SimBridgeNode:
     sdf, n2 = CAMERA_LINK_POSE_RE['camera_link_chase'].subn(
         lambda m: m.group(1) + ("%.6f %.6f %.6f 0 %.6f %.6f " %
             (scene_x, scene_y, scene_z, math.radians(scene_tilt_deg), math.radians(scene_yaw_deg))) + m.group(2), sdf)
-    if n1 != 1 or n2 != 1:
+    fov_rad = math.radians(fov_deg)
+    sdf, n3 = CAMERA_FOV_RE['rover_camera'].subn(
+        lambda m: m.group(1) + ("%.7f" % fov_rad) + m.group(2), sdf)
+    sdf, n4 = CAMERA_FOV_RE['rover_camera_chase'].subn(
+        lambda m: m.group(1) + ("%.7f" % fov_rad) + m.group(2), sdf)
+    if n1 != 1 or n2 != 1 or n3 != 1 or n4 != 1:
       # A structural change to generic_rover/model.sdf (renamed link, reordered
-      # pose) could make this regex stop matching -- fail loudly rather than
-      # silently spawning the rover with its OLD/default camera poses, which
-      # would look exactly like "the offset setting doesn't do anything".
-      rospy.logerr(PKG_NAME + ": Camera pose substitution matched " + str(n1) +
-                   "/1 camera_link and " + str(n2) + "/1 camera_link_chase -- "
-                   "refusing to respawn with an unverified model")
+      # pose/fov) could make one of these regexes stop matching -- fail loudly
+      # rather than silently spawning the rover with its OLD/default camera
+      # poses or FOV, which would look exactly like "the setting doesn't do
+      # anything".
+      rospy.logerr(PKG_NAME + ": Camera substitution matched " + str(n1) +
+                   "/1 camera_link, " + str(n2) + "/1 camera_link_chase, " +
+                   str(n3) + "/1 rover_camera fov, " + str(n4) +
+                   "/1 rover_camera_chase fov -- refusing to respawn with an "
+                   "unverified model")
       return
 
     # Capture the rover's current pose so the respawn doesn't teleport it back
@@ -716,6 +958,19 @@ class SimBridgeNode:
                      old_name + " still present " +
                      str(DELETE_CONFIRM_TIMEOUT_SEC) + "s after DeleteModel")
         return
+      # get_world_properties no longer listing old_name is NOT the same as
+      # its camera plugins having actually finished unadvertising their own
+      # ROS services -- confirmed live (2026-09-08): a SECOND respawn
+      # shortly after a first one hit "Tried to advertise a service that is
+      # already advertised" for /rover/camera/set_parameters and
+      # /rover/camera_chase/set_parameters, then left BOTH camera topics
+      # with zero publishers (this method's own success log still fired --
+      # the SpawnModel call itself succeeds, it's the new plugins' own
+      # service registration that silently loses the naming collision).
+      # Actually wait for those two specific services to disappear from the
+      # ROS master's registry -- the real signal the old plugins are gone,
+      # not a proxy for it -- before spawning the replacement.
+      self._waitForOldCameraServicesGone()
       rospy.wait_for_service(SPAWN_MODEL_SERVICE, timeout=GAZEBO_SERVICE_WAIT_SEC)
       spawn = rospy.ServiceProxy(SPAWN_MODEL_SERVICE, SpawnModel)
       resp = spawn(new_name, sdf, '', initial_pose, 'world')
@@ -731,40 +986,173 @@ class SimBridgeNode:
     self.applied_camera_offsets = offsets
     self.held_pose = None  # Stale anchor from before the respawn -- see resetRover.
     rospy.loginfo(PKG_NAME + ": Applied camera offsets, robot=(%.2f,%.2f,%.2f,yaw=%.1f,tilt=%.1f) "
-                  "scene=(%.2f,%.2f,%.2f,yaw=%.1f,tilt=%.1f), model now '%s'"
+                  "scene=(%.2f,%.2f,%.2f,yaw=%.1f,tilt=%.1f), fov=%.1fdeg, model now '%s'"
                   % (offsets + (new_name,)))
+    # Camera sensor health after this respawn is checked by the periodic
+    # watchdog (cameraWatchdogCb), not here -- see that method's own
+    # comment for why a check performed immediately after this respawn
+    # succeeds is not a reliable signal (confirmed live 2026-09-08: a
+    # sensor can publish normally for the first several seconds after a
+    # respawn and then stop, well after any check placed right here would
+    # have already returned "fine").
+    self.last_respawn_time = time.time()
+
+  def _gzserverAlive(self):
+    return subprocess.call(['pgrep', '-x', 'gzserver'],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+
+  def cameraWatchdogCb(self, event):
+    # Confirmed live (2026-09-08): a second-or-later respawn in the same
+    # gzserver process can leave a camera sensor's ROS plumbing looking
+    # perfectly healthy (model exists, its /set_parameters service
+    # responds, image_raw has a registered /gazebo publisher) while the
+    # sensor has silently stopped actually rendering -- and this can take
+    # several seconds AFTER the respawn to manifest, so a one-time check
+    # performed right after a respawn succeeds is not a reliable signal (it
+    # can catch the sensor still working, seconds before it stops). This
+    # periodic watchdog is the actual fix: track "time since a frame last
+    # arrived" continuously, independent of when/why a respawn happened,
+    # and recover whenever that goes stale for too long.
+    # Re-tested live (2026-09-08) after the camera_respawn_inflight_lock +
+    # _waitForOldCameraServicesGone() fixes above: three sequential
+    # respawns (fov 100 -> 80 -> 50, ~20s apart) all left both camera
+    # topics publishing a healthy steady ~15Hz afterward, cross-checked via
+    # rostopic echo, not just this class's own subscriber timestamps. The
+    # earlier "still degraded after those fixes" read came from `rostopic
+    # hz`, which was independently confirmed broken in this environment (it
+    # reports "no new messages" even against /clock, which is always
+    # alive) -- so that read was a tooling false positive, not a real
+    # ongoing degradation. This watchdog stays as a safety net regardless
+    # (per the user's own call, given a race here is genuinely hard to
+    # fully rule out), just tuned tighter now that real data says a healthy
+    # camera never sits idle anywhere near CAMERA_DEAD_THRESHOLD_SEC.
+    now = time.time()
+    if now - self.last_respawn_time < RESPAWN_GRACE_SEC:
+      return  # a respawn's own delete+spawn gap, not a real failure
+    robot_stale = now - self.last_robot_raw_frame_time > CAMERA_DEAD_THRESHOLD_SEC
+    scene_stale = now - self.last_scene_raw_frame_time > CAMERA_DEAD_THRESHOLD_SEC
+    if not (robot_stale or scene_stale):
+      return
+    if self._recovering_gzserver:
+      # Already inside a recovery's own re-applying respawn (see
+      # _recoverDeadGzserver's own final call) -- if a supposedly-fresh
+      # gzserver STILL can't hold a camera sensor, restarting it again is
+      # unlikely to help and risks looping forever. Leave it broken and
+      # loud rather than silently spin.
+      rospy.logerr_throttle(CAMERA_WATCHDOG_PERIOD_SEC,
+                            PKG_NAME + ": Cameras still dead after a gzserver recovery attempt "
+                            "-- not retrying again automatically")
+      return
+    rospy.logerr(PKG_NAME + ": Camera watchdog: no frame on " +
+                 ("robot " if robot_stale else "") + ("scene " if scene_stale else "") +
+                 "view for over " + str(CAMERA_DEAD_THRESHOLD_SEC) + "s -- restarting gzserver to recover")
+    self._recoverDeadGzserver()
+
+  def _recoverDeadGzserver(self):
+    # Sets the re-entrancy guard for the WHOLE recovery (not just the final
+    # re-apply-respawn step) -- the kill+relaunch+settle sequence below can
+    # take 15-20+ seconds, comfortably longer than one
+    # CAMERA_WATCHDOG_PERIOD_SEC tick, and last_robot_raw_frame_time/
+    # last_scene_raw_frame_time stay stale (no gzserver running to publish
+    # anything) for that whole window -- without the guard covering this
+    # entire method, cameraWatchdogCb would see the same staleness and try
+    # to start a SECOND concurrent recovery mid-recovery.
+    self._recovering_gzserver = True
+    try:
+      self._recoverDeadGzserverImpl()
+    finally:
+      self._recovering_gzserver = False
+
+  def _recoverDeadGzserverImpl(self):
+    """Kills and relaunches gzserver/gzclient against the same world file,
+    then re-applies whatever this bridge currently believes should be
+    live -- the environment model (if any) and the current camera
+    offsets/FOV -- since a fresh gzserver reloads generic_rover.world from
+    scratch (the world file's own <include>, back under ROVER_MODEL_NAME,
+    with none of this session's customization). roscore, this bridge
+    itself, camera_rig_controller.py, and the rest of the VM-side stack
+    are untouched -- only gzserver/gzclient restart, so this is seconds,
+    not a full redeploy, and the device-side connection this bridge holds
+    never drops.
+
+    Best-effort throughout: logs and returns on any step failing rather
+    than raising, matching this whole file's own "a bridge command failure
+    should never crash the node" convention -- an operator still sees the
+    dead cameras and can fall back to a fresh Deploy if this recovery
+    itself doesn't pan out.
+    """
+    subprocess.call(['pkill', '-x', 'gzclient'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.call(['pkill', '-x', 'gzserver'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.time() + GAZEBO_SERVICE_WAIT_SEC
+    while time.time() < deadline and self._gzserverAlive():
+      time.sleep(0.2)
+    if self._gzserverAlive():
+      rospy.logerr(PKG_NAME + ": gzserver recovery failed -- old process would not die")
+      return
+
+    try:
+      subprocess.Popen(['rosrun', 'gazebo_ros', 'gazebo', GAZEBO_WORLD_PATH],
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+      rospy.logerr(PKG_NAME + ": gzserver recovery failed to relaunch: " + str(e))
+      return
+
+    deadline = time.time() + GAZEBO_PROCESS_WAIT_SEC
+    while time.time() < deadline and not self._gzserverAlive():
+      time.sleep(0.2)
+    if not self._gzserverAlive():
+      rospy.logerr(PKG_NAME + ": gzserver recovery failed -- new process never started")
+      return
+    time.sleep(GAZEBO_RESTART_SETTLE_SEC)
+
+    # Fresh world -- back to the <include>-spawned default name and no
+    # environment model, regardless of what this bridge thought was true a
+    # moment ago.
+    self.rover_model_name = ROVER_MODEL_NAME
+    if self.env_spawner.spawned_name is not None:
+      name = self.env_spawner.spawned_name
+      self.env_spawner.spawned_name = None
+      self.env_spawner.set_active_model(name)
+
+    # Force the respawn even though offsets will equal self.
+    # applied_camera_offsets (that's the whole point: re-apply the same
+    # customization gzserver just forgot) -- reset the sentinel first so
+    # _respawnRoverWithCameraOffsetsLocked's own already-applied guard
+    # doesn't skip it.
+    offsets_to_reapply = self.applied_camera_offsets
+    self.applied_camera_offsets = None
+    rospy.loginfo(PKG_NAME + ": gzserver recovered, re-applying camera offsets/FOV")
+    # _recovering_gzserver is already True here -- set by the outer
+    # _recoverDeadGzserver wrapper for this whole method's duration, not
+    # re-set locally (see that wrapper's own comment for why it needs to
+    # cover more than just this one call).
+    self._respawnRoverWithCameraOffsetsLocked(offsets_to_reapply)
 
   def bridgeServerLoop(self):
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    # rospy sets a process-global socket.setdefaulttimeout(60), which
-    # accept() applies to every accepted connection. The command stream is
-    # legitimately idle for long stretches (commands are sporadic), so a
-    # recv timeout must not be treated as client death -- clear the timeout
-    # and block instead; a real disconnect still unblocks recv with EOF, and
-    # a half-open client is caught by the 10 Hz telemetry push failing.
-    srv.settimeout(None)
-    # 0.0.0.0, not 127.0.0.1 -- binding to loopback only structurally forced
-    # every connection through the reverse SSH tunnel's port forwarding,
-    # even when this VM and the NEPI device share a real physical LAN and
-    # could reach this port directly (requested live 2026-09-04: "packets
-    # can just be sent through there" when there's an ethernet connection).
-    # Binding wide doesn't remove the tunnel path -- 0.0.0.0 still answers
-    # on 127.0.0.1 too, so a laptop reachable only via the reverse tunnel
-    # keeps working exactly as before; it just also accepts a direct
-    # connection to this VM's real interface when one exists. See
-    # rbx_sim_discovery.py's own sim_host discovery option, which is the
-    # other half of this: the device now dials whichever address that
-    # option names instead of always assuming loopback-via-tunnel.
-    srv.bind(('0.0.0.0', BRIDGE_PORT))
-    srv.listen(1)
+    # Name kept for history -- this is a dial-out reconnect loop now, not a
+    # server accept loop (see module docstring's 2026-09-08 note). Mirrors
+    # the retry shape rbx_sim_node.py's OLD bridgeLoop used before the
+    # direction reversed: connect, serve until disconnect/error, sleep,
+    # retry -- so the device's rbx_sim node (or this VM's own sim stack) can
+    # restart independently of the other and the connection just re-forms.
     while not rospy.is_shutdown():
       try:
-        conn, _ = srv.accept()
-        conn.settimeout(None)
-      except Exception:
+        conn = socket.create_connection((DEVICE_HOST, BRIDGE_PORT), timeout = 5)
+      except Exception as e:
+        rospy.logwarn_throttle(10, PKG_NAME + ": Bridge connect to " + DEVICE_HOST +
+                               ":" + str(BRIDGE_PORT) + " failed: " + str(e))
+        time.sleep(BRIDGE_RECONNECT_INTERVAL_SEC)
         continue
-      rospy.loginfo(PKG_NAME + ": Bridge client connected")
+      # rospy sets a process-global socket.setdefaulttimeout(60), which
+      # create_connection above already applied to the connect itself --
+      # clear it for the life of the connection. The command stream is
+      # legitimately idle for long stretches (commands are sporadic), so a
+      # recv timeout must not be treated as client death -- a real
+      # disconnect still unblocks recv with EOF, and a half-open peer is
+      # caught by the 10 Hz telemetry push failing.
+      conn.settimeout(None)
+      rospy.loginfo(PKG_NAME + ": Connected to device bridge at " + DEVICE_HOST +
+                    ":" + str(BRIDGE_PORT))
       with self.client_lock:
         self.client_conn = conn
       # Tell the device which environment models exist on this VM right
@@ -779,6 +1167,13 @@ class SimBridgeNode:
       with self.client_lock:
         if self.client_conn is conn:
           self.client_conn = None
+      try:
+        conn.close()
+      except Exception:
+        pass
+      rospy.logwarn(PKG_NAME + ": Bridge connection lost -- retrying in " +
+                    str(BRIDGE_RECONNECT_INTERVAL_SEC) + "s")
+      time.sleep(BRIDGE_RECONNECT_INTERVAL_SEC)
       try:
         conn.close()
       except Exception:

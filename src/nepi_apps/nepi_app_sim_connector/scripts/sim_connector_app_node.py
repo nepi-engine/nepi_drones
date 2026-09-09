@@ -1434,6 +1434,45 @@ class NepiSimConnectorApp:
     if pub is not None:
       pub.publish(Bool(data = self.dimensions_dirty.get(role, False)))
 
+  def dimensionsToDeploy(self, role):
+    """Returns (yaml_text, sdf_override_text) to actually deploy for role --
+    the SELECTED preset's own saved content, never whatever unsaved edits
+    might currently be sitting in the active store. Requested live
+    (2026-09-08): "there's a popup that keeps saying robot dimensions have
+    been edited by not saved as a preset. this should never be a popup...
+    if its edited but not saved, the default, or whatever is selected for
+    the robot config, should just launch. only time it can be changed is if
+    the user saves the changes, it shows up on the robot config dropdown,
+    and they select that." That popup (removed, see
+    Nepi_IF_SimLauncher.onDeployClicked's own comment) used to be the only
+    thing standing between an unsaved edit and a real deploy; this is the
+    actual fix, on the side that matters (there is no RUI left to bypass).
+
+    selected_dimension_config[role] is '' exactly when the active store's
+    current content doesn't match any saved preset (see
+    resolveMatchingDimensionConfigName) -- an unsaved edit, or any other
+    unresolved state. Whenever it's non-empty, applyDimensionConfigByName
+    already wrote that exact preset's content into the active store, so
+    reading the active store IS reading the selected preset; only the
+    empty case needs to substitute the built-in default's own file
+    instead.
+    """
+    if self.selected_dimension_config.get(role, '') != '':
+      return self.readStoredDimensionsYaml(role), self.readStoredSdfOverride(role)
+    fallback_name = FALLBACK_DIMENSION_CONFIG_NAME.get(role)
+    if fallback_name is not None:
+      path = self.dimensionConfigPath(role, fallback_name)
+      if os.path.exists(path):
+        try:
+          with open(path, 'r') as f:
+            return f.read(), ''
+        except Exception as e:
+          self.msg_if.pub_warn("Failed to read fallback " + role + " dimensions config '" +
+                               fallback_name + "': " + str(e))
+    # No resolvable fallback either (shouldn't happen -- every role has a
+    # built-in) -- deploying the active store is still better than nothing.
+    return self.readStoredDimensionsYaml(role), self.readStoredSdfOverride(role)
+
   def pushDirtyDimensions(self, target_key):
     # Called right before a real Launch (see runLaunch) and once at startup
     # for whatever the device-side store already had persisted -- best
@@ -1465,8 +1504,8 @@ class NepiSimConnectorApp:
       else:
         model_name = DIMENSION_ROLE_MODEL[role]
       try:
-        self.launcher.push_dimensions(target, model_name,
-            self.readStoredDimensionsYaml(role), self.readStoredSdfOverride(role))
+        yaml_text, sdf_override_text = self.dimensionsToDeploy(role)
+        self.launcher.push_dimensions(target, model_name, yaml_text, sdf_override_text)
         self.dimensions_dirty[role] = False
         self.publishDimensionsDirty(role)
         self.msg_if.pub_info("Pushed " + role + " dimensions (" + model_name + ") to the sim VM")

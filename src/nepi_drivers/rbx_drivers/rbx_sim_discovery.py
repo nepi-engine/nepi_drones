@@ -18,6 +18,7 @@
 
 import time
 import socket
+import threading
 
 from nepi_sdk import nepi_sdk
 from nepi_sdk import nepi_drvs
@@ -44,33 +45,47 @@ class SimDiscovery:
 
   # The generic-rover Gazebo simulation runs on the dev VM, whose sim stack
   # (sim_rover_gazebo / sim_rover_gazebo_multi in sim_rover_dev_env.sh)
-  # starts a tiny plain-TCP heartbeat listener (sim_heartbeat_listener.py)
-  # per robot. The two machines have separate ROS masters, so the sim's
-  # /sim/heartbeat ROS topic is invisible here -- the raw heartbeat TCP
-  # ports are the liveness signal.
+  # starts a tiny plain-TCP heartbeat pinger (sim_heartbeat_listener.py,
+  # name kept for history -- it is a client now, not a listener) per robot.
+  # The two machines have separate ROS masters, so the sim's /sim/heartbeat
+  # ROS topic is invisible here -- a raw TCP signal is the liveness check.
   #
-  # Address is now the DISCOVERY_DICT OPTIONS 'sim_host' value (see
-  # rbx_sim_params.yaml), not a hardcoded constant -- requested live
-  # (2026-09-04): "this should automatically work if the vm host computer
-  # has an ethernet connection to the nepi device, as packets can just be
-  # sent through there." Two real cases, same code path:
-  #   - VM and device on a shared physical LAN (the common case this was
-  #     requested for) -- sim_host is that VM's own real, directly routable
-  #     IP, set automatically once by sim_connector_app_node.py when an OS
-  #     instance is selected (see OsInstanceRegistry.select's own comment),
-  #     and packets flow over the real network with no tunnel involved at
-  #     all -- confirmed this same day that sim_bridge_node.py's own TCP
-  #     server (the bridge port these heartbeat probes lead to a rbx node
-  #     for) binds 0.0.0.0, not 127.0.0.1, precisely so a direct connection
-  #     like this can actually complete.
-  #   - VM reachable only via the reverse SSH tunnel (an operator's laptop
-  #     behind NAT, no direct route) -- sim_host stays the '127.0.0.1'
-  #     default, and nepi_tunnel's own port forwarding makes the VM's ports
-  #     answer on the device's own loopback exactly as it always has.
-  # Still a list (not a single value) for the same reason it always was: a
-  # future multi-VM setup could probe more than one address per cycle; only
-  # ONE entry is populated today.
-  sim_addr_list = ['127.0.0.1']
+  # 2026-09-08 -- DIRECTION REVERSED: this class used to dial OUT to the
+  # VM's sim_host:heartbeat_port (see git history for that version). That
+  # requires the VM to accept an unsolicited inbound connection, which
+  # fails by default on a very common real setup this app is meant to
+  # support out of the box -- Windows + WSL2, where Windows Firewall's
+  # Public-profile default blocks inbound to the VM even once WSL mirrored
+  # networking makes it LAN-addressable, and per-machine firewall exceptions
+  # do not scale ("everyone would need to configure this themselves").
+  # Outbound connections are essentially never blocked on any OS, so now
+  # the device only ever LISTENS (see _startHeartbeatListener below) and
+  # the VM dials in. This also drops the last piece of required
+  # configuration: discovery no longer checks a pre-configured sim_host/
+  # DISCOVERY_DICT OPTIONS address at all -- see _recentPeersForPort,
+  # which asks "who has actually pinged this port recently" instead of
+  # "did my configured target answer". Any VM that starts pinging is
+  # discovered under its own real source IP, whatever that turns out to
+  # be, with nothing to set up on the device side first. Naturally
+  # supports more than one VM pinging in at once, for free.
+
+  # peer IP -> last time a heartbeat ping from it was received, populated by
+  # the listener thread(s) started in __init__. checkForSimDevice reads
+  # this instead of dialing out. Class-level (shared across instances,
+  # matching every other piece of state on this class) but there is
+  # normally exactly one SimDiscovery instance per driver process anyway.
+  heartbeat_last_seen = dict()
+  heartbeat_lock = threading.Lock()
+  # Guards against starting more than one listener thread on the same port
+  # if discoveryFunction's caller ever constructs more than one SimDiscovery.
+  heartbeat_listeners_started = set()
+  # How recent a heartbeat ping must be to count as "alive". Pingers ping
+  # every ~2s (see sim_heartbeat_listener.py) when gzserver is genuinely up;
+  # 6s tolerates one dropped ping without flapping, matching the old
+  # dial-out version's own connect timeout of 6s (see its 2026-09-01
+  # history) -- HEARTBEAT_MISS_THRESHOLD below is a second, outer layer of
+  # debounce on top of this, unchanged from before.
+  HEARTBEAT_LISTEN_TIMEOUT_SEC = 6
   # Robot slots (Phase 4): one (heartbeat_port, bridge_port) pair plus
   # VM-side identity per simulated robot. Each slot whose heartbeat answers
   # gets its own rbx_sim node wired to its own bridge port -- slots probe
@@ -134,9 +149,54 @@ class SimDiscovery:
     self.log_name = PKG_NAME.lower() + "_discovery"
     self.logger = nepi_sdk.logger(log_name = self.log_name)
     self.heartbeat_miss_counts = dict()
+    # One always-on listener per robot slot's heartbeat_port -- started once
+    # here, independent of whether any rbx_sim node has been launched yet,
+    # since this IS the bootstrap signal discoveryFunction uses to decide
+    # whether to launch one in the first place.
+    for robot_slot in self.SIM_ROBOT_SLOTS:
+      self._startHeartbeatListener(int(robot_slot['heartbeat_port']))
     time.sleep(1)
     self.logger.log_info("Starting Initialization")
     self.logger.log_info("Initialization Complete")
+
+  def _startHeartbeatListener(self, port):
+    # Accepts a VM's heartbeat ping, records the sender's IP and the time,
+    # and closes -- no reply is needed (unlike the old dial-out version's
+    # ALIVE reply): the VM already decided to send a ping only because its
+    # own gzserver_is_alive() check passed (see sim_heartbeat_listener.py),
+    # so this side has nothing further to confirm back.
+    if port in self.heartbeat_listeners_started:
+      return
+    self.heartbeat_listeners_started.add(port)
+
+    def _handle(conn, peer_ip):
+      try:
+        conn.settimeout(3)
+        data = conn.recv(16)
+        if data.startswith(self.SIM_ALIVE_REPLY):
+          with self.heartbeat_lock:
+            self.heartbeat_last_seen[(peer_ip, str(port))] = time.time()
+      except Exception:
+        pass
+      finally:
+        try:
+          conn.close()
+        except Exception:
+          pass
+
+    def _acceptLoop():
+      srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+      srv.bind(('0.0.0.0', port))
+      srv.listen(16)
+      while True:
+        try:
+          conn, addr = srv.accept()
+        except Exception:
+          continue
+        threading.Thread(target = _handle, args = (conn, addr[0]), daemon = True).start()
+
+    threading.Thread(target = _acceptLoop, daemon = True).start()
 
 
   ##########  Drv Standard Discovery Function
@@ -154,13 +214,6 @@ class SimDiscovery:
     except Exception as e:
       self.logger.log_warn("Failed to load options " + str(e))
       return None
-    # sim_host is a later addition (see this class's own sim_addr_list
-    # comment) -- .get() with the loopback default so a driver config that
-    # predates this option (or a malformed/missing OPTIONS entry) still
-    # behaves exactly as before rather than raising.
-    sim_host = drv_dict['DISCOVERY_DICT']['OPTIONS'].get('sim_host', {}).get('value', '127.0.0.1')
-    self.sim_addr_list = [sim_host] if sim_host else ['127.0.0.1']
-
     # Retry behavior
     self.retry = retry_enabled
     if self.retry == True:
@@ -181,19 +234,33 @@ class SimDiscovery:
 
     ### Checking each robot slot's heartbeat listener
     if connection_type == 'SIMULATOR':
-      for ip_addr_str in self.sim_addr_list:
-        for robot_slot in self.SIM_ROBOT_SLOTS:
-          ip_port_str = robot_slot['heartbeat_port']
+      for robot_slot in self.SIM_ROBOT_SLOTS:
+        ip_port_str = robot_slot['heartbeat_port']
+        # No pre-configured address to check any more (see class comment
+        # above) -- ask whichever peer(s) have actually pinged this port
+        # recently. This is what makes the whole thing work with zero
+        # configuration: any VM that starts pinging is discovered, whatever
+        # its real address turns out to be.
+        for ip_addr_str in self._recentPeersForPort(ip_port_str):
           path_str = "SIM_" + ip_addr_str + "_" + ip_port_str
           if path_str not in self.active_paths_list and path_str not in self.dont_retry_list:
-            found_device = self.checkForSimDevice(ip_addr_str, ip_port_str)
-            if found_device:
-              self.logger.log_info("Sim heartbeat detected at " + ip_addr_str + ":" + ip_port_str + ". Launching sim rbx node for " + robot_slot['device_id'])
-              success = self.launchSimDeviceNode(path_str, robot_slot)
-              if success:
-                self.active_paths_list.append(path_str)
+            self.logger.log_info("Sim heartbeat detected at " + ip_addr_str + ":" + ip_port_str + ". Launching sim rbx node for " + robot_slot['device_id'])
+            success = self.launchSimDeviceNode(path_str, robot_slot)
+            if success:
+              self.active_paths_list.append(path_str)
     # Wrap Up
     return self.active_paths_list
+
+  def _recentPeersForPort(self, ip_port_str):
+    # Every peer IP that has pinged this port recently -- drives the
+    # SIMULATOR loop above without any pre-configured address (see class
+    # comment for why: this class used to dial a configured sim_host, now
+    # it only ever listens, so discovery has to ask "who actually pinged
+    # me" instead of "did my configured target answer").
+    now = time.time()
+    with self.heartbeat_lock:
+      return [addr for (addr, port), seen in self.heartbeat_last_seen.items()
+              if port == str(ip_port_str) and (now - seen) < self.HEARTBEAT_LISTEN_TIMEOUT_SEC]
 
 
   ################################################
@@ -256,30 +323,12 @@ class SimDiscovery:
   ########## SIMULATOR PROCESSES ############
 
   def checkForSimDevice(self, ip_addr_str, ip_port_str):
-    # Probe the sim heartbeat listener's TCP port (through the reverse tunnel)
-    # and require its ALIVE reply -- a bare connect succeeds against sshd even
-    # when the far-end listener is down (see class comment above).
-    #
-    # Raised from 2s to 6s (2026-09-01): even with HEARTBEAT_MISS_THRESHOLD
-    # raised to 6, a live rover was still purged mid-session -- the reverse
-    # tunnel carrying real traffic (Gazebo's own topics, image streams) adds
-    # real round-trip latency on top of the connect+ALIVE-reply exchange, and
-    # a 2s socket timeout was tight enough to misread that latency as "not
-    # answering" under normal running load, not just at startup.
-    found_device = False
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(6)
-    try:
-      result = sock.connect_ex((ip_addr_str, int(ip_port_str)))
-      if result == 0:
-        reply = sock.recv(16)
-        if reply.startswith(self.SIM_ALIVE_REPLY):
-          found_device = True
-    except Exception:
-      found_device = False
-    finally:
-      sock.close()
-    return found_device
+    # No dial-out any more (see class comment above) -- just check whether
+    # a heartbeat ping from this address has arrived recently at the
+    # listener _startHeartbeatListener already has running.
+    with self.heartbeat_lock:
+      last_seen = self.heartbeat_last_seen.get((ip_addr_str, str(ip_port_str)), 0)
+    return (time.time() - last_seen) < self.HEARTBEAT_LISTEN_TIMEOUT_SEC
 
 
   def launchSimDeviceNode(self, path_str, robot_slot):

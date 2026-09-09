@@ -1,38 +1,49 @@
 #!/usr/bin/env python3
-"""Tiny liveness listener for the generic-rover Gazebo simulation.
+"""Tiny liveness pinger for the generic-rover Gazebo simulation.
 
-Listens on 127.0.0.1:<port>. On each connection, checks whether gzserver is
-ACTUALLY still running (see GZSERVER_PGREP_PATTERN below) and only then
-replies ALIVE, closing the connection either way. Deliberately NOT a ROS
-node: the remote NEPI device and this dev VM run separate ROS masters
-bridged only by a reverse SSH tunnel that forwards raw TCP ports, so the
-NEPI rbx_sim driver's discovery cannot see this VM's ROS graph (no
-/sim/heartbeat topic) -- it probes this plain TCP port instead. The ALIVE
-reply matters: with an ssh -R forward, a connect() on the device side
-succeeds against the device's sshd even when nothing is listening here, so
-discovery must read the reply, not just connect.
+Name kept for history -- this is a CLIENT now, not a listener. Every
+CHECK_INTERVAL_SEC it checks whether gzserver is ACTUALLY still running
+(see gzserver_is_alive() below) and, only if so, dials out to the NEPI
+device's own heartbeat listener (rbx_sim_discovery.py's
+_startHeartbeatListener) and sends ALIVE. Deliberately NOT a ROS node: the
+remote NEPI device and this dev VM run separate ROS masters, so the NEPI
+rbx_sim driver's discovery cannot see this VM's ROS graph (no
+/sim/heartbeat topic) -- a raw TCP ping stands in instead.
 
-Checks gzserver's real liveness (2026-08-26) rather than unconditionally
-replying ALIVE just because this process itself is running -- this
-listener and gzserver are separate processes, started together by
-launch_command but with no guaranteed teardown coupling after that: a
-gzserver crash, an operator manually killing just gzserver/gzclient (e.g.
-to debug something), or any stop path that doesn't happen to hit this
-listener's own PID all leave it running and happily lying "ALIVE" forever.
-Reported live: "even though the rover is killed in gazebo, it still shows
-it in robots... this is a recurring issue" -- rbx_sim_discovery.py's own
-liveness check (checkForSimDevice) is only as honest as this reply, so a
-stale reply means a stale robot entry that never clears from Devices ->
+2026-09-08 -- DIRECTION REVERSED (see rbx_sim_discovery.py's own comment
+for the full reasoning): this used to be a server the device dialed into,
+relying on a reverse SSH tunnel to make that inbound connection possible.
+That requires the VM to accept an unsolicited inbound connection, which a
+very common real setup -- Windows + WSL2 -- blocks by default even once
+mirrored networking makes the VM LAN-addressable (Windows Firewall's
+Public-profile default), and asking every operator to add a firewall
+exception doesn't scale. Outbound is never blocked, so this now dials the
+device instead of waiting to be dialed -- no tunnel, no firewall config, on
+any OS.
+
+Checks gzserver's real liveness (2026-08-26, unchanged by the above)
+rather than unconditionally pinging ALIVE just because this process itself
+is running -- this pinger and gzserver are separate processes, started
+together by launch_command but with no guaranteed teardown coupling after
+that: a gzserver crash, an operator manually killing just gzserver/
+gzclient (e.g. to debug something), or any stop path that doesn't happen
+to hit this process's own PID all leave it running and happily able to lie
+"ALIVE" forever. Reported live: "even though the rover is killed in
+gazebo, it still shows it in robots... this is a recurring issue" --
+rbx_sim_discovery.py's own liveness check (checkForSimDevice) is only as
+honest as whether a ping actually arrives, so a stale "still running"
+belief here means a stale robot entry that never clears from Devices ->
 Robots no matter how long gzserver has been gone.
 
 Started and stopped by the sim_heartbeat_listener function in
 sim_rover_dev_env.sh as part of sim_rover_gazebo, alongside roscore, Gazebo,
-and sim_bridge_node.py -- so reachability of this port USED TO mean the
-rover sim stack is up; now it only means the stack was launched at some
-point AND gzserver is still actually alive right now, closing that gap.
-Modeled on gz_reset_listener.py (same pattern, ArduPilot workflow).
+and sim_bridge_node.py -- so a ping arriving USED TO mean only "the port
+answers"; now (both before and after the direction reversal) it means the
+stack was launched at some point AND gzserver is still actually alive right
+now. Modeled on gz_reset_listener.py (same pattern, ArduPilot workflow).
 """
 
+import os
 import socket
 import subprocess
 import sys
@@ -40,6 +51,20 @@ import threading
 import time
 
 DEFAULT_PORT = 9022
+
+# The NEPI device's own reachable address -- same env var and same default
+# ("nepi", meant to resolve via whatever ~/.ssh/config / /etc/hosts entry
+# the operator's one-time device SSH setup already created) as
+# nepi_tunnel()'s device_host in nepi_sitl_dev_env.sh, reused rather than
+# inventing a second variable for the same machine.
+DEVICE_HOST = os.environ.get('NEPI_DEVICE_SSH_HOST', 'nepi')
+
+# How often to ping when alive. Well under rbx_sim_discovery.py's
+# HEARTBEAT_LISTEN_TIMEOUT_SEC (6s) so one dropped ping or one slow
+# connection attempt doesn't read as "gone".
+PING_INTERVAL_SEC = 2.0
+
+SIM_ALIVE_PING = b'ALIVE\n'
 
 # World-file substring gazserver_is_alive() requires in a candidate
 # process's OWN argv -- scoped to this specific world, not a bare
@@ -109,47 +134,33 @@ def _livenessLoop():
         time.sleep(CHECK_INTERVAL_SEC)
 
 
-def _handleConnection(conn):
+def _pingOnce(port):
+    with _alive_lock:
+        alive = _alive
+    if not alive:
+        # Send nothing at all this cycle -- rbx_sim_discovery.py's
+        # checkForSimDevice reads "no recent ping" as "not alive", the same
+        # conclusion a failed/empty reply used to produce, so simply
+        # skipping the dial is enough; no need to connect just to say
+        # nothing.
+        return
     try:
-        with _alive_lock:
-            alive = _alive
-        if alive:
-            conn.sendall(b'ALIVE\n')
-        # Else: send nothing and just close -- checkForSimDevice's
-        # reply.startswith(SIM_ALIVE_REPLY) check on an empty read
-        # correctly reads as "not alive", the same as no listener at
-        # all, rather than a confusing partial/wrong reply.
+        with socket.create_connection((DEVICE_HOST, port), timeout = 3) as sock:
+            sock.sendall(SIM_ALIVE_PING)
     except Exception:
+        # Device listener not up yet / momentarily unreachable -- harmless,
+        # matches every other reconnect-style loop in this codebase (e.g.
+        # sim_bridge_node.py's own dial loop); just try again next cycle.
         pass
-    finally:
-        conn.close()
 
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
     threading.Thread(target=_livenessLoop, daemon=True).start()
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(('0.0.0.0', port))  # 0.0.0.0: direct-LAN reachable, see sim_bridge_node.py's own bind comment
-    # A generous backlog (not the original 1) -- rbx_sim_discovery.py's own
-    # probe cadence plus the reverse tunnel's connection setup/teardown
-    # timing means more than one probe can land back-to-back; a backlog of
-    # 1 measurably dropped connections on a busy VM (confirmed live: ~1 in
-    # 15 probes failed), which rbx_sim_discovery.py's checkForSimDevice
-    # reads as "sim heartbeat no longer answering" and kills+relaunches the
-    # rbx node over it -- a full restart loop caused by nothing more than a
-    # brief moment of contention on this listener's own accept queue,
-    # compounded by (now removed) per-connection pgrep fork latency.
-    srv.listen(16)
-    print(f"sim_heartbeat_listener listening on 127.0.0.1:{port}", flush=True)
+    print(f"sim_heartbeat_listener pinging {DEVICE_HOST}:{port} every {PING_INTERVAL_SEC}s", flush=True)
     while True:
-        conn, _ = srv.accept()
-        # Handled on its own thread so one connection's socket I/O can never
-        # delay accept()ing the next one -- the liveness check itself is now
-        # a cheap shared-memory read (see _livenessLoop), not the bottleneck
-        # this was originally, but the accept loop should still never block
-        # on connection-handling work as a matter of principle.
-        threading.Thread(target=_handleConnection, args=(conn,), daemon=True).start()
+        _pingOnce(port)
+        time.sleep(PING_INTERVAL_SEC)
 
 
 if __name__ == '__main__':

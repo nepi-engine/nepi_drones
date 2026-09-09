@@ -238,6 +238,7 @@ class NepiIFSimControls extends Component {
     this.isRbxLive = this.isRbxLive.bind(this)
 
     this.onEnterSetRbxFloatSetting = this.onEnterSetRbxFloatSetting.bind(this)
+    this.pushCameraFovLive = this.pushCameraFovLive.bind(this)
     this.renderCameraOffsetControls = this.renderCameraOffsetControls.bind(this)
     this.renderCompactToggle = this.renderCompactToggle.bind(this)
     this.setEnvironmentSetting = this.setEnvironmentSetting.bind(this)
@@ -417,25 +418,24 @@ class NepiIFSimControls extends Component {
         updates[name] = deviceVal
       }
     }
-    if (valuesDict["environment"] !== undefined
-        && valuesDict["environment"] !== this.state.rbxSettingsValuesDict["environment"]) {
-      if (this.state.environment_setting_pending !== null) {
+    if (valuesDict["environment"] !== undefined) {
+      const pending = this.state.environment_setting_pending
+      if (pending !== null && valuesDict["environment"] !== pending) {
         // The environment dimensions-config selector (via setEnvironmentSetting,
-        // called through Nepi_IF_Sim.js's own ref) picked this before the
-        // device existed to send it to. Now that a real SettingsStatus has
-        // arrived, the driver namespace exists -- send the pending pick for
-        // real instead of letting this status resync back to whatever
-        // "environment" this fresh device happened to carry over from a
-        // previous session. Clearing the pending flag here, not in
-        // setEnvironmentSetting, is what makes this a one-shot catch-up
-        // rather than resending on every subsequent status tick. Already
-        // the final Setting value (setEnvironmentSetting does the display-
-        // name -> Setting-value translation up front), so this is a direct
+        // called through Nepi_IF_Sim.js's own ref) is what the operator last
+        // explicitly chose here -- resend it EVERY tick this mismatches,
+        // not just once, and never clear this back to null on our own (see
+        // setEnvironmentSetting's own comment for the full root-cause
+        // writeup: a fresh redeploy's brand-new rbx_sim_node.py process
+        // resyncs on connect from whatever was last SAVED to its own
+        // persisted-settings YAML, which can be stale from a much earlier
+        // session and has nothing to do with this dropdown or any live
+        // Setting update that was never separately saved). Already the
+        // final Setting value (setEnvironmentSetting does the display-name
+        // -> Setting-value translation up front), so this is a direct
         // resend, no re-translation needed.
-        const pending = this.state.environment_setting_pending
-        updates.environment_setting_pending = null
         this.props.ros.updateSetting(this.state.rbx_namespace + "/settings", "environment", "Discrete", pending)
-      } else {
+      } else if (valuesDict["environment"] !== this.state.rbxSettingsValuesDict["environment"]) {
         // No display purpose left for this (see setEnvironmentSetting's own
         // comment -- nothing renders a dropdown driven by it anymore), just
         // tracked so the membership check above keeps working correctly.
@@ -1208,6 +1208,34 @@ class NepiIFSimControls extends Component {
     }
   }
 
+  // Callable via ref from Nepi_IF_Sim.js's own "Set Horizontal FOV" quick-
+  // edit box (2026-09-08, requested live: "making edits to the set
+  // horizontal fov in degrees and hitting enter still doesnt really do
+  // anything. the changing offset seems to actually change the camera
+  // position, but these dont"). That box only ever wrote to the robot
+  // dimensions store (generate_model_sdf.py's curated
+  // camera_horizontal_fov_deg field, which just sets what a FRESH deploy
+  // starts at) -- it never reached camera_fov_deg, the actual live RBX
+  // Setting added the same day that a running sim's cameras can be
+  // respawned with a new FOV. This is the bridge between the two: same
+  // updateSetting call renderCameraOffsetControls' own offset inputs use,
+  // just reachable from the other component. No-op in preview/not-live,
+  // same guard as onEnterSetRbxFloatSetting.
+  pushCameraFovLive(fovDeg) {
+    const value = parseFloat(fovDeg)
+    if (isNaN(value)) {
+      console.warn("pushCameraFovLive: '" + fovDeg + "' is not a number, ignoring")
+      return
+    }
+    if (!this.isRbxLive()) {
+      console.warn("pushCameraFovLive: no live RBX device connected (rbx_namespace='" +
+                    this.state.rbx_namespace + "'), FOV not pushed -- deploy a simulator first")
+      return
+    }
+    const { updateSetting } = this.props.ros
+    updateSetting(this.state.rbx_namespace + "/settings", "camera_fov_deg", "Float", String(value))
+  }
+
 
   // Recomputes scene_offset_yaw/scene_offset_tilt from the CURRENT
   // scene_offset_x/y/z so the scene (chase) camera keeps facing the robot's
@@ -1405,14 +1433,37 @@ class NepiIFSimControls extends Component {
     const settingValue = (value === "Flat" || value === "Flat Ground")
       ? "FLAT_GROUND"
       : value.toUpperCase().replace(/[^A-Z0-9]+/g, "_")
+    // environment_setting_pending is now kept set indefinitely (never
+    // cleared back to null after a successful send) -- requested live
+    // (2026-09-08): "i have it set to flat on the dropdown and when i
+    // launched it, it shows the obstacle course. when i change it to
+    // obstacle and back to flat, nothing happens." Root cause confirmed
+    // live: rbx_sim_node.py's own persisted RBX-settings YAML only updates
+    // on an explicit, separate Save Config action, never on a live Setting
+    // change -- so a fresh redeploy's brand-new process resyncs on connect
+    // from whatever "environment" value was last SAVED (often stale,
+    // confirmed live to be 'OBSTACLE_COURSE' from earlier testing),
+    // completely independent of whatever this dropdown shows or last sent.
+    // The one-shot version of this pending flag (cleared to null right
+    // after its first resend) only ever caught the narrow "picked before
+    // the device even existed yet" case, never "picked while live, then
+    // redeployed later" -- the far more common sequence. Keeping this set
+    // makes rbxSettingsListener re-assert this dropdown's own last choice
+    // every time the device's reported value disagrees with it, including
+    // after any future redeploy, not just the very next status tick after
+    // picking it. Same "re-assert on every tick until it sticks"
+    // self-healing shape gotoControlCb already uses for velocity commands
+    // over the same lossy, no-ack bridge link (see that method's own
+    // comment) -- a harmless low-rate resend if the value can genuinely
+    // never validate (e.g. a custom name with no real VM-side model),
+    // since the device's own Discrete-setting validation just keeps
+    // ignoring it either way.
+    this.setState({ selected_environment_setting: settingValue, environment_setting_pending: settingValue })
     if (!live) {
-      // No driver namespace to send updateSetting to yet -- remember the
-      // pick as pending so rbxSettingsListener can send it the moment this
-      // device goes live, instead of it being lost.
-      this.setState({ selected_environment_setting: settingValue, environment_setting_pending: settingValue })
+      // No driver namespace to send updateSetting to yet -- rbxSettingsListener
+      // sends it for real the moment this device goes live.
       return
     }
-    this.setState({ selected_environment_setting: settingValue, environment_setting_pending: null })
     updateSetting(this.state.rbx_namespace + "/settings", "environment", "Discrete", settingValue)
   }
 

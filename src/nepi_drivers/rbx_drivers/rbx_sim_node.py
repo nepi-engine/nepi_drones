@@ -18,13 +18,27 @@
 
 # RBX driver node for the Gazebo simulated rover (RBX_SIM), following
 # rbx_ardupilot_node.py's RBXRobotIF integration pattern. The simulator runs
-# on a dev VM with its own ROS master, reachable from this device solely
-# through a reverse SSH tunnel forwarding raw TCP ports, so this node holds a
-# persistent TCP connection to the VM's sim_bridge_node.py (host/port from
-# DEVICE_DICT) speaking newline-delimited JSON: velocity commands out
-# ({"linear_x","angular_z"}, republished onto the VM's /nepi/sim/cmd_vel),
-# odometry telemetry in ({"x","y","yaw","linear_x","angular_z","stamp"},
-# pushed at 10 Hz from the VM's /rover/odom).
+# on a dev VM with its own ROS master, so this node holds a persistent TCP
+# connection to the VM's sim_bridge_node.py speaking newline-delimited
+# JSON: velocity commands out ({"linear_x","angular_z"}, republished onto
+# the VM's /nepi/sim/cmd_vel), odometry telemetry in
+# ({"x","y","yaw","linear_x","angular_z","stamp"}, pushed at 10 Hz from the
+# VM's /rover/odom).
+#
+# 2026-09-08 -- DIRECTION REVERSED: this node used to DIAL OUT to the VM's
+# sim_host:bridge_port (see git history for that version), reachable only
+# through a reverse SSH tunnel when the VM had no direct route. That
+# requires the VM to accept an unsolicited inbound connection, which fails
+# by default on a very common real setup this app is meant to support out
+# of the box -- Windows + WSL2, where Windows Firewall's Public-profile
+# default blocks inbound to the VM even once WSL mirrored networking makes
+# it LAN-addressable, and asking every operator to add a firewall exception
+# doesn't scale. Outbound is never blocked, so now this node only ever
+# LISTENS on bridge_port (see bridgeLoop) and the VM's sim_bridge_node.py
+# dials in instead -- no tunnel, no firewall config, on any OS. DEVICE_DICT's
+# sim_host is therefore unused here now (still populated by
+# rbx_sim_discovery.py, still used there to match a heartbeat's arriving
+# peer IP -- see that file's own comment).
 #
 # Unlike the ArduPilot driver there is no onboard autopilot to delegate goto
 # setpoints to: the rover only understands instantaneous velocity, so this
@@ -116,12 +130,17 @@ class SimNode:
   # neither camera has ever had roll. Factory values reproduce
   # generic_rover/model.sdf's hard-coded rotations exactly: camera_link has
   # none (0, 0, 0) -- FACTORY_CAMERA_LINK_TILT_DEG stays 0.0 -- and
-  # camera_link_chase's own hard-coded downward-look pitch (0.5404195 rad)
-  # is what FACTORY_SCENE_TILT_DEG below reproduces in degrees.
+  # camera_link_chase's own hard-coded downward-look pitch is what
+  # FACTORY_SCENE_TILT_DEG below reproduces in degrees (see that constant's
+  # own comment further down for how it's derived).
+  #
+  # camera_fov_deg added (2026-09-08) -- shared horizontal FOV for both
+  # cameras, same live-respawn mechanism as the offsets above.
   CAMERA_SETTING_NAMES = ("camera_offset_x", "camera_offset_y", "camera_offset_z",
                           "camera_offset_yaw", "camera_offset_tilt",
                           "scene_offset_x", "scene_offset_y", "scene_offset_z",
-                          "scene_offset_yaw", "scene_offset_tilt")
+                          "scene_offset_yaw", "scene_offset_tilt",
+                          "camera_fov_deg")
 
   # Suffixes for the six always-live ROS topics published off
   # self.image_topic_name -- see processImageLine's routing by the bridge
@@ -179,13 +198,6 @@ class SimNode:
   CAPABILITY_SETTING_NAMES = ("autonomous_movement_enabled",
                               "camera_controls_enabled", "enabled_image_sources")
 
-  # generic_rover/model.sdf's own hard-coded camera_link_chase pitch, in
-  # degrees -- FACTORY_SETTINGS' scene_offset_tilt reproduces this exactly so
-  # an unconfigured robot config's default view is unchanged. camera_link
-  # itself has no rotation at all (0 rad), so no equivalent constant is
-  # needed for camera_offset_tilt's own factory value (just "0.0" below).
-  FACTORY_SCENE_TILT_DEG = math.degrees(0.5404195)
-
   # generic_rover/model.sdf's own hard-coded camera_link_chase POSITION
   # (body-frame, relative to the rover's own origin) -- requested live
   # (2026-09-04): "for the scene view cam, the 0 0 0 point should be set
@@ -199,6 +211,44 @@ class SimNode:
   FACTORY_SCENE_OFFSET_X = -2.5
   FACTORY_SCENE_OFFSET_Y = 0.0
   FACTORY_SCENE_OFFSET_Z = 1.65
+
+  # generic_rover/model.sdf's own hard-coded camera_link (robot/first-person
+  # view) mount point -- same delta convention as FACTORY_SCENE_OFFSET_X/Y/Z
+  # above, applied here too (2026-09-08, requested live: "the 0 0 0 position
+  # for the robot view cam offset should also be where it is by default on
+  # the rover... make it like what it is for the scene view so its not
+  # confusing"). camera_offset_x/y/z is now a DELTA from this factory mount
+  # point, not an absolute robot-frame coordinate -- FACTORY_SETTINGS below
+  # is "0.0" for all three, and sim_bridge_node.py's own
+  # respawnRoverWithCameraOffsets adds these same three constants back in
+  # before writing the actual SDF pose, exactly like the scene camera's own.
+  FACTORY_CAMERA_OFFSET_X = 0.2
+  FACTORY_CAMERA_OFFSET_Y = 0.0
+  FACTORY_CAMERA_OFFSET_Z = 0.65
+
+  # generic_rover/model.sdf's own hard-coded camera_link_chase pitch, in
+  # degrees -- FACTORY_SETTINGS' scene_offset_tilt reproduces this exactly so
+  # an unconfigured robot config's default view is unchanged. camera_link
+  # itself has no rotation at all (0 rad), so no equivalent constant is
+  # needed for camera_offset_tilt's own factory value (just "0.0" below).
+  # Computed from FACTORY_SCENE_OFFSET_X/Z directly (2026-09-08, was a
+  # hardcoded math.degrees(0.5404195) -- atan2(1.5, 2.5), stale from when
+  # the mount height was 1.5m, not 1.65m -- so this constant and the actual
+  # mount height silently drifted apart; ties them together so they can't
+  # drift again if either ever changes).
+  FACTORY_SCENE_TILT_DEG = math.degrees(math.atan2(FACTORY_SCENE_OFFSET_Z, -FACTORY_SCENE_OFFSET_X))
+
+  # generic_rover/model.sdf's own hard-coded camera horizontal FOV (shared by
+  # both the robot and scene/chase cameras -- see generate_model_sdf.py).
+  # Runtime-adjustable (2026-09-08, requested live: "changing fov settings
+  # doesn't seem to do anything") the same way the camera offsets are: a
+  # change respawns the rover with the new value baked into both cameras'
+  # <horizontal_fov> -- see sim_bridge_node.py's respawnRoverWithCameraOffsets.
+  # This is a SEPARATE control from the Sim Connector app's own
+  # camera_horizontal_fov_deg dimensions field, which only takes effect at
+  # the next fresh deploy (a curated "starting" value, like wheelbase_m);
+  # this one is this robot's live camera setting, works while already running.
+  FACTORY_CAMERA_FOV_DEG = 80.0
 
   CAP_SETTINGS = dict(
     max_linear_speed_mps = {"type":"Float","name":"max_linear_speed_mps","options":["0.05","5.0"]},
@@ -214,6 +264,11 @@ class SimNode:
     scene_offset_z = {"type":"Float","name":"scene_offset_z","options":["-10.0","10.0"]},
     scene_offset_yaw = {"type":"Float","name":"scene_offset_yaw","options":["-180.0","180.0"]},
     scene_offset_tilt = {"type":"Float","name":"scene_offset_tilt","options":["-90.0","90.0"]},
+    # Bounds match generate_model_sdf.py's own camera_horizontal_fov_deg
+    # curated-field range -- below ~20 deg is barely a lens, above ~150 deg
+    # starts hitting Gazebo's own rendering distortion limits for this
+    # sensor type.
+    camera_fov_deg = {"type":"Float","name":"camera_fov_deg","options":["20.0","150.0"]},
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]},
     # No fixed options -- the candidate topic set is per-deployment.
@@ -225,9 +280,13 @@ class SimNode:
     max_angular_rate_dps = {"type":"Float","name":"max_angular_rate_dps","value":"45.0"},
     environment = {"type":"Discrete","name":"environment","value":"FLAT_GROUND"},
     # Reproduces generic_rover/model.sdf's hard-coded camera_link pose exactly.
-    camera_offset_x = {"type":"Float","name":"camera_offset_x","value":"0.2"},
+    # Zero delta from generic_rover/model.sdf's own hard-coded camera_link
+    # mount point (FACTORY_CAMERA_OFFSET_X/Y/Z) -- see that constant's own
+    # comment for why this is 0.0 now instead of the absolute 0.2/0.0/0.65
+    # pose.
+    camera_offset_x = {"type":"Float","name":"camera_offset_x","value":"0.0"},
     camera_offset_y = {"type":"Float","name":"camera_offset_y","value":"0.0"},
-    camera_offset_z = {"type":"Float","name":"camera_offset_z","value":"0.65"},
+    camera_offset_z = {"type":"Float","name":"camera_offset_z","value":"0.0"},
     camera_offset_yaw = {"type":"Float","name":"camera_offset_yaw","value":"0.0"},
     camera_offset_tilt = {"type":"Float","name":"camera_offset_tilt","value":"0.0"},
     # Zero delta from generic_rover/model.sdf's own hard-coded
@@ -239,6 +298,7 @@ class SimNode:
     scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"0.0"},
     scene_offset_yaw = {"type":"Float","name":"scene_offset_yaw","value":"0.0"},
     scene_offset_tilt = {"type":"Float","name":"scene_offset_tilt","value":str(FACTORY_SCENE_TILT_DEG)},
+    camera_fov_deg = {"type":"Float","name":"camera_fov_deg","value":str(FACTORY_CAMERA_FOV_DEG)},
     # Both default to enabled: a robot config that never touches these
     # settings behaves exactly as every robot config did before this feature
     # existed.
@@ -990,25 +1050,36 @@ class SimNode:
   ### Bridge Processes
 
   def bridgeLoop(self):
-    # Persistent client to the VM-side bridge server. The sim stack (or the
-    # tunnel) can restart independently of this node -- any failure tears
-    # the socket down and retries the connect on a fixed interval.
-    buf = b''
-    while not nepi_sdk.is_shutdown():
-      sock = None
+    # Listens for the VM's sim_bridge_node.py to dial in (see this file's
+    # own 2026-09-08 module-docstring note for why the direction reversed).
+    # Bind/listen once; accept in a loop so the VM side can restart
+    # independently of this node -- any disconnect just goes back to
+    # accept() and waits for the next connection.
+    srv = None
+    while srv is None and not nepi_sdk.is_shutdown():
       try:
-        sock = socket.create_connection((self.sim_host, int(self.bridge_port)),
-                                        timeout = self.SOCKET_TIMEOUT_SEC)
-        sock.settimeout(self.SOCKET_TIMEOUT_SEC)
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(('0.0.0.0', int(self.bridge_port)))
+        srv.listen(1)
       except Exception as e:
-        self.msg_if.pub_warn("Bridge connect to " + self.sim_host + ":" +
-                             str(self.bridge_port) + " failed: " + str(e))
+        self.msg_if.pub_warn("Bridge listen on 0.0.0.0:" + str(self.bridge_port) +
+                             " failed: " + str(e))
+        srv = None
         time.sleep(self.RECONNECT_INTERVAL_SEC)
+    if srv is None:
+      return
+    self.msg_if.pub_info("Listening for sim bridge on 0.0.0.0:" + str(self.bridge_port))
+
+    while not nepi_sdk.is_shutdown():
+      try:
+        sock, addr = srv.accept()
+        sock.settimeout(self.SOCKET_TIMEOUT_SEC)
+      except Exception:
         continue
       with self.sock_lock:
         self.sock = sock
-      self.msg_if.pub_info("Connected to sim bridge at " + self.sim_host +
-                           ":" + str(self.bridge_port))
+      self.msg_if.pub_info("Sim bridge connected from " + str(addr[0]))
       # Sync the VM side to this node's actual current camera settings on
       # every (re)connect -- a bare restart of this node resets settings_dict
       # to factory, but the VM's camera_rig_controller.py keeps whatever ROS
@@ -1036,8 +1107,8 @@ class SimNode:
         try:
           data = sock.recv(4096)
         except socket.timeout:
-          # Server pushes at 10 Hz -- a quiet-but-open socket past the
-          # timeout means the far side is gone (e.g. tunnel half-open)
+          # VM side pushes at 10 Hz -- a quiet-but-open socket past the
+          # timeout means the far side is gone
           data = b''
         except Exception:
           data = b''
@@ -1054,9 +1125,7 @@ class SimNode:
         sock.close()
       except Exception:
         pass
-      self.msg_if.pub_warn("Sim bridge connection lost -- retrying in " +
-                           str(self.RECONNECT_INTERVAL_SEC) + "s")
-      time.sleep(self.RECONNECT_INTERVAL_SEC)
+      self.msg_if.pub_warn("Sim bridge connection lost -- waiting for reconnect")
 
   def processBridgeLine(self, line):
     # Single entry point for every line off the bridge socket: parse once,
@@ -1213,6 +1282,7 @@ class SimNode:
       'scene_offset_z': float(self.settings_dict['scene_offset_z']['value']),
       'scene_offset_yaw': float(self.settings_dict['scene_offset_yaw']['value']),
       'scene_offset_tilt': float(self.settings_dict['scene_offset_tilt']['value']),
+      'fov_deg': float(self.settings_dict['camera_fov_deg']['value']),
     }
     self.sendLineToBridge(cmd, "Camera settings")
 
