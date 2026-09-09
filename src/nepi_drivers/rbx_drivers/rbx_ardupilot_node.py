@@ -245,8 +245,16 @@ class ArdupilotNode:
   # simultaneous topics (color, colorized-depth-view, raw-depth-map) instead
   # of switching between color and depth via a depth_map_enabled toggle --
   # see CAMERA_PUB_ATTR/DEPTH_MAP_CAMERAS below.
+  # camera_fov_deg added (2026-09-09, requested live: "changing the fov
+  # values still doesnt seem to do anything for the drone") -- same shared-
+  # horizontal-FOV, respawn-on-change Setting as rbx_sim_node.py's own
+  # camera_fov_deg (see that file's own comment), now that
+  # camera_rig_controller_ardupilot.py has a respawn path for it (see that
+  # file's own FACTORY_CAMERA_FOV_DEG comment). Previously this driver had
+  # no such Setting at all -- a genuinely missing feature, not a bug.
   CAMERA_SETTING_NAMES = ("camera_offset_x", "camera_offset_y", "camera_offset_z",
-                          "scene_offset_x", "scene_offset_y", "scene_offset_z")
+                          "scene_offset_x", "scene_offset_y", "scene_offset_z",
+                          "camera_fov_deg")
 
   # Live environment model spawn/despawn -- same "type":"environment" wire
   # message and same Setting-value ("FLAT_GROUND" / uppercased scanned model
@@ -285,6 +293,13 @@ class ArdupilotNode:
   CAPABILITY_SETTING_NAMES = ("autonomous_movement_enabled", "teleop_movement_enabled",
                               "camera_controls_enabled", "enabled_image_sources")
 
+  # Matches camera_rig_controller_ardupilot.py's own FACTORY_CAMERA_FOV_DEG
+  # and models/camera_rig/model.sdf + models/camera_rig_chase/model.sdf's
+  # own hard-coded 1.3962634 rad (80 deg), so this driver's own factory
+  # default agrees with what the VM's rigs actually start at, before any
+  # live FOV change.
+  FACTORY_CAMERA_FOV_DEG = 80.0
+
   CAP_SETTINGS = dict(
     takeoff_height_m = {"type":"Float","name":"takeoff_height_m","options":["0.0","100.0"]},
     takeoff_min_pitch_deg =  {"type":"Float","name":"takeoff_min_pitch_deg","options":["-90.0","90.0"]},
@@ -297,6 +312,8 @@ class ArdupilotNode:
     scene_offset_x = {"type":"Float","name":"scene_offset_x","options":["-10.0","10.0"]},
     scene_offset_y = {"type":"Float","name":"scene_offset_y","options":["-10.0","10.0"]},
     scene_offset_z = {"type":"Float","name":"scene_offset_z","options":["-10.0","10.0"]},
+    # Bounds match rbx_sim_node.py's own camera_fov_deg range.
+    camera_fov_deg = {"type":"Float","name":"camera_fov_deg","options":["20.0","150.0"]},
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
     teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","options":["TRUE","FALSE"]},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]},
@@ -328,6 +345,7 @@ class ArdupilotNode:
     scene_offset_x = {"type":"Float","name":"scene_offset_x","value":"0.0"},
     scene_offset_y = {"type":"Float","name":"scene_offset_y","value":"0.0"},
     scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"0.0"},
+    camera_fov_deg = {"type":"Float","name":"camera_fov_deg","value":str(FACTORY_CAMERA_FOV_DEG)},
     # All default to enabled: a robot config that never touches these
     # settings behaves exactly as it did before this feature existed.
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","value":"TRUE"},
@@ -2366,6 +2384,7 @@ class ArdupilotNode:
       'scene_offset_x': float(self.settings_dict['scene_offset_x']['value']),
       'scene_offset_y': float(self.settings_dict['scene_offset_y']['value']),
       'scene_offset_z': float(self.settings_dict['scene_offset_z']['value']),
+      'fov_deg': float(self.settings_dict['camera_fov_deg']['value']),
     }
     self.sendLineToCameraBridge(cmd, "Camera settings")
 
