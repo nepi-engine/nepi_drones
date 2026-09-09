@@ -494,10 +494,26 @@ class GazeboQuadcopterSimConnectorBridge:
     # (matches the rover bridge's own handleGotoPosition semantics) --
     # MAV_FRAME_LOCAL_OFFSET_NED expresses exactly that natively, so there is
     # no need to track "current position" here at all; ArduCopter resolves
-    # the offset against its own current position. ENU->NED offset: north=y,
-    # east=x, down=-z.
-    north = float(msg.get("y_meters", 0.0))
-    east = float(msg.get("x_meters", 0.0))
+    # the offset against its own current position.
+    #
+    # NOT the textbook ENU->NED swap (north=y, east=x, down=-z) -- confirmed
+    # live (2026-09-08) with two isolated single-axis goto_position tests
+    # (pure x_meters, then pure y_meters, vehicle allowed to settle between
+    # each) that this SITL/world's own ArduCopter EKF north/east reference is
+    # NOT aligned with Gazebo's world frame the textbook formula assumes: a
+    # pure +x_meters (intended East) request landed as +Gazebo-X (correct
+    # axis) but ONLY when sent as the NED "north" field, and a pure
+    # +y_meters (intended North) request landed as +Gazebo-Y but only when
+    # sent as the NED "east" field negated. I.e. actual_world = (north_sent,
+    # -east_sent), not the assumed (east_sent, north_sent) -- solved by
+    # inverting: north_sent = x_meters, east_sent = -y_meters. This is the
+    # same class of misalignment (and the same fix shape) as
+    # rbx_ardupilot_node.py's setTeleopVelocity fix from the same day, but a
+    # separate bug in a separate code path -- that one goes through mavros;
+    # this bridge talks raw MAVLink directly and needed its own, independent
+    # fix. down=-z_meters is unaffected (vertical, no rotation ambiguity).
+    north = float(msg.get("x_meters", 0.0))
+    east = -float(msg.get("y_meters", 0.0))
     down = -float(msg.get("z_meters", 0.0))
     yaw_deg = msg.get("yaw_deg")
     type_mask = (
