@@ -110,7 +110,11 @@ for i in $(seq 1 15); do
   mountpoint -q /mnt/nepi_share_storage && break
   sleep 1
 done
-sudo systemctl enable --now nepi-vm-command-watcher.service
+# restart, not enable --now: this script is meant to be safely re-runnable
+# (e.g. after editing a unit template) -- enable --now is a no-op on an
+# already-running service, silently leaving it on its OLD unit definition.
+sudo systemctl enable nepi-vm-command-watcher.service
+sudo systemctl restart nepi-vm-command-watcher.service
 
 # --- 6. verify ---
 echo

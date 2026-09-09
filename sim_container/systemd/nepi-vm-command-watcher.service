@@ -30,6 +30,15 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+# WorkingDirectory=~ (resolves to User='s own home dir, systemd >= 227) --
+# without this, a systemd-launched process defaults to cwd=/, which every
+# descendant this watcher execs (gzserver, mavproxy, ...) inherits. Confirmed
+# live (2026-09-08): mavproxy.py failed outright with "ERROR: opening log
+# file for writing: [Errno 13] Permission denied: 'mav.tlog'" because it
+# writes that relative path into whatever cwd it inherited, and a non-root
+# user can't write to /. Every launch_command in simulator_launch_targets.yaml
+# is itself written as "bash -lc '...'", which sources login profile files
+# but does NOT itself cd anywhere -- it still needed a sane inherited cwd.
 # Runs as the same non-root user that owns the repo checkout and the
 # CIFS-mounted files it reads/writes (uid=2000 per nepi_vm_storage_mount.sh's
 # own mount options) -- nepi_vm_connect_setup.sh fills this in with
@@ -39,6 +48,7 @@ Type=simple
 # setup script picks a sensible default; override here or via the env file
 # if the device side used something else).
 User=suraj
+WorkingDirectory=~
 Environment=NEPI_DRONES_REPO_PATH=/home/suraj/nepi_engine_ws/nepi_drones
 Environment=NEPI_VM_INSTANCE_ID=baseline
 EnvironmentFile=-/etc/nepi-storage-mount.env

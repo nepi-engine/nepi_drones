@@ -28,6 +28,7 @@
 # bridge connection is a plain socket the launched node holds open itself, so
 # only one process per robot is tracked.
 
+import os
 import socket
 import time
 
@@ -233,10 +234,29 @@ class WebotsDiscovery:
     # Guarded so a launch-helper exception (e.g. the node file not yet deployed)
     # reads as a failed launch instead of taking the whole driver offline --
     # drivers_mgr disables a driver whose discoveryFunction raises.
+    # LD_PRELOAD needed here, not a general drivers_mgr/launchDriverNode fix --
+    # same root cause and same fix as rbx_ardupilot_discovery.py's own
+    # launchDeviceNode (see that method's own comment for the full writeup):
+    # this node's `from nepi_api.device_if_rbx import RBXRobotIF` (-> nepi_pc
+    # -> `import open3d`) crashes with "libgomp.so.1: cannot allocate memory
+    # in static TLS block" on this aarch64 build whenever cv2 (also imported
+    # by this node, earlier) has already claimed libgomp's one static TLS
+    # slot. Preloading libgomp before the interpreter starts guarantees it
+    # gets the only claim regardless of import order. Restored right after
+    # the spawn call returns so this doesn't leak into unrelated drivers_mgr
+    # spawns that never needed it.
+    ld_preload_key = 'LD_PRELOAD'
+    prev_ld_preload = os.environ.get(ld_preload_key)
+    os.environ[ld_preload_key] = '/lib/aarch64-linux-gnu/libgomp.so.1'
     try:
       [success, msg, rbx_subproc] = nepi_drvs.launchDriverNode(file_name, rbx_node_name)
     except Exception as e:
       [success, msg, rbx_subproc] = [False, str(e), None]
+    finally:
+      if prev_ld_preload is None:
+        os.environ.pop(ld_preload_key, None)
+      else:
+        os.environ[ld_preload_key] = prev_ld_preload
 
     # Process launch results
     self.launch_time_dict[launch_id] = nepi_sdk.get_time()
