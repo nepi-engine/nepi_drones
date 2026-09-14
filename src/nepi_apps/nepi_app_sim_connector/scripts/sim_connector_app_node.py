@@ -468,7 +468,7 @@ class NepiSimConnectorApp:
     self.selected_simulator = ""
 
     ##############################
-    # Common six-topic mirror -- a stable, simulator-agnostic viewing point
+    # Common four-topic mirror -- a stable, simulator-agnostic viewing point
     # for whichever robot is currently selected_simulator, regardless of
     # which underlying driver/bridge type it is. Distinct from
     # image_pub/color_2d_image below (the generic-connector bridge protocol's
@@ -477,19 +477,18 @@ class NepiSimConnectorApp:
     # quadcopter, Webots rover/quadcopter) instead goes through an RBX
     # driver that already publishes real ROS Image topics on this same ROS
     # master -- see rbx_sim_node.py/rbx_ardupilot_node.py's own
-    # color_2d_image/robot_color + .../scene_color + depth/depth_map topics
-    # -- so this mirror is a plain re-subscribe, not a protocol decode.
-    # Reported live (2026-08-18): the operator wants one topic to look at
-    # "no matter the simulator" rather than needing to know the current
-    # instance's own device-name-qualified topic. Expanded 2026-08-20 from
-    # two topics (robot_view/scene_view) to six (color, colorized-depth-view,
-    # raw-depth-map x robot/scene), matching the driver-side removal of the
-    # depth_map_enabled toggle in favor of always-simultaneous publishing.
-    # Any of the six can have no publisher at all for a robot that honestly
-    # has no scene camera or no depth sensor (the Webots drivers) -- an
-    # absent feed there is accurate, not a bug.
-    self.MIRROR_VIEWS = ["robot_color", "scene_color", "robot_depth", "scene_depth",
-                         "robot_depth_map", "scene_depth_map"]
+    # color_2d_image/robot_color + .../scene_color topics -- so this mirror
+    # is a plain re-subscribe, not a protocol decode. Reported live
+    # (2026-08-18): the operator wants one topic to look at "no matter the
+    # simulator" rather than needing to know the current instance's own
+    # device-name-qualified topic. The raw robot_depth_map/scene_depth_map
+    # pair (float32-meters, for downstream processing) removed entirely
+    # (2026-09-14, requested live: "unness and dont do anything") -- never a
+    # viewing feed and had no processing consumer either. Either remaining
+    # topic can have no publisher at all for a robot that honestly has no
+    # scene camera or no depth sensor (the Webots drivers) -- an absent
+    # feed there is accurate, not a bug.
+    self.MIRROR_VIEWS = ["robot_color", "scene_color", "robot_depth", "scene_depth"]
     self.mirror_pubs = dict()
     self.mirror_subs = dict()
     self.mirror_source_topics = dict()
@@ -505,7 +504,7 @@ class NepiSimConnectorApp:
     # devices -> apps also doesn't seem to detect any of the values" --
     # root cause: self.navpose_dict was only ever populated by
     # processTelemetryLine, fed from the generic-connector bridge protocol
-    # (webots_rover/pybullet_rover/wpilib_rover) -- Gazebo rover/quadcopter
+    # (webots_rover) -- Gazebo rover/quadcopter
     # go through an RBX driver instead (rbx_sim_node.py/rbx_ardupilot_node.py),
     # exactly like the image mirror's own comment already documents, and
     # that driver's already-correct NavPose (its own NPXDeviceIF, publishing
@@ -2196,20 +2195,16 @@ class NepiSimConnectorApp:
       # (old_source not empty) -- otherwise this fires once at startup for
       # every never-yet-connected view, which is just noise.
       if old_source != "":
-        self.publishBlankCommonViewFrame(pub, which)
+        self.publishBlankCommonViewFrame(pub)
       return
     new_sub = nepi_sdk.create_subscriber(source_topic, Image, self.commonViewImageCb,
                                         queue_size = 1, callback_args = (pub,))
     self.mirror_subs[which] = new_sub
 
-  def publishBlankCommonViewFrame(self, pub, which):
+  def publishBlankCommonViewFrame(self, pub):
     try:
-      if which in ("robot_depth_map", "scene_depth_map"):
-        blank = np.zeros((480, 640), dtype = np.float32)
-        pub.publish(nepi_img.cv2img_to_rosimg(blank, encoding = "32FC1"))
-      else:
-        blank = np.zeros((480, 640, 3), dtype = np.uint8)
-        pub.publish(nepi_img.cv2img_to_rosimg(blank, encoding = "bgr8"))
+      blank = np.zeros((480, 640, 3), dtype = np.uint8)
+      pub.publish(nepi_img.cv2img_to_rosimg(blank, encoding = "bgr8"))
     except Exception as e:
       self.msg_if.pub_warn("Failed to publish blank common-view frame: " + str(e))
 

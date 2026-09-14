@@ -881,31 +881,24 @@ class NepiIFSimControls extends Component {
 
         {(setup_actions.length > 0) ?
           <ButtonMenu>
-            {setup_actions.map((action, i) => (
-              <Button
-                key={action}
-                onClick={() => {
-                  sendIntMsg(namespace + "/setup_action", String(i))
-                  // RESET_SIM now clears the driver's own motor_ratios (see
-                  // rbx_sim_node.py's resetSimAction), so the NEXT status
-                  // publish correctly reports all-zero motor speeds -- but
-                  // the sliders below are deliberately NOT continuously
-                  // re-synced from status (see the seeding effect above,
-                  // gated on the motor COUNT changing, not every update, so
-                  // a live server echo can't fight an operator's own drag
-                  // in progress). Reset Sim is exactly the one case that
-                  // SHOULD override local slider state outright, requested
-                  // live (2026-09-02): "this change should happen in the
-                  // RUI too if they are set to something and reset sim is
-                  // hit" -- reuse turnOffAllMotors (same "snap sliders to 0
-                  // and publish it" the All-Off button already does) rather
-                  // than a near-duplicate method.
-                  if (action === 'RESET') {
-                    this.turnOffAllMotors()
-                  }
-                }}
-              >{action}</Button>
-            ))}
+            {setup_actions.map((action, i) => {
+              // RESET_SIM moved to renderRobotCapabilityControls's own
+              // dedicated button (requested live 2026-09-14: "the reset_sim
+              // command shouldnt be in the setup actions of robots... move
+              // it there instead [Sim Connector]... maybe keep it in the
+              // robot capabilities section"). `i` is still the right index
+              // for every OTHER action below -- this array itself is never
+              // filtered, only this render skips one entry.
+              if (action === 'RESET_SIM') {
+                return null
+              }
+              return (
+                <Button
+                  key={action}
+                  onClick={() => sendIntMsg(namespace + "/setup_action", String(i))}
+                >{action}</Button>
+              )
+            })}
           </ButtonMenu>
         : null}
 
@@ -1055,8 +1048,26 @@ class NepiIFSimControls extends Component {
     const has_autonomous_toggle = settingsKnown ? settings.includes("autonomous_movement_enabled") : true
     const has_camera_toggle = settingsKnown ? settings.includes("camera_controls_enabled") : true
     const has_image_curation = settingsKnown && settings.includes("enabled_image_sources")
-    if (has_autonomous_toggle === false
-        && has_camera_toggle === false && has_image_curation === false) {
+
+    // Reset Sim -- moved here from the generic Devices -> Robots "Setup
+    // Actions" dropdown (requested live 2026-09-14: "the reset_sim command
+    // shouldnt be in the setup actions of robots... move it there instead
+    // [Sim Connector]... maybe keep it in the robot capabilities section
+    // instead for that"). Index resolved against the ACTUAL reported
+    // setup_action_options list, not hardcoded -- it sits at a different
+    // position per driver (rbx_sim_node.py/rbx_mujoco_node.py/
+    // rbx_webots_node.py all report it first, index 0;
+    // rbx_ardupilot_node.py/rbx_webots_quadcopter_node.py report it after
+    // TAKEOFF/LAUNCH, a later index -- see each driver's own
+    // RBX_SETUP_ACTIONS list), so looking it up by name is the only safe
+    // way to get the right index regardless of which driver is connected.
+    const caps = this.state.capabilities
+    const setup_actions = (caps != null && caps.setup_action_options !== undefined) ? caps.setup_action_options : []
+    const reset_sim_index = setup_actions.indexOf("RESET_SIM")
+    const has_reset_sim = reset_sim_index !== -1
+
+    if (has_autonomous_toggle === false && has_camera_toggle === false
+        && has_image_curation === false && has_reset_sim === false) {
       return null
     }
 
@@ -1106,6 +1117,31 @@ class NepiIFSimControls extends Component {
             : null}
           </Column>
         </Columns>
+
+        {(has_reset_sim === true) ?
+          <ButtonMenu>
+            <Button
+              onClick={() => {
+                const { sendIntMsg } = this.props.ros
+                sendIntMsg(this.props.namespace + "/setup_action", String(reset_sim_index))
+                // RESET_SIM clears the driver's own motor_ratios (see
+                // rbx_sim_node.py's resetSimAction), so the NEXT status
+                // publish correctly reports all-zero motor speeds -- but
+                // the sliders in renderMotorControls are deliberately NOT
+                // continuously re-synced from status (seeded only when the
+                // motor COUNT changes, so a live server echo can't fight an
+                // operator's own drag in progress). Reset Sim is exactly
+                // the one case that SHOULD override local slider state
+                // outright, requested live (2026-09-02): "this change
+                // should happen in the RUI too if they are set to
+                // something and reset sim is hit" -- reuse turnOffAllMotors
+                // (same "snap sliders to 0 and publish it" the All-Off
+                // button already does) rather than a near-duplicate method.
+                this.turnOffAllMotors()
+              }}
+            >{"Reset Sim"}</Button>
+          </ButtonMenu>
+        : null}
 
         {this.renderImageSourceCuration()}
 
@@ -1216,23 +1252,12 @@ class NepiIFSimControls extends Component {
       // its own curation entry either. endsWith, not includes, so a genuine
       // future topic that merely contains "/image" elsewhere in its name
       // isn't accidentally caught.
-      // Also exclude any "*_depth_map" topic -- robot_depth_map/scene_depth_map
-      // (and any driver's own per-robot equivalent) carry raw 32FC1-meters
-      // float data for downstream processing, not a human-viewable image (see
-      // rbx_sim_node.py's own publisher comment: "for later processing rather
-      // than viewing"). enabled_image_sources is purely a human-facing
-      // "which camera looks good" allowlist for NepiDeviceRBX.js's
-      // Image_Source dropdown -- it has no processing-pipeline consumer -- so
-      // offering a raw depth map here just adds an option that renders as
-      // useless noise. The underlying topic keeps publishing untouched for
-      // any real subscriber; this only trims what this one picker offers.
-      // Reported live: "the robot depth map and scene depth map seem kind of
-      // redundant here -- theres no reason for both" (2026-08-26) -- they
-      // aren't redundant as DATA (colorized-for-viewing vs. raw-for-processing
-      // serve different consumers), just both wrongly offered in a
-      // viewing-only picker.
+      // robot_depth_map/scene_depth_map (raw float32-meters, for downstream
+      // processing) removed entirely 2026-09-14 (requested live: "unness
+      // and dont do anything") -- no processing-pipeline consumer ever
+      // existed for them, just extra bandwidth and noise in this picker.
       return topic.includes('color_2d_image') === false && topic.includes('zed_node') === false
-        && topic.endsWith('/image') === false && topic.endsWith('_depth_map') === false
+        && topic.endsWith('/image') === false
     })
     if (candidates.length === 0) {
       return null

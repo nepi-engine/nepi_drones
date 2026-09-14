@@ -92,15 +92,19 @@ class SimNode:
   # Camera-rover feature. Both cameras are rigid links welded onto
   # generic_rover itself (fixed joint poses in generic_rover/model.sdf), not a
   # single repositionable rig -- that's what makes them lag-free. Both are now
-  # relayed simultaneously as six always-live ROS Image topics (see the
-  # *_TOPIC_SUFFIX constants below: color, colorized depth view, and raw
-  # depth map, for each of robot/scene), not switched between via a
-  # camera_view_mode Setting: reworked (2026-08-18) after a live report that
-  # a single topic whose content gets reassigned depending on a mode setting
-  # isn't a real second view a client can rely on ("the third-person view
-  # doesn't really exist"), then widened again (2026-08-20) so color and
-  # depth are simultaneously available instead of a depth_map_enabled toggle
-  # swapping one topic's content. The existing Image Source dropdown's
+  # relayed simultaneously as four always-live ROS Image topics (see the
+  # *_TOPIC_SUFFIX constants below: color and colorized depth view, for each
+  # of robot/scene), not switched between via a camera_view_mode Setting:
+  # reworked (2026-08-18) after a live report that a single topic whose
+  # content gets reassigned depending on a mode setting isn't a real second
+  # view a client can rely on ("the third-person view doesn't really
+  # exist"), then widened again (2026-08-20) so color and depth are
+  # simultaneously available instead of a depth_map_enabled toggle swapping
+  # one topic's content. A raw robot_depth_map/scene_depth_map pair (32FC1-
+  # meters, for downstream processing) existed briefly alongside these but
+  # was removed entirely (2026-09-14, requested live: "unness and dont do
+  # anything") -- no processing-pipeline consumer ever existed for it. The
+  # existing Image Source dropdown's
   # find_topics_by_msg('Image') discovery picks up all of them with no new
   # RUI plumbing needed (see NepiDeviceRBX.js's createImageOptions).
   #
@@ -142,19 +146,16 @@ class SimNode:
                           "scene_offset_yaw", "scene_offset_tilt",
                           "camera_fov_deg")
 
-  # Suffixes for the six always-live ROS topics published off
+  # Suffixes for the four always-live ROS topics published off
   # self.image_topic_name -- see processImageLine's routing by the bridge
   # line's "camera" field. color/depth (colorized, for viewing) replace the
   # old robot_view/scene_view pair once depth_map_enabled was removed
   # (2026-08-20) in favor of always publishing both simultaneously rather
-  # than toggling which one a single topic shows; depth_map is the raw
-  # 32FC1-meters data, for later processing rather than viewing.
+  # than toggling which one a single topic shows.
   ROBOT_COLOR_TOPIC_SUFFIX = "robot_color"
   SCENE_COLOR_TOPIC_SUFFIX = "scene_color"
   ROBOT_DEPTH_TOPIC_SUFFIX = "robot_depth"
   SCENE_DEPTH_TOPIC_SUFFIX = "scene_depth"
-  ROBOT_DEPTH_MAP_TOPIC_SUFFIX = "robot_depth_map"
-  SCENE_DEPTH_MAP_TOPIC_SUFFIX = "scene_depth_map"
 
   # Environment: was originally two RBX_SETUP_ACTIONS entries
   # (OBSTACLE_COURSE_ON/OFF), then a dedicated "Environment" dropdown was
@@ -533,9 +534,9 @@ class SimNode:
     # against the shared device-wide namespace), but now distinguished by
     # content, so /nepi/<device>/sim_rover1/color_2d_image and
     # .../sim_rover2/color_2d_image never collide.
-    # Six always-live topics (robot/scene x color/depth-view/depth_map), not
-    # one bare topic -- see CAMERA_SETTING_NAMES's own comment for why.
-    # image_topic_name stays the shared, device-name-qualified BASE all six
+    # Four always-live topics (robot/scene x color/depth-view), not one bare
+    # topic -- see CAMERA_SETTING_NAMES's own comment for why.
+    # image_topic_name stays the shared, device-name-qualified BASE all four
     # are built from, so the cross-instance collision fix above still
     # applies identically to all of them.
     self.image_topic_name = self.device_name + "/color_2d_image"
@@ -543,17 +544,10 @@ class SimNode:
     self.scene_color_topic_name = self.image_topic_name + "/" + self.SCENE_COLOR_TOPIC_SUFFIX
     self.robot_depth_topic_name = self.image_topic_name + "/" + self.ROBOT_DEPTH_TOPIC_SUFFIX
     self.scene_depth_topic_name = self.image_topic_name + "/" + self.SCENE_DEPTH_TOPIC_SUFFIX
-    self.robot_depth_map_topic_name = self.image_topic_name + "/" + self.ROBOT_DEPTH_MAP_TOPIC_SUFFIX
-    self.scene_depth_map_topic_name = self.image_topic_name + "/" + self.SCENE_DEPTH_MAP_TOPIC_SUFFIX
     self.image_pub_robot_color = nepi_sdk.create_publisher(self.robot_color_topic_name, Image, queue_size = 1)
     self.image_pub_scene_color = nepi_sdk.create_publisher(self.scene_color_topic_name, Image, queue_size = 1)
     self.image_pub_robot_depth = nepi_sdk.create_publisher(self.robot_depth_topic_name, Image, queue_size = 1)
     self.image_pub_scene_depth = nepi_sdk.create_publisher(self.scene_depth_topic_name, Image, queue_size = 1)
-    # Raw depth maps: 32FC1 meters, not compressed-and-decompressed color --
-    # published straight through once decoded (see processImageLine), for
-    # later processing rather than live viewing.
-    self.image_pub_robot_depth_map = nepi_sdk.create_publisher(self.robot_depth_map_topic_name, Image, queue_size = 1)
-    self.image_pub_scene_depth_map = nepi_sdk.create_publisher(self.scene_depth_map_topic_name, Image, queue_size = 1)
 
     ##############################
     # Goto controller state
@@ -1173,47 +1167,26 @@ class SimNode:
     "scene_color": "image_pub_scene_color",
     "robot_depth": "image_pub_robot_depth",
     "scene_depth": "image_pub_scene_depth",
-    "robot_depth_map": "image_pub_robot_depth_map",
-    "scene_depth_map": "image_pub_scene_depth_map",
   }
-  # Raw depth maps travel as 16-bit millimeter PNGs (see
-  # camera_rig_controller.py's depthToMillimeterPng) -- matches the encoding
-  # this file's own DEPTH_MAP_MAX_MM-equivalent uses on the sending side.
-  DEPTH_MAP_CAMERAS = ("robot_depth_map", "scene_depth_map")
 
   def processImageLine(self, msg):
     # Bridge image frame -> decode the relayed frame and republish as a raw
     # sensor_msgs/Image on this instance's own namespaced image topic (see
     # the image_pub_robot_color / setImageTopicCb comments in __init__ for
     # why the topic name is device_name-qualified and RBXRobotIF is pointed
-    # at one of them via set_image_topic). "camera" picks which of the six
+    # at one of them via set_image_topic). "camera" picks which of the four
     # publishers this frame goes to; an older sender with no "camera" field
     # defaults to robot_color, matching the original single-topic behavior.
-    #
-    # The two depth_map cameras carry 16-bit millimeter PNGs, not JPEG color
-    # -- decoded back into a genuine 32FC1-meters NumPy array (float32,
-    # meters) before republishing, since that raw array -- not the PNG
-    # bytes -- is what every NEPI depth-map consumer (and cv2/numpy in
-    # general) expects an Image message's data to already be.
     try:
       camera = msg.get('camera', self.ROBOT_COLOR_TOPIC_SUFFIX)
       pub_attr = self.CAMERA_PUB_ATTR.get(camera, "image_pub_robot_color")
       image_pub = getattr(self, pub_attr)
       encoded_bytes = base64.b64decode(msg['data'])
       arr = np.frombuffer(encoded_bytes, dtype = np.uint8)
-      if camera in self.DEPTH_MAP_CAMERAS:
-        depth_mm = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
-        if depth_mm is None or depth_mm.dtype != np.uint16:
-          raise ValueError("cv2.imdecode did not return a 16-bit depth map")
-        # NumPy array in actual meters, float32 -- the format every
-        # depth-map consumer downstream expects, not raw millimeter PNG bytes.
-        depth_m = depth_mm.astype(np.float32) / 1000.0
-        ros_img = nepi_img.cv2img_to_rosimg(depth_m, encoding = "32FC1")
-      else:
-        cv2_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if cv2_img is None:
-          raise ValueError("cv2.imdecode returned None")
-        ros_img = nepi_img.cv2img_to_rosimg(cv2_img, encoding = "bgr8")
+      cv2_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+      if cv2_img is None:
+        raise ValueError("cv2.imdecode returned None")
+      ros_img = nepi_img.cv2img_to_rosimg(cv2_img, encoding = "bgr8")
       image_pub.publish(ros_img)
     except Exception as e:
       self.msg_if.pub_warn("Failed to process camera image frame: " + str(e), throttle_s = 5.0)

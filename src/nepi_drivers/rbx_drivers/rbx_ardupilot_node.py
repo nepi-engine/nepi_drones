@@ -241,10 +241,12 @@ class ArdupilotNode:
   # below), after a live report that a single reassignable topic and a
   # single teleported camera model meant the "third-person view" wasn't
   # really an independent thing a client could rely on. Further expanded
-  # 2026-08-20: each of the two views now always publishes three
-  # simultaneous topics (color, colorized-depth-view, raw-depth-map) instead
-  # of switching between color and depth via a depth_map_enabled toggle --
-  # see CAMERA_PUB_ATTR/DEPTH_MAP_CAMERAS below.
+  # 2026-08-20: each of the two views now always publishes two simultaneous
+  # topics (color, colorized-depth-view) instead of switching between color
+  # and depth via a depth_map_enabled toggle -- see CAMERA_PUB_ATTR below. A
+  # raw robot_depth_map/scene_depth_map pair existed briefly alongside these
+  # but was removed entirely (2026-09-14, requested live: "unness and dont
+  # do anything") -- no processing-pipeline consumer ever existed for it.
   # camera_fov_deg added (2026-09-09, requested live: "changing the fov
   # values still doesnt seem to do anything for the drone") -- same shared-
   # horizontal-FOV, respawn-on-change Setting as rbx_sim_node.py's own
@@ -719,29 +721,25 @@ class ArdupilotNode:
     # colliding with a DIFFERENT RBX driver (e.g. rbx_sim) that might be
     # running on this same device and left at RBXRobotIF's bare
     # "color_2d_image" factory default.
-    # Six always-live topics (color/depth-view/raw-depth-map x robot/scene),
-    # not one bare topic -- see CAMERA_SETTING_NAMES's own comment for why,
-    # and rbx_sim_node.py's matching comment for the full 2026-08-20 redesign
+    # Four always-live topics (color/depth-view x robot/scene), not one bare
+    # topic -- see CAMERA_SETTING_NAMES's own comment for why, and
+    # rbx_sim_node.py's matching comment for the full 2026-08-20 redesign
     # (superseding the old depth_map_enabled toggle with simultaneous
-    # publishing on all six). A real onboard camera (REAL_CAMERA_TOPIC_PATTERN
+    # publishing on all four). A real onboard camera (REAL_CAMERA_TOPIC_PATTERN
     # below) only ever feeds robot_color -- a real airframe has no chase-cam
-    # concept and no depth stream, so scene_color/robot_depth/scene_depth/
-    # robot_depth_map/scene_depth_map simply stay idle (topics exist, nothing
-    # ever publishes to them) on real hardware, an honest reflection of
-    # reality rather than a fabricated feed.
+    # concept and no depth stream, so scene_color/robot_depth/scene_depth
+    # simply stay idle (topics exist, nothing ever publishes to them) on
+    # real hardware, an honest reflection of reality rather than a
+    # fabricated feed.
     self.image_topic_name = self.device_name + "/color_2d_image"
     self.robot_color_topic_name = self.image_topic_name + "/robot_color"
     self.scene_color_topic_name = self.image_topic_name + "/scene_color"
     self.robot_depth_topic_name = self.image_topic_name + "/robot_depth"
     self.scene_depth_topic_name = self.image_topic_name + "/scene_depth"
-    self.robot_depth_map_topic_name = self.image_topic_name + "/robot_depth_map"
-    self.scene_depth_map_topic_name = self.image_topic_name + "/scene_depth_map"
     self.image_pub_robot_color = nepi_sdk.create_publisher(self.robot_color_topic_name, Image, queue_size = 1)
     self.image_pub_scene_color = nepi_sdk.create_publisher(self.scene_color_topic_name, Image, queue_size = 1)
     self.image_pub_robot_depth = nepi_sdk.create_publisher(self.robot_depth_topic_name, Image, queue_size = 1)
     self.image_pub_scene_depth = nepi_sdk.create_publisher(self.scene_depth_topic_name, Image, queue_size = 1)
-    self.image_pub_robot_depth_map = nepi_sdk.create_publisher(self.robot_depth_map_topic_name, Image, queue_size = 1)
-    self.image_pub_scene_depth_map = nepi_sdk.create_publisher(self.scene_depth_map_topic_name, Image, queue_size = 1)
 
     # Camera bridge client state and connection thread -- see
     # camera_rig_controller_ardupilot.py and CAMERA_BRIDGE_HOST/PORT above.
@@ -2293,23 +2291,16 @@ class ArdupilotNode:
                                 "Environment set to " + environment_value)
     return True
 
-  # "camera" (added alongside camera_rig_controller_ardupilot.py's six-topic
-  # split) picks which of the six publishers a frame goes to; an older
+  # "camera" (added alongside camera_rig_controller_ardupilot.py's four-topic
+  # split) picks which of the four publishers a frame goes to; an older
   # sender with no "camera" field defaults to robot_color, matching the
-  # original single-topic behavior. depth_map cameras carry a 16-bit PNG
-  # (millimeters) instead of a JPEG -- see camera_rig_controller_ardupilot.py
-  # and rbx_sim_node.py's matching CAMERA_PUB_ATTR/DEPTH_MAP_CAMERAS comment
-  # for the full wire-format rationale (this is the numpy-array
-  # reconstruction the platform actually needs to read depth data).
+  # original single-topic behavior.
   CAMERA_PUB_ATTR = {
     "robot_color": "image_pub_robot_color",
     "scene_color": "image_pub_scene_color",
     "robot_depth": "image_pub_robot_depth",
     "scene_depth": "image_pub_scene_depth",
-    "robot_depth_map": "image_pub_robot_depth_map",
-    "scene_depth_map": "image_pub_scene_depth_map",
   }
-  DEPTH_MAP_CAMERAS = ("robot_depth_map", "scene_depth_map")
 
   def processCameraImageLine(self, msg):
     # Bridge image frame -> decode the relayed frame and republish as a raw
@@ -2321,17 +2312,10 @@ class ArdupilotNode:
       image_pub = getattr(self, pub_attr)
       encoded_bytes = base64.b64decode(msg['data'])
       arr = np.frombuffer(encoded_bytes, dtype = np.uint8)
-      if camera in self.DEPTH_MAP_CAMERAS:
-        depth_mm = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
-        if depth_mm is None or depth_mm.dtype != np.uint16:
-          raise ValueError("cv2.imdecode did not return a 16-bit depth map")
-        depth_m = depth_mm.astype(np.float32) / 1000.0
-        ros_img = nepi_img.cv2img_to_rosimg(depth_m, encoding = "32FC1")
-      else:
-        cv2_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if cv2_img is None:
-          raise ValueError("cv2.imdecode returned None")
-        ros_img = nepi_img.cv2img_to_rosimg(cv2_img, encoding = "bgr8")
+      cv2_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+      if cv2_img is None:
+        raise ValueError("cv2.imdecode returned None")
+      ros_img = nepi_img.cv2img_to_rosimg(cv2_img, encoding = "bgr8")
       image_pub.publish(ros_img)
       self.camera_last_frame_time = nepi_utils.get_time()
     except Exception as e:
