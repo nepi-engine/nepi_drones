@@ -1195,6 +1195,23 @@ class ArdupilotNode:
   def gotoPosition(self,point_enu_m,orientation_enu_deg):
     pos_str = str(point_enu_m)
     self.msg_if.pub_info("Recieved Position setpoint command: " + pos_str)
+    # Flip Y (left/right) for this driver only -- reported live 2026-09-14:
+    # "positive y should probably be right, not left." The shared
+    # setpoint_position_local_body (nepi_api/device_if_rbx.py) already
+    # rotated the caller's body-frame command into this ENU offset using
+    # its own documented y+=left convention -- the same code the rover uses
+    # with no reported issue, so that shared function stays untouched.
+    # Undoing the rotation, negating the body-frame y component, and
+    # re-applying the same rotation (same yaw_deg the shared code used,
+    # read fresh here) gives the equivalent of "y+=right" for just this
+    # driver, without disturbing any other RBX driver that shares this code.
+    body_pt = nepi_nav.convert_point_enu2body(
+      [point_enu_m.x, point_enu_m.y, point_enu_m.z], self.navpose_dict['yaw_deg'])
+    body_pt[1] = -body_pt[1]
+    flipped_enu = nepi_nav.convert_point_body2enu(body_pt, self.navpose_dict['yaw_deg'])
+    point_enu_m.x = flipped_enu[0]
+    point_enu_m.y = flipped_enu[1]
+    point_enu_m.z = flipped_enu[2]
     # RBXRobotIF (setpoint_position_local_body) only ever hands drivers an
     # ENU OFFSET -- the requested body-frame point rotated by current yaw,
     # NOT added to current position; its own docstring says "Commands the
@@ -1343,7 +1360,11 @@ class ArdupilotNode:
     max_lin = self.TELEOP_MAX_LINEAR_MPS
     max_ang = math.radians(self.TELEOP_MAX_ANGULAR_DPS)
     body_x = max(-1.0, min(1.0, linear_x)) * max_lin
-    body_y = max(-1.0, min(1.0, linear_y)) * max_lin
+    # Negated -- reported live 2026-09-14: "positive y should probably be
+    # right, not left." See gotoPosition's identical note; this driver
+    # alone treats y+ as right, everything else sharing this convention
+    # (the rover, convert_point_body2enu itself) is untouched.
+    body_y = -max(-1.0, min(1.0, linear_y)) * max_lin
     yaw_rad = math.radians(self.navpose_dict['yaw_deg'])
     # Standard body(x+forward,y+left)->ENU rotation, matching
     # convert_point_body2enu exactly. The hand-tuned "+90 degree
