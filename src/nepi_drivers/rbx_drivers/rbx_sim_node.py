@@ -197,7 +197,8 @@ class SimNode:
   # since the candidate topic set is per-deployment and can't be enumerated as
   # fixed Discrete options the way TRUE/FALSE can.
   CAPABILITY_SETTING_NAMES = ("autonomous_movement_enabled",
-                              "camera_controls_enabled", "enabled_image_sources")
+                              "camera_controls_enabled", "enabled_image_sources",
+                              "move_with_manual_enabled")
 
   # generic_rover/model.sdf's own hard-coded camera_link_chase POSITION
   # (body-frame, relative to the rover's own origin) -- requested live
@@ -272,6 +273,7 @@ class SimNode:
     camera_fov_deg = {"type":"Float","name":"camera_fov_deg","options":["20.0","150.0"]},
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]},
+    move_with_manual_enabled = {"type":"Discrete","name":"move_with_manual_enabled","options":["TRUE","FALSE"]},
     # No fixed options -- the candidate topic set is per-deployment.
     enabled_image_sources = {"type":"String","name":"enabled_image_sources"}
   )
@@ -305,6 +307,12 @@ class SimNode:
     # existed.
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","value":"TRUE"},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","value":"TRUE"},
+    # Defaults TRUE (unlike rbx_ardupilot_node.py's own copy of this
+    # Setting, which defaults FALSE) -- this driver's manual motor control
+    # (motorControlToVelocity, gated below in gotoControlCb) already moved
+    # the rover directly before this Setting existed, so TRUE preserves
+    # that exact prior behavior for anyone who never touches this toggle.
+    move_with_manual_enabled = {"type":"Discrete","name":"move_with_manual_enabled","value":"TRUE"},
     # Empty = unrestricted -- see the CAPABILITY_SETTING_NAMES comment above.
     enabled_image_sources = {"type":"String","name":"enabled_image_sources","value":""}
   )
@@ -1015,10 +1023,22 @@ class SimNode:
           # Target reached: clear (lin/ang stay 0.0 -- rover stops)
           self.clearGotoTarget()
           self.msg_if.pub_info("Goto target reached")
-    elif any(self.motor_ratios):
+    elif any(self.motor_ratios) and self.settings_dict['move_with_manual_enabled']['value'] == 'TRUE':
       # No active goto -- an active manual motor command takes over this same
       # tick, so there is exactly one authoritative sender rather than a race
       # between this loop and a separate one-shot command.
+      #
+      # Gated on move_with_manual_enabled (added 2026-09-14, requested live:
+      # "it be nice for there to be a checkbox in the sim connector called
+      # move with manual that actually moves the robot when the motors are
+      # messed with manually, and when they're not, it moves the motors
+      # properly but it doesnt actually move the robot. this should work
+      # for the rover too"). setMotorControlRatio below still always
+      # updates self.motor_ratios regardless of this Setting -- the RUI's
+      # own sliders and rbx/status's current_motor_control_settings keep
+      # reporting the commanded ratio either way ("moves the motors
+      # properly"); only whether that ratio also drives the rover's body
+      # velocity is what this toggle controls.
       lin, ang = self.motorControlToVelocity()
     self.sendVelocityCmd(lin, ang)
 

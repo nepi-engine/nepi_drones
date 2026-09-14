@@ -872,7 +872,17 @@ class NepiIFSimControls extends Component {
   // Home, stop, and enumerated setup/go action buttons. Every one is gated on
   // its own capability flag or on its reported option list being non-empty.
   renderHomeControls() {
-    const caps = this.state.capabilities
+    // Reads this.props.ros.rbxDevices (the connected robot's OWN live
+    // RBXCapabilitiesQuery report), NOT this.state.capabilities -- same
+    // fix as renderRobotCapabilityControls's own Reset Sim button
+    // (2026-09-14), same underlying bug class: this.state.capabilities is
+    // THIS APP's own static, config-file-declared SimCapabilitiesQuery
+    // profile, which can name/order its setup_actions differently from the
+    // real driver's own list (e.g. the checked-in "4-Wheel Rover" config
+    // declares "RESET", the real rbx_sim_node.py driver actually reports
+    // "RESET_SIM") -- dispatching by INDEX into the wrong list can fire the
+    // wrong action entirely, not just the right one under a stale namespace.
+    const caps = this.props.ros.rbxDevices[this.state.rbx_namespace]
     if (caps == null) {
       return null
     }
@@ -887,7 +897,7 @@ class NepiIFSimControls extends Component {
       return null
     }
 
-    const namespace = this.props.namespace
+    const namespace = this.state.rbx_namespace
     const { sendTriggerMsg, sendIntMsg } = this.props.ros
 
     return (
@@ -1076,6 +1086,12 @@ class NepiIFSimControls extends Component {
     const has_autonomous_toggle = settingsKnown ? settings.includes("autonomous_movement_enabled") : true
     const has_camera_toggle = settingsKnown ? settings.includes("camera_controls_enabled") : true
     const has_image_curation = settingsKnown && settings.includes("enabled_image_sources")
+    // Not given the same "true when unknown" preview default as the two
+    // toggles above -- unlike those, move_with_manual_enabled (added
+    // 2026-09-14) only actually exists on rbx_sim_node.py/
+    // rbx_ardupilot_node.py so far, not every RBX sim driver, so showing it
+    // unconditionally in preview mode would be a guess, not a confirmed fact.
+    const has_move_with_manual_toggle = settingsKnown && settings.includes("move_with_manual_enabled")
 
     // Reset Sim -- moved here from the generic Devices -> Robots "Setup
     // Actions" dropdown (requested live 2026-09-14: "the reset_sim command
@@ -1109,7 +1125,8 @@ class NepiIFSimControls extends Component {
     const has_reset_sim = reset_sim_index !== -1
 
     if (has_autonomous_toggle === false && has_camera_toggle === false
-        && has_image_curation === false && has_reset_sim === false) {
+        && has_image_curation === false && has_reset_sim === false
+        && has_move_with_manual_toggle === false) {
       return null
     }
 
@@ -1154,6 +1171,29 @@ class NepiIFSimControls extends Component {
                 <Toggle
                   checked={values["camera_controls_enabled"] !== "FALSE"}
                   onClick={() => setToggle("camera_controls_enabled", values["camera_controls_enabled"] === "FALSE")}
+                />
+              )
+            : null}
+          </Column>
+          <Column>
+            {/* Requested live 2026-09-14: "it be nice for there to be a
+                checkbox in the sim connector called move with manual that
+                actually moves the robot when the motors are messed with
+                manually, and when they're not, it moves the motors
+                properly but it doesnt actually move the robot." Checked ->
+                manual motor slider changes drive real movement (rover:
+                its own diff-drive velocity, matching what it already did
+                before this toggle existed; drone: an approximate climb-
+                rate command via the existing teleop velocity path, see
+                setMotorControlRatio's own comment). Unchecked -> motors
+                still visibly respond (value accepted and reported) but
+                the vehicle itself does not move. */}
+            {(has_move_with_manual_toggle === true) ?
+              this.renderCompactToggle(
+                "Move With Manual",
+                <Toggle
+                  checked={values["move_with_manual_enabled"] !== "FALSE"}
+                  onClick={() => setToggle("move_with_manual_enabled", values["move_with_manual_enabled"] === "FALSE")}
                 />
               )
             : null}

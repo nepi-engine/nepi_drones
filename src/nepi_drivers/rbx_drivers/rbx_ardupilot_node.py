@@ -293,7 +293,8 @@ class ArdupilotNode:
   # rbxSettingsNamesList.includes("enabled_image_sources")), including the
   # physical camera candidate the curation list would otherwise have shown.
   CAPABILITY_SETTING_NAMES = ("autonomous_movement_enabled", "teleop_movement_enabled",
-                              "camera_controls_enabled", "enabled_image_sources")
+                              "camera_controls_enabled", "enabled_image_sources",
+                              "move_with_manual_enabled")
 
   # Matches camera_rig_controller_ardupilot.py's own FACTORY_CAMERA_FOV_DEG
   # and models/camera_rig/model.sdf + models/camera_rig_chase/model.sdf's
@@ -319,6 +320,7 @@ class ArdupilotNode:
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
     teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","options":["TRUE","FALSE"]},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]},
+    move_with_manual_enabled = {"type":"Discrete","name":"move_with_manual_enabled","options":["TRUE","FALSE"]},
     # No fixed options -- the candidate topic set is per-deployment.
     enabled_image_sources = {"type":"String","name":"enabled_image_sources"},
     # Static default here; replaced wholesale once a real "environment_options"
@@ -353,6 +355,13 @@ class ArdupilotNode:
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","value":"TRUE"},
     teleop_movement_enabled = {"type":"Discrete","name":"teleop_movement_enabled","value":"TRUE"},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","value":"TRUE"},
+    # Defaults FALSE here (unlike the other three, which default TRUE) --
+    # this driver's manual motor control (MAV_CMD_DO_MOTOR_TEST, see
+    # setMotorControlRatio) never produced real flight before this Setting
+    # existed, so FALSE preserves that exact prior behavior for anyone who
+    # never touches this toggle. rbx_sim_node.py's own copy of this Setting
+    # defaults TRUE for the opposite reason -- see that file's comment.
+    move_with_manual_enabled = {"type":"Discrete","name":"move_with_manual_enabled","value":"FALSE"},
     # Empty = unrestricted -- see the CAPABILITY_SETTING_NAMES comment above.
     enabled_image_sources = {"type":"String","name":"enabled_image_sources","value":""},
     # FLAT_GROUND ("nothing spawned") is always valid regardless of what the
@@ -1064,6 +1073,30 @@ class ArdupilotNode:
     response = nepi_sdk.call_service(self.command_client, test_cmd)
     if response is not None and response.success:
       self.motor_ratios[motor_ind] = speed_ratio
+      # "Move With Manual" -- reported live 2026-09-14: "it be nice for
+      # there to be a checkbox in the sim connector called move with
+      # manual that actually moves the robot when the motors are messed
+      # with manually, and when they're not, it moves the motors properly
+      # but it doesnt actually move the robot." MAV_CMD_DO_MOTOR_TEST above
+      # (unconditional, both branches of this toggle) is a ground-test
+      # command that spins one real motor with no relation to flight --
+      # exactly the "moves the motors but not the robot" OFF behavior,
+      # already true before this Setting existed. ON reuses this driver's
+      # own existing, already-armed-and-tested teleop velocity mechanism
+      # (setTeleopVelocity/sendTeleopVelocityLoop, the same path a keyboard
+      # teleop command uses) rather than inventing a new, materially
+      # riskier direct per-motor mixing/thrust path: real per-motor mixing
+      # would mean reimplementing a chunk of what the flight controller's
+      # own attitude control loop already does, and getting individual
+      # rotor positions/spin directions wrong would risk commanding an
+      # actual, physically wrong attitude response. Average of every motor's
+      # own ratio (all non-negative, since a motor test throttle can't be
+      # negative) becomes a simple climb-rate command -- "moving the
+      # motors" now visibly moves the vehicle too, without guessing this
+      # frame's exact per-rotor roll/pitch/yaw mixing.
+      if self.settings_dict['move_with_manual_enabled']['value'] == 'TRUE' and self.teleopControlsReady():
+        avg_ratio = sum(self.motor_ratios) / float(len(self.motor_ratios))
+        self.setTeleopVelocity(0.0, 0.0, avg_ratio, 0.0)
     else:
       fail_msg = "Motor " + str(motor_ind + 1) + " test command rejected"
       reason = self.get_recent_fcu_reason()
