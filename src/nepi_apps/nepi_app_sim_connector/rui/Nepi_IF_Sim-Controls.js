@@ -44,6 +44,14 @@ import NepiIFImageViewer from "./Nepi_IF_ImageViewer"
 const FACTORY_SCENE_OFFSET_X = -2.5
 const FACTORY_SCENE_OFFSET_Y = 0.0
 const FACTORY_SCENE_OFFSET_Z = 1.65
+// Default (unlocked) scene-camera orientation -- yaw 0 matches
+// camera_link_chase's own unrotated factory pose (see
+// computeLockedSceneYawTilt's own comment); tilt computed the same way
+// rbx_sim_node.py's FACTORY_SCENE_TILT_DEG is (atan2(Z, -X)), duplicated
+// here as a literal for the same reason FACTORY_SCENE_OFFSET_X/Y/Z already
+// is (this file can't import that class).
+const FACTORY_SCENE_YAW_DEG = 0.0
+const FACTORY_SCENE_TILT_DEG = Math.atan2(FACTORY_SCENE_OFFSET_Z, -FACTORY_SCENE_OFFSET_X) * 180 / Math.PI
 
 // Fallback Control 'type' for a Setting name, used only until the connected
 // driver's own SettingsStatus has actually reported one (rbxSettingsTypesDict
@@ -1428,15 +1436,21 @@ class NepiIFSimControls extends Component {
   // writing the delta (this is the one place that needs the absolute
   // pose, same as sim_bridge_node.py's own respawnRoverWithCameraOffsets).
   computeLockedSceneYawTilt() {
+    // Falls back to 0 (the factory delta) for any field that isn't a valid
+    // number yet, rather than returning null and silently doing nothing --
+    // reported live 2026-09-14: "the lock scene camera to robot still
+    // doesnt work." scene_offset_x/y/z start as '' in this component's
+    // initial state and only become real numbers once the driver's own
+    // SettingsStatus reply arrives; toggling the lock on in that window (or
+    // any window where a field has been cleared mid-edit) silently
+    // computed nothing at all, with no error to explain why the toggle
+    // appeared to do nothing.
     const deltaX = parseFloat(this.state.scene_offset_x)
     const deltaY = parseFloat(this.state.scene_offset_y)
     const deltaZ = parseFloat(this.state.scene_offset_z)
-    if (isNaN(deltaX) || isNaN(deltaY) || isNaN(deltaZ)) {
-      return null
-    }
-    const x = deltaX + FACTORY_SCENE_OFFSET_X
-    const y = deltaY + FACTORY_SCENE_OFFSET_Y
-    const z = deltaZ + FACTORY_SCENE_OFFSET_Z
+    const x = (isNaN(deltaX) ? 0 : deltaX) + FACTORY_SCENE_OFFSET_X
+    const y = (isNaN(deltaY) ? 0 : deltaY) + FACTORY_SCENE_OFFSET_Y
+    const z = (isNaN(deltaZ) ? 0 : deltaZ) + FACTORY_SCENE_OFFSET_Z
     const yawRad = Math.atan2(-y, -x)
     const horizontalDist = Math.sqrt(x * x + y * y)
     const tiltRad = Math.atan2(z, horizontalDist)
@@ -1467,6 +1481,17 @@ class NepiIFSimControls extends Component {
     this.setState({ lock_scene_to_robot: checked })
     if (checked) {
       this.applyLockedSceneYawTilt()
+    } else {
+      // Reported live 2026-09-14: "if its deselected, it should just go
+      // back to the default orientation of what it should be." Unchecking
+      // previously did nothing at all -- the camera stayed at whatever
+      // yaw/tilt the lock had last computed, with no way back to the
+      // factory look-angle short of retyping it by hand.
+      this.setState({ scene_offset_yaw: FACTORY_SCENE_YAW_DEG, scene_offset_tilt: FACTORY_SCENE_TILT_DEG })
+      if (this.isRbxLive()) {
+        this.sendControlUpdate(this.state.rbx_namespace + "/settings", "scene_offset_yaw", "Float", String(FACTORY_SCENE_YAW_DEG))
+        this.sendControlUpdate(this.state.rbx_namespace + "/settings", "scene_offset_tilt", "Float", String(FACTORY_SCENE_TILT_DEG))
+      }
     }
   }
 
