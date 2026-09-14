@@ -1201,17 +1201,38 @@ class ArdupilotNode:
     # rotated the caller's body-frame command into this ENU offset using
     # its own documented y+=left convention -- the same code the rover uses
     # with no reported issue, so that shared function stays untouched.
-    # Undoing the rotation, negating the body-frame y component, and
-    # re-applying the same rotation (same yaw_deg the shared code used,
-    # read fresh here) gives the equivalent of "y+=right" for just this
-    # driver, without disturbing any other RBX driver that shares this code.
-    body_pt = nepi_nav.convert_point_enu2body(
-      [point_enu_m.x, point_enu_m.y, point_enu_m.z], self.navpose_dict['yaw_deg'])
-    body_pt[1] = -body_pt[1]
-    flipped_enu = nepi_nav.convert_point_body2enu(body_pt, self.navpose_dict['yaw_deg'])
-    point_enu_m.x = flipped_enu[0]
-    point_enu_m.y = flipped_enu[1]
-    point_enu_m.z = flipped_enu[2]
+    #
+    # A first attempt at this (2026-09-14, reverted) round-tripped through
+    # nepi_nav.convert_point_enu2body()/convert_point_body2enu(): undo the
+    # rotation, negate body-frame y, redo it. That broke BOTH axes at any
+    # yaw other than 0/180 degrees -- reported live: "x now goes backwards
+    # instead of forwards and y still goes left instead of right ... it
+    # says -10 and -9 for x and y even though i typed 10 and 10." Root
+    # cause: convert_point_enu2body's own formula adds yaw_enu_deg the same
+    # way convert_point_body2enu does (`yaw_enu_deg + atan2(...)`), rather
+    # than subtracting it -- it is not actually the inverse of
+    # convert_point_body2enu for a general heading, only coincidentally
+    # correct at yaw 0 and 180 degrees (the only angles where a rotation is
+    # its own inverse), which is why a heading anywhere else scrambled both
+    # axes instead of cleanly flipping just one.
+    #
+    # Fixed by deriving the flip directly in ENU, with no dependency on
+    # that inverse function at all. Substituting enu = R(yaw)*[body_x,
+    # body_y] into "rotate [body_x, -body_y] by the same yaw" and expanding
+    # with the double-angle identities collapses to a plain reflection of
+    # the ENU point across the line through the origin at angle yaw (the
+    # vehicle's own forward direction) -- verified by hand at yaw=0 (pure
+    # identity except y negates, as expected), yaw=90, and yaw=45 (a pure
+    # forward command is unaffected; a pure left command becomes right)
+    # against the standard 2D reflection matrix [cos2yaw, sin2yaw; sin2yaw,
+    # -cos2yaw].
+    yaw_rad = math.radians(self.navpose_dict['yaw_deg'])
+    cos_2yaw = math.cos(2.0 * yaw_rad)
+    sin_2yaw = math.sin(2.0 * yaw_rad)
+    ex = point_enu_m.x
+    ey = point_enu_m.y
+    point_enu_m.x = ex * cos_2yaw + ey * sin_2yaw
+    point_enu_m.y = ex * sin_2yaw - ey * cos_2yaw
     # RBXRobotIF (setpoint_position_local_body) only ever hands drivers an
     # ENU OFFSET -- the requested body-frame point rotated by current yaw,
     # NOT added to current position; its own docstring says "Commands the
