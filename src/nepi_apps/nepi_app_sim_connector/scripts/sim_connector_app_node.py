@@ -860,6 +860,11 @@ class NepiSimConnectorApp:
     self.dimension_config_model = dict()
     self.dimension_config_names_pubs = dict()
     self.dimension_config_selected_pubs = dict()
+    # Not latched -- a transient "this just happened" notice for the RUI to
+    # show as a fading indicator (see setDimensionsCb's own comment), not
+    # persistent state a late subscriber should replay on mount the way
+    # dimension_config_selected_pubs's own latched value should.
+    self.dimension_config_autosaved_pubs = dict()
     self.environment_dimensions_model_pub = nepi_sdk.create_publisher(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/environment_dimensions_selected_model'),
         String, queue_size = 1, latch = True)
@@ -870,6 +875,9 @@ class NepiSimConnectorApp:
       self.dimension_config_selected_pubs[role] = nepi_sdk.create_publisher(
           nepi_sdk.create_namespace(self.node_namespace, 'sim/' + role + '_dimensions_selected_config'),
           String, queue_size = 1, latch = True)
+      self.dimension_config_autosaved_pubs[role] = nepi_sdk.create_publisher(
+          nepi_sdk.create_namespace(self.node_namespace, 'sim/' + role + '_dimensions_autosaved'),
+          String, queue_size = 1, latch = False)
       # Resolved from the active file's ACTUAL content, not just assumed to
       # be the fallback -- see resolveMatchingDimensionConfigName's own
       # comment for why (reported live, 2026-09-01: after some unsaved
@@ -1150,6 +1158,22 @@ class NepiSimConnectorApp:
       self.sim_if.apply_capability_profile(**self.buildCapabilityKwargs(self.profile))
     # Tell the simulator which kind of robot is wanted.
     self.sendLineToBridge({'type': 'robot_config', 'config': config_name}, "Robot config")
+    # Also re-apply the matching "robot" dimensions config (by display_name,
+    # not key -- the two axes are keyed independently, see
+    # sanitizeRobotConfigKey's own comment) if one exists. Reported live
+    # 2026-09-14: saving a new custom robot ("diyrover1") left it selected
+    # on the DIMENSIONS axis, and picking "4-Wheel Rover" back on the
+    # CAPABILITY axis (this method) did nothing to the dimensions axis --
+    # so the shared generic_rover Gazebo model kept diyrover1's geometry
+    # even while "4-Wheel Rover" showed as selected, and deploying it
+    # summoned diyrover1's dimensions under the 4-Wheel-Rover name. A config
+    # with no dimensions counterpart (Quadcopter -- a vendored third-party
+    # airframe, see ROBOT_BUILTIN_DIMENSION_CONFIG_NAME's own comment) is
+    # silently skipped, not a warning-worthy failure.
+    entry = self.robot_configs.get(config_name, dict())
+    display_name = entry.get('display_name', config_name) if isinstance(entry, dict) else config_name
+    if display_name in self.listDimensionConfigs('robot'):
+      self.applyDimensionConfigByName('robot', display_name)
     self.msg_if.pub_info("Selected robot config: " + config_name)
 
   def uploadRobotConfigCb(self, msg):
@@ -1292,6 +1316,19 @@ class NepiSimConnectorApp:
     except (TypeError, ValueError) as e:
       self.msg_if.pub_warn("Cannot save robot config '" + name + "': invalid field value: " + str(e))
       return
+    key = self.persistRobotConfigEntry(name, entry)
+    if key is None:
+      return
+    self.setSelectedRobotConfig(key)
+    self.msg_if.pub_info("Saved robot config '" + name + "' as " + key)
+
+  def persistRobotConfigEntry(self, name, entry):
+    # Shared tail of saveRobotConfigCb (an operator-authored/uploaded YAML)
+    # and saveDimensionConfigCb's own auto-link (see that method's own
+    # comment) -- both mean "this display name is now a real, selectable
+    # capability profile," just from different starting material. Returns
+    # the new key, or None if the write failed (already warned).
+    entry = copy.deepcopy(entry)
     entry['display_name'] = name
     key = self.sanitizeRobotConfigKey(name)
     try:
@@ -1300,10 +1337,9 @@ class NepiSimConnectorApp:
         yaml.safe_dump(entry, f, default_flow_style = False, sort_keys = False)
     except Exception as e:
       self.msg_if.pub_warn("Failed to save robot config '" + name + "': " + str(e))
-      return
+      return None
     self.robot_configs[key] = entry
-    self.setSelectedRobotConfig(key)
-    self.msg_if.pub_info("Saved robot config '" + name + "' as " + key)
+    return key
 
   def deleteRobotConfigCb(self, msg):
     key = str(msg.data).strip()
@@ -1779,9 +1815,56 @@ class NepiSimConnectorApp:
     except Exception as e:
       self.msg_if.pub_warn("Failed to save " + role + " dimensions config '" + name + "': " + str(e))
       return
+    if role == 'robot':
+      self.linkRobotConfigToDimensions(name)
     self.publishAvailableDimensionConfigs(role)
     self.applyDimensionConfigByName(role, name)
     self.msg_if.pub_info("Saved " + role + " dimensions config: " + name)
+
+  def linkRobotConfigToDimensions(self, name):
+    # A "robot" dimensions config (chassis/wheel geometry) and a
+    # robot_configs entry (capability profile -- wheel_count, goto flags,
+    # setup_actions, etc.) are two independent axes with two independent
+    # key spaces (sanitizeRobotConfigKey prefixes "custom_" and lowercases;
+    # sanitizeDimensionConfigName does neither -- see each one's own
+    # comment) -- merged in the RUI purely by matching DISPLAY NAME
+    # (renderRobotConfigAndDimensionsButtons). Reported live 2026-09-14:
+    # saving a new custom robot ("diyrover1") only ever touched the
+    # dimensions axis, so it never appeared in available_robot_configs (the
+    # plain Robot Config dropdown, which only lists capability entries),
+    # its capability YAML view kept showing whichever capability profile
+    # was last actually selected (stale display_name), and the merged
+    # button row's selected-highlight logic -- which keys off the
+    # capability axis matching too -- had nothing of its own to match.
+    #
+    # Only creates an entry if this exact display_name has no capability
+    # counterpart yet -- re-saving an already-linked custom config (further
+    # edits under the same name) must not reset its capability profile back
+    # to whatever the CURRENTLY selected one happens to be right now.
+    for entry in self.robot_configs.values():
+      if isinstance(entry, dict) and entry.get('display_name') == name:
+        return
+    # Clones the CURRENTLY selected capability profile as the new entry's
+    # starting point -- matches the natural workflow (pick "4-Wheel Rover",
+    # customize its dimensions, Save As a new name): the capability side
+    # (wheel count, which goto modes, setup actions) carries over unchanged,
+    # only display_name and the physical dimensions differ.
+    source_key = self.selected_robot_config
+    source_entry = self.robot_configs.get(source_key, dict())
+    entry = copy.deepcopy(source_entry) if isinstance(source_entry, dict) else dict()
+    entry.pop('hidden_from_selector', None)
+    key = self.persistRobotConfigEntry(name, entry)
+    if key is not None:
+      # Also makes it the selected capability config (setSelectedRobotConfig
+      # re-applies this same dimensions config, harmlessly redundant with
+      # saveDimensionConfigCb's own applyDimensionConfigByName call right
+      # after this returns) -- without this, the capability axis kept
+      # showing whichever profile was selected before the save, so the
+      # merged button row's selected-highlight never matched the config
+      # that was actually just created and applied.
+      self.setSelectedRobotConfig(key)
+      self.msg_if.pub_info("Linked new capability config '" + name + "' (from '" +
+                           source_key + "') to its dimensions config")
 
   def deleteRobotDimensionsConfigCb(self, msg):
     self.deleteDimensionConfigCb('robot', msg)
@@ -1844,21 +1927,55 @@ class NepiSimConnectorApp:
     # silently never take effect.
     self.clearStoredSdfOverride(role)
     self.markDimensionsDirty(role)
-    # Re-resolves rather than just clearing to "unsaved" outright -- an edit
-    # that happens to reproduce a saved config's fields exactly (e.g.
-    # editing a value and back) should still show that config as selected.
-    # This is the fix for a real report (2026-09-01): editing while a
-    # BUILT-IN like "4-Wheel Rover"/"Obstacle Course" was selected kept
-    # showing that name as selected even after the values no longer
-    # matched what its own file holds, reading as "editing changed the
-    # default" -- it never did (setDimensionsCb only ever writes the
-    # ACTIVE single-file store, see this method's own docstring, never a
-    # named config's own file); only the SELECTED-NAME INDICATOR was wrong.
-    # Now it correctly drops to '' (nothing selected -- shown in the RUI as
-    # unsaved edits) the moment the active content no longer matches
-    # anything on disk, exactly the "only applies if saved and selected"
-    # behavior reported missing.
-    self.selected_dimension_config[role] = self.resolveMatchingDimensionConfigName(role)
+    # Auto-save: if a CUSTOM (non-built-in) config was selected before this
+    # edit landed, write the edited fields straight back to that same named
+    # file too, so incremental tweaks to a robot you created don't each
+    # need a separate "Save As <same name>" click. Reported live
+    # 2026-09-14: "if a custom robot is selected like diyrover1 and changes
+    # are made to it, there should be an indicator every time a change is
+    # made which says auto-saved to config."
+    #
+    # A BUILT-IN (4-Wheel Rover/Obstacle Course) must never be silently
+    # overwritten this way -- same protection saveDimensionConfigCb already
+    # enforces on an explicit save, just checked here too since this path
+    # bypasses that method entirely. For a built-in (or nothing selected --
+    # an edit made with no saved config active yet), behavior is UNCHANGED
+    # from before: re-resolve from content, dropping to '' if the edit no
+    # longer matches anything on disk (see this method's own long-standing
+    # comment below, kept verbatim for that case).
+    prev_selected = self.selected_dimension_config.get(role, '')
+    is_custom = (prev_selected != ''
+                 and self.sanitizeDimensionConfigName(prev_selected)
+                     not in PROTECTED_DIMENSION_CONFIG_NAMES.get(role, set()))
+    if is_custom:
+      try:
+        with open(self.dimensionConfigPath(role, prev_selected), 'w') as f:
+          f.write(yaml_text)
+        self.selected_dimension_config[role] = prev_selected
+        pub = self.dimension_config_autosaved_pubs.get(role)
+        if pub is not None:
+          pub.publish(String(data = prev_selected))
+        self.msg_if.pub_info("Auto-saved " + role + " dimensions edit to '" + prev_selected + "'")
+      except Exception as e:
+        self.msg_if.pub_warn("Failed to auto-save " + role + " dimensions config '" +
+                             prev_selected + "': " + str(e))
+        is_custom = False
+    if not is_custom:
+      # Re-resolves rather than just clearing to "unsaved" outright -- an edit
+      # that happens to reproduce a saved config's fields exactly (e.g.
+      # editing a value and back) should still show that config as selected.
+      # This is the fix for a real report (2026-09-01): editing while a
+      # BUILT-IN like "4-Wheel Rover"/"Obstacle Course" was selected kept
+      # showing that name as selected even after the values no longer
+      # matched what its own file holds, reading as "editing changed the
+      # default" -- it never did (setDimensionsCb only ever writes the
+      # ACTIVE single-file store, see this method's own docstring, never a
+      # named config's own file); only the SELECTED-NAME INDICATOR was wrong.
+      # Now it correctly drops to '' (nothing selected -- shown in the RUI as
+      # unsaved edits) the moment the active content no longer matches
+      # anything on disk, exactly the "only applies if saved and selected"
+      # behavior reported missing.
+      self.selected_dimension_config[role] = self.resolveMatchingDimensionConfigName(role)
     self.publishSelectedDimensionConfig(role)
     if role == 'robot':
       self.updateCameraFovFromRobotDimensions()

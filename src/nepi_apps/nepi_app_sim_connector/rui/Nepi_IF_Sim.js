@@ -367,6 +367,11 @@ class NepiIFSim extends Component {
       environment_dimensions_fields: defaultDimensionFields(OBSTACLE_COURSE_DIMENSION_FIELDS),
       robot_dimensions_dirty: false,
       environment_dimensions_dirty: false,
+      // Transient "just auto-saved" indicator text (see setDimensionsCb's
+      // own comment on the device side) -- cleared a few seconds after it
+      // arrives by autosaveMsgTimer, not persisted/restored on mount.
+      robot_dimensions_autosave_msg: '',
+      environment_dimensions_autosave_msg: '',
       // Which model the currently-selected ENVIRONMENT config targets (see
       // ENVIRONMENT_DIMENSION_FIELDS_BY_MODEL) -- read from the device's own
       // sim/environment_dimensions_selected_model (latched), updated
@@ -458,6 +463,10 @@ class NepiIFSim extends Component {
     // hatch -- one per role, same reasoning as uploadInputRef above.
     this.uploadRobotSdfInputRef = React.createRef()
     this.uploadEnvironmentSdfInputRef = React.createRef()
+    // Per-role timers clearing *_dimensions_autosave_msg a few seconds
+    // after it's shown -- plain instance fields, not state, since the
+    // timer itself is never rendered.
+    this.autosaveMsgTimers = {}
 
     this.getSimNamespace = this.getSimNamespace.bind(this)
 
@@ -492,6 +501,7 @@ class NepiIFSim extends Component {
     this.onSaveDimensionConfigAsClicked = this.onSaveDimensionConfigAsClicked.bind(this)
     this.onDeleteDimensionConfigClicked = this.onDeleteDimensionConfigClicked.bind(this)
     this.onDeleteMergedRobotConfigClicked = this.onDeleteMergedRobotConfigClicked.bind(this)
+    this.showDimensionsAutosaveMsg = this.showDimensionsAutosaveMsg.bind(this)
     this.renderRobotConfigAndDimensionsButtons = this.renderRobotConfigAndDimensionsButtons.bind(this)
     this.renderAerialObstacleCourseDiagram = this.renderAerialObstacleCourseDiagram.bind(this)
     this.onDownloadDimensionsClicked = this.onDownloadDimensionsClicked.bind(this)
@@ -556,6 +566,7 @@ class NepiIFSim extends Component {
 
   // Lifecycle method called just before the component unmounts.
   componentWillUnmount() {
+    Object.values(this.autosaveMsgTimers).forEach((timer) => { if (timer) { clearTimeout(timer) } })
     if (this.state.statusListener) {
       this.state.statusListener.unsubscribe()
     }
@@ -634,6 +645,7 @@ class NepiIFSim extends Component {
       this.state.robotDimensionsDirtyListener, this.state.environmentDimensionsDirtyListener,
       this.state.robotDimensionsConfigNamesListener, this.state.environmentDimensionsConfigNamesListener,
       this.state.robotDimensionsSelectedConfigListener, this.state.environmentDimensionsSelectedConfigListener,
+      this.state.robotDimensionsAutosavedListener, this.state.environmentDimensionsAutosavedListener,
       this.state.environmentDimensionsModelListener]
       .forEach((listener) => { if (listener != null) { listener.unsubscribe() } })
     if (namespace == null || namespace === 'None') {
@@ -641,6 +653,7 @@ class NepiIFSim extends Component {
                       robotDimensionsDirtyListener: null, environmentDimensionsDirtyListener: null,
                       robotDimensionsConfigNamesListener: null, environmentDimensionsConfigNamesListener: null,
                       robotDimensionsSelectedConfigListener: null, environmentDimensionsSelectedConfigListener: null,
+                      robotDimensionsAutosavedListener: null, environmentDimensionsAutosavedListener: null,
                       environmentDimensionsModelListener: null })
       return
     }
@@ -680,6 +693,19 @@ class NepiIFSim extends Component {
       namespace + '/environment_dimensions_selected_config', "std_msgs/String",
       (message) => this.setState({ environment_dimensions_selected_config: message.data })
     )
+    // Transient "just auto-saved" notice (see setDimensionsCb's own
+    // comment on the device side) -- not latched on that end, so this only
+    // ever fires for an edit that happens while this component is mounted,
+    // which is exactly when there's a UI to show it in. Each new message
+    // resets its own fade timer rather than stacking timers.
+    const robotAutosavedListener = this.props.ros.setupStatusListener(
+      namespace + '/robot_dimensions_autosaved', "std_msgs/String",
+      (message) => this.showDimensionsAutosaveMsg('robot', message.data)
+    )
+    const environmentAutosavedListener = this.props.ros.setupStatusListener(
+      namespace + '/environment_dimensions_autosaved', "std_msgs/String",
+      (message) => this.showDimensionsAutosaveMsg('environment', message.data)
+    )
     // Which model the currently-selected environment config targets --
     // drives which curated field set (ENVIRONMENT_DIMENSION_FIELDS_BY_MODEL)
     // is shown/edited. Tops up any of that model's fields not yet present
@@ -717,6 +743,8 @@ class NepiIFSim extends Component {
                     environmentDimensionsConfigNamesListener: environmentConfigNamesListener,
                     robotDimensionsSelectedConfigListener: robotSelectedConfigListener,
                     environmentDimensionsSelectedConfigListener: environmentSelectedConfigListener,
+                    robotDimensionsAutosavedListener: robotAutosavedListener,
+                    environmentDimensionsAutosavedListener: environmentAutosavedListener,
                     environmentDimensionsModelListener: environmentModelListener,
                     environmentDimensionsViewingYamlListener: environmentDimensionsViewingYamlListener })
     this.props.ros.sendTriggerMsg(namespace + '/get_robot_dimensions')
@@ -1093,6 +1121,21 @@ class NepiIFSim extends Component {
     const name = this.state[role + '_dimensions_save_as_name'].trim()
     this.saveDimensionsAsNamed(role, name)
     this.setState({ [role + '_dimensions_save_as_name']: '' })
+  }
+
+  // Shows the "Auto-saved to '<name>'" indicator (see setDimensionsCb's own
+  // comment on the device side) and fades it out a few seconds later. Each
+  // call resets its own role's timer rather than letting several stack up
+  // and clear each other early on a burst of rapid edits.
+  showDimensionsAutosaveMsg(role, name) {
+    if (this.autosaveMsgTimers[role]) {
+      clearTimeout(this.autosaveMsgTimers[role])
+    }
+    this.setState({ [role + '_dimensions_autosave_msg']: 'Auto-saved to "' + name + '"' })
+    this.autosaveMsgTimers[role] = setTimeout(() => {
+      this.setState({ [role + '_dimensions_autosave_msg']: '' })
+      this.autosaveMsgTimers[role] = null
+    }, 3000)
   }
 
   // Deletes whichever dimensions config is currently selected. A built-in
@@ -2588,6 +2631,16 @@ class NepiIFSim extends Component {
               {"Save As New Config"}
             </Button>
           </ButtonMenu>
+          {(this.state[role + '_dimensions_autosave_msg'] !== '') ?
+            <div style={{
+              fontStyle: "italic",
+              color: Styles.vars.colors.grey1,
+              marginTop: Styles.vars.spacing.small,
+              marginBottom: Styles.vars.spacing.small,
+            }}>
+              {this.state[role + '_dimensions_autosave_msg']}
+            </div>
+          : null}
         </Section>
       </React.Fragment>
     )
