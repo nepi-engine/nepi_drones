@@ -400,6 +400,26 @@ class NepiIFSimControls extends Component {
     if (selected_simulator !== prevState.rbx_namespace) {
       this.setState({ rbx_namespace: selected_simulator })
       this.updateRbxSettingsListener(selected_simulator)
+      // Populates this.props.ros.rbxDevices[selected_simulator] -- the
+      // Reset Sim button (renderRobotCapabilityControls) reads its
+      // setup_action_options from there. Requested live (2026-09-14): "i
+      // cant see the reset_sim thing in the sim connector anywhere" --
+      // root cause: it was reading this.state.capabilities instead, which
+      // comes from THIS app's own SimCapabilitiesQuery (queryCapabilities,
+      // above), whose setup_action_options is always empty --
+      // sim_connector_app_node.py only ever populates it from a target's
+      // own 'setup_actions' entry in simulator_launch_targets.yaml, and
+      // that key is never actually set there for any target. The real,
+      // always-correctly-populated list is the connected RBX driver's own
+      // capabilities (confirmed live: rosservice call .../rbx/
+      // capabilities_query already reports ["RESET_SIM", "RETURN_HOME"]),
+      // reached the same way NepiDeviceRBX.js's own Setup Actions dropdown
+      // does. A one-time query on every namespace change is enough --
+      // setup_action_options doesn't change over a robot's lifetime,
+      // unlike Settings values.
+      if (selected_simulator !== null && selected_simulator !== '' && selected_simulator !== 'None') {
+        this.props.ros.callRBXCapabilitiesQueryService(selected_simulator)
+      }
     }
 
     // Seed the motor sliders once the motor count becomes known, and resize them
@@ -1061,8 +1081,22 @@ class NepiIFSimControls extends Component {
     // TAKEOFF/LAUNCH, a later index -- see each driver's own
     // RBX_SETUP_ACTIONS list), so looking it up by name is the only safe
     // way to get the right index regardless of which driver is connected.
-    const caps = this.state.capabilities
-    const setup_actions = (caps != null && caps.setup_action_options !== undefined) ? caps.setup_action_options : []
+    //
+    // Reads this.props.ros.rbxDevices (populated by
+    // callRBXCapabilitiesQueryService in componentDidUpdate above), NOT
+    // this.state.capabilities -- found live (2026-09-14): "i cant see the
+    // reset_sim thing in the sim connector anywhere." this.state.capabilities
+    // comes from THIS app's own SimCapabilitiesQuery (queryCapabilities),
+    // whose setup_action_options is always empty: sim_connector_app_node.py
+    // only ever populates it from a target's own 'setup_actions' entry in
+    // simulator_launch_targets.yaml, and that key is never actually set
+    // there for any target. rbxDevices holds the connected RBX driver's own
+    // capabilities instead (confirmed live: rosservice call .../rbx/
+    // capabilities_query already reports ["RESET_SIM", "RETURN_HOME"]),
+    // the same source NepiDeviceRBX.js's own Setup Actions dropdown uses.
+    const rbx_caps = this.props.ros.rbxDevices[this.state.rbx_namespace]
+    const setup_actions = (rbx_caps != null && rbx_caps.setup_action_options !== undefined)
+      ? rbx_caps.setup_action_options : []
     const reset_sim_index = setup_actions.indexOf("RESET_SIM")
     const has_reset_sim = reset_sim_index !== -1
 
