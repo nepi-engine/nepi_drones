@@ -1157,7 +1157,22 @@ class NepiIFSimControls extends Component {
             <Button
               onClick={() => {
                 const { sendIntMsg } = this.props.ros
-                sendIntMsg(this.props.namespace + "/setup_action", String(reset_sim_index))
+                // this.state.rbx_namespace (the connected robot's OWN real
+                // rbx namespace), NOT this.props.namespace (this app's own
+                // "sim" namespace, e.g. app_sim_connector/sim) -- reported
+                // live 2026-09-14: "the reset sim button still doesnt work
+                // for either [rover or drone]... it used to work when it
+                // was in robot -> devices - make it so it does the same
+                // commands." NepiDeviceRBX.js's own working Setup Actions
+                // dropdown always published to the real per-robot rbx
+                // namespace (currentRBXNamespace + "/setup_action"), never
+                // to this app's own sim namespace -- and every OTHER real
+                // command in this exact file (settings updates, camera FOV,
+                // environment) already uses this.state.rbx_namespace for
+                // the same reason. This one button was the one place that
+                // didn't, so it silently published to a namespace nothing
+                // subscribes to.
+                sendIntMsg(this.state.rbx_namespace + "/setup_action", String(reset_sim_index))
                 // RESET_SIM clears the driver's own motor_ratios (see
                 // rbx_sim_node.py's resetSimAction), so the NEXT status
                 // publish correctly reports all-zero motor speeds -- but
