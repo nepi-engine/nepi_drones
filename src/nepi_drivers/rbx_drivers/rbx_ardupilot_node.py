@@ -1325,14 +1325,17 @@ class ArdupilotNode:
             and self.isAirborne())
 
   def setTeleopVelocity(self, linear_x, linear_y, linear_z, angular_z):
-    # Inputs are body-frame ratios in [-1,1] (forward/right/up, yaw-rate) --
-    # see device_if_rbx.py's setTeleopVelocityCb. MAVROS's velocity setpoint
-    # topic (sendTeleopVelocityLoop below) is LOCAL ENU, a fixed world frame,
-    # not body frame -- "forward" there means a fixed compass direction, not
-    # "wherever the nose is pointing," which is not what a keyboard teleop
-    # control is for. Rotating by the vehicle's own current yaw is what makes
-    # "W" mean forward relative to the drone regardless of which way it is
-    # facing, the same way a real quadcopter's stick inputs work.
+    # Inputs are body-frame ratios in [-1,1] (forward/left/up, yaw-rate) --
+    # see device_if_rbx.py's setTeleopVelocityCb ("linear.x forward/back,
+    # linear.y left/right" -- left is positive, the same x+forward/y+left
+    # convention GotoPosition and convert_point_body2enu already use).
+    # MAVROS's velocity setpoint topic (sendTeleopVelocityLoop below) is
+    # LOCAL ENU, a fixed world frame, not body frame -- "forward" there
+    # means a fixed compass direction, not "wherever the nose is
+    # pointing," which is not what a keyboard teleop control is for.
+    # Rotating by the vehicle's own current yaw is what makes "W" mean
+    # forward relative to the drone regardless of which way it is facing,
+    # the same way a real quadcopter's stick inputs work.
     #
     # Scaled by max_linear_speed_mps-equivalent -- this driver has no such
     # Setting today (unlike rbx_sim_node.py), so a fixed, conservative cap is
@@ -1342,38 +1345,23 @@ class ArdupilotNode:
     body_x = max(-1.0, min(1.0, linear_x)) * max_lin
     body_y = max(-1.0, min(1.0, linear_y)) * max_lin
     yaw_rad = math.radians(self.navpose_dict['yaw_deg'])
-    # Confirmed live (2026-09-08) with two isolated, single-axis burst
-    # tests at yaw ~= 0 (pure body_x=1,body_y=0 for 3s, then separately
-    # pure body_x=0,body_y=1 for 3s, vehicle re-teleported to the origin
-    # between the two so neither test's drift contaminated the other):
-    # a pure "forward" command produced pure WORLD -Y Gazebo movement (not
-    # +X), and a pure "right" command produced pure WORLD -X movement (not
-    # -Y) -- i.e. actual_world = (published_y, -published_x), a
-    # consistent -90 degree rotation between whatever mavros's
-    # setpoint_velocity/cmd_vel_unstamped plugin treats as its own local
-    # ENU frame and the frame Gazebo's world_states/get_model_state
-    # actually reports -- NOT a bug in the body->world rotation math
-    # itself (which was already correct: forward=(cos,sin), right=
-    # (sin,-cos) is the right-handed pair a right-positive body_y needs).
-    # This is a fixed, yaw-independent misalignment between mavros's own
-    # frame and Gazebo's world frame for this particular ardupilot_gazebo
-    # model/world (unrelated to, and in addition to, the vehicle's own
-    # yaw -- which is what yaw_rad below still correctly rotates by).
-    # Compensated by publishing the correctly-rotated body->world vector
-    # pre-rotated by the inverse of that same -90 degree misalignment
-    # (i.e. +90 degrees: (x,y) -> (-y,x)) so that mavros's own -90 degree
-    # offset cancels it out exactly, leaving the real Gazebo-world result
-    # matching the intended forward/right semantics -- re-verified against
-    # both burst tests after this change (forward -> +X, right -> -Y).
-    # A previous attempt at this same class of fix (2026-09-08, same day,
-    # earlier in this investigation) only flipped the sign of the body_y
-    # cross-term without adding this rotation, which does correctly fix a
-    # PURE body_y command's sign but still leaves pure body_x commands
-    # landing on the wrong world axis entirely -- confirmed insufficient
-    # by the pure-forward burst test above, which that earlier fix alone
-    # cannot explain or correct.
-    enu_x = body_y * math.cos(yaw_rad) - body_x * math.sin(yaw_rad)
-    enu_y = body_x * math.cos(yaw_rad) + body_y * math.sin(yaw_rad)
+    # Standard body(x+forward,y+left)->ENU rotation, matching
+    # convert_point_body2enu exactly. The hand-tuned "+90 degree
+    # pre-rotation" that lived here before (added 2026-09-08, swapping
+    # body_x/body_y and negating a term) was reverse-engineered against
+    # self.navpose_dict['yaw_deg'] while that value was still being computed
+    # via the wrong convert_yaw_ned2enu reflection (odom_topic_callback,
+    # fixed 2026-09-14) -- it only cancelled out correctly at the single
+    # heading (reported yaw ~= 0) that fix was tested against, and produces
+    # a wrong rotation everywhere else (confirmed algebraically once
+    # yaw_deg's real relationship to Gazebo ground truth -- a fixed +90
+    # degree offset shared with x_m/y_m -- is substituted in symbolically).
+    # Now that yaw_deg is the raw, self-consistent mavros value (offset
+    # from Gazebo by that same fixed rotation x_m/y_m already carries),
+    # the plain rotation below is correct for every heading with no
+    # separate world-frame compensation needed.
+    enu_x = body_x * math.cos(yaw_rad) - body_y * math.sin(yaw_rad)
+    enu_y = body_x * math.sin(yaw_rad) + body_y * math.cos(yaw_rad)
     with self.teleop_lock:
       self.teleop_linear_enu = [enu_x, enu_y, max(-1.0, min(1.0, linear_z)) * max_lin]
       self.teleop_angular_z = max(-1.0, min(1.0, angular_z)) * max_ang
@@ -1491,28 +1479,40 @@ class ArdupilotNode:
       self.navpose_dict['time_orientation'] = time_ns
       self.navpose_dict['roll_deg'] = rpy[0]
       self.navpose_dict['pitch_deg'] = rpy[1]
-      # NOT rpy[2] directly. Confirmed live 2026-09-04 (a follow-mission
-      # controller commanding rbx/set_teleop_velocity consistently ended
-      # up 15-20+ m off course, in a consistent, reproducible direction
-      # each run -- not the random scatter a numerically noisy bearing
-      # would produce): mavros's global_position/local orientation
-      # quaternion, on this ArduPilot/mavros combination, comes out
-      # yaw-referenced from NORTH (NED-style, 0 deg = facing Gazebo's own
-      # +Y/"north"), not from EAST/ENU's own +X axis the way every other
-      # yaw source in this app (ai_targeting_controller_ardupilot.py's own
-      # ground-truth drone_yaw, Gazebo's raw model_states orientation)
-      # assumes -- a consistent ~90 degree offset measured directly
-      # against Gazebo ground truth at rest (yaw_deg reporting ~90 while
-      # ground truth read ~1, repeatably). setTeleopVelocity (this
-      # variable's only other reader in this file) rotates a caller's
-      # body-frame command into world ENU using this value, so that fixed
-      # ~90 degree error rotated every commanded direction by a fixed
-      # wrong amount -- not noise, a real and entirely reproducible
-      # misdirection. convert_yaw_ned2enu is nepi_sdk's own existing
-      # utility for exactly this conversion (already used elsewhere in
-      # this platform for the identical NED<->ENU yaw mismatch), just
-      # never applied to this particular odometry source before.
-      self.navpose_dict['yaw_deg'] = nepi_nav.convert_yaw_ned2enu(rpy[2])
+      # Use rpy[2] directly -- NOT convert_yaw_ned2enu(rpy[2]) (removed
+      # 2026-09-14). mavros's global_position/local orientation quaternion
+      # is already expressed in ENU (mavros converts the FCU's internal NED
+      # attitude to ENU before publishing this topic, same as every other
+      # mavros pose/odometry topic), so rpy[2] here is already an ENU yaw --
+      # just one that, on this world/model combination, reads ~90 deg high
+      # of Gazebo's own ground-truth yaw at rest (a fixed, self-consistent
+      # offset that also shows up identically in x_m/y_m below: this
+      # topic's position is mavros's own ENU too, related to Gazebo's true
+      # world frame by that same fixed rotation -- confirmed by directly
+      # comparing this driver's reported position against
+      # /gazebo/model_states: driver_x ~= -gazebo_y, driver_y ~= gazebo_x).
+      # convert_yaw_ned2enu (90-yaw) treats rpy[2] as a compass-style NED
+      # heading and reflects it -- the wrong operation on an already-ENU
+      # value -- which happened to cancel out at the single heading it was
+      # verified against (2026-09-04, vehicle facing ~Gazebo-north, raw
+      # yaw ~90 which the reflection formula collapses to ~0) but produces
+      # a heading-dependent wrong answer everywhere else. That's the
+      # confirmed root cause of goto_position's axis flip (2026-09-14):
+      # setpoint_position_local_body (nepi_api/device_if_rbx.py) rotates a
+      # caller's body-frame command into ENU using this yaw value, then
+      # gotoPosition below adds it to x_m/y_m (already in this same,
+      # self-consistent, ~90-deg-rotated-from-Gazebo ENU) -- so as long as
+      # yaw and x_m/y_m agree on which ENU they're both in (which requires
+      # NOT reflecting only one of them), "forward" rotates correctly
+      # relative to the vehicle's own current heading and the relative-
+      # position add above lands in the right place. Reflecting yaw alone
+      # broke that agreement. This does not attempt to also correct the
+      # fixed ~90 deg offset from Gazebo's own world frame -- nothing in
+      # this app needs the vehicle's ENU to numerically match Gazebo's
+      # world axes, only that goto/teleop motions stay self-consistent
+      # with the vehicle's own reported heading and position, which this
+      # restores.
+      self.navpose_dict['yaw_deg'] = rpy[2]
 
       # Relative Position Meters in selected 3d frame (x,y,z) with x forward, y right/left, and z up/down
       self.navpose_dict['has_position'] = True
