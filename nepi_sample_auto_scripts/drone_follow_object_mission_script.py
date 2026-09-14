@@ -104,14 +104,17 @@ RBX_ROBOT_NAME = "ardupilot"
 # Robot Settings Overides
 ###################
 TAKEOFF_HEIGHT_M = 10.0
-# Ignore Yaw Control -- True (default) leaves the vehicle's heading alone
-# while following: a holonomic multirotor can close on a target that isn't
-# dead ahead without turning to face it (see velocityControlLoopCb's own
-# comment), so this is a style choice, not a requirement. Set False to
-# also yaw toward the target proportionally (FOLLOW_YAW_GAIN_PER_DEG
-# below), same idea as
-# https://github.com/sieuwe1/Autonomous-Ai-drone-scripts's own pidYaw.
-IGNORE_YAW_CONTROL = True
+# Ignore Yaw Control -- True leaves the vehicle's heading alone while
+# following: a holonomic multirotor can close on a target that isn't dead
+# ahead without turning to face it (see velocityControlLoopCb's own
+# comment), so this was a style choice, not a requirement. False (now the
+# default) also yaws toward the target proportionally
+# (FOLLOW_YAW_GAIN_PER_DEG below), same idea as
+# https://github.com/sieuwe1/Autonomous-Ai-drone-scripts's own pidYaw --
+# switched on 2026-09-14, requested live: "the front of the drone should
+# also always be facing the chair, meaning that if the chair moves out to
+# the side, the drone should rotate to look towards that."
+IGNORE_YAW_CONTROL = False
 
 ###!!!!!!!! Set Automation action parameters !!!!!!!!
 TARGET_TO_FOLLOW = "chair" # Either a target class name (will follow first found of that class) or specific target_id
@@ -269,12 +272,19 @@ FOLLOW_SPEED_GAIN_PER_M = 0.1
 # a bounded, controllable speed rather than commanding the driver's own
 # absolute max.
 FOLLOW_MAX_SPEED_RATIO = 0.5
-# Only used when IGNORE_YAW_CONTROL is False -- ratio-per-degree gain for
-# the optional yaw-toward-target term, same proportional idea as
-# FOLLOW_SPEED_GAIN_PER_M above but on azimuth instead of range. At 0.02,
-# the yaw-rate ratio cap (1.0, i.e. TELEOP_MAX_ANGULAR_DPS) is reached at
-# 50 degrees off-center.
-FOLLOW_YAW_GAIN_PER_DEG = 0.02
+# Used whenever IGNORE_YAW_CONTROL is False -- ratio-per-degree gain for
+# the yaw-toward-target term, same proportional idea as
+# FOLLOW_SPEED_GAIN_PER_M above but on azimuth instead of range. Doubled
+# from 0.02 to 0.04 (2026-09-14, requested live: "the front of the drone
+# should also always be facing the chair"): proportional-only control
+# chasing a CONTINUOUSLY moving azimuth (the target's own orbit) settles
+# to a steady-state lag rather than zero error, roughly inversely
+# proportional to this gain -- confirmed live at 0.02 the vehicle held a
+# stable (not diverging) ~12 degree offset from dead-on while otherwise
+# correctly tracking range; 0.04 (cap still reached at a conservative 25
+# degrees off-center, well under TELEOP_MAX_ANGULAR_DPS) roughly halves
+# that residual lag for noticeably closer facing.
+FOLLOW_YAW_GAIN_PER_DEG = 0.04
 # Debugging aid (2026-09-04): even with the -999-yaw-sentinel, coast-
 # forever, close-range-instability, and ~90 degree driver yaw-convention
 # bugs all found and fixed this same session, one more test still showed
@@ -961,7 +971,20 @@ class drone_follow_object_mission(object):
     if IGNORE_YAW_CONTROL:
       twist.angular.z = 0.0
     else:
-      twist.angular.z = max(-1.0, min(1.0, azimuth_deg * FOLLOW_YAW_GAIN_PER_DEG))
+      # Negated -- found live 2026-09-14 before ever arming: azimuth_deg is
+      # positive when the target is to the RIGHT of the nose (see
+      # ai_targeting_controller_ardupilot.py's own computeTargetReport
+      # docstring), but rbx_ardupilot_node.py passes angular_z straight
+      # through, unrotated, as a standard ROS body-frame yaw rate
+      # (x+forward, y+left, z+up, right-handed) -- POSITIVE angular.z turns
+      # the nose from +x toward +y, i.e. LEFT, by that frame's own
+      # right-hand rule. A positive (unnegated) gain here would therefore
+      # yaw the nose AWAY from a target that's to the right, the opposite
+      # of "look toward the target" -- this convention is a plain fact of
+      # the body frame's own geometry, unrelated to (and not fixed by) any
+      # of the earlier mavros/Gazebo world-frame yaw bugs fixed this same
+      # session, so it needed its own separate check.
+      twist.angular.z = max(-1.0, min(1.0, -azimuth_deg * FOLLOW_YAW_GAIN_PER_DEG))
     self.rbx_set_teleop_velocity_pub.publish(twist)
     self._logFollowDebug("TRACK", range_m, azimuth_deg, elevation_deg, speed_ratio, twist)
 
