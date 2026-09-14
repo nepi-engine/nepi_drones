@@ -90,7 +90,7 @@ from std_msgs.msg import Empty, Bool, String, UInt32, Int32, Float32, Float64
 from geographic_msgs.msg import GeoPoint
 from geometry_msgs.msg import Twist
 from nepi_interfaces.msg import DeviceRBXInfo, DeviceRBXStatus, AxisControls, ErrorBounds, GotoErrors, MotorControl, \
-     GotoPose, GotoPosition, GotoLocation, Setting, Settings, SettingsStatus
+     GotoPose, GotoPosition, GotoLocation, Setting, Settings, ControlsStatus, UpdateControl
 from nepi_interfaces.srv import RBXCapabilitiesQuery, RBXCapabilitiesQueryResponse
 from sensor_msgs.msg import NavSatFix, Image
 from nepi_interfaces.msg import Target, Targets, NavPose
@@ -425,9 +425,27 @@ class drone_follow_object_mission(object):
     #### publishers used below are defined in rbx_initialize() above
 
     # Apply Takeoff Height setting overide
+    #
+    # Builds an UpdateControl directly rather than through nepi_sdk's own
+    # nepi_settings.create_msg_from_setting, which still builds the old,
+    # stale Setting() message (type_str/name_str/value_str) -- see this
+    # method's own rbx_setting_update_pub comment. Only Float/Int/Bool/
+    # String are handled since settings_update above only ever declares
+    # "Float" entries today; extend here if a future override needs a
+    # different Control type.
     for setting_name in self.settings_update.keys():
       setting = self.settings_update[setting_name]
-      setting_msg = nepi_settings.create_msg_from_setting(setting)
+      setting_msg = UpdateControl()
+      setting_msg.name = setting['name']
+      setting_msg.type = setting['type']
+      if setting['type'] == "Int":
+        setting_msg.set_int = int(setting['value'])
+      elif setting['type'] in ("Float", "FloatSlider", "FloatSliders"):
+        setting_msg.set_float = float(setting['value'])
+      elif setting['type'] in ("Bool", "Toggle", "Trigger"):
+        setting_msg.set_bool = (str(setting['value']) == "TRUE")
+      else:
+        setting_msg.set_string = str(setting['value'])
       self.msg_if.pub_info("Updated setting msg:" + str(setting_msg))
       self.rbx_setting_update_pub.publish(setting_msg)
 
@@ -526,10 +544,24 @@ class drone_follow_object_mission(object):
     self.msg_if.pub_info("RBX Go Action Options: " + str(self.rbx_cap_go_actions))
 
     ## Settings live under rbx/settings/ (latched status -- no manual publish-trigger needed)
+    #
+    # ControlsStatus, NOT SettingsStatus (found live 2026-09-14: this script
+    # hung forever on "Waiting for current rbx settings to publish" --
+    # SettingsStatus was renamed to ControlsStatus platform-wide, same
+    # rename that broke the RUI's own Store.js this same session (see
+    # rbx_ardupilot_node.py/Nepi_IF_Sim-Controls.js commit history). A
+    # rospy subscriber declaring the OLD message type never completes its
+    # TCPROS handshake against a publisher advertising the new one, so it
+    # silently never receives a single message -- no error, no timeout,
+    # just an infinite wait. rbx_settings_callback below is rewritten to
+    # match, since nepi_sdk's own nepi_settings.parse_setting_msgs_list is
+    # equally stale (reads msg.settings_list/.name_str/.value_str, which
+    # ControlsStatus does not have either) and is shared SDK code out of
+    # this script's own scope to fix.
     NEPI_RBX_SETTINGS_TOPIC = NEPI_RBX_NAMESPACE + "settings/status"
     self.msg_if.pub_info("Waiting for topic: " + NEPI_RBX_SETTINGS_TOPIC)
     nepi_ros.wait_for_topic(NEPI_RBX_SETTINGS_TOPIC)
-    nepi_ros.create_subscriber(NEPI_RBX_SETTINGS_TOPIC, SettingsStatus, self.rbx_settings_callback, queue_size=None)
+    nepi_ros.create_subscriber(NEPI_RBX_SETTINGS_TOPIC, ControlsStatus, self.rbx_settings_callback, queue_size=None)
     while self.rbx_settings is None and not nepi_ros.is_shutdown():
       self.msg_if.pub_info("Waiting for current rbx settings to publish")
       time.sleep(1)
@@ -559,8 +591,14 @@ class drone_follow_object_mission(object):
       rbx_status_pub.publish(Empty())
     self.msg_if.pub_info(str(self.rbx_status))
 
+    # UpdateControl, NOT Setting -- found live 2026-09-14 alongside the
+    # ControlsStatus rename above: the driver's real subscriber on this
+    # topic is nepi_interfaces/UpdateControl (confirmed live via rostopic
+    # type), so a publisher declaring the old Setting type here never
+    # completes a TCPROS connection to it either -- every settings_update
+    # override below (e.g. takeoff_height_m) was silently going nowhere.
     NEPI_RBX_SETTINGS_UPDATE_TOPIC = NEPI_RBX_NAMESPACE + "settings/update_setting"
-    self.rbx_setting_update_pub = nepi_ros.create_publisher(NEPI_RBX_SETTINGS_UPDATE_TOPIC, Setting, queue_size=1)
+    self.rbx_setting_update_pub = nepi_ros.create_publisher(NEPI_RBX_SETTINGS_UPDATE_TOPIC, UpdateControl, queue_size=1)
 
     NEPI_RBX_SET_STATE_TOPIC = NEPI_RBX_NAMESPACE + "set_state"
     NEPI_RBX_SET_MODE_TOPIC = NEPI_RBX_NAMESPACE + "set_mode"
@@ -613,7 +651,33 @@ class drone_follow_object_mission(object):
     self.msg_if.pub_info("RBX initialize process complete")
 
   def rbx_settings_callback(self, msg):
-    self.rbx_settings = nepi_settings.parse_setting_msgs_list(msg)
+    # ControlsStatus's per-entry nepi_interfaces/Control carries its value in
+    # ONE of several typed fields depending on its own .type (Menu -> set_index,
+    # Selection/String -> set_string, Selections -> set_strings, Int -> set_int,
+    # Float/FloatSlider/FloatSliders -> set_float, Bool/Trigger -> set_bool) --
+    # see nepi_interfaces/Control.msg's own comment for the full mapping. Mirrors
+    # extractControlValue in the RUI's own Nepi_IF_Sim-Controls.js (same rename,
+    # same fix, same session).
+    settings = dict()
+    for i, name in enumerate(msg.controls_name_list):
+      control = msg.controls_msg_list[i]
+      ctype = control.type
+      if ctype == "Int":
+        value = str(control.set_int)
+      elif ctype in ("Float", "FloatSlider", "FloatSliders"):
+        value = str(control.set_float)
+      elif ctype in ("Selections", "Toggles"):
+        value = ",".join(control.set_strings)
+      elif ctype in ("Bool", "Toggle", "Trigger"):
+        value = "TRUE" if control.set_bool else "FALSE"
+      elif ctype == "Menu":
+        options = control.string_options
+        value = options[control.set_index] if 0 <= control.set_index < len(options) else str(control.set_index)
+      else:
+        # Selection, Discrete (legacy alias), String, and any other type.
+        value = control.set_string
+      settings[name] = {"name": name, "type": ctype, "value": value}
+    self.rbx_settings = settings
 
   def rbx_info_callback(self, msg):
     self.rbx_info = msg
