@@ -194,6 +194,24 @@ _SettingsStatus = _slot_class(
     ["node_name", "settings_topic", "settings_count", "setting_caps_list",
      "settings_list", "has_cap_updates"],
 )
+# ControlsStatus / Control / UpdateControl -- SettingsStatus/Setting's
+# platform-wide replacement (found live 2026-09-14, see
+# drone_follow_object_mission_script.py's own rbx_settings_callback comment).
+# Control carries its value in exactly one type-specific field, selected by
+# .type -- matches nepi_interfaces/Control.msg's real shape closely enough
+# for this test's purposes (name/type + every set_* field the script reads
+# or writes). UpdateControl (outgoing) and the per-entry items inside
+# ControlsStatus.controls_msg_list (incoming) share this same shape in the
+# real interface too, so one fake class serves both.
+_Control = _slot_class(
+    "Control",
+    ["name", "type", "set_int", "set_float", "set_string", "set_strings",
+     "set_bool", "set_index", "string_options"],
+)
+_UpdateControl = _Control
+_ControlsStatus = _slot_class(
+    "ControlsStatus", ["controls_name_list", "controls_msg_list"]
+)
 _Target = _slot_class(
     "Target",
     [
@@ -244,6 +262,11 @@ class _RBXCapabilitiesQuery:
 
 
 _GeoPoint = _slot_class("GeoPoint", ["latitude", "longitude", "altitude"])
+# NavPose -- only ever used as a subscriber message *type* (navpose_callback
+# reads yaw_deg/heading_deg off whatever instance arrives); the script never
+# constructs one itself, so a plain instantiable placeholder is enough, same
+# convention as _RBXCapabilitiesQuery above.
+_NavPose = _slot_class("NavPose", ["yaw_deg", "heading_deg"])
 
 
 def _install_stub_modules():
@@ -349,6 +372,10 @@ def _install_stub_modules():
     msg_stub.Setting = _Setting
     msg_stub.Settings = _Settings
     msg_stub.SettingsStatus = _SettingsStatus
+    msg_stub.Control = _Control
+    msg_stub.UpdateControl = _UpdateControl
+    msg_stub.ControlsStatus = _ControlsStatus
+    msg_stub.NavPose = _NavPose
     msg_stub.Target = _Target
     msg_stub.Targets = _Targets
     srv_stub.RBXCapabilitiesQuery = _RBXCapabilitiesQuery
@@ -521,13 +548,13 @@ class TestDroneFollowObjectMissionScript(unittest.TestCase):
         )
         _FakeServiceProxy._next_response = caps_response
 
-        settings_msg = _SettingsStatus(
-            node_name="ardupilot_rbx",
-            settings_topic="rbx/settings",
-            settings_count=1,
-            setting_caps_list=[],
-            settings_list=[_Setting(type_str="Float", name_str="takeoff_height_m", value_str="10.0")],
-            has_cap_updates=False,
+        settings_msg = _ControlsStatus(
+            controls_name_list=["takeoff_height_m"],
+            controls_msg_list=[_Control(
+                name="takeoff_height_m", type="Float", set_int=0, set_float=10.0,
+                set_string="", set_strings=[], set_bool=False, set_index=0,
+                string_options=[],
+            )],
         )
         info_msg = _DeviceRBXInfo(
             connected=True, device_name="ardupilot", serial_num="", hw_version="", sw_version="",
@@ -552,7 +579,7 @@ class TestDroneFollowObjectMissionScript(unittest.TestCase):
 
         def _auto_firing_create_subscriber(namespace, msg, callback, queue_size=10, callback_args=(), log_name_list=[]):
             sub = self.real_create_subscriber(namespace, msg, callback, queue_size=queue_size, callback_args=callback_args)
-            if msg is self.module.SettingsStatus:
+            if msg is self.module.ControlsStatus:
                 callback(settings_msg)
             elif msg is self.module.DeviceRBXInfo:
                 callback(info_msg)
@@ -584,12 +611,15 @@ class TestDroneFollowObjectMissionScript(unittest.TestCase):
         self.assertIn("LAUNCH", instance.rbx_cap_setup_actions)
         self.assertIn("RTL", instance.rbx_cap_modes)
 
-        # Settings override: create_msg_from_setting -> Setting(type_str/
-        # name_str/value_str) published to the settings/update_setting topic.
+        # Settings override: built directly as an UpdateControl (name/type +
+        # the type-specific set_* field) and published to the settings
+        # update-control topic -- see this method's own 2026-09-14 comment
+        # for why this bypasses nepi_sdk.nepi_settings.create_msg_from_setting.
         published_settings = instance.rbx_setting_update_pub.published
         self.assertEqual(len(published_settings), 1)
-        self.assertEqual(published_settings[0].name_str, "takeoff_height_m")
-        self.assertEqual(published_settings[0].value_str, "10.0")
+        self.assertEqual(published_settings[0].name, "takeoff_height_m")
+        self.assertEqual(published_settings[0].type, "Float")
+        self.assertEqual(published_settings[0].set_float, 10.0)
 
         # Fake GPS / set-home are both deliberately OFF against a SITL target
         # (ENABLE_FAKE_GPS = False, SET_HOME = False -- see the module's own

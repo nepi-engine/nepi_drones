@@ -16,7 +16,8 @@
 #        - rbx/capabilities_query (nepi_interfaces/RBXCapabilitiesQuery service)
 #        - rbx/info (nepi_interfaces/DeviceRBXInfo)
 #        - rbx/status (nepi_interfaces/DeviceRBXStatus)
-#        - rbx/settings/status (nepi_interfaces/SettingsStatus)
+#        - rbx/settings/status (nepi_interfaces/ControlsStatus -- renamed
+#          from SettingsStatus, found live 2026-09-14)
 #        - rbx/goto_location (nepi_interfaces/GotoLocation)
 #        - rbx/set_goto_timeout (std_msgs/UInt32) -- renamed from
 #          rbx/set_cmd_timeout this session; this check is the actual
@@ -148,11 +149,14 @@ def main():
     print("\nChecking for rbx/status (nepi_interfaces/DeviceRBXStatus, optional)...")
     status_ok = check_topic_type("rbx/status", "nepi_interfaces/DeviceRBXStatus", required=False)
 
-    print("\nChecking for rbx/settings/status (nepi_interfaces/SettingsStatus, "
+    print("\nChecking for rbx/settings/status (nepi_interfaces/ControlsStatus, "
           "optional -- confirms settings moved under the rbx/settings/ "
-          "sub-namespace)...")
+          "sub-namespace; SettingsStatus was renamed to ControlsStatus "
+          "platform-wide, found live 2026-09-14 -- see "
+          "drone_follow_object_mission_script.py's own rbx_settings_callback "
+          "comment for the full story)...")
     settings_ok = check_topic_type(
-        "rbx/settings/status", "nepi_interfaces/SettingsStatus", required=False)
+        "rbx/settings/status", "nepi_interfaces/ControlsStatus", required=False)
 
     print("\nChecking for rbx/goto_location (nepi_interfaces/GotoLocation, optional)...")
     goto_ok = check_topic_type("rbx/goto_location", "nepi_interfaces/GotoLocation", required=False)
