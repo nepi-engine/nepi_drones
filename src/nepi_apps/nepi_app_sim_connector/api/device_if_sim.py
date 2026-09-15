@@ -1178,6 +1178,12 @@ class SimDeviceIF:
       self.update_error_msg("Motor speed ratio " + str(m_sr) + " out of range")
       return
     self.setMotorControlRatio(m_ind, m_sr)
+    # Clears any stale rejection (e.g. an earlier "manual controls not ready"
+    # from before the sim bridge connected) now that a motor command has
+    # actually gone through -- update_error_msg() has no expiry of its own,
+    # so without this a transient, no-longer-true error stuck in the RUI's
+    # "Last Error" banner forever. See update_error_msg's own docstring.
+    self.status_msg.last_error_message = ""
 
   def setCmdTimeoutCb(self, msg):
     if self.node_if is not None:
