@@ -221,6 +221,206 @@ class CameraBridgeDeviceRelay:
           return dst is b
 
 
+class DeviceSideRelay:
+  """Generic device-side half of a plain TCP relay -- listens on
+  device_listen_port for a VM-side "..._relay_vm.py" script to dial in, and
+  re-exposes whatever it forwards as a local TCP server on
+  127.0.0.1:local_port, exactly the address this driver's own code (or a
+  sample script's) already expects -- so that code needs zero changes.
+  Mirrors CameraBridgeDeviceRelay/SitlMavlinkRelay's already-proven shape
+  (VM dials device, never the device blindly dialing its own loopback and
+  hoping a reverse SSH tunnel is forwarding it). Generalized into one
+  parameterized class here, unlike those two hand-written copies, since a
+  third and fourth near-identical ~90-line class for RESET_SIM/TEARDOWN/
+  START_TRIGGER was worse than one class instantiated three times.
+
+  Found live 2026-09-15: RESET_SIM (rbx_ardupilot_node.py's own reset_sim())
+  and the follow-mission script's own TEARDOWN/START_TRIGGER connections
+  still dialed 127.0.0.1:<port> assuming a reverse SSH tunnel would forward
+  it -- unlike MAVLink and the camera bridge, which were already fixed to
+  this same VM-dials-device pattern back on 2026-09-08. Reported live: "hit
+  stop on the script, but the chair keeps moving... reset sim doesn't work
+  either... why not just use the same thing the rover uses to reset" -- the
+  rover's own fix (rbx_sim_node.py's bridgeLoop) is this exact pattern; the
+  quadcopter driver had it for MAVLink/camera already but never extended it
+  to these three one-shot control signals.
+
+  UNLIKE the continuous MAVLink/camera streams, RESET_SIM/TEARDOWN/
+  START_TRIGGER's real VM-side services (gz_reset_listener.py, and
+  ai_targeting_controller_ardupilot.py's teardown/start-trigger listeners)
+  are one-shot: the mere act of a client connecting IS the whole request --
+  neither side ever sends a payload (reset_sim() itself only connects and
+  reads a reply; see that method's own body). A first cut of this class
+  simply pumped raw bytes between local_conn and vm_conn like the
+  continuous relays do, which meant the VM-side relay script's own
+  reconnect loop re-dialed the real local service every ~2s regardless of
+  whether anything had actually asked for it -- confirmed live, resetting
+  the sim's pose on a timer with nobody pressing Reset Sim. Fixed by having
+  _relayLocalConn send an explicit TRIGGER_MARKER over vm_conn the instant
+  (and only when) a genuine local connection lands, so the VM-side script
+  can wait for that marker and dial its own real local service lazily, on
+  demand, instead of speculatively.
+  """
+  TRIGGER_MARKER = b'TRIGGER\n'
+  def __init__(self, label, device_listen_port, local_port):
+    self.label = label
+    self.device_listen_port = device_listen_port
+    self.local_port = local_port
+    self._started = False
+    self._start_lock = threading.Lock()
+    self._vm_conn = None
+    self._vm_conn_lock = threading.Lock()
+    self._local_active_lock = threading.Lock()
+
+  def ensure_started(self, msg_if):
+    with self._start_lock:
+      if self._started:
+        return
+      self._started = True
+      threading.Thread(target=self._vmAcceptLoop, args=(msg_if,), daemon=True).start()
+      threading.Thread(target=self._localAcceptLoop, args=(msg_if,), daemon=True).start()
+
+  def _vmAcceptLoop(self, msg_if):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.settimeout(None)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+      srv.bind(('0.0.0.0', self.device_listen_port))
+      srv.listen(1)
+    except Exception as e:
+      msg_if.pub_warn("%s: could not bind VM-facing port %d: %s" %
+                       (self.label, self.device_listen_port, str(e)))
+      return
+    msg_if.pub_info("%s: listening for the VM's relay script on port %d" %
+                     (self.label, self.device_listen_port))
+    while True:
+      try:
+        conn, addr = srv.accept()
+      except Exception as e:
+        msg_if.pub_warn("%s: VM-facing accept() error (continuing): %s" % (self.label, str(e)))
+        time.sleep(1.0)
+        continue
+      conn.settimeout(None)
+      msg_if.pub_info("%s: VM connected from %s" % (self.label, str(addr)))
+      with self._vm_conn_lock:
+        old = self._vm_conn
+        self._vm_conn = conn
+      if old is not None:
+        try:
+          old.close()
+        except Exception:
+          pass
+
+  def _localAcceptLoop(self, msg_if):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.settimeout(None)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+      srv.bind(('127.0.0.1', self.local_port))
+      srv.listen(1)
+    except Exception as e:
+      msg_if.pub_warn("%s: could not bind local port %d: %s" % (self.label, self.local_port, str(e)))
+      return
+    msg_if.pub_info("%s: listening for local clients on 127.0.0.1:%d" %
+                     (self.label, self.local_port))
+    while True:
+      try:
+        conn, addr = srv.accept()
+      except Exception as e:
+        msg_if.pub_warn("%s: local accept() error (continuing): %s" % (self.label, str(e)))
+        time.sleep(1.0)
+        continue
+      conn.settimeout(None)
+      threading.Thread(target=self._relayLocalConn, args=(conn, msg_if), daemon=True).start()
+
+  def _relayLocalConn(self, local_conn, msg_if):
+    if not self._local_active_lock.acquire(blocking=False):
+      try:
+        local_conn.close()
+      except Exception:
+        pass
+      return
+    try:
+      with self._vm_conn_lock:
+        vm_conn = self._vm_conn
+      if vm_conn is None:
+        msg_if.pub_warn("%s: local client connected but no VM relay is connected yet" % self.label)
+        try:
+          local_conn.recv(1)
+        except Exception:
+          pass
+        return
+      # See this class's own docstring: the marker is the ONLY thing ever
+      # sent on this connection before the real exchange -- it's what tells
+      # the VM-side relay script this is a genuine trigger, not a
+      # speculative reconnect, so it dials the real local service (e.g.
+      # gz_reset_listener.py) only now, on demand.
+      try:
+        vm_conn.sendall(self.TRIGGER_MARKER)
+      except Exception as e:
+        msg_if.pub_warn("%s: failed to send trigger marker to VM: %s" % (self.label, str(e)))
+        return
+      vm_conn_failed = self._pump(local_conn, vm_conn)
+      if vm_conn_failed:
+        with self._vm_conn_lock:
+          if self._vm_conn is vm_conn:
+            self._vm_conn = None
+        try:
+          vm_conn.close()
+        except Exception:
+          pass
+    except Exception as e:
+      msg_if.pub_warn("%s: local relay error: %s" % (self.label, str(e)))
+    finally:
+      try:
+        local_conn.close()
+      except Exception:
+        pass
+      self._local_active_lock.release()
+
+  @staticmethod
+  def _pump(a, b):
+    # Returns True only if `b` (vm_conn) is the side that actually failed --
+    # see CameraBridgeDeviceRelay._pump's own comment for why conflating
+    # "local side closed" with "vm_conn is dead" is the bug to avoid.
+    a.setblocking(False)
+    b.setblocking(False)
+    while True:
+      r, _, x = select.select([a, b], [], [a, b], 5.0)
+      if b in x:
+        return True
+      if a in x:
+        return False
+      for s in r:
+        try:
+          data = s.recv(65536)
+        except BlockingIOError:
+          continue
+        except Exception:
+          return s is b
+        if not data:
+          return s is b
+        dst = b if s is a else a
+        try:
+          dst.sendall(data)
+        except Exception:
+          return dst is b
+
+
+# Module-level singletons -- next free device-listen ports after
+# SitlMavlinkRelay's 9031 and CameraBridgeDeviceRelay's 9032 (see this
+# node's own RESET_SIM_HOST/PORT and the follow-mission script's
+# SIM_TEARDOWN_PORT/SIM_START_PORT for the local ports these expose).
+RESET_SIM_DEVICE_RELAY = DeviceSideRelay("ResetSimDeviceRelay", device_listen_port=9034, local_port=9021)
+TEARDOWN_DEVICE_RELAY = DeviceSideRelay("TeardownDeviceRelay", device_listen_port=9035, local_port=9029)
+# local_port=9037, NOT 9030 -- see drone_follow_object_mission_script.py's
+# own SIM_START_PORT comment: 9030 on THIS device collides with
+# sim_connector_app_node.py's unrelated FACTORY_LISTEN_PORT. Only this
+# device-local leg moved; ai_targeting_controller_ardupilot.py still listens
+# on 9030 on the VM.
+START_TRIGGER_DEVICE_RELAY = DeviceSideRelay("StartTriggerDeviceRelay", device_listen_port=9036, local_port=9037)
+
+
 #########################################
 # Node Class
 #########################################
@@ -780,6 +980,14 @@ class ArdupilotNode:
     # cameraBridgeLoop's own connect target either, both just harmlessly
     # retry forever).
     CameraBridgeDeviceRelay.ensure_started(self.msg_if)
+    # Same fix, extended to RESET_SIM and the follow-mission script's own
+    # TEARDOWN/START_TRIGGER connections -- see DeviceSideRelay's own
+    # docstring for why these three needed the identical treatment.
+    # Idempotent/unconditional to start exactly like CameraBridgeDeviceRelay
+    # above: harmless no-op retries against real hardware and the rover path.
+    RESET_SIM_DEVICE_RELAY.ensure_started(self.msg_if)
+    TEARDOWN_DEVICE_RELAY.ensure_started(self.msg_if)
+    START_TRIGGER_DEVICE_RELAY.ensure_started(self.msg_if)
     self.camera_bridge_thread = threading.Thread(target = self.cameraBridgeLoop)
     self.camera_bridge_thread.daemon = True
     self.camera_bridge_thread.start()

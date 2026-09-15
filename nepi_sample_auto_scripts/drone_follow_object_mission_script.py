@@ -326,8 +326,19 @@ SIM_TEARDOWN_TIMEOUT_SEC = 5.0
 # "selected" means this script was started, not that it later reaches any
 # particular stage of its own mission. Same best-effort,
 # times-out-quietly-against-real-hardware shape as the teardown call.
+#
+# Local port changed from 9030 to 9037 (2026-09-15): 9030 collides on THIS
+# DEVICE with sim_connector_app_node.py's own unrelated FACTORY_LISTEN_PORT
+# (its generic simulator-bridge listener, see sim_connector_app_node.py) --
+# harmless historically since the two ports lived on different machines
+# (this one dialed the VM's loopback through a reverse tunnel), but became a
+# real bind conflict once rbx_ardupilot_node.py's new
+# START_TRIGGER_DEVICE_RELAY needed to expose this SAME port locally on the
+# device itself (see DeviceSideRelay's own docstring for the full
+# VM-dials-device fix this is part of). ai_targeting_controller_ardupilot.py
+# itself still listens on 9030 on the VM -- only this device-local leg moved.
 SIM_START_HOST = "127.0.0.1"
-SIM_START_PORT = 9030
+SIM_START_PORT = 9037
 SIM_START_TIMEOUT_SEC = 5.0
 
 #########################################
