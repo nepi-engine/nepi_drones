@@ -87,16 +87,15 @@ class NepiAppSimConnector extends Component {
       <Columns>
         <Column>
 
-          {/* The reverse-SSH "OS instance" deploy-target picker
-              (NepiIFSimOsInstances, see docs/SIM_OS_INSTANCES_PLAN.md) is
-              deliberately not mounted here anymore -- requested live
-              (2026-09-04): with the shared-storage deploy_state.yaml flag
-              file now the real deploy/kill transport (see
-              simulator_launcher.py's _launch_via_deploy_state), reverse SSH
-              and per-machine registration aren't needed for deploy/kill to
-              work. The component and its backend topics are untouched, just
-              unmounted -- remount it here if reverse SSH deploy targets are
-              needed again later. */}
+          {/* The reverse-SSH "OS instance" multi-machine deploy-target picker
+              (formerly NepiIFSimOsInstances) has been removed entirely, not
+              just unmounted -- requested live (2026-09-15): the
+              shared-storage transport (simulator_launch_targets.yaml's
+              connection_mode: shared_storage + os_instance_id, dispatched
+              via simulator_launcher.py's _dispatch_shared_storage to
+              vm_command_watcher.py's mailbox) is the only deploy mechanism
+              in use, one fixed VM, no reverse SSH tunnel and no per-machine
+              registration UI needed. */}
 
           {/* show_controls is deliberately false, not a bug -- this panel's job is
               standing up the right sim/robot config, not direct control. Manual
