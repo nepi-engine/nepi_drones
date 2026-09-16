@@ -311,6 +311,29 @@ class ArdupilotDiscovery:
     self.logger = nepi_sdk.logger(log_name = self.log_name)
     time.sleep(1)
     self.logger.log_info("Starting Initialization")
+
+    # Requested live 2026-09-16: run a physical (SERIAL) ArduPilot and an
+    # ArduPilot SITL sim concurrently, with Robot Link mirroring commands
+    # between them, instead of the connection option's SERIAL/SITL toggle
+    # being an exclusive either-or. That only works if two driver entries
+    # (e.g. RBX_ARDUPILOT + RBX_ARDUPILOT_SITL, see
+    # rbx_ardupilot_sitl_params.yaml) can run this SAME class concurrently
+    # without corrupting each other -- drivers_mgr.py caches one
+    # ArdupilotDiscovery() instance per driver_name (keyed off each
+    # driver's own params yaml pkg_name), so two entries DO get two
+    # separate instances. But active_devices_dict/launch_time_dict/
+    # dont_retry_list were declared as CLASS attributes above and never
+    # reassigned here, so every instance mutating them in place
+    # (self.active_devices_dict[x] = ...) was actually reading and writing
+    # the ONE shared class-level dict/list -- undetectable with a single
+    # driver entry (nothing else could ever collide), but two concurrent
+    # instances would silently share and corrupt each other's purge/retry/
+    # backoff bookkeeping. Shadow each with a real instance attribute so
+    # every ArdupilotDiscovery() gets its own.
+    self.active_devices_dict = dict()
+    self.launch_time_dict = dict()
+    self.dont_retry_list = []
+
     self.logger.log_info("Initialization Complete")
 
 
@@ -321,6 +344,18 @@ class ArdupilotDiscovery:
     self.available_paths_list = available_paths_list
     self.active_paths_list = active_paths_list
     self.base_namespace = base_namespace
+
+    # Re-derive the log name from this driver entry's own pkg_name (e.g.
+    # "RBX_ARDUPILOT" vs "RBX_ARDUPILOT_SITL") the first time it's seen,
+    # rather than the module-level PKG_NAME constant every instance of this
+    # class would otherwise share -- with two concurrent driver entries
+    # now possible (see __init__'s comment), identical log names would
+    # make their log lines indistinguishable from each other.
+    drv_pkg_name = drv_dict.get('pkg_name', PKG_NAME)
+    wanted_log_name = drv_pkg_name.lower() + "_discovery"
+    if wanted_log_name != self.log_name:
+      self.log_name = wanted_log_name
+      self.logger = nepi_sdk.logger(log_name = self.log_name)
 
     ########################
     # Get discovery options

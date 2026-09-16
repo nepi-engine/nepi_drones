@@ -1,0 +1,39 @@
+driver:
+  pkg_name: RBX_ARDUPILOT_SITL
+  display_name: Ardupilot Autopilot (SITL)
+  description: >
+    Same ArdupilotDiscovery/ArdupilotNode as RBX_ARDUPILOT, run as a second,
+    independent driver entry pinned to connection=SITL. Requested live
+    2026-09-16 so a physical ArduPilot (RBX_ARDUPILOT, left on connection=
+    SERIAL) and an ArduPilot SITL sim can be discovered as two separate RBX
+    devices at the same time -- the single "connection" option on ONE entry
+    can only ever be SERIAL or SITL, never both, so this is a second entry
+    rather than a third option. Enable both this and RBX_ARDUPILOT
+    together to link a physical drone with Robot Link while flying its
+    SITL twin.
+  type: RBX
+  group_id: ARDU
+  NODE_DICT:
+    file_name: rbx_ardupilot_node.py
+    class_name: ArdupilotNode
+  DRIVER_DICT:
+    file_name: None
+    class_name: None
+  DISCOVERY_DICT:
+    file_name: rbx_ardupilot_discovery.py
+    class_name: ArdupilotDiscovery
+    process: CALL
+    OPTIONS:
+      connection:
+        type: Discrete
+        options:
+          - SERIAL
+          - SITL
+        default: SITL
+        value: SITL
+      fake_gps:
+        type: 'Bool'
+        options:
+          - ''
+        default: 'True'
+        value: 'True'
