@@ -46,8 +46,9 @@
 import threading
 
 from std_msgs.msg import Int32, UInt32, Empty
-from geometry_msgs.msg import Twist
-from geographic_msgs.msg import GeoPoint
+from geometry_msgs.msg import Twist, PoseStamped
+from geographic_msgs.msg import GeoPoint, GeoPoseStamped
+from mavros_msgs.msg import AttitudeTarget
 from nepi_interfaces.msg import MotorControl, GotoLocation, GotoPosition, GotoPose, ErrorBounds
 from nepi_interfaces.srv import RBXCapabilitiesQuery, RBXCapabilitiesQueryRequest
 
@@ -59,6 +60,41 @@ from nepi_sdk import nepi_sdk
 # analogue, unlike TAKEOFF/LAUNCH which are meaningful arm+mode+motor
 # sequences on real hardware too.
 NEVER_MIRRORED_ACTIONS = ('RESET_SIM',)
+
+# mavros setpoint topic (relative to each device's own mavlink_<id> node
+# namespace, a SIBLING of the RBX device's own namespace, not nested under
+# it) -> message type. Requested live 2026-09-16: "launching and the drone
+# flying in gazebo doesnt affect the physical drone at all... maybe it
+# might be better then to constantly send the commands... and translate it
+# over". Once GUIDED-mode autonomous flight is underway (from LAUNCH or any
+# goto_*), rbx_ardupilot_node.py's own sendGotoCommandLoop streams
+# position/attitude SETPOINTS directly to its own mavros connection --
+# entirely inside the MAVLink layer, never touching the RBX ROS command
+# topics MIRRORED_TOPICS relays. Mirroring only those RBX-level commands
+# (arm/mode/goto/motor-test) is why the physical drone armed and launched
+# correctly but then went no further: nothing carries the ONGOING setpoint
+# stream that is actually flying the sim. Two other approaches were
+# considered and rejected: MAV_CMD_DO_MOTOR_TEST (this driver's own
+# set_motor_control) is explicitly a ground-test command with no relation
+# to flight once airborne; RC_CHANNELS_OVERRIDE represents pilot STICK
+# axes, which GUIDED mode ignores entirely for its own internal control
+# loop, so it has nothing to feed the sim's autonomous flight into anyway.
+# Relaying the actual setpoint stream instead lets the physical drone's OWN
+# flight controller compute its own motor response to the SAME target the
+# sim is tracking -- each vehicle keeps its own control/safety loop, only
+# the target is shared.
+#
+# Only wired when BOTH devices' own device_node_name starts with
+# "ardupilot_" (see _maybe_wire_mavlink_setpoint_relay) -- this scheme is
+# ArduPilot/mavros-specific, not a generic RBX contract, and both ends
+# happening to share a driver class (ArduPilot serial + ArduPilot SITL) is
+# what makes the mavlink_<id> sibling-namespace derivation below safe to
+# assume.
+MAVLINK_SETPOINT_TOPICS = {
+  'setpoint_position/local': PoseStamped,
+  'setpoint_position/global': GeoPoseStamped,
+  'setpoint_raw/attitude': AttitudeTarget,
+}
 
 
 # topic name (relative to a device's own ".../rbx" namespace) -> message type,
@@ -181,8 +217,10 @@ class RobotLinkRelay:
     # (see rbx_ardupilot_node.py's launch()), never publishing to set_mode/
     # set_state themselves, so mirroring only those two topics (already in
     # MIRRORED_TOPICS) never actually mirrors what LAUNCH does.
-    sim_actions = self._query_setup_action_options(self.sim_namespace)
-    phys_actions = self._query_setup_action_options(self.physical_namespace)
+    sim_caps = self._query_capabilities(self.sim_namespace)
+    phys_caps = self._query_capabilities(self.physical_namespace)
+    sim_actions = list(sim_caps.setup_action_options) if sim_caps is not None else []
+    phys_actions = list(phys_caps.setup_action_options) if phys_caps is not None else []
     phys_index_by_name = {name: i for i, name in enumerate(phys_actions)
                           if name not in NEVER_MIRRORED_ACTIONS}
     sim_index_to_phys_index = {i: phys_index_by_name[name]
@@ -205,6 +243,8 @@ class RobotLinkRelay:
                           "(or capabilities_query unavailable), TAKEOFF/LAUNCH will not be mirrored",
                           log_name_list = self.log_name_list)
 
+    self._wire_mavlink_setpoint_relay(sim_caps, phys_caps, new_subs, new_pubs)
+
     self._pubs = new_pubs
     self._subs = new_subs
     self.enabled = True
@@ -212,22 +252,73 @@ class RobotLinkRelay:
     self.msg_if.pub_info("Robot link enabled: " + self.sim_namespace + " -> " +
                         self.physical_namespace, log_name_list = self.log_name_list)
 
-  def _query_setup_action_options(self, namespace):
+  def _query_capabilities(self, namespace):
     # Short, bounded wait -- a driver with no capabilities_query service (or
     # one that's slow to come up) should not block enabling the rest of the
     # link for 60s (nepi_sdk.wait_for_service's own default). Absence just
-    # means setup_action mirroring is skipped for this link, logged above.
+    # means setup_action/setpoint mirroring is skipped for this link, logged
+    # by each caller.
     service_name = namespace + '/capabilities_query'
     found = nepi_sdk.wait_for_service(service_name, timeout = 3, log_name_list = self.log_name_list)
     if not found:
-      return []
+      return None
     service = nepi_sdk.connect_service(service_name, RBXCapabilitiesQuery,
                                        log_name_list = self.log_name_list)
-    response = nepi_sdk.call_service(service, RBXCapabilitiesQueryRequest(),
-                                     verbose = False, log_name_list = self.log_name_list)
-    if response is None:
-      return []
-    return list(response.setup_action_options)
+    return nepi_sdk.call_service(service, RBXCapabilitiesQueryRequest(),
+                                 verbose = False, log_name_list = self.log_name_list)
+
+  def _wire_mavlink_setpoint_relay(self, sim_caps, phys_caps, new_subs, new_pubs):
+    # See MAVLINK_SETPOINT_TOPICS' own module-level comment for why this
+    # exists and why the other two approaches (MAV_CMD_DO_MOTOR_TEST,
+    # RC_CHANNELS_OVERRIDE) don't work for mirroring in-flight behavior.
+    if sim_caps is None or phys_caps is None:
+      self.msg_if.pub_info("Robot link: capabilities_query unavailable for sim or physical robot, "
+                          "in-flight setpoint mirroring will not be wired",
+                          log_name_list = self.log_name_list)
+      return
+    sim_node_name = str(sim_caps.device_node_name)
+    phys_node_name = str(phys_caps.device_node_name)
+    if not sim_node_name.startswith('ardupilot_') or not phys_node_name.startswith('ardupilot_'):
+      self.msg_if.pub_info("Robot link: in-flight setpoint mirroring only supports ArduPilot on "
+                          "both ends (device_node_name " + sim_node_name + " / " + phys_node_name +
+                          "), skipping",
+                          log_name_list = self.log_name_list)
+      return
+
+    # rbx_ardupilot_discovery.py's own launchDeviceNode names the ardupilot
+    # RBX node "ardupilot_<device_id_str>" and its mavros node
+    # "mavlink_<device_id_str>" from the SAME device_id_str -- e.g.
+    # "ardupilot_sitl" always has a sibling "mavlink_sitl". The mavlink node
+    # is NOT nested under the RBX device's own namespace (".../ardupilot_
+    # sitl/rbx"), it's a sibling directly under the shared root (".../
+    # mavlink_sitl"), so this replaces the RBX namespace's device segment
+    # rather than appending under it.
+    def mavlink_namespace(rbx_namespace, ardupilot_node_name, mavlink_node_name):
+      device_base = rbx_namespace.split('/rbx')[0]
+      root = device_base[:device_base.rfind('/' + ardupilot_node_name)]
+      return root + '/' + mavlink_node_name
+
+    sim_mavlink_ns = mavlink_namespace(self.sim_namespace, sim_node_name,
+                                       'mavlink_' + sim_node_name.split('_', 1)[1])
+    phys_mavlink_ns = mavlink_namespace(self.physical_namespace, phys_node_name,
+                                        'mavlink_' + phys_node_name.split('_', 1)[1])
+
+    for topic_name, msg_type in MAVLINK_SETPOINT_TOPICS.items():
+      pub = nepi_sdk.create_publisher(phys_mavlink_ns + '/' + topic_name, msg_type, queue_size = 5)
+      sub = nepi_sdk.create_subscriber(sim_mavlink_ns + '/' + topic_name, msg_type,
+                                       self._relay_cb, queue_size = 5,
+                                       callback_args = ('mavlink:' + topic_name, pub))
+      if pub is None or sub is None:
+        self.msg_if.pub_warn("Robot link: failed to wire mavlink setpoint relay topic: " + topic_name,
+                             log_name_list = self.log_name_list)
+        if pub is not None:
+          try:
+            pub.unregister()
+          except Exception:
+            pass
+        continue
+      new_pubs['mavlink:' + topic_name] = pub
+      new_subs['mavlink:' + topic_name] = sub
 
   def _stop_locked(self, reason):
     if not self.enabled and not self._subs:
