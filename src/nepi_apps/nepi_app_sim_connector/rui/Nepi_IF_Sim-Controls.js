@@ -73,32 +73,38 @@ const FALLBACK_SETTING_TYPES = {
   camera_fov_deg: "Float",
 }
 
-// Reads a nepi_interfaces/Control's CURRENT value out of whichever set_*
-// field its own 'type' selects. The real, live message (confirmed via
-// rosmsg on the device 2026-09-09 -- see rbxSettingsListener's own comment)
-// carries every type's field on every Control regardless of that Control's
-// own type, at message-default (0/''/false), so this must dispatch on
-// ctrl.type rather than checking which fields are merely present.
+// Reads a nepi_interfaces/Control's CURRENT value. This was written against
+// a retired per-type field shape (set_int/set_float/set_string/set_bool/
+// set_index/set_strings/string_options), none of which exist on the message
+// any more -- confirmed live 2026-09-16 chasing why enabled_image_sources
+// never actually restricted the Image Source dropdown: those field reads
+// were all silently `undefined`, so rbxSettingsValuesDict["enabled_image_
+// sources"] was always '', which renderImageSourceCuration's own "empty
+// means unrestricted" fallback then (correctly, given what it saw) treated
+// as "show every candidate checked" -- the curation Setting could never be
+// read back, independent of whether it was ever saved. The current message
+// carries one generic `value` (string[]) field for every type instead (see
+// Nepi_IF_Control.js's own getControlValue(), the reference implementation
+// this mirrors) -- a single-element array for every type this function
+// handles, joined for the two real list types (Selections/Toggles).
 function extractControlValue(ctrl) {
   if (ctrl == null) { return '' }
   const type = ctrl.type
-  if (type === "Int") { return String(ctrl.set_int) }
-  if (type === "Float" || type === "FloatSlider" || type === "FloatSliders") {
-    return String(ctrl.set_float)
-  }
+  const msg_value = ctrl.value || []
   if (type === "Selections" || type === "Toggles") {
-    return (ctrl.set_strings || []).join(',')
-  }
-  if (type === "Bool" || type === "Toggle" || type === "Trigger") {
-    return ctrl.set_bool ? "TRUE" : "FALSE"
+    return msg_value.join(',')
   }
   if (type === "Menu") {
-    const options = ctrl.string_options || ctrl.options || []
-    const index = ctrl.set_index
-    return (index >= 0 && index < options.length) ? options[index] : String(index)
+    const options = ctrl.options || []
+    const index = parseInt(msg_value[0], 10)
+    return (index >= 0 && index < options.length) ? options[index] : String(msg_value[0])
   }
-  // Selection, Discrete (legacy alias), String, and any other type.
-  return (ctrl.set_string !== undefined) ? ctrl.set_string : ''
+  if (type === "Toggle") {
+    return (msg_value[0] === 'True' || msg_value[0] === 'true') ? "TRUE" : "FALSE"
+  }
+  // Selection, Discrete (legacy alias), String, Int, Float, and any other
+  // scalar type -- value[0] is already the plain string representation.
+  return (msg_value.length > 0) ? String(msg_value[0]) : ''
 }
 
 @inject("ros")
@@ -1746,31 +1752,47 @@ class NepiIFSimControls extends Component {
       : (FALLBACK_SETTING_TYPES[name] !== undefined) ? FALLBACK_SETTING_TYPES[name]
       : ((typeHint === "Discrete") ? "Selection" : typeHint)
 
+    // UpdateControl.msg's ACTUAL current fields (confirmed live via `rosmsg
+    // show nepi_interfaces/UpdateControl` 2026-09-16): name, display_name,
+    // description, value (string[]), index (string), min_bound (string),
+    // max_bound (string), options (string[]) -- a single generic value
+    // carrier for every type, mirroring Control.msg's own read-side shape
+    // (see extractControlValue() above). This used to build a retired
+    // per-type field set (set_index/set_string/set_strings/set_int/
+    // set_float/set_floats/set_bool) that doesn't exist on the message any
+    // more, so every update sent through this function -- environment
+    // selection, camera_controls_enabled and other capability toggles, and
+    // enabled_image_sources curation -- published a value-less message and
+    // silently never took effect, independent of the backend
+    // settingUpdateFunction bugs fixed separately in rbx_sim_node.py /
+    // rbx_ardupilot_node.py.
     const data = {
       name: name,
       display_name: "",
       description: "",
       type: type,
-      set_index: 0,
-      set_string: "",
-      set_strings: [],
-      set_int: 0,
-      set_float: 0.0,
-      set_floats: [],
-      set_bool: false,
+      value: [],
+      index: "",
+      min_bound: "",
+      max_bound: "",
+      options: [],
     }
-    if (type === "Menu") { data.set_index = parseInt(value, 10) || 0 }
+    if (type === "Menu") {
+      // Menu's value is the selected option's index, as a string (matches
+      // extractControlValue()'s own read of msg_value[0] as an index).
+      data.value = [String(parseInt(value, 10) || 0)]
+    }
     else if (type === "Selections" || type === "Toggles") {
-      data.set_strings = Array.isArray(value) ? value : String(value).split(',')
+      data.value = Array.isArray(value) ? value.map(String) : String(value).split(',')
     }
-    else if (type === "Int") { data.set_int = parseInt(value, 10) || 0 }
+    else if (type === "Int") { data.value = [String(parseInt(value, 10) || 0)] }
     else if (type === "Float" || type === "FloatSlider" || type === "FloatSliders") {
-      data.set_float = parseFloat(value) || 0.0
+      data.value = [String(parseFloat(value) || 0.0)]
     }
     else if (type === "Bool" || type === "Toggle" || type === "Trigger") {
-      data.set_bool = (value === true || value === "True" || value === "TRUE")
+      data.value = [(value === true || value === "True" || value === "TRUE") ? "True" : "False"]
     }
-    else { data.set_string = String(value) } // Selection, Discrete, String
+    else { data.value = [String(value)] } // Selection, Discrete, String
 
     this.props.ros.publishMessage({
       name: settingsNamespace + "/update_setting",
