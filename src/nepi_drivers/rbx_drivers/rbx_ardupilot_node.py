@@ -36,6 +36,7 @@ from nepi_sdk import nepi_sdk
 from nepi_sdk import nepi_nav
 from nepi_sdk import nepi_utils
 from nepi_sdk import nepi_settings
+from nepi_sdk import nepi_controls
 from nepi_sdk import nepi_img
 
 from std_msgs.msg import Empty, Int8, UInt8, UInt32, Bool, String, Float32, Float64
@@ -47,7 +48,7 @@ from mavros_msgs.srv import CommandBool, CommandBoolRequest, SetMode, SetModeReq
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Image, NavSatFix, BatteryState
 
-from nepi_interfaces.msg import AxisControls
+from nepi_interfaces.msg import AxisControls, UpdateBool
 
 from nepi_api.device_if_rbx import RBXRobotIF
 from nepi_api.messages_if import MsgIF
@@ -695,7 +696,11 @@ class ArdupilotNode:
   navpose_dict = copy.deepcopy(nepi_nav.BLANK_NAVPOSE_DICT)
 
 
-  settings_dict = FACTORY_SETTINGS
+  # Built by initSettingsDict() -- these two are legacy-shaped ({'type','name',
+  # 'value'/'options'} per entry) inputs, not the modern nepi_controls controls
+  # dict SettingsIF actually requires (see initSettingsDict()'s own comment).
+  init_settings_dict = dict()
+  settings_dict = dict()
 
   axis_controls = AxisControls()
   axis_controls.x = True
@@ -988,6 +993,18 @@ class ArdupilotNode:
     RESET_SIM_DEVICE_RELAY.ensure_started(self.msg_if)
     TEARDOWN_DEVICE_RELAY.ensure_started(self.msg_if)
     START_TRIGGER_DEVICE_RELAY.ensure_started(self.msg_if)
+    # Build the real, modern nepi_controls controls dict before starting the
+    # camera bridge thread below -- confirmed live: with this after the
+    # thread start instead, a fast bridge connect could call
+    # sendCameraSettings() (which reads self.settings_dict['camera_offset_x']
+    # etc.) while self.settings_dict was still its empty class-level default,
+    # raising "KeyError: 'camera_offset_x'" in that thread. initSettingsDict()
+    # only needs self.msg_if/self.node_name (set at the very top of __init__)
+    # and the CAP_SETTINGS/FACTORY_SETTINGS class constants, so there's no
+    # reason it needs to run this late in the first place.
+    self.settings_dict = self.initSettingsDict()
+    self.settings_dict = self.refreshSettingsDict()
+
     self.camera_bridge_thread = threading.Thread(target = self.cameraBridgeLoop)
     self.camera_bridge_thread.daemon = True
     self.camera_bridge_thread.start()
@@ -1047,12 +1064,19 @@ class ArdupilotNode:
     FAKE_GPS_APP_NODE_NAME = "app_fake_gps"
     FAKE_GPS_NAMESPACE = os.path.join(self.base_namespace, FAKE_GPS_APP_NODE_NAME)
     self.msg_if.pub_info("Setting up fake_gps pubs at namespace: " + FAKE_GPS_NAMESPACE)
-    self.fake_gps_enable_pub = nepi_sdk.create_publisher(FAKE_GPS_NAMESPACE + "/enable", Bool, queue_size=1)
+    # update_device_enable (UpdateBool: name=this device's OWN mavros namespace,
+    # value=enabled) replaced the old select_mavros_node+enable pair. app_fake_gps
+    # is a single shared instance, and the previous single global enabled+
+    # selected_mavros_node meant two ArduPilot devices running at once (a
+    # physical drone + its SITL twin) fought over the same shared toggle --
+    # whichever device (re)launched most recently silently won and undid the
+    # other's setting (confirmed live 2026-09-16). Addressing by name means this
+    # device only ever touches its own entry, never anyone else's.
+    self.fake_gps_update_enable_pub = nepi_sdk.create_publisher(FAKE_GPS_NAMESPACE + "/update_device_enable", UpdateBool, queue_size=1)
     self.fake_gps_reset_pub = nepi_sdk.create_publisher(FAKE_GPS_NAMESPACE + "/reset", GeoPoint, queue_size=1)
     self.fake_gps_go_stop_pub = nepi_sdk.create_publisher(FAKE_GPS_NAMESPACE + "/go_stop", Empty, queue_size=1)
     self.fake_gps_goto_position_pub = nepi_sdk.create_publisher(FAKE_GPS_NAMESPACE + "/goto_position", Point, queue_size=1)
     self.fake_gps_goto_location_pub = nepi_sdk.create_publisher(FAKE_GPS_NAMESPACE + "/goto_location", GeoPoint, queue_size=1)
-    self.fake_gps_select_pub = nepi_sdk.create_publisher(FAKE_GPS_NAMESPACE + "/select_mavros_node", String, queue_size=1)
 
     # Reconcile the Fake GPS app against what kind of vehicle this actually is.
     # Placed here, after the fake_gps publishers exist, rather than earlier next
@@ -1173,29 +1197,133 @@ class ArdupilotNode:
             settings[setting_name]['value'] = self.FACTORY_SETTINGS_OVERRIDES[setting_name]
     return settings
 
+  def initSettingsDict(self):
+    # CAP_SETTINGS/FACTORY_SETTINGS are a legacy, pre-controls-system shape
+    # ({'type','name','options'} / {'type','name','value'}) that RBXRobotIF's
+    # own capSettings=/factorySettings= constructor args accept but never
+    # actually consume any more (see device_if_rbx.py's own comment at its
+    # SettingsIF(...) construction) -- getSettingsFunction/setSettingFunction
+    # are the only things SettingsIF actually reads, and it requires a real
+    # nepi_controls controls dict (each entry carrying 'default', and
+    # 'bounds'/'options' as its type requires), not this legacy shape.
+    # Confirmed live: leaving self.settings_dict as a bare alias of
+    # FACTORY_SETTINGS meant every entry was missing 'default', so
+    # nepi_controls.update_status_msg() dropped every single setting out of
+    # the RUI's settings status ("update_status_msg: left control 'x' out
+    # of the status message: KeyError: 'default'", once per setting per
+    # publish) -- the RUI's Settings panel was empty because there was
+    # nothing valid left to show it. This mirrors the reference pattern in
+    # nepi_engine_ws's own (unused-by-this-checkout) rbx_ardupilot_node.py.
+    init_settings_dict = dict()
+    for setting_name in self.CAP_SETTINGS.keys():
+      cap_setting = self.CAP_SETTINGS[setting_name]
+      setting_type = cap_setting['type']
+      setting_dict = dict()
+      setting_dict['type'] = setting_type
+      # The retired cap-settings form carried an Int/Float control's min and
+      # max in an 'options' pair; a Selection/Discrete/String control's
+      # actual option list also rode in 'options' -- the controls contract
+      # splits these into 'bounds' (numeric) vs 'options' (named choices).
+      if 'options' in cap_setting.keys():
+        try:
+          if setting_type == 'Int':
+            setting_dict['bounds'] = [int(cap_setting['options'][0]), int(cap_setting['options'][1])]
+          elif setting_type == 'Float':
+            setting_dict['bounds'] = [float(cap_setting['options'][0]), float(cap_setting['options'][1])]
+          else:
+            setting_dict['options'] = [str(option) for option in cap_setting['options']]
+        except Exception as e:
+          self.msg_if.pub_warn("Invalid bounds/options for setting: " + setting_name + " : " + str(e))
 
-  def getSettings(self):  
-    return self.settings_dict
+      default = None
+      if setting_name in self.FACTORY_SETTINGS.keys():
+        default = self.FACTORY_SETTINGS[setting_name]['value']
+      if setting_name in self.FACTORY_SETTINGS_OVERRIDES.keys():
+        default = self.FACTORY_SETTINGS_OVERRIDES[setting_name]
+      if default is None:
+        continue
+      try:
+        if setting_type == 'Int':
+          default = int(float(default))
+        elif setting_type == 'Float':
+          default = float(default)
+        elif setting_type == 'Toggle':
+          default = (str(default) == 'True' or str(default) == 'true')
+        else:
+          default = str(default)
+      except Exception as e:
+        self.msg_if.pub_warn("Invalid factory value for setting: " + setting_name + " : " + str(e))
+        continue
+      setting_dict['default'] = default
+      init_settings_dict[setting_name] = setting_dict
 
-  def settingUpdateFunction(self,setting):
+    self.init_settings_dict = init_settings_dict
+    settings_dict = nepi_controls.create_controls_dict(init_settings_dict)
+    settings_dict_values = nepi_controls.get_controls_values_dict(settings_dict)
+    self.msg_if.pub_info("Initialized Settings: " + str(settings_dict_values))
+    return settings_dict
+
+  def refreshSettingsDict(self):
+    # Nothing live to read back at startup -- 'environment' is the one
+    # setting whose real option list arrives later, asynchronously, over the
+    # camera bridge (see processCameraBridgeLine's 'environment_options'
+    # branch), which updates self.settings_dict directly via
+    # nepi_controls.set_control_options() once it actually arrives.
+    return copy.deepcopy(self.settings_dict)
+
+  def getSettings(self):
+    # Deep copy, not a bare reference: SettingsIF assigns whatever this
+    # returns directly to its own self.settings_dict (system_if.py's
+    # __init__/init()/reset()/factory_reset()), then mutates individual
+    # entries of it in place (nepi_controls.reset_control_values() etc.).
+    # Without a copy here, that mutation lands on THIS object's own live
+    # settings_dict too (same nested dicts, shared by reference) --
+    # confirmed live: motor_test_max_throttle_percent's own 'value' field
+    # was intermittently observed replaced with a whole nested dict,
+    # racing against SettingsIF's own init/reset cycle, which crashed
+    # setMotorControlRatio ("TypeError: float() argument must be ... not
+    # 'dict'") and silently no-op'd manual motor control and (via the same
+    # settings_dict) the LAUNCH/TAKEOFF setup action, while ARM/DISARM
+    # (which never reads settings_dict) kept working -- exactly the
+    # reported "can arm and disarm, not much else" symptom.
+    return copy.deepcopy(self.settings_dict)
+
+  def settingUpdateFunction(self, setting_name, setting_value):
+    # SettingsIF (system_if.py) calls setSettingFunction(name, value,
+    # [callback_arg]) -- two/three plain positional args, not the single
+    # combined {'name','type','value'} dict this function's own body used to
+    # be written against (see git history/session notes for that mismatch).
+    # Validation now goes through nepi_controls.get_clean_value(), matching
+    # the modern controls dict initSettingsDict() actually builds -- the old
+    # nepi_settings.check_valid_setting(setting, self.cap_settings) path
+    # validated against CAP_SETTINGS' legacy shape, which is no longer what
+    # self.settings_dict's entries look like.
     success = False
-    setting_str = str(setting)
-    setting_name = setting['name']
-    if nepi_settings.check_valid_setting(setting,self.cap_settings):
-      if setting_name in self.settings_dict.keys():
-        self.settings_dict[setting_name]['value'] = setting['value']
-        success = True
-      else:
-        msg = (self.node_name  + " Setting name" + setting_str + " is not supported") 
-      if success == True:
-        msg = ( self.node_name  + " UPDATED SETTINGS " + setting_str)
-        if setting_name in self.CAMERA_SETTING_NAMES:
-          self.sendCameraSettings()
-        if setting_name in self.ENVIRONMENT_SETTING_NAMES:
-          self.setEnvironmentAction(setting['value'])
-    else:
-      msg = (self.node_name  + " Setting data" + setting_str + " is not valid")
-    return success, msg
+    setting_str = setting_name + ":" + str(setting_value)
+    if setting_name not in self.settings_dict.keys():
+      msg = (self.node_name + " Setting name " + setting_str + " is not supported")
+      return success, msg, copy.deepcopy(self.settings_dict)
+    # get_clean_value() returns None for an invalid value -- test 'is None',
+    # not falsiness, since a Toggle can legitimately clean to False.
+    if nepi_controls.get_clean_value(self.settings_dict, setting_name, setting_value) is None:
+      msg = (self.node_name + " Setting data " + setting_str + " is not valid")
+      return success, msg, copy.deepcopy(self.settings_dict)
+
+    self.settings_dict = nepi_controls.set_control_value(self.settings_dict, setting_name, setting_value)
+    success = True
+    msg = (self.node_name + " UPDATED SETTINGS " + setting_str)
+    if setting_name == 'motor_count':
+      # motor_ratios is sized from motor_count, so it has to be resized with it.
+      self.motor_ratios = [0.0] * int(nepi_controls.get_control_value(self.settings_dict, 'motor_count'))
+    if setting_name in self.CAMERA_SETTING_NAMES:
+      self.sendCameraSettings()
+    if setting_name in self.ENVIRONMENT_SETTING_NAMES:
+      self.setEnvironmentAction(setting_value)
+    # Deep copy, matching getSettings()'s own reasoning exactly: SettingsIF
+    # assigns this 3rd element straight to its own self.settings_dict, so
+    # returning the live object here would re-alias it right back after
+    # getSettings() already stopped doing so.
+    return success, msg, copy.deepcopy(self.settings_dict)
 
   ##########################
   # RBX Interface Functions
@@ -1252,7 +1380,8 @@ class ArdupilotNode:
     return self.home_location
 
   def setFakeGPSFunction(self,fake_gps_enabled):
-    self.fake_gps_enable_pub.publish(data = fake_gps_enabled)
+    self.fake_gps_update_enable_pub.publish(name = self.mavlink_namespace.rstrip('/'),
+                                            name2 = "", name3 = "", value = fake_gps_enabled)
 
 
   def setMotorControlRatio(self,motor_ind,speed_ratio):
@@ -2119,35 +2248,40 @@ class ArdupilotNode:
     # builds as connection_type + "_" + address (see discoveryFunction): a SITL
     # connection is always "SITL_<addr>_<port>", every real connection type
     # (SERIAL/USB/TCP/UDP to an actual FCU) is not.
-    #   SITL  -> disable Fake GPS (the sim has its own GPS; injection breaks it)
-    #   real  -> point Fake GPS at this vehicle's mavros node and enable it
+    #   SITL  -> disable Fake GPS for THIS device's own mavros node (the sim
+    #            has its own GPS; injection would break it)
+    #   real  -> enable Fake GPS for THIS device's own mavros node
     #
-    # Ordering matters on the enable path: select_mavros_node is published and
-    # allowed to land BEFORE enable, otherwise the app can start publishing
-    # against a stale/None selection. Both publishers are latched so the app
-    # still receives them if it comes up after this driver.
+    # update_device_enable (UpdateBool: name=this device's own mavros
+    # namespace, value=enabled) addresses only this device's own entry in
+    # app_fake_gps's per-device enabled_devices list -- see
+    # fake_gps_app_node.py's own NepiAppFakeGpsStatus.msg comment for why this
+    # replaced a single global enabled+selected_mavros_node: with two ArduPilot
+    # devices running at once (a physical drone + its SITL twin), each one's
+    # own reconcile used to stomp the other's setting, since there was only
+    # one shared toggle for the whole system to fight over. Addressing by name
+    # means this device's reconcile can never touch anyone else's entry.
     #
     # Timing note: this runs once, here, rather than on a timer. Discovery
     # relaunches this whole node whenever the vehicle is re-detected (see
     # checkOnDevice), so "once per detected vehicle" is exactly the right
     # granularity, and it deliberately does NOT fight a human who later toggles
-    # Fake GPS by hand in the RUI for that same vehicle.
+    # Fake GPS by hand in the RUI for that same vehicle's own row.
     is_sitl = self.is_sitl
     try:
       # Wait for the app's subscriber to actually connect before publishing.
-      # These publishers are created immediately above, and a rospy publish
+      # This publisher is created immediately above, and a rospy publish
       # issued before the subscriber connection completes is dropped on the
       # floor with no error -- confirmed live 2026-08-12, an earlier version
       # published straight after create_publisher and the app's enabled flag
       # never changed. Absence of a subscriber is not an error (the Fake GPS app
       # need not be installed), so waitForPubConnection just times out and we
       # publish anyway.
-      if is_sitl == False:
-        self.waitForPubConnection(self.fake_gps_select_pub)
-        nepi_sdk.publish_pub(self.fake_gps_select_pub, String(self.mavlink_namespace.rstrip('/')))
-        nepi_sdk.sleep(1,10)
-      self.waitForPubConnection(self.fake_gps_enable_pub)
-      nepi_sdk.publish_pub(self.fake_gps_enable_pub, Bool(not is_sitl))
+      self.waitForPubConnection(self.fake_gps_update_enable_pub)
+      update_msg = UpdateBool()
+      update_msg.name = self.mavlink_namespace.rstrip('/')
+      update_msg.value = (not is_sitl)
+      nepi_sdk.publish_pub(self.fake_gps_update_enable_pub, update_msg)
       if is_sitl:
         self.msg_if.pub_warn("Simulated vehicle detected (device_path " + str(self.device_path)
                              + ") -- disabling the Fake GPS app so its injected GPS_INPUT cannot"
@@ -2551,7 +2685,12 @@ class ArdupilotNode:
       # driver's own Discrete-setting validation, same safety net every other
       # Setting here already relies on.
       model_names = [str(n) for n in msg.get('options', [])]
-      self.CAP_SETTINGS['environment']['options'] = ["FLAT_GROUND"] + [n.upper() for n in model_names]
+      options = ["FLAT_GROUND"] + [n.upper() for n in model_names]
+      self.CAP_SETTINGS['environment']['options'] = options
+      # CAP_SETTINGS is only ever consulted once, at initSettingsDict() time --
+      # the live settings_dict (what SettingsIF/the RUI actually see) has to
+      # be updated directly, or this resync never reaches anything.
+      self.settings_dict = nepi_controls.set_control_options(self.settings_dict, 'environment', options)
       self.ENVIRONMENT_VALUE_TO_MODEL.update({n.upper(): n for n in model_names})
     else:
       self.msg_if.pub_warn("Unrecognized camera bridge line type: " + str(msg.get('type')))
