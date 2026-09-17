@@ -43,6 +43,7 @@
 # acknowledgment, immediately disables an active link rather than leaving it
 # running against a stale target.
 
+import copy
 import threading
 
 from std_msgs.msg import Int32, UInt32, Empty
@@ -96,6 +97,24 @@ MAVLINK_SETPOINT_TOPICS = {
   'setpoint_raw/attitude': AttitudeTarget,
 }
 
+# Reported live 2026-09-16: mirroring worked "up to an instant" (while the sim
+# was actively mid-goto), then the physical drone "just sat in armed and
+# guided mode, but not really flying or hovering anymore -- the motors just
+# doing their default arm thing". Root cause: sendGotoCommandLoop only
+# republishes a setpoint WHILE a goto is actively converging (its own loop
+# checks status_msg.ready == False); once the target is reached (or the
+# attempt times out) it stops publishing entirely and the sim's OWN flight
+# controller holds position from then on using nothing but its internal EKF
+# -- no further ROS traffic to relay. The physical drone's mavros then has no
+# guided-mode target fresher than that one last message, and ArduPilot's own
+# "no recent guided target" handling is exactly the idle-pulsing behavior
+# reported. Fixed by caching the latest message per setpoint topic and
+# re-publishing it continuously on a timer (with a freshened header stamp)
+# instead of relaying only on receipt -- the physical drone's own flight
+# controller then always has a live, recent target to track, whether the sim
+# is actively moving or holding still.
+MAVLINK_SETPOINT_STREAM_RATE_HZ = 10.0
+
 
 # topic name (relative to a device's own ".../rbx" namespace) -> message type,
 # for every RBX command this relay mirrors from sim to physical robot.
@@ -131,6 +150,15 @@ class RobotLinkRelay:
 
     self._subs = {}   # topic_name -> rospy Subscriber, on sim_namespace
     self._pubs = {}   # topic_name -> rospy Publisher, on physical_namespace
+
+    # mavlink setpoint continuous-restream state (see MAVLINK_SETPOINT_
+    # STREAM_RATE_HZ's own comment). _mavlink_lock is separate from self.lock:
+    # the stream timer callback must never risk blocking behind self.lock,
+    # which _start_locked/_stop_locked can hold for the whole (re)wiring
+    # pass -- a timer tick landing mid-rewire would otherwise deadlock or
+    # publish through a half-torn-down publisher.
+    self._mavlink_lock = threading.Lock()
+    self._mavlink_latest_msgs = {}   # 'mavlink:<topic_name>' -> last received msg
 
   def select_sim_robot(self, sim_namespace):
     sim_namespace = str(sim_namespace)
@@ -303,11 +331,13 @@ class RobotLinkRelay:
     phys_mavlink_ns = mavlink_namespace(self.physical_namespace, phys_node_name,
                                         'mavlink_' + phys_node_name.split('_', 1)[1])
 
+    wired_any = False
     for topic_name, msg_type in MAVLINK_SETPOINT_TOPICS.items():
+      topic_key = 'mavlink:' + topic_name
       pub = nepi_sdk.create_publisher(phys_mavlink_ns + '/' + topic_name, msg_type, queue_size = 5)
       sub = nepi_sdk.create_subscriber(sim_mavlink_ns + '/' + topic_name, msg_type,
-                                       self._relay_cb, queue_size = 5,
-                                       callback_args = ('mavlink:' + topic_name, pub))
+                                       self._cacheAndRelayMavlinkSetpointCb, queue_size = 5,
+                                       callback_args = (topic_key,))
       if pub is None or sub is None:
         self.msg_if.pub_warn("Robot link: failed to wire mavlink setpoint relay topic: " + topic_name,
                              log_name_list = self.log_name_list)
@@ -317,8 +347,21 @@ class RobotLinkRelay:
           except Exception:
             pass
         continue
-      new_pubs['mavlink:' + topic_name] = pub
-      new_subs['mavlink:' + topic_name] = sub
+      new_pubs[topic_key] = pub
+      new_subs[topic_key] = sub
+      wired_any = True
+
+    # Kick off the continuous-restream timer (see MAVLINK_SETPOINT_STREAM_
+    # RATE_HZ's own comment) -- self-rescheduling oneshot rather than a
+    # repeating timer, since nepi_sdk.start_timer_process returns only a
+    # success bool, not a handle this class could later shut down; the
+    # callback's own `if not self.enabled: return` guard ends the chain
+    # cleanly once _stop_locked flips that flag, with no leaked timer.
+    if wired_any:
+      with self._mavlink_lock:
+        self._mavlink_latest_msgs = {}
+      nepi_sdk.start_timer_process(1.0 / MAVLINK_SETPOINT_STREAM_RATE_HZ,
+                                   self._mavlinkStreamCb, oneshot = True)
 
   def _stop_locked(self, reason):
     if not self.enabled and not self._subs:
@@ -335,6 +378,8 @@ class RobotLinkRelay:
         pass
     self._subs = {}
     self._pubs = {}
+    with self._mavlink_lock:
+      self._mavlink_latest_msgs = {}
     was_enabled = self.enabled
     self.enabled = False
     if was_enabled:
@@ -347,6 +392,47 @@ class RobotLinkRelay:
     except Exception as e:
       self.msg_if.pub_warn("Robot link relay failed on " + topic_name + ": " + str(e),
                            log_name_list = self.log_name_list, throttle_s = 5.0)
+
+  def _cacheAndRelayMavlinkSetpointCb(self, msg, args):
+    # Immediate relay (low latency while the sim is actively moving) AND
+    # cache the latest value so _mavlinkStreamCb can keep re-publishing it
+    # even after the sim stops sending new ones (see MAVLINK_SETPOINT_
+    # STREAM_RATE_HZ's own comment for why that gap existed).
+    topic_key = args[0]
+    with self._mavlink_lock:
+      self._mavlink_latest_msgs[topic_key] = msg
+    pub = self._pubs.get(topic_key)
+    if pub is not None:
+      self._publishMavlinkSetpoint(topic_key, pub, msg)
+
+  def _publishMavlinkSetpoint(self, topic_key, pub, msg):
+    try:
+      out = copy.deepcopy(msg)
+      if hasattr(out, 'header'):
+        # Freshen the stamp on every re-publish (including replays of a
+        # cached message the sim itself hasn't touched in a while) -- the
+        # physical FC needs to see this as a live, current target, not
+        # stale data from whenever the sim last actually changed it.
+        out.header.stamp = nepi_sdk.get_msg_stamp()
+      pub.publish(out)
+    except Exception as e:
+      self.msg_if.pub_warn("Robot link relay failed on " + topic_key + ": " + str(e),
+                           log_name_list = self.log_name_list, throttle_s = 5.0)
+
+  def _mavlinkStreamCb(self, timer):
+    if not self.enabled:
+      # Link was disabled since this chain's last tick -- end it here
+      # rather than rescheduling again. No timer handle to explicitly
+      # cancel (see this chain's own start-site comment).
+      return
+    with self._mavlink_lock:
+      items = list(self._mavlink_latest_msgs.items())
+    for topic_key, msg in items:
+      pub = self._pubs.get(topic_key)
+      if pub is not None:
+        self._publishMavlinkSetpoint(topic_key, pub, msg)
+    nepi_sdk.start_timer_process(1.0 / MAVLINK_SETPOINT_STREAM_RATE_HZ,
+                                 self._mavlinkStreamCb, oneshot = True)
 
   def _relay_setup_action_cb(self, msg, args):
     sim_index_to_phys_index, pub = args
