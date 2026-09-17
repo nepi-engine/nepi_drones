@@ -629,12 +629,24 @@ class ArdupilotNode:
 
   RBX_STATES = ["DISARM","ARM"]
   RBX_MODES = ["STABILIZE","LAND","RTL","LOITER","GUIDED","RESUME"]
-  RBX_SETUP_ACTIONS = ["TAKEOFF","LAUNCH","RESET_SIM"]
+  # FORCE_DISARM requested live 2026-09-16: a plain DISARM (set_state) is
+  # correctly REFUSED by ArduPilot's own mid-air safety interlock while the
+  # vehicle is genuinely airborne -- reported live as "gazebo one still
+  # continues to fly" after sending disarm while linked, because that's
+  # exactly what real ArduCopter is supposed to do with a bare disarm
+  # request in flight. RESET_SIM already force-disarms as its own last step
+  # (see reset_sim()), but only after first attempting a Gazebo-only pose
+  # reset over RESET_SIM_HOST/PORT -- meaningless on the physical robot, and
+  # not something an operator should have to invoke just to get a clean
+  # force-disarm. FORCE_DISARM is the same MAV_CMD_COMPONENT_ARM_DISARM +
+  # MAV_CMD_FORCE_MAGIC call reset_sim() already uses, standalone, with no
+  # sim-only reset attached -- usable on both the SITL and physical devices.
+  RBX_SETUP_ACTIONS = ["TAKEOFF","LAUNCH","RESET_SIM","FORCE_DISARM"]
   RBX_GO_ACTIONS = []
 
   RBX_STATE_FUNCTIONS = ["disarm","arm"]
   RBX_MODE_FUNCTIONS = ["stabilize","land","rtl","loiter","guided","resume"]
-  RBX_SETUP_ACTION_FUNCTIONS = ["takeoff","launch","reset_sim"]
+  RBX_SETUP_ACTION_FUNCTIONS = ["takeoff","launch","reset_sim","force_disarm"]
   RBX_GO_ACTION_FUNCTIONS = []
 
   # RESET_SIM reaches across the reverse SSH tunnel to a tiny listener
@@ -2466,6 +2478,26 @@ class ArdupilotNode:
     force_disarm_cmd.param2 = self.MAV_CMD_FORCE_MAGIC # bypass in-flight safety interlock
     nepi_sdk.call_service(self.command_client, force_disarm_cmd)
     return cmd_success
+
+  ### Standalone force-disarm -- see RBX_SETUP_ACTIONS' own comment for why
+  ### this exists separately from RESET_SIM (which force-disarms too, but
+  ### only after a Gazebo-only pose-reset attempt that's meaningless on real
+  ### hardware). Bypasses ArduPilot's own mid-air safety interlock -- a
+  ### plain DISARM (set_state) is correctly refused while genuinely
+  ### airborne; this is the deliberate override for when that's actually
+  ### needed (e.g. recovering from a stuck/unexpected armed state on the
+  ### bench).
+  global force_disarm
+  def force_disarm(self):
+    self.msg_if.pub_info("Received Force Disarm cmd")
+    force_disarm_cmd = CommandLongRequest()
+    force_disarm_cmd.broadcast = False
+    force_disarm_cmd.command = self.MAV_CMD_COMPONENT_ARM_DISARM
+    force_disarm_cmd.confirmation = 0
+    force_disarm_cmd.param1 = 0.0                     # 0 = disarm
+    force_disarm_cmd.param2 = self.MAV_CMD_FORCE_MAGIC # bypass in-flight safety interlock
+    response = nepi_sdk.call_service(self.command_client, force_disarm_cmd)
+    return (response is not None and response.success)
 
   ### Function for switching to STABILIZE mode
   global stabilize

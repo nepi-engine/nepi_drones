@@ -36,6 +36,12 @@
 #   - set_image_topic, enable_image_overlay, publish_status, publish_info,
 #     set_process_name, set_navpose_frame: viewer/bookkeeping controls, not
 #     "what happens to the robot" in the sense this feature is for.
+#   - set_state, set_mode: NOT a raw command pass-through (unlike everything
+#     else here) -- mirrored from the sim's own OBSERVED mavros/state
+#     instead, so the physical robot only ever ends up wherever the sim's
+#     arm/mode state ACTUALLY landed, not wherever the input command alone
+#     would imply. See the module comment above MIRRORED_TOPICS and
+#     _stateMirrorCb.
 #
 # Safety: enabling the relay requires an explicit, standing
 # acknowledge_props_off(True) call in addition to selecting both robots --
@@ -49,7 +55,7 @@ import threading
 from std_msgs.msg import Int32, UInt32, Empty
 from geometry_msgs.msg import Twist, PoseStamped
 from geographic_msgs.msg import GeoPoint, GeoPoseStamped
-from mavros_msgs.msg import AttitudeTarget
+from mavros_msgs.msg import AttitudeTarget, State
 from nepi_interfaces.msg import MotorControl, GotoLocation, GotoPosition, GotoPose, ErrorBounds
 from nepi_interfaces.srv import RBXCapabilitiesQuery, RBXCapabilitiesQueryRequest
 
@@ -86,7 +92,7 @@ NEVER_MIRRORED_ACTIONS = ('RESET_SIM',)
 # the target is shared.
 #
 # Only wired when BOTH devices' own device_node_name starts with
-# "ardupilot_" (see _maybe_wire_mavlink_setpoint_relay) -- this scheme is
+# "ardupilot_" (see _wire_mavlink_relay) -- this scheme is
 # ArduPilot/mavros-specific, not a generic RBX contract, and both ends
 # happening to share a driver class (ArduPilot serial + ArduPilot SITL) is
 # what makes the mavlink_<id> sibling-namespace derivation below safe to
@@ -115,12 +121,38 @@ MAVLINK_SETPOINT_TOPICS = {
 # is actively moving or holding still.
 MAVLINK_SETPOINT_STREAM_RATE_HZ = 10.0
 
+# Reported live 2026-09-16: "when i set the mode on the ardupilot sitl to
+# disarm when theyre linked, the physical drone just stops while the gazebo
+# one still continues to fly. also, when i set the mode to land while its
+# previosuly armed and guided for the sim, the physical one keeps flying, but
+# the sim comes down to the floor... the physical drone should always match
+# the behavior of the sim, not jsut directly send seperate commands to both
+# -- since they clearly work differently." Root cause: set_state/set_mode
+# used to be raw index pass-throughs in MIRRORED_TOPICS -- relaying the
+# COMMAND, not the outcome. ArduPilot's own mid-air safety interlock
+# correctly REFUSES a plain DISARM while genuinely airborne (this is real
+# ArduCopter behavior, not a bug): the sim, if actually flying, stays armed
+# and keeps flying -- but the physical robot (which, per this session's
+# separate motor-response finding, was never actually producing real thrust)
+# has nothing stopping IT from accepting the same disarm, so it silently
+# diverges from what the sim actually did. Mirroring the sim's own reported
+# `mavros/state` (armed bool, mode string) instead of the raw input command
+# means the physical robot only ever ends up wherever the sim's state
+# ACTUALLY landed, including "command refused, nothing changed" -- see
+# _stateMirrorCb. No separate timer needed here (unlike the setpoint
+# restream above) -- mavros's own /state topic already publishes
+# continuously on its own (every FCU heartbeat), so a plain subscriber
+# that only acts on an actual armed/mode CHANGE is enough.
 
+
+# set_state/set_mode deliberately NOT in here -- see STATE_MIRROR_RATE_HZ's
+# own comment just below MAVLINK_SETPOINT_TOPICS' derivation helper for why
+# arm/mode is mirrored from the sim's own OBSERVED outcome instead of a raw
+# command relay.
+#
 # topic name (relative to a device's own ".../rbx" namespace) -> message type,
 # for every RBX command this relay mirrors from sim to physical robot.
 MIRRORED_TOPICS = {
-  'set_state': Int32,
-  'set_mode': Int32,
   'set_motor_control': MotorControl,
   'set_teleop_velocity': Twist,
   'go_action': Int32,
@@ -159,6 +191,13 @@ class RobotLinkRelay:
     # publish through a half-torn-down publisher.
     self._mavlink_lock = threading.Lock()
     self._mavlink_latest_msgs = {}   # 'mavlink:<topic_name>' -> last received msg
+
+    # State-mirror (arm/mode) tracking -- see the module-level comment above
+    # MIRRORED_TOPICS' own docstring for why. None means "not yet seen", so
+    # the very first /state message after linking always reconciles the
+    # physical robot to match, even though nothing has "changed" yet.
+    self._last_sim_armed = None
+    self._last_sim_mode = None
 
   def select_sim_robot(self, sim_namespace):
     sim_namespace = str(sim_namespace)
@@ -271,7 +310,7 @@ class RobotLinkRelay:
                           "(or capabilities_query unavailable), TAKEOFF/LAUNCH will not be mirrored",
                           log_name_list = self.log_name_list)
 
-    self._wire_mavlink_setpoint_relay(sim_caps, phys_caps, new_subs, new_pubs)
+    self._wire_mavlink_relay(sim_caps, phys_caps, new_subs, new_pubs)
 
     self._pubs = new_pubs
     self._subs = new_subs
@@ -295,7 +334,7 @@ class RobotLinkRelay:
     return nepi_sdk.call_service(service, RBXCapabilitiesQueryRequest(),
                                  verbose = False, log_name_list = self.log_name_list)
 
-  def _wire_mavlink_setpoint_relay(self, sim_caps, phys_caps, new_subs, new_pubs):
+  def _wire_mavlink_relay(self, sim_caps, phys_caps, new_subs, new_pubs):
     # See MAVLINK_SETPOINT_TOPICS' own module-level comment for why this
     # exists and why the other two approaches (MAV_CMD_DO_MOTOR_TEST,
     # RC_CHANNELS_OVERRIDE) don't work for mirroring in-flight behavior.
@@ -363,6 +402,36 @@ class RobotLinkRelay:
       nepi_sdk.start_timer_process(1.0 / MAVLINK_SETPOINT_STREAM_RATE_HZ,
                                    self._mavlinkStreamCb, oneshot = True)
 
+    # State mirror (arm/mode) -- see the module comment above MIRRORED_TOPICS
+    # for why this replaced a raw set_state/set_mode command relay. Built
+    # from the SAME capabilities responses already fetched above for
+    # setup_action translation -- state_options/mode_options are on the same
+    # RBXCapabilitiesQueryResponse.
+    phys_state_index_by_name = {name: i for i, name in enumerate(phys_caps.state_options)}
+    phys_mode_index_by_name = {name: i for i, name in enumerate(phys_caps.mode_options)}
+    self._last_sim_armed = None
+    self._last_sim_mode = None
+    state_pub = nepi_sdk.create_publisher(self.physical_namespace + '/set_state', Int32, queue_size = 5)
+    mode_pub = nepi_sdk.create_publisher(self.physical_namespace + '/set_mode', Int32, queue_size = 5)
+    state_sub = nepi_sdk.create_subscriber(sim_mavlink_ns + '/state', State,
+                                           self._stateMirrorCb, queue_size = 5,
+                                           callback_args = (phys_state_index_by_name,
+                                                            phys_mode_index_by_name,
+                                                            state_pub, mode_pub))
+    if state_pub is not None and mode_pub is not None and state_sub is not None:
+      new_pubs['state_mirror:set_state'] = state_pub
+      new_pubs['state_mirror:set_mode'] = mode_pub
+      new_subs['state_mirror:state'] = state_sub
+    else:
+      self.msg_if.pub_warn("Robot link: failed to wire arm/mode state mirror, continuing without it",
+                           log_name_list = self.log_name_list)
+      for p in (state_pub, mode_pub):
+        if p is not None:
+          try:
+            p.unregister()
+          except Exception:
+            pass
+
   def _stop_locked(self, reason):
     if not self.enabled and not self._subs:
       return
@@ -380,6 +449,8 @@ class RobotLinkRelay:
     self._pubs = {}
     with self._mavlink_lock:
       self._mavlink_latest_msgs = {}
+    self._last_sim_armed = None
+    self._last_sim_mode = None
     was_enabled = self.enabled
     self.enabled = False
     if was_enabled:
@@ -433,6 +504,35 @@ class RobotLinkRelay:
         self._publishMavlinkSetpoint(topic_key, pub, msg)
     nepi_sdk.start_timer_process(1.0 / MAVLINK_SETPOINT_STREAM_RATE_HZ,
                                  self._mavlinkStreamCb, oneshot = True)
+
+  def _stateMirrorCb(self, msg, args):
+    # Mirrors the sim's own OBSERVED arm/mode state onto the physical robot,
+    # not the raw command that was sent -- see the module comment above
+    # MIRRORED_TOPICS for the full root-cause writeup. Only acts on an
+    # actual CHANGE from the last-seen value (self._last_sim_armed/_mode),
+    # so a command the sim itself refused (armed/mode unchanged) correctly
+    # never gets forwarded at all.
+    phys_state_index_by_name, phys_mode_index_by_name, state_pub, mode_pub = args
+    if msg.armed != self._last_sim_armed:
+      self._last_sim_armed = msg.armed
+      target_name = "ARM" if msg.armed else "DISARM"
+      phys_index = phys_state_index_by_name.get(target_name)
+      if phys_index is not None:
+        try:
+          state_pub.publish(Int32(data = phys_index))
+        except Exception as e:
+          self.msg_if.pub_warn("Robot link state-mirror failed publishing set_state: " + str(e),
+                               log_name_list = self.log_name_list, throttle_s = 5.0)
+    mode_name = str(msg.mode)
+    if mode_name != self._last_sim_mode:
+      self._last_sim_mode = mode_name
+      phys_index = phys_mode_index_by_name.get(mode_name)
+      if phys_index is not None:
+        try:
+          mode_pub.publish(Int32(data = phys_index))
+        except Exception as e:
+          self.msg_if.pub_warn("Robot link state-mirror failed publishing set_mode: " + str(e),
+                               log_name_list = self.log_name_list, throttle_s = 5.0)
 
   def _relay_setup_action_cb(self, msg, args):
     sim_index_to_phys_index, pub = args
