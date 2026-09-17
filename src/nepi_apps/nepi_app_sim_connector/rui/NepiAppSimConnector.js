@@ -24,6 +24,7 @@ import { observer, inject } from "mobx-react"
 import { Columns, Column } from "./Columns"
 
 import NepiIFSim from "./Nepi_IF_Sim"
+import NepiIFRobotLink from "./Nepi_IF_RobotLink"
 
 @inject("ros")
 @observer
@@ -110,6 +111,10 @@ class NepiAppSimConnector extends Component {
             show_controls={false}
             make_section={true}
             title={"Sim Connector"}
+          />
+
+          <NepiIFRobotLink
+            namespace={simNamespace}
           />
 
         </Column>

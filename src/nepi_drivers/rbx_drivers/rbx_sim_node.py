@@ -68,6 +68,7 @@ from nepi_sdk import nepi_sdk
 from nepi_sdk import nepi_nav
 from nepi_sdk import nepi_utils
 from nepi_sdk import nepi_settings
+from nepi_sdk import nepi_controls
 from nepi_sdk import nepi_img
 
 from std_msgs.msg import UInt32, String
@@ -598,7 +599,12 @@ class SimNode:
 
     ##############################
     # Initialize RBX Settings
-    self.settings_dict = copy.deepcopy(self.FACTORY_SETTINGS)
+    # Build the real, modern nepi_controls controls dict here -- see
+    # initSettingsDict()'s own comment (mirrors the identical fix applied to
+    # rbx_ardupilot_node.py) for why self.settings_dict can no longer just be
+    # CAP_SETTINGS/FACTORY_SETTINGS' own legacy shape.
+    self.settings_dict = self.initSettingsDict()
+    self.settings_dict = self.refreshSettingsDict()
     self.cap_settings = self.getCapSettings()
     self.factory_settings = self.getFactorySettings()
 
@@ -728,28 +734,104 @@ class SimNode:
             settings[setting_name]['value'] = self.FACTORY_SETTINGS_OVERRIDES[setting_name]
     return settings
 
-  def getSettings(self):
-    return self.settings_dict
+  def initSettingsDict(self):
+    # CAP_SETTINGS/FACTORY_SETTINGS are a legacy, pre-controls-system shape
+    # ({'type','name','options'} / {'type','name','value'}) that RBXRobotIF's
+    # own capSettings=/factorySettings= constructor args accept but never
+    # actually consume any more -- getSettingsFunction/setSettingFunction are
+    # the only things SettingsIF actually reads, and it requires a real
+    # nepi_controls controls dict (each entry carrying 'default', and
+    # 'bounds'/'options' as its type requires), not this legacy shape.
+    # Mirrors the identical fix applied to rbx_ardupilot_node.py -- see that
+    # file's own copy of this method for the full incident writeup
+    # (KeyError: 'default' warnings on every settings status publish,
+    # "setSettingFunction callback failed" on every settings update, and
+    # "cannot marshal None unless allow_none is enabled" once a config reset
+    # tried to persist the resulting None values -- confirmed live
+    # 2026-09-16 for sim_rover1 specifically).
+    init_settings_dict = dict()
+    for setting_name in self.CAP_SETTINGS.keys():
+      cap_setting = self.CAP_SETTINGS[setting_name]
+      setting_type = cap_setting['type']
+      setting_dict = dict()
+      setting_dict['type'] = setting_type
+      # The retired cap-settings form carried an Int/Float control's min and
+      # max in an 'options' pair. The controls contract calls that 'bounds'.
+      if 'options' in cap_setting.keys():
+        try:
+          if setting_type == 'Int':
+            setting_dict['bounds'] = [int(cap_setting['options'][0]), int(cap_setting['options'][1])]
+          elif setting_type == 'Float':
+            setting_dict['bounds'] = [float(cap_setting['options'][0]), float(cap_setting['options'][1])]
+          else:
+            setting_dict['options'] = [str(option) for option in cap_setting['options']]
+        except Exception as e:
+          self.msg_if.pub_warn("Invalid bounds/options for setting: " + setting_name + " : " + str(e))
 
-  def settingUpdateFunction(self,setting):
+      default = None
+      if setting_name in self.FACTORY_SETTINGS.keys():
+        default = self.FACTORY_SETTINGS[setting_name]['value']
+      if setting_name in self.FACTORY_SETTINGS_OVERRIDES.keys():
+        default = self.FACTORY_SETTINGS_OVERRIDES[setting_name]
+      if default is None:
+        continue
+      try:
+        if setting_type == 'Int':
+          default = int(float(default))
+        elif setting_type == 'Float':
+          default = float(default)
+        elif setting_type == 'Toggle':
+          default = (str(default) == 'True' or str(default) == 'true')
+        else:
+          default = str(default)
+      except Exception as e:
+        self.msg_if.pub_warn("Invalid factory value for setting: " + setting_name + " : " + str(e))
+        continue
+      setting_dict['default'] = default
+      init_settings_dict[setting_name] = setting_dict
+
+    settings_dict = nepi_controls.create_controls_dict(init_settings_dict)
+    settings_dict_values = nepi_controls.get_controls_values_dict(settings_dict)
+    self.msg_if.pub_info("Initialized Settings: " + str(settings_dict_values))
+    return settings_dict
+
+  def refreshSettingsDict(self):
+    # 'environment' is the one setting whose real option list arrives later,
+    # asynchronously, over the sim bridge (see processEnvironmentOptionsLine),
+    # which updates self.settings_dict directly via
+    # nepi_controls.set_control_options() once it actually arrives.
+    return copy.deepcopy(self.settings_dict)
+
+  def getSettings(self):
+    # Deep copy, not a bare reference -- SettingsIF assigns whatever this
+    # returns directly to its own self.settings_dict, then mutates
+    # individual entries of it in place. See rbx_ardupilot_node.py's own
+    # getSettings() for the full cross-object mutation hazard this avoids.
+    return copy.deepcopy(self.settings_dict)
+
+  def settingUpdateFunction(self, setting_name, setting_value):
+    # SettingsIF (system_if.py) calls setSettingFunction(name, value,
+    # [callback_arg]) -- two/three plain positional args, not the single
+    # combined {'name','type','value'} dict this function's own body used to
+    # be written against. See rbx_ardupilot_node.py's own settingUpdateFunction
+    # for the full incident writeup of this exact bug.
     success = False
-    setting_str = str(setting)
-    setting_name = setting['name']
-    if nepi_settings.check_valid_setting(setting,self.cap_settings):
-      if setting_name in self.settings_dict.keys():
-        self.settings_dict[setting_name]['value'] = setting['value']
-        success = True
-      else:
-        msg = (self.node_name  + " Setting name" + setting_str + " is not supported")
-      if success == True:
-        msg = ( self.node_name  + " UPDATED SETTINGS " + setting_str)
-        if setting_name in self.CAMERA_SETTING_NAMES:
-          self.sendCameraSettings()
-        if setting_name in self.ENVIRONMENT_SETTING_NAMES:
-          self.setEnvironmentAction(setting['value'])
-    else:
-      msg = (self.node_name  + " Setting data" + setting_str + " is not valid")
-    return success, msg
+    setting_str = setting_name + ":" + str(setting_value)
+    if setting_name not in self.settings_dict.keys():
+      msg = (self.node_name + " Setting name " + setting_str + " is not supported")
+      return success, msg, copy.deepcopy(self.settings_dict)
+    if nepi_controls.get_clean_value(self.settings_dict, setting_name, setting_value) is None:
+      msg = (self.node_name + " Setting data " + setting_str + " is not valid")
+      return success, msg, copy.deepcopy(self.settings_dict)
+
+    self.settings_dict = nepi_controls.set_control_value(self.settings_dict, setting_name, setting_value)
+    success = True
+    msg = (self.node_name + " UPDATED SETTINGS " + setting_str)
+    if setting_name in self.CAMERA_SETTING_NAMES:
+      self.sendCameraSettings()
+    if setting_name in self.ENVIRONMENT_SETTING_NAMES:
+      self.setEnvironmentAction(setting_value)
+    return success, msg, copy.deepcopy(self.settings_dict)
 
   ##########################
   # RBX Interface Functions
@@ -1173,7 +1255,12 @@ class SimNode:
     # bounded startup wait in __init__ as soon as the first announcement
     # arrives, rather than waiting out the full timeout.
     model_names = [str(n) for n in msg.get('options', [])]
-    self.CAP_SETTINGS['environment']['options'] = ["FLAT_GROUND"] + [n.upper() for n in model_names]
+    options = ["FLAT_GROUND"] + [n.upper() for n in model_names]
+    self.CAP_SETTINGS['environment']['options'] = options
+    # CAP_SETTINGS is only ever consulted once, at initSettingsDict() time --
+    # the live settings_dict (what SettingsIF/the RUI actually see) has to
+    # be updated directly, or this resync never reaches anything.
+    self.settings_dict = nepi_controls.set_control_options(self.settings_dict, 'environment', options)
     self.ENVIRONMENT_VALUE_TO_MODEL = {"FLAT_GROUND": None}
     self.ENVIRONMENT_VALUE_TO_MODEL.update({n.upper(): n for n in model_names})
     self.environment_options_received_event.set()

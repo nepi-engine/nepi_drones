@@ -108,6 +108,7 @@ import yaml
 # first and avoids the exhaustion. Do not reorder cv2 above this without
 # re-verifying against that failure.
 from nepi_api.device_if_sim import SimDeviceIF
+from nepi_api.robot_link_relay import RobotLinkRelay
 
 import numpy as np
 import cv2
@@ -711,6 +712,26 @@ class NepiSimConnectorApp:
     nepi_sdk.create_subscriber(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/delete_robot_config'),
         String, self.deleteRobotConfigCb, queue_size = 1)
+
+    ##############################
+    # Robot Link -- mirrors RBX flight/motion commands from the currently
+    # attached sim onto a selected physical robot. See robot_link_relay.py's
+    # own module docstring for the full design and what is deliberately not
+    # mirrored. self.robot_link's sim-side target is kept in sync with
+    # self.selected_simulator from simDiscoveryCb, not set here.
+    self.robot_link = RobotLinkRelay(self.msg_if)
+    self.robot_link_status_pub = nepi_sdk.create_publisher(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/robot_link/status'),
+        String, queue_size = 1, latch = True)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/robot_link/select_physical_robot'),
+        String, self.selectPhysicalRobotCb, queue_size = 1)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/robot_link/set_props_off_acknowledged'),
+        Bool, self.setPropsOffAcknowledgedCb, queue_size = 1)
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/robot_link/enable'),
+        Bool, self.setRobotLinkEnabledCb, queue_size = 1)
 
     ##############################
     # Physical-dimension editing (robot chassis/wheel + environment
@@ -2094,6 +2115,21 @@ class NepiSimConnectorApp:
       if len(available) == 1:
         self.setSelectedSimulator(available[0])
 
+    # Robot Link tracks self.selected_simulator automatically (no separate
+    # "select sim" control of its own -- there is already exactly one sim
+    # selector in this app). Also drop a selected physical robot that has
+    # gone away, same reasoning as the simulator-selection check above --
+    # an active link whose physical target vanished is disabled outright
+    # rather than left running against a dead namespace.
+    self.robot_link.select_sim_robot(self.selected_simulator)
+    if self.robot_link.physical_namespace != "":
+      available_physical, _names = self.getAvailablePhysicalRobots()
+      if self.robot_link.physical_namespace not in available_physical:
+        self.msg_if.pub_warn("Linked physical robot " + self.robot_link.physical_namespace +
+                             " is no longer available, clearing link")
+        self.robot_link.select_physical_robot("")
+        self.publishRobotLinkStatus()
+
     self.updateCommonViewSubscriptions()
     self.updateNavPoseMirrorSubscription()
 
@@ -2292,6 +2328,65 @@ class NepiSimConnectorApp:
       return
     self.selected_simulator = namespace
     self.msg_if.pub_info("Selected simulator: " + namespace)
+
+  def getAvailablePhysicalRobots(self):
+    # Mirror image of getAvailableSimulators() over the exact same
+    # self.sim_device_info scan (simDiscoveryCb subscribes to every
+    # DeviceRBXStatus-publishing device in the ROS graph, sim or not) --
+    # everything that ISN'T a simulator is a candidate physical robot to
+    # link a sim to.
+    namespaces = []
+    names = []
+    now = nepi_utils.get_time()
+    with self.sim_scan_lock:
+      for topic in sorted(self.sim_device_info.keys()):
+        entry = self.sim_device_info[topic]
+        if entry['data_source_description'] == SIM_SOURCE_DESCRIPTION:
+          continue
+        if (now - entry['time']) > SIM_DEVICE_STALE_SEC:
+          continue
+        namespace = topic
+        if namespace.endswith('/status'):
+          namespace = namespace[:-len('/status')]
+        namespaces.append(namespace)
+        names.append(entry['device_name'] if entry['device_name'] else namespace)
+    return namespaces, names
+
+  def selectPhysicalRobotCb(self, msg):
+    namespace = str(msg.data)
+    if namespace in ("", "None"):
+      self.robot_link.select_physical_robot("")
+      self.msg_if.pub_info("Cleared physical robot selection")
+      self.publishRobotLinkStatus()
+      return
+    available, _names = self.getAvailablePhysicalRobots()
+    if namespace not in available:
+      self.msg_if.pub_warn("Physical robot '" + namespace + "' is not currently available, ignoring")
+      return
+    self.robot_link.select_physical_robot(namespace)
+    self.msg_if.pub_info("Selected physical robot for linking: " + namespace)
+    self.publishRobotLinkStatus()
+
+  def setPropsOffAcknowledgedCb(self, msg):
+    self.robot_link.acknowledge_props_off(bool(msg.data))
+    self.publishRobotLinkStatus()
+
+  def setRobotLinkEnabledCb(self, msg):
+    self.robot_link.set_enabled(bool(msg.data))
+    self.publishRobotLinkStatus()
+
+  def publishRobotLinkStatus(self):
+    if self.robot_link_status_pub is None:
+      return
+    status = self.robot_link.get_status_dict()
+    available_physical, available_physical_names = self.getAvailablePhysicalRobots()
+    status['available_physical_robots'] = available_physical
+    status['available_physical_robot_names'] = available_physical_names
+    status['selected_sim'] = self.selected_simulator
+    try:
+      self.robot_link_status_pub.publish(String(data = json.dumps(status)))
+    except Exception as e:
+      self.msg_if.pub_warn("Failed to publish robot link status: " + str(e), throttle_s = 5.0)
 
   #**********************
   # Simulator auto-launch. A convenience trigger over the existing passive
@@ -3226,6 +3321,7 @@ class NepiSimConnectorApp:
     if self.sim_if is not None:
       self.sim_if.publish_status()
     self.refreshLauncherConfigCb()
+    self.publishRobotLinkStatus()
 
   def refreshLauncherConfigCb(self):
     # Picks up launch-target config changes (an edited file, or a file that
