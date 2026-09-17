@@ -1,0 +1,45 @@
+driver:
+  pkg_name: PTX_SIDUS_SS109_SERIAL
+  display_name: Sidus SS109 Serial PanTilt
+  description: Sidus SS109 Serial PanTilt Driver Interface
+  type: PTX
+  group_id: None
+  NODE_DICT:
+    file_name: ptx_sidus_ss109_serial_node.py
+    class_name: SidusSS109SerialNode
+  DRIVER_DICT:
+    file_name: None
+    class_name: None
+  DISCOVERY_DICT:
+    file_name: ptx_sidus_ss109_serial_discovery.py
+    class_name: SidusSS109SerialDiscovery
+    process: CALL
+    OPTIONS:
+      baud_rate:
+        type: Selection
+        options:
+          - All
+          - '2400'
+          - '9600'
+          - '19200'
+          - '38400'
+          - '57600'
+          - '115200'
+        default: '9600'
+        value: '9600'
+      start_addr:
+        type: 'String'
+        default: 'A'
+        value: 'A'
+      stop_addr:
+        type: 'String'
+        default: 'B'
+        value: 'B'
+      system_config:
+        type: Selection
+        options:
+          - 'Standard'
+          - 'HighTorque'
+          - 'HighSpeed'
+        default: 'Standard'
+        value: 'Standard'

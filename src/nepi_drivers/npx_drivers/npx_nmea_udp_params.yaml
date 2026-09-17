@@ -1,0 +1,39 @@
+driver:
+  pkg_name: NPX_NMEA_UDP
+  display_name: NMEA UDP
+  description: NMEA over UDP Ethernet
+  type: NPX
+  group_id: None
+  NODE_DICT:
+    file_name: npx_nmea_udp_node.py
+    class_name: NMEAUDPNode
+  DRIVER_DICT:
+    file_name: None
+    class_name: None
+  DISCOVERY_DICT:
+    file_name: npx_nmea_udp_discovery.py
+    class_name: NMEAUDPDiscovery
+    process: CALL
+    OPTIONS:
+      # Connection options (TCP or Serial)
+      tcp_host:
+        type: String
+        default: '127.0.0.1'
+        value: 'NEPI_NAV_IP_NMEA'
+      tcp_port:
+        type: Int
+        default: '50000'
+        value: 'NEPI_NAV_PORT_NMEA'
+      serial_port:
+        type: Selection
+        options: ['Auto']
+        default: 'Auto'
+        value: 'Auto'
+      baud_rate:
+        type: Selection
+        options: ['9600','19200','38400','57600','115200']
+        default: '115200'
+        value: '115200'
+
+
+  

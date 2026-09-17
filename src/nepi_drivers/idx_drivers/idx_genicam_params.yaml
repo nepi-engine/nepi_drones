@@ -1,0 +1,22 @@
+driver:
+  pkg_name: IDX_GENICAM
+  display_name: Generic Genicam Camera
+  description: Driver package for generic GenICam camera devices
+  type: IDX
+  group_id: GENICAM
+  NODE_DICT:
+    file_name: idx_genicam_node.py
+    class_name: GenicamCamNode
+  DRIVER_DICT:
+    file_name: idx_genicam_driver.py
+    class_name: GenicamCamDriver
+  DISCOVERY_DICT:
+    file_name: idx_genicam_discovery.py
+    class_name: GenicamCamDiscovery
+    process: LAUNCH
+    OPTIONS:
+      data_products:
+        type: Selection
+        options:
+          - 'color_image'
+        default: 'color_image'

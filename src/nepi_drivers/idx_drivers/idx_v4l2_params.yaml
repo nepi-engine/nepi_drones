@@ -1,0 +1,28 @@
+driver:
+  pkg_name: IDX_V4L2
+  display_name: Generic USB Camera
+  description: Driver package for generic USB camera devices
+  type: IDX
+  group_id: None
+  NODE_DICT:
+    file_name: idx_v4l2_node.py
+    class_name: V4l2CamNode
+  DRIVER_DICT:
+    file_name: idx_v4l2_driver.py
+    class_name: V4l2CamDriver
+  DISCOVERY_DICT:
+    file_name: idx_v4l2_discovery.py
+    class_name: V4L2CamDiscovery
+    process: LAUNCH
+    OPTIONS:
+      launch_delay_sec:
+        type: Int
+        options:
+          - '0'
+          - '10'
+        default: '0'
+      data_products:
+          type: Selection
+          options:
+            - 'color_image'
+          default: 'color_image'

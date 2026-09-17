@@ -1,0 +1,22 @@
+driver:
+  pkg_name: IDX_LIMELIGHT4_USB
+  display_name: Limelight 4 Camera (USB)
+  description: Driver for Limelight 4 smart camera via USB virtual ethernet (HTTP REST + MJPEG)
+  type: IDX
+  group_id: LIMELIGHT
+  NODE_DICT:
+    file_name: idx_limelight4_usb_node.py
+    class_name: Limelight4UsbCamNode
+  DRIVER_DICT:
+    file_name: idx_limelight4_usb_driver.py
+    class_name: Limelight4UsbCamDriver
+  DISCOVERY_DICT:
+    file_name: idx_limelight4_usb_discovery.py
+    class_name: Limelight4UsbCamDiscovery
+    process: LAUNCH
+    OPTIONS:
+      data_products:
+        type: Selection
+        options:
+          - 'color_image'
+        default: 'color_image'

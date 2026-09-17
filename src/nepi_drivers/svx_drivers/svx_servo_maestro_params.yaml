@@ -1,0 +1,51 @@
+driver:
+  pkg_name: SVX_SERVO_MAESTRO
+  display_name: Pololu Maestro Servo
+  description: Single-servo SVX driver for the Pololu Micro Maestro USB servo controller (one node per servo channel; degrees to pulse-width over USB serial)
+  type: SVX
+  group_id: None
+  NODE_DICT:
+    file_name: svx_servo_maestro_node.py
+    class_name: SvxServoMaestroNode
+  DRIVER_DICT:
+    file_name: None
+    class_name: None
+  DISCOVERY_DICT:
+    file_name: svx_servo_maestro_discovery.py
+    class_name: SvxServoMaestroDiscovery
+    process: CALL
+    OPTIONS:
+      channels:
+        type: 'String'
+        description: 'Which Maestro channels carry servos. Comma-separated, any subset in any order (e.g. "0", "0,1", "4,5", "5,0,4"), or "all" for every channel on the board. One SVX node -- one selectable device -- is launched per listed channel, and the list can be edited while the driver is running: adding a channel launches just that node, removing one kills just that node, and reordering changes nothing. The valid range depends on the board (6 for a Micro Maestro, 12/18/24 for the Minis); out-of-range entries are ignored with a warning. Defaults to "all" because the Maestro is open loop with no feedback wire and cannot detect whether a servo is physically attached -- so set this to the channels you have actually wired to avoid phantom devices. Each servo is then calibrated individually in its own Device Settings panel (pulse widths, degree range, acceleration), not here -- those describe the servo, not the board.'
+        default: 'all'
+        value: 'all'
+      protocol:
+        type: Selection
+        description: 'Serial command protocol. Compact works for a single controller; Pololu adds a device number for daisy-chained boards.'
+        options:
+          - 'Compact'
+          - 'Pololu'
+        default: 'Compact'
+        value: 'Compact'
+      device_number:
+        type: 'String'
+        description: 'Maestro device number (Pololu protocol only; factory default is 12).'
+        default: '12'
+        value: '12'
+      command_port_index:
+        type: 'String'
+        description: 'Which of a board''s two USB serial ports is the Command Port: 0 = lowest USB interface (default), 1 = the other. Flip if commands get no response.'
+        default: '0'
+        value: '0'
+      baud_rate:
+        type: Selection
+        description: 'Serial baud rate. Ignored for the USB Command Port (USB is not rate-limited); kept for TTL/UART use.'
+        options:
+          - '9600'
+          - '19200'
+          - '38400'
+          - '57600'
+          - '115200'
+        default: '9600'
+        value: '9600'

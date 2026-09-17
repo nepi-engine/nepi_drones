@@ -1,0 +1,48 @@
+driver:
+  pkg_name: IDX_ZED
+  display_name: Zed Stereo Camera
+  description: Driver package for StereoLab Zed stereo camera devices
+  type: IDX
+  group_id: None
+  NODE_DICT:
+    file_name: idx_zed_node.py
+    class_name: ZedCamNode
+  DRIVER_DICT:
+    file_name: None
+    class_name: None
+  DISCOVERY_DICT:
+    file_name: idx_zed_discovery.py
+    class_name: ZedCamDiscovery
+    process: LAUNCH
+    OPTIONS:
+      resolution:
+        type: Selection
+        options:
+          - HD2K
+          - HD1080
+          - HD720
+          - VGA
+        default: HD720
+      framerate:
+        type: Int
+        options:
+          - '15'
+          - '30'
+        default: '15'
+      data_products:
+        type: Selection
+        options:
+          - 'color_image'
+          - 'color_image,depth_map'
+          - 'color_image,depth_map,pointcloud'
+        default: 'color_image,depth_map,pointcloud'
+      navpose_enabled:
+        type: Toggle
+        default: 'False'
+      navpose_pub_rate:
+        type: Int
+        options:
+          - '1'
+          - '20'
+        default: '10'
+

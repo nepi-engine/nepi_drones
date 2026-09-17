@@ -34,7 +34,7 @@ from nepi_sdk import nepi_utils
 from nepi_sdk import nepi_system
 from nepi_sdk import nepi_mgrs
 from nepi_sdk import nepi_keys
-from nepi_sdk import nepi_settings
+from nepi_sdk import nepi_controls
 
                  
 #####################
@@ -139,11 +139,13 @@ class SystemMgrNode():
 
     SYSTEM_SETTINGS_KEYS = []
     SYSTEM_SETTINGS_DICT = dict()
-    system_capSettings = None
-    system_factorySettings = None
+    SYSTEM_ENABLE_KEYS = ['NEPI_DEVICE_ID','NEPI_DEVICE_MD','NEPI_DEVICE_SN','IP']
+    SYSTEM_DISABLE_KEYS = ['ROS']
+   
     system_update_time = 0
     system_update_delay = 60
     nepi_service_running = False
+    nepi_config_updating = False
     nepi_update_requested = False
     nepi_updating_config = False
     nepi_expand_requested = False
@@ -228,6 +230,10 @@ class SystemMgrNode():
     timezone_str = 'UTC'
     internet_connected = False
     date_time_str = ''
+
+    system_settings_if = None
+    settings_initialized = False
+    settings_values_dict = dict()
     #######################
     ### Node Initialization
     DEFAULT_NODE_NAME = "system_mgr" # Can be overwitten by luanch command
@@ -270,20 +276,7 @@ class SystemMgrNode():
             self.msg_if.pub_warn("Failed to Read NEPI config file")
             nepi_sdk.signal_shutdown("Shutting Down: Failed to Read NEPI config file")
             return
-        self.system_capSettings = self.getCapSettings(self.system_config)
-        self.system_factorySettings = self.getSettings(self.system_config)
-        
-        # self.factory_config = nepi_system.load_nepi_factory_config()
-        # self.msg_if.pub_warn("Got System Config: " + str(self.factory_config))
-        # if self.factory_config is None:
-        #     self.factory_config = dict()
-        # if len(self.factory_config.keys()) == 0:
-        #     self.factory_config = self.system_config
-        # else:
-        #     for key in self.system_config.keys():
-        #         if key not in self.factory_config.keys():
-        #             self.factory_config[key] = self.system_config[key]
-        # self.system_factorySettings = self.getSettings(self.factory_config)
+      
        
         
 
@@ -774,34 +767,29 @@ class SystemMgrNode():
 
 
         self.initCb(do_updates = True)
-
+        # Want to update the op_environment (from param server) through the whole system once at
+        # start-up, but the only reasonable way to do that is to delay long enough to let all nodes start
+        self.msg_if.pub_warn("Updating From Param Server")
+        self.initConfig()
 
         ###############################
         # Setup System Settings IF Class ####################
         self.msg_if.pub_debug("Starting Settings IF Initialization", log_name_list = [self.node_name])
         system_settings_ns = self.base_namespace
 
-        self.SYSTEM_SETTINGS_DICT = {
-                    'capSettings': self.system_capSettings, 
-                    'factorySettings': self.system_factorySettings,
-                    'setSettingFunction': self.systemSettingUpdateFunction, 
-                    'getSettingsFunction': self.systemGetSettingsFunction
-                    
-        }
-
-    
         self.system_settings_if = SettingsIF(namespace = system_settings_ns,
-                        settings_dict = self.SYSTEM_SETTINGS_DICT,
-                        log_name_list = [self.node_name],
-                        save_params = False,
-                            msg_if = self.msg_if
-                        )
+                              getSettingsFunction=self.getSettingsFunction,
+                              setSettingFunction=self.setSettingFunction, 
+                              save_params = False,
+                              msg_if = self.msg_if,
+                              node_if = self.node_if
+                              )
 
         #######################
         # Setup NEPI Managers Updater Process
         self.msg_if.pub_info(":" + self.class_name + ": Starting states status pub service: ")
         nepi_sdk.start_timer_process(1, self.updaterCb, oneshot = True)
-
+        nepi_sdk.start_timer_process(1, self.updateDockerCb, oneshot = True)
 
         #######################
         # Setup System IF Classes
@@ -833,10 +821,7 @@ class SystemMgrNode():
         nepi_sdk.start_timer_process(self.states_pub_interval, self.systemStatesPubCb)
 
     
-        # Want to update the op_environment (from param server) through the whole system once at
-        # start-up, but the only reasonable way to do that is to delay long enough to let all nodes start
-        self.msg_if.pub_warn("Updating From Param Server")
-        self.initConfig()
+
     
 
 
@@ -845,7 +830,7 @@ class SystemMgrNode():
         nepi_sdk.start_timer_process(self.STATUS_PERIOD, self.publishStatusCb)
         nepi_sdk.start_timer_process(1, self.updateTopicsServicesCb, oneshot = True)
         nepi_sdk.start_timer_process(60000, self.ClearLogsCb, oneshot = True)
-        nepi_sdk.start_timer_process(1, self.updateDockerCb)
+        
         self.msg_if.pub_warn("System status ready")
 
         ##################################
@@ -909,28 +894,7 @@ class SystemMgrNode():
 
 
             # Now gather all the params and set members appropriately
-            # Keep the value __init__ already resolved from the system config
-            # (NEPI_STORAGE) whenever the param server has nothing usable for
-            # us yet. get_param() returns None when the param is not on the
-            # server, and the very next thing initConfig does with this is
-            # os.statvfs(self.storage_folder), which raises TypeError on None
-            # -- an UNCAUGHT crash in __init__, so system_mgr dies outright.
-            # That takes the whole platform with it (every other manager waits
-            # on system_mgr, and the RUI blocks forever on its status topic),
-            # and nothing respawns it. Confirmed live 2026-08-12 after an
-            # in-place `supervisorctl restart nepi_engine`: the restart wipes
-            # the param server with roscore, and this read lost the race
-            # against the params being re-registered, so the platform came up
-            # with 11 managers but no system_mgr and a publisher-less
-            # /nepi/device1/status. It is intermittent -- the same restart
-            # succeeded on the immediate retry -- which is exactly why it
-            # needs a fallback rather than being left to timing.
-            storage_folder_param = self.node_if.get_param("storage_folder")
-            if storage_folder_param:
-                self.storage_folder = storage_folder_param
-            else:
-                self.msg_if.pub_warn("No usable storage_folder param yet; keeping " +
-                                     str(self.storage_folder) + " from the system config")
+            self.storage_folder = self.node_if.get_param("storage_folder")
 
 
             # nepi_storage has some additional logic
@@ -949,22 +913,9 @@ class SystemMgrNode():
             self.status_msg.warning_temps.append(60.0)
             self.status_msg.critical_temps.append(70.0)
 
-            # Reporting an unknown disk capacity is a cosmetic degradation; an
-            # exception here is fatal, because this runs inside __init__ and
-            # nothing respawns system_mgr -- and without system_mgr no other
-            # manager initializes and the RUI blocks forever on its status
-            # topic. Never let a bad/blank storage path take the platform down
-            # over one status field (self.storage_folder is also deliberately
-            # set to "" further up when the disk is full, which would raise
-            # here too).
-            try:
-                statvfs = os.statvfs(self.storage_folder)
-                self.status_msg.disk_capacity = statvfs.f_frsize * statvfs.f_blocks / \
-                    BYTES_PER_MEGABYTE     # Size of data filesystem in Megabytes
-            except Exception as e:
-                self.status_msg.disk_capacity = 0
-                self.msg_if.pub_warn("Could not determine disk capacity of " +
-                                     str(self.storage_folder) + ": " + str(e))
+            statvfs = os.statvfs(self.storage_folder)
+            self.status_msg.disk_capacity = statvfs.f_frsize * statvfs.f_blocks / \
+                BYTES_PER_MEGABYTE     # Size of data filesystem in Megabytes
 
             for i in self.status_msg.temperature_sensor_names:
                 self.status_msg.temperatures.append(0.0)
@@ -992,6 +943,7 @@ class SystemMgrNode():
 
             if do_updates == True:
                 managers_dict = nepi_mgrs.refreshManagersDict(self.managers_param_folder,self.managers_dict)
+                
                 purge_list = []
                 if 'MANAGER-NETWORK' in managers_dict.keys() and self.system_config['NEPI_MANAGES_NETWORK'] == 0:
                     purge_list.append('MANAGER-NETWORK')
@@ -1032,89 +984,93 @@ class SystemMgrNode():
     ###################################
     # System Settings Functions
 
-    def getCapSettings(self, config_dict):
-        cap_settings = dict()
-        if config_dict is None:
-            cap_settings = copy.deepcopy(nepi_settings.NONE_CAP_SETTINGS)
-        else:
-            for key in config_dict.keys():
-                cap_setting = None
-                val = str(config_dict[key])
-                try:
-                    val_int = int(val)
-                    cap_setting = {"name":key,"type":"Int","optons":[]}
-                except:
-                    cap_setting = {"name":key,"type":"String","optons":[]}
-                if cap_setting is not None:
-                    cap_settings[key] = cap_setting
-        return cap_settings
-    
-    def getSettings(self, config_dict):
-        settings = dict()
-        if config_dict is None:
-            settings = copy.deepcopy(nepi_settings.NONE_SETTINGS)
-        else:
-            for key in config_dict.keys():
-                setting = None
-                val = str(config_dict[key])
-                try:
-                    val_int = int(val)
-                    setting = {"name":key,"type":"Int","value":val}
-                except:
-                    val_str = val
-                    setting = {"name":key,"type":"String","value":val}
-                if setting is not None:
-                    settings[key] = setting
-        return settings
-                
-        
-    def systemGetSettingsFunction(self):
-        settings = self.getSettings(self.system_config)
-        return settings
 
-    def systemSettingUpdateFunction(self, setting):
+    
+        
+    def getSettingsFunction(self):
+        config_dict = copy.deepcopy(self.system_config)
+        # Built as an init_dict (name -> {'type','default'}) and run through
+        # nepi_controls.create_controls_dict() -- this used to hand-roll each
+        # entry with only 'name'/'type'/'default'/'value' set, which left out
+        # the type-specific factory_int/default_int/set_int (or
+        # factory_string/default_string/set_string) fields every other
+        # consumer of a settings/controls dict expects (nepi_controls.
+        # get_control_value() indexes control_dict['set_int'] etc. directly).
+        # Found live 2026-09-15: KeyError: 'set_int' out of
+        # get_control_value(), called from SettingsIF.init() the first time
+        # system_mgr's own settings ever got initialized -- crashed the whole
+        # node, every time, on every boot.
+        init_dict = dict()
+        if config_dict is not None:
+            for key in config_dict.keys():
+                val = config_dict[key]
+                entry = dict()
+                try:
+                    entry['type'] = 'Int'
+                    entry['default'] = int(val)
+                except Exception:
+                    entry['type'] = 'String'
+                    entry['default'] = str(val)
+                init_dict[key] = entry
+            self.settings_initialized = True
+        settings_dict = nepi_controls.create_controls_dict(init_dict)
+        return settings_dict
+
+    def setSettingFunction(self, setting_name, setting_value):
       success = False
       msg = ""
-      setting_str = str(setting)
-      [s_name, s_type, data] = nepi_settings.get_data_from_setting(setting)
-      if data is not None:
-        setting_name = setting['name']
-        setting_data = data
-        # NONE is the config file's sentinel for an unset entry and is the shipped
-        # value for NEPI_GATEWAY_IP, NEPI_ALIAS_IP_2/3, and NEPI_NAV_IP, so it has to
-        # survive the IP check or those keys can never be cleared once set.
-        if 'IP' in setting_name and setting_data != self.CONFIG_NONE_VALUE:
-            if nepi_utils.is_valid_ip(setting_data) == False:
-                msg = (self.node_name  + " Setting data" + setting_str + " is Not a valid IP address")
-                self.add_info_string(msg, StampedString.PRI_HIGH)
-                return success, msg
-        if 'NEPI_DEVICE_SN' == setting_name:
-            if nepi_utils.is_valid_serial_number(setting_data) == False:
-                msg = (self.node_name  + " Serial Number" + setting_str + " is Not a valid 6 Diget Number")
-                self.add_info_string(msg, StampedString.PRI_HIGH)
-                return success, msg
-        self.system_config[setting_name] = setting_data
-        # nepi_system.update_nepi_system_config(setting_name,setting_data)         
-        success = True
-        msg = ( self.node_name  + " UPDATED SETTINGS " + setting_str)   
+      setting_str = setting_name + ":" + str(setting_value)
+      #self.msg_if.pub_warn("Got Config Setting Update: " + str(setting_str))
+      if setting_value is not None:
+        if setting_name not in self.settings_values_dict.keys():
+            self.settings_values_dict[setting_name] = setting_value
+        elif self.settings_values_dict[setting_name] != setting_value:
+            
+            # NONE is the config file's sentinel for an unset entry and is the shipped
+            # value for NEPI_GATEWAY_IP, NEPI_ALIAS_IP_2/3, and NEPI_NAV_IP, so it has to
+            # survive the IP check or those keys can never be cleared once set.
+            if 'IP' in setting_name and setting_value != self.CONFIG_NONE_VALUE:
+                if nepi_utils.is_valid_ip(setting_value) == False:
+                    msg = (self.node_name  + " Setting data" + setting_str + " is Not a valid IP address")
+                    self.add_info_string(msg, StampedString.PRI_HIGH)
+                    return success, msg
+            if 'NEPI_DEVICE_SN' == setting_name:
+                if nepi_utils.is_valid_serial_number(setting_value) == False:
+                    msg = (self.node_name  + " Serial Number" + setting_str + " is Not a valid 6 Diget Number")
+                    self.add_info_string(msg, StampedString.PRI_HIGH)
+                    return success, msg
+
+            #self.msg_if.pub_warn("Updating Config Setting File with: " + str([setting_name,setting_value]))
+            self.system_config[setting_name] = setting_value
+            nepi_system.update_nepi_system_config(setting_name,setting_value)         
+            success = True
+            msg = ( self.node_name  + " UPDATED SETTINGS " + setting_str)   
       else:
         msg = (self.node_name  + " Setting data" + setting_str + " is None")
-      return success, msg
+      #self.msg_if.pub_warn("Setting Update returned msg: " + str(msg))
+      return success, msg, self.getSettingsFunction()
 
     def setNepiConfigsCb(self, msg):
-        self.msg_if.pub_info("Got Set Configs msg: " + str(msg))
-        if self.system_settings_if is not None:
-            key_strs = msg.key_strs
-            value_strs = msg.value_strs
-            if len(key_strs) == len(value_strs):
-                for i, key_str in enumerate(key_strs):
-                    self.system_settings_if.update_setting_value(key_str, value_strs[i])
-                    nepi_sdk.sleep(0.2)
+        updating = copy.deepcopy(self.nepi_config_updating)
+        if updating == False:
+            self.nepi_config_updating = True
+            self.msg_if.pub_info("Got Set Configs msg: " + str(msg))
+            if self.system_settings_if is not None:
+                key_strs = msg.key_strs
+                value_strs = msg.value_strs
+                if len(key_strs) == len(value_strs):
+                    for i, key_str in enumerate(key_strs):
+                        #self.system_settings_if.update_setting_value(key_str, value_strs[i])
+                        nepi_sdk.sleep(0.2)
+            self.nepi_config_updating = False
+        
 
     def updateNepiConfigCb(self, msg):
         self.msg_if.pub_info("Got Update Config msg: " + str(msg))
         start_config = nepi_system.load_nepi_system_config()
         if self.nepi_update_requested == False and self.nepi_updating_config == False:
+            while (self.nepi_config_updating == True):
+              nepi_sdk.sleep(0.5)            
             self.msg_if.pub_warn("Starting System Update Process")
             umsg = "Sending NEPI Update Request"
             self.msg_if.pub_info(str(umsg))
@@ -1123,11 +1079,12 @@ class SystemMgrNode():
             system_config = copy.deepcopy(self.system_config)
             nepi_system.update_nepi_system_configs(system_config) 
             nepi_sdk.sleep(1)
+
+            ####################
             update_config = 1
-            nepi_system.update_nepi_docker_config('NEPI_UPDATE_CONFIG',update_config)
-            # Wait for updates
             success = False
             umsg = 'NEPI Config Failed to Update'
+            nepi_system.update_nepi_docker_config('NEPI_UPDATE_CONFIG',update_config)
             last_time = nepi_utils.get_time()
             timer = 0
             while (timer < self.UPDATE_START_WAIT_S):
@@ -1164,11 +1121,12 @@ class SystemMgrNode():
                 nepi_system.save_nepi_system_config(start_config)
                 nepi_sdk.sleep(1)
             updated_config = nepi_system.load_nepi_system_config()
-            self.msg_if.pub_warn("Got Updted System Config: " + str(updated_config))
+            #self.msg_if.pub_warn("Got Updated System Config: " + str(updated_config))
             if updated_config is None:
                 self.system_config = dict()
-            for key in updated_config.keys():
-                self.system_settings_if.update_setting_value(key,updated_config[key])
+            if self.system_settings_if is not None:
+                for key in updated_config.keys():
+                    self.system_settings_if.update_setting_value(key,updated_config[key])
             
         else:
             self.msg_if.pub_warn("System Update Process Allready in Progress")
@@ -1261,13 +1219,7 @@ class SystemMgrNode():
         try:
             statvfs = os.statvfs(self.storage_folder)
         except Exception as e:
-            # str(e), not e.what() -- the latter is C++ idiom; on a Python
-            # exception it raises AttributeError from inside this very handler,
-            # converting a handled disk-check failure back into the fatal,
-            # platform-killing crash the try/except exists to prevent. Also
-            # guard against storage_folder being None/"" here, since string
-            # concatenation with None raises TypeError the same way.
-            warn_str = "Error checking data storage status of " + str(self.storage_folder) + ": " + str(e)
+            warn_str = "Error checking data storage status of " + self.storage_folder + ": " + e.what()
             self.msg_if.pub_warn(warn_str)
             self.add_info_string("warn_str")
             self.status_msg.disk_usage = 0
@@ -1310,21 +1262,25 @@ class SystemMgrNode():
             netlist_text = netlist_text.replace('end_file','')
             self.status_msg.netlist_str = str(netlist_text)
 
-        nepi_service_running = False
+        nepi_service_running = True
         nepi_updating_config = False
         nepi_expanding_fs = False
-        nepi_docker_config = nepi_system.load_nepi_docker_config()
-        if nepi_docker_config is not None:
-            if 'NEPI_UPDATING_CONFIG' in nepi_docker_config.keys():
-                nepi_updating_config = nepi_docker_config['NEPI_UPDATING_CONFIG'] == 1
 
-            if 'NEPI_EXPANDING_FS' in nepi_docker_config.keys():
-                nepi_expanding_fs = nepi_docker_config['NEPI_EXPANDING_FS'] == 1
+        # nepi_service_running = False
+        # nepi_updating_config = False
+        # nepi_expanding_fs = False
+        # nepi_docker_config = nepi_system.load_nepi_docker_config()
+        # if nepi_docker_config is not None:
+        #     if 'NEPI_UPDATING_CONFIG' in nepi_docker_config.keys():
+        #         nepi_updating_config = nepi_docker_config['NEPI_UPDATING_CONFIG'] == 1
 
-            if 'NEPI_SERVICE_RUNNING' in nepi_docker_config.keys():
-                nepi_service_running = nepi_docker_config['NEPI_SERVICE_RUNNING'] == 1
-                #Reset for next check
-                # nepi_docker_config = nepi_system.update_nepi_docker_config('NEPI_SERVICE_RUNNING', 0)
+        #     if 'NEPI_EXPANDING_FS' in nepi_docker_config.keys():
+        #         nepi_expanding_fs = nepi_docker_config['NEPI_EXPANDING_FS'] == 1
+
+        #     if 'NEPI_SERVICE_RUNNING' in nepi_docker_config.keys():
+        #         nepi_service_running = nepi_docker_config['NEPI_SERVICE_RUNNING'] == 1
+        #         #Reset for next check
+        #         # nepi_docker_config = nepi_system.update_nepi_docker_config('NEPI_SERVICE_RUNNING', 0)
 
         self.nepi_service_running = nepi_service_running
         self.status_msg.nepi_service_running = nepi_service_running
@@ -1343,7 +1299,7 @@ class SystemMgrNode():
             # Expansion just finished, clear the in-progress warning
             self.status_msg.nepi_update_msg = 'STORAGE EXPANSION FINISHED'
         self.nepi_expanding_fs = nepi_expanding_fs
-
+        nepi_sdk.start_timer_process(1, self.updateDockerCb, oneshot = True)
         
         
 

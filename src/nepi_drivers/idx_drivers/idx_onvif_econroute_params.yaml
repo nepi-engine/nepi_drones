@@ -1,0 +1,22 @@
+driver:
+  pkg_name: IDX_ONVIF_EconRoute
+  display_name: EconRC ONVIF Camera
+  description: Driver package for Econ Route Cam Onvif camera devices
+  type: IDX
+  group_id: ONVIF
+  NODE_DICT:
+    file_name: idx_onvif_econroutecam_node.py
+    class_name:  OnvifCamEconRCNode
+  DRIVER_DICT:
+    file_name: idx_onvif_econroutecam_driver.py
+    class_name: EConRouteCam_NVT
+  DISCOVERY_DICT:
+    file_name: None
+    class_name: None
+    process: None
+    OPTIONS:
+      data_products:
+        type: Selection
+        options:
+          - 'color_image'
+        default: 'color_image'

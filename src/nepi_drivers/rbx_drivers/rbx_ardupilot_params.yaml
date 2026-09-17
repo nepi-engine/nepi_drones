@@ -16,14 +16,14 @@ driver:
     process: CALL
     OPTIONS:
       connection:
-        type: Discrete
+        type: Selection
         options:
           - SERIAL
           - SITL
         default: SERIAL
         value: SERIAL
       fake_gps:
-        type: 'Bool'
+        type: 'Toggle'
         options:
           - ''
         default: 'True'

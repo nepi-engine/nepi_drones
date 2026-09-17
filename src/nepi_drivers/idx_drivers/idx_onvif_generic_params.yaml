@@ -1,0 +1,23 @@
+driver:
+  pkg_name: IDX_ONVIF_GENERIC
+  display_name: Generic ONVIF Camera
+  description: Driver package for generic ONVIF camera devices
+  type: IDX
+  group_id: ONVIF
+  NODE_DICT:
+    file_name: idx_onvif_generic_node.py
+    class_name: OnvifCamNode
+  DRIVER_DICT:
+    file_name: idx_onvif_generic_driver.py
+    class_name: GenericONVIF_NVT
+  DISCOVERY_DICT:
+    file_name: None
+    class_name: None
+    process: None
+    OPTIONS:
+      data_products:
+          type: Selection
+          options:
+            - 'color_image'
+          default: 'color_image'
+    

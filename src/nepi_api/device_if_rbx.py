@@ -835,16 +835,22 @@ class RBXRobotIF:
         self.msg_if.pub_info("Starting Settings IF Initialization", log_name_list = self.log_name_list)
         settings_ns = self.namespace
 
-        self.SETTINGS_DICT = {
-                    'capSettings': capSettings, 
-                    'factorySettings': factorySettings,
-                    'setSettingFunction': settingUpdateFunction, 
-                    'getSettingsFunction': getSettingsFunction
-                    
-        }
-
+        # SettingsIF's current __init__ takes getSettingsFunction/
+        # setSettingFunction directly -- no settings_dict/capSettings/
+        # factorySettings kwargs exist any more (that bundling predates the
+        # controls-system refactor; capability info now comes from
+        # getSettingsFunction's own nepi_controls-based return value, same
+        # as every other SettingsIF caller in this codebase). Confirmed
+        # live: this call's old settings_dict= kwarg crashed every RBX
+        # device (rover sim and the physical ArduPilot alike) with
+        # "TypeError: __init__() got an unexpected keyword argument
+        # 'settings_dict'" before ever reaching Settings IF init, let alone
+        # discovery. capSettings/factorySettings are accepted above only
+        # for this constructor's own backward-compatible call signature --
+        # neither is consumed anywhere in this class any more.
         self.settings_if = SettingsIF(namespace = settings_ns,
-                        settings_dict = self.SETTINGS_DICT,
+                        getSettingsFunction = getSettingsFunction,
+                        setSettingFunction = settingUpdateFunction,
                         log_name_list = self.log_name_list,
                             msg_if = self.msg_if
                         )
@@ -1219,6 +1225,14 @@ class RBXRobotIF:
     ### Function to set motor control
     def setMotorControl(self,new_motor_ctrl):
         if self.manualControlsReadyFunction() is True and self.setMotorControlRatio is not None:
+            # Clear any stale error (e.g. an earlier "Not Ready" from before
+            # the bridge/vehicle became ready) now that a command is actually
+            # being accepted -- requested live (2026-09-16): a since-resolved
+            # error was staying in Last Error indefinitely since nothing ever
+            # cleared it. The driver's own setMotorControlRatio below still
+            # sets a fresh, specific error if IT rejects the command for its
+            # own reasons (e.g. the FCU refusing the motor test).
+            self.status_msg.last_error_message = ""
             m_ind = new_motor_ctrl.motor_ind
             m_sr = new_motor_ctrl.speed_ratio
             m_len = len(self.getMotorControlRatios())
@@ -1240,7 +1254,7 @@ class RBXRobotIF:
             elif self.setMotorControlRatio is not None:
                 self.setMotorControlRatio(m_ind,m_sr)
         else:
-            self.update_error_msg("Ignoring Set Motor Control msg, Manual Controls not Ready")
+            self.update_error_msg("Ignoring Set Motor Control msg, " + self._notReadyReason())
 
 
     ### Callback to set teleop (keyboard-driven) velocity
@@ -1250,7 +1264,7 @@ class RBXRobotIF:
             self.update_error_msg("Ignoring teleop velocity command, no teleop function")
             return
         if self.teleopControlsReadyFunction is None or self.teleopControlsReadyFunction() is not True:
-            self.update_error_msg("Ignoring teleop velocity command, Teleop Controls not Ready")
+            self.update_error_msg("Ignoring teleop velocity command, " + self._notReadyReason())
             return
         # linear.x/y/z, angular.z only. angular.x/y (roll-rate/pitch-rate) are
         # deliberately not read here: a rover has no meaning for them at all,
@@ -2066,6 +2080,31 @@ class RBXRobotIF:
       """
       self.msg_if.pub_info(error_msg)
       self.status_msg.last_error_message = error_msg
+
+    def _notReadyReason(self):
+        """Best-effort, driver-agnostic reason a manual/teleop command was
+        rejected, for a clearer status message than a bare "Not Ready".
+
+        Requested live (2026-09-16): "if it detects that its a drone and the
+        user is trying manual commands without arming the drone, there
+        should be some text message that informs the user about that."
+        Every flight-capable driver (ArduPilot's own manualControlsReady()
+        always returns True specifically to avoid an arm-state deadlock
+        during motor tests -- see that method's own comment -- so it is
+        teleopControlsReady() that actually gates on ARM) reports ARM/DISARM
+        through the same self.states/getStateIndFunction this class already
+        has; a rover has no states at all (RBX_STATES = []), so this quietly
+        falls back to the old generic wording for it instead of claiming
+        anything about arming that doesn't apply.
+        """
+        if (self.states and self.getStateIndFunction is not None):
+            try:
+                state_ind = self.getStateIndFunction()
+                if 0 <= state_ind < len(self.states) and self.states[state_ind] != "ARM":
+                    return "Not Ready (vehicle is not armed -- arm it first)"
+            except Exception:
+                pass
+        return "Not Ready"
 
     def get_motor_controls_status_msg(self,motor_controls):
       """Builds a list of MotorControl messages from a speed-ratio list.

@@ -1,0 +1,24 @@
+driver:
+  pkg_name: LSX_AFTOWERLIGHT
+  display_name: Adafruit TowerLight LED
+  description: Adafruit Tri-Color USB Controlled Tower Light with Buzzer
+  type: LSX
+  group_id: None
+  NODE_DICT:
+    file_name: lsx_aftowerlight_node.py
+    class_name: AfTowerLightNode
+  DRIVER_DICT:
+    file_name: None
+    class_name: None
+  DISCOVERY_DICT:
+    file_name: lsx_aftowerlight_discovery.py
+    class_name: AfTowerLightDiscovery
+    process: CALL
+    OPTIONS:
+      baud_rate:
+        type: Selection
+        options:
+          - '9600'
+        default: '9600'
+        value: '9600'
+

@@ -25,7 +25,7 @@ import { Columns, Column } from "./Columns"
 import Label from "./Label"
 import Select, { Option } from "./Select"
 import Button, { ButtonMenu } from "./Button"
-import Toggle from "react-toggle"
+import AsyncToggle from "./AsyncToggle"
 import Input from "./Input"
 import Styles from "./Styles"
 
@@ -71,6 +71,9 @@ class NepiDeviceRBX extends Component {
       cmd_timeout: null,
       image_source: null,
       image_status_overlay: null,
+      home_lat: null,
+      home_long: null,
+      home_alt: null,
       fake_gps_enabled: null,
       states_list: null,
       states_menu: null,
@@ -87,24 +90,50 @@ class NepiDeviceRBX extends Component {
       currentRBXNamespaceText: "No device selected",
 
       rbxInfoListener: null,
-      capabilitiesPollTimer: null,
 
-      // Which Settings this device's driver actually registers -- driver-
-      // specific, not present on every RBX driver, so controls built on top
-      // of them are gated on this list rather than an unrelated capability
-      // flag that would silently no-op for drivers that don't define them.
+      // Requested live 2026-09-16: "theres a bunch of random image sources
+      // that appear... only things actually inputting real image topics
+      // should show up." rbx_ardupilot_node.py/rbx_sim_node.py both
+      // deliberately advertise a fixed set of camera relay topics
+      // unconditionally (idle placeholders on hardware with no camera --
+      // see that driver's own comment), and enabled_image_sources is the
+      // existing, purpose-built Setting for curating which candidates
+      // should actually be offered (Nepi_IF_Sim-Controls.js's own
+      // renderImageSourceCuration writes it) -- createImageOptions() below
+      // just never read it back. Comma-separated topic list, or empty for
+      // "unrestricted" (no curation saved yet).
       rbxSettingsListener: null,
-      settingsNamesList: [],
-      settingsValuesDict: {}
+      enabled_image_sources: "",
+
+      // Requested live 2026-09-16: "if linked in sim connector, when i go to
+      // the ardupilot sitl in devices -> robots, there should be some
+      // indicator next to the device saying linked with .. for whichever
+      // its linked with." robot_link/status (nepi_app_sim_connector's own
+      // Robot Link feature, see Nepi_IF_RobotLink.js) is a JSON-encoded
+      // std_msgs/String, not a typed message -- same reasoning as that
+      // file's own docstring. There's exactly one sim connector app
+      // instance, at <this device's own root namespace>/app_sim_connector,
+      // so this derives that root from currentRBXNamespace rather than
+      // hardcoding "/nepi/device1" (which wouldn't survive a different
+      // ROOTNAME/DEVICE_ID). Absence of the app (not installed/running) is
+      // silently fine -- setupStatusListener on a topic with no publisher
+      // just never calls back, same as every other optional listener here.
+      robotLinkListener: null,
+      robot_link_status: null
     }
 
     this.updateInfoListener = this.updateInfoListener.bind(this)
     this.infoListener = this.infoListener.bind(this)
-    this.updateRBXSettingsListener = this.updateRBXSettingsListener.bind(this)
-    this.rbxSettingsListener = this.rbxSettingsListener.bind(this)
+    this.updateRbxSettingsListener = this.updateRbxSettingsListener.bind(this)
+    this.rbxSettingsListenerCb = this.rbxSettingsListenerCb.bind(this)
+    this.updateRobotLinkListener = this.updateRobotLinkListener.bind(this)
+    this.robotLinkListenerCb = this.robotLinkListenerCb.bind(this)
 
-    this.onTopicRBXSelected = this.onTopicRBXSelected.bind(this)
-    this.clearTopicRBXSelection = this.clearTopicRBXSelection.bind(this)
+    this.setDeviceSelection = this.setDeviceSelection.bind(this)
+    this.clearDeviceSelection = this.clearDeviceSelection.bind(this)
+    this.reconcileDeviceSelection = this.reconcileDeviceSelection.bind(this)
+    this.selectDeviceNamespace = this.selectDeviceNamespace.bind(this)
+
     this.createTopicOptions = this.createTopicOptions.bind(this)
     this.createImageOptions = this.createImageOptions.bind(this)
     this.onEnterSetInputErrorBoundValue = this.onEnterSetInputErrorBoundValue.bind(this)
@@ -133,39 +162,123 @@ class NepiDeviceRBX extends Component {
       error_stabilize_s: message.error_bounds.min_stabilize_time_s,
       cmd_timeout: message.cmd_timeout,
       image_source: message.image_source,
-      image_status_overlay: message.image_status_overlay
+      image_status_overlay: message.image_status_overlay,
+      home_lat: message.home_lat,
+      home_long: message.home_long,
+      home_alt: message.home_alt
     })
-    // Was gated on `this.state.rbx_capabilities === null` -- fetched once per
-    // device selection and never again. That hid the whole point of the Sim
-    // Connector capability-configuration UI: toggling "automated movement" (or
-    // any other has_* flag) there mutates the driver's live caps_report object
-    // in place (device_if_rbx.py's capabilities_query_callback returns it by
-    // reference, not a fresh snapshot), so the NEXT service call already
-    // reflects it -- but nothing was making that next call happen, and even if
-    // it had, this guard would have thrown the answer away. Now re-synced on
-    // every /info tick (paired with the capabilitiesPollTimer in
-    // updateInfoListener below, which is what actually re-issues the query).
-    const capabilities = rbxDevices[this.state.currentRBXNamespace]
-    if (capabilities) {
-      const states = capabilities.state_options
-      const states_menu_options = createMenuListFromStrList(states, false, [], [], [])
-      const modes = capabilities.mode_options
-      const modes_menu_options = createMenuListFromStrList(modes, false, [], [], [])
-      const actions = capabilities.setup_action_options
-      const actions_menu_options = createMenuListFromStrList(actions, false, [], [], [])
+    if (this.state.rbx_capabilities === null) {
+      const capabilities = rbxDevices[this.state.currentRBXNamespace]
+      if (capabilities) {
+        const states = capabilities.state_options
+        const states_menu_options = createMenuListFromStrList(states, false, [], [], [])
+        const modes = capabilities.mode_options
+        const modes_menu_options = createMenuListFromStrList(modes, false, [], [], [])
+        const actions = capabilities.setup_action_options
+        // RESET_SIM filtered out here (requested live 2026-09-14): it now
+        // has its own dedicated button in the Sim Connector app's Robot
+        // Capabilities section (Nepi_IF_Sim-Controls.js's
+        // renderRobotCapabilityControls) instead of sitting in this
+        // generic Setup Actions dropdown. Every other setup action (e.g.
+        // RETURN_HOME, TAKEOFF/LAUNCH/LAND on the flight drivers) stays.
+        const actions_menu_options = createMenuListFromStrList(actions, false, ["RESET_SIM"], [], [])
 
-      this.setState({
-        rbx_capabilities: capabilities,
-        states_list: states,
-        states_menu: states_menu_options,
-        modes_list: modes,
-        modes_menu: modes_menu_options,
-        actions_list: actions,
-        actions_menu: actions_menu_options,
-      })
+        this.setState({
+          rbx_capabilities: capabilities,
+          states_list: states,
+          states_menu: states_menu_options,
+          modes_list: modes,
+          modes_menu: modes_menu_options,
+          actions_list: actions,
+          actions_menu: actions_menu_options,
+        })
+      }
     }
   }
 
+
+  // Reads just the one Setting createImageOptions() needs (enabled_image_sources),
+  // off the same nepi_interfaces/SettingsStatus every device's Nepi_IF_Settings
+  // panel already subscribes to -- a second, independent subscription here
+  // rather than threading the value down from NepiIFSettings, since this
+  // component builds the dropdown before NepiIFSettings mounts in the render
+  // tree below it and has no other current channel for a device's live Setting
+  // values. Mirrors Nepi_IF_Sim-Controls.js's own updateRbxSettingsListener/
+  // rbxSettingsListener (see that file for why controls_name_list/
+  // controls_msg_list, and why value lives in ctrl.value, a string[]).
+  rbxSettingsListenerCb(message) {
+    const names = (message.controls_name_list !== undefined) ? message.controls_name_list : []
+    const msgs = (message.controls_msg_list !== undefined) ? message.controls_msg_list : []
+    const ind = names.indexOf("enabled_image_sources")
+    const ctrl = (ind !== -1) ? msgs[ind] : null
+    const value = (ctrl != null && ctrl.value !== undefined && ctrl.value.length > 0) ? ctrl.value[0] : ""
+    this.setState({ enabled_image_sources: value })
+  }
+
+  updateRbxSettingsListener(rbxNamespace) {
+    if (this.state.rbxSettingsListener) {
+      this.state.rbxSettingsListener.unsubscribe()
+      this.setState({ rbxSettingsListener: null, enabled_image_sources: "" })
+    }
+    if (rbxNamespace !== null && rbxNamespace !== '' && rbxNamespace !== 'None') {
+      var listener = this.props.ros.setupSettingsStatusListener(
+        rbxNamespace + "/settings/status",
+        this.rbxSettingsListenerCb
+      )
+      this.setState({ rbxSettingsListener: listener })
+    }
+  }
+
+  updateRobotLinkListener(rbxNamespace) {
+    if (this.state.robotLinkListener) {
+      this.state.robotLinkListener.unsubscribe()
+      this.setState({ robotLinkListener: null, robot_link_status: null })
+    }
+    if (rbxNamespace === null || rbxNamespace === '' || rbxNamespace === 'None') {
+      return
+    }
+    const deviceBaseNamespace = rbxNamespace.split('/rbx')[0]
+    const rootNamespace = deviceBaseNamespace.substring(0, deviceBaseNamespace.lastIndexOf('/'))
+    const listener = this.props.ros.setupStatusListener(
+      rootNamespace + "/app_sim_connector/sim/robot_link/status",
+      "std_msgs/String",
+      this.robotLinkListenerCb
+    )
+    this.setState({ robotLinkListener: listener })
+  }
+
+  robotLinkListenerCb(message) {
+    try {
+      this.setState({ robot_link_status: JSON.parse(message.data) })
+    } catch (e) {
+      // Malformed/empty payload -- keep the last good status.
+    }
+  }
+
+  // Renders "Linked with <other device>" next to the device selector when
+  // Robot Link is actively enabled and this device is one end of it.
+  renderLinkIndicator() {
+    const status = this.state.robot_link_status
+    const namespace = this.state.currentRBXNamespace
+    if (status == null || namespace == null || status.enabled !== true) {
+      return null
+    }
+    var otherNamespace = null
+    if (status.sim_namespace === namespace) {
+      otherNamespace = status.physical_namespace
+    } else if (status.physical_namespace === namespace) {
+      otherNamespace = status.sim_namespace
+    }
+    if (!otherNamespace) {
+      return null
+    }
+    const otherName = otherNamespace.split('/rbx')[0].split('/').pop()
+    return (
+      <Label title={""}>
+        <p style={{ color: Styles.vars.colors.green }}>{"Linked with " + otherName}</p>
+      </Label>
+    )
+  }
 
   // Function for configuring and subscribing to the device /info topic
   updateInfoListener() {
@@ -180,10 +293,6 @@ class NepiDeviceRBX extends Component {
         actions_list: null
       })
     }
-    if (this.state.capabilitiesPollTimer) {
-      clearInterval(this.state.capabilitiesPollTimer)
-      this.setState({ capabilitiesPollTimer: null })
-    }
     if (deviceNamespace !== null && deviceNamespace.indexOf('null') === -1) {
       var listener = this.props.ros.setupStatusListener(
         deviceNamespace + "/info",
@@ -191,20 +300,6 @@ class NepiDeviceRBX extends Component {
         this.infoListener
       )
       this.setState({ rbxInfoListener: listener })
-
-      // Re-issue the capabilities_query service call periodically so a
-      // capability toggled from the Sim Connector app (has_goto_position for
-      // "automated movement", has_camera_view_control, etc.) actually reaches
-      // this panel without requiring the user to reselect the device or reload
-      // the page. Store.js's own rbxDevices cache (callRBXCapabilitiesQueryService)
-      // otherwise only refreshes on ROS-graph topology change -- a capability
-      // flip on an already-connected device is invisible to it. 3s: fast
-      // enough to feel live, far below anything that would visibly load the
-      // rosbridge connection.
-      const pollTimer = setInterval(() => {
-        this.props.ros.callRBXCapabilitiesQueryService(deviceNamespace)
-      }, 3000)
-      this.setState({ capabilitiesPollTimer: pollTimer })
     }
   }
 
@@ -212,12 +307,17 @@ class NepiDeviceRBX extends Component {
   // Lifecycle method called when component updates.
   // Used to track changes in the selected device.
   componentDidUpdate(prevProps, prevState) {
+    // Reconcile first: this is the safe phase for the setState calls that used
+    // to run during render out of createTopicOptions.
+    this.reconcileDeviceSelection(Object.keys(this.props.ros.rbxDevices))
+
     const currentRBXNamespace = this.state.currentRBXNamespace
     if (prevState.currentRBXNamespace !== currentRBXNamespace && currentRBXNamespace !== null) {
       if (currentRBXNamespace.indexOf('null') === -1) {
         this.setState({ image_topic: currentRBXNamespace.split('/rbx')[0] + "/image" })
         this.updateInfoListener()
-        this.updateRBXSettingsListener()
+        this.updateRbxSettingsListener(currentRBXNamespace)
+        this.updateRobotLinkListener(currentRBXNamespace)
       }
     }
   }
@@ -232,245 +332,128 @@ class NepiDeviceRBX extends Component {
     if (this.state.rbxSettingsListener) {
       this.state.rbxSettingsListener.unsubscribe()
     }
-    if (this.state.capabilitiesPollTimer) {
-      clearInterval(this.state.capabilitiesPollTimer)
-    }
-  }
-
-
-  // Callback for handling nepi_interfaces/SettingsStatus messages -- tracks
-  // just the setting NAMES this device's driver actually registers, so
-  // driver-specific controls (camera POV toggle, camera offset) can gate
-  // their own visibility on whether the underlying Setting exists at all,
-  // the same way has_manual_controls/has_fake_gps already gate on a real
-  // capability rather than assuming every RBX driver looks alike.
-  rbxSettingsListener(message) {
-    const settings = (message.settings_list !== undefined) ? message.settings_list : []
-    var namesList = []
-    var valuesDict = {}
-    for (let ind = 0; ind < settings.length; ind++) {
-      namesList.push(settings[ind].name_str)
-      valuesDict[settings[ind].name_str] = settings[ind].value_str
-    }
-    this.setState({ settingsNamesList: namesList, settingsValuesDict: valuesDict })
-  }
-
-
-  // Function for configuring and subscribing to this device's settings/status
-  updateRBXSettingsListener() {
-    const deviceNamespace = this.state.currentRBXNamespace
-
-    if (this.state.rbxSettingsListener) {
-      this.state.rbxSettingsListener.unsubscribe()
-      this.setState({ rbxSettingsListener: null, settingsNamesList: [] })
-    }
-    if (deviceNamespace !== null && deviceNamespace.indexOf('null') === -1) {
-      var listener = this.props.ros.setupSettingsStatusListener(
-        deviceNamespace + "/settings/status",
-        this.rbxSettingsListener
-      )
-      this.setState({ rbxSettingsListener: listener })
+    if (this.state.robotLinkListener) {
+      this.state.robotLinkListener.unsubscribe()
     }
   }
 
 
   // Function for creating topic options for Select input
   createTopicOptions(topics) {
+    // const namespace = this.state.currentRBXNamespace
     var items = []
     items.push(<Option>{"None"}</Option>)
     var device_name = ""
-    var device_names = []
     for (var i = 0; i < topics.length; i++) {
       device_name = topics[i].split('/rbx')[0].split('/').pop()
-      device_names.push(device_name)
       items.push(<Option value={topics[i]}>{device_name}</Option>)
     }
-    // Check that our current selection hasn't disappeared as an available option
-    const { currentRBXNamespace } = this.state
-    if ((currentRBXNamespace != null) && (!topics.includes(currentRBXNamespace))) {
-      this.clearTopicRBXSelection()
-    } else if (currentRBXNamespace == null && topics.length === 1) {
-      // Auto-select the sole discovered device, mirroring
-      // sim_connector_app_node.py's simDiscoveryCb (auto-select when nothing
-      // is selected and exactly one candidate exists). Without this,
-      // currentRBXNamespace stays null on every fresh mount -- including
-      // every page reload -- and the entire Process Controls panel
-      // (Teleop included) stays unrendered until this dropdown is manually
-      // re-picked, an easy step to miss after a refresh.
-      this.setState({
-        currentRBXNamespace: topics[0],
-        currentRBXNamespaceText: device_names[0],
-      })
-    }
+    // Selection reconciliation deliberately does NOT happen here. This runs
+    // during render, and both branches call setState -- see
+    // reconcileDeviceSelection(), called from componentDidUpdate instead.
     return items
+  }
+
+  // Keep the current selection consistent with what is actually on the system:
+  // drop a selection whose device has disappeared, and adopt the first device
+  // when nothing is selected yet.
+  //
+  // Runs from componentDidUpdate, not from render. It also selects by NAMESPACE
+  // rather than by calling setDeviceSelection: that method is a DOM event
+  // handler and reads event.nativeEvent.target, so handing it a namespace
+  // string threw "Cannot read properties of undefined (reading 'target')" and
+  // took the whole page down as soon as any RBX device existed.
+  reconcileDeviceSelection(topics) {
+    const namespace = this.state.currentRBXNamespace
+    const selected = (namespace != null && namespace !== 'None')
+
+    if (selected && topics.includes(namespace) === false) {
+      this.clearDeviceSelection()
+      return
+    }
+    if (selected === false && topics.length > 0) {
+      this.selectDeviceNamespace(topics[0])
+    }
+  }
+
+  // The selection itself, independent of how it was chosen. Both the Select
+  // handler and the auto-adopt path above go through here.
+  selectDeviceNamespace(namespace) {
+    if (namespace == null || namespace === 'None') {
+      this.clearDeviceSelection()
+      return
+    }
+    this.setState({
+      currentRBXNamespace: namespace,
+      currentRBXNamespaceText: namespace.split('/rbx')[0].split('/').pop(),
+    })
   }
 
   createImageOptions(RBXDeviceNamespace) {
     var items = []
     items.push(<Option>{"None"}</Option>)
 
+    // RBXDeviceNamespace is currentRBXNamespace, which ends in "/rbx" (e.g.
+    // ".../ardupilot_ttyUSB0/rbx"), but a device's own camera relay topics
+    // live directly under its base namespace (".../ardupilot_ttyUSB0/
+    // color_2d_image/..."), not under "/rbx" -- so the startsWith check
+    // below never actually matched anything and a device's own (idle, on
+    // hardware with no camera) relay topics showed up as candidates in its
+    // own Image Source dropdown. Strip the "/rbx" suffix first so
+    // self-exclusion actually works.
+    const deviceBaseNamespace = RBXDeviceNamespace.split('/rbx')[0]
+
+    // enabled_image_sources (see rbxSettingsListenerCb above) is the
+    // existing curation Setting: when the operator has saved a non-empty
+    // allowlist via the Sim Connector's Robot Capabilities panel, only
+    // those topics should appear here at all -- matching what
+    // Nepi_IF_Sim-Controls.js's own comment already documented as the
+    // intended contract. Empty means "nothing curated yet", so fall back
+    // to the full (self-excluded) candidate list rather than showing none.
+    const enabledRaw = this.state.enabled_image_sources || ""
+    const enabledList = enabledRaw.split(',').map((s) => s.trim()).filter((s) => s !== "")
+
     const image_topics = this.props.ros.imageTopics
     var img_topics = []
 
-    // Scope this list to THIS robot's own cameras.
-    //
-    // props.ros.imageTopics is the RUI-wide list of every sensor_msgs/Image
-    // topic on the system (Store.js updateImageTopics), shared by every image
-    // selector in the app. Offering all of it here listed things that have
-    // nothing to do with the selected robot -- on this device: another app's
-    // feed (app_sim_connector/color_2d_image) and a physical USB camera
-    // (nexigo_02/idx/color_image) -- and createShortValuesFromNamespaces
-    // renders only the last two path segments, so unrelated topics could even
-    // display under identical-looking labels. For a robot panel the useful
-    // answer is "this robot's camera".
-    //
-    // RBXDeviceNamespace ends in "/rbx"; the device's own image topics are
-    // siblings of it under the plain node namespace (RBXRobotIF's
-    // self.namespace is a CHILD of self.node_namespace -- see
-    // device_if_rbx.py), so match on the node namespace, not on
-    // RBXDeviceNamespace itself.
-    //
-    // ownImageTopic is RBXRobotIF's own republished output, fed BY whatever
-    // is selected here -- selecting your own output as your own input is
-    // never a real choice, so it stays excluded even though it lives in the
-    // right namespace.
-    const nodeNamespace = RBXDeviceNamespace.split('/rbx')[0]
-    const ownImageTopic = nodeNamespace + "/image"
-
     for (var i = 0; i < image_topics.length; i++) {
       const topic = image_topics[i]
-      if (topic === ownImageTopic || topic.includes('zed_node') === true) {
+      if (topic.includes('zed_node') === true) {
         continue
       }
-      if (topic.startsWith(nodeNamespace + "/") === true) {
+      // Explicit curation (enabled_image_sources) always wins, for whichever
+      // device it was saved on -- an operator who deliberately added a
+      // topic to the allowlist gets it, even if it would otherwise be
+      // filtered below.
+      if (enabledList.includes(topic)) {
         img_topics.push(topic)
+        continue
       }
-    }
-
-    // Sim Connector's own "choose what image sources are good and what
-    // aren't" curation -- enabled_image_sources is a comma-separated
-    // allowlist Setting (see rbx_sim_node.py's CAPABILITY_SETTING_NAMES).
-    // Empty (a driver that doesn't define it, or hasn't set it, or every
-    // candidate is simply left at its default-enabled state) means
-    // unrestricted -- every discovered topic is offered, matching
-    // Nepi_IF_Sim-Controls.js's own renderImageSourceCuration, which shows
-    // every candidate as already checked for this exact state. Non-empty
-    // means the operator has deliberately narrowed the list to specific
-    // topics -- curationRestricted gates that path so a curated-down-to-zero
-    // list (e.g. every allowed topic happens to be temporarily unpublished)
-    // doesn't silently fall through to "show everything unfiltered",
-    // defeating the curation the operator explicitly set up exactly when it
-    // looks like it worked.
-    //
-    // When active, the allowlist can ADD topics from OUTSIDE this robot's
-    // own namespace, not just narrow the namespace-scoped list -- found live
-    // (2026-08-18): a physical camera genuinely connected to this device
-    // (e.g. nexigo_02/idx/color_image) could never be offered as an image
-    // source for a simulated robot, even after the operator explicitly
-    // allowlisted it via the Sim Connector's own image-source curation
-    // control, because this scoping ran BEFORE the allowlist and only ever
-    // narrowed within it. The allowlist is the operator's own deliberate,
-    // per-instance choice (surfaced by the Sim Connector precisely so a real
-    // camera can stand in for a simulated one) -- it should be honored
-    // wherever the topic actually lives, not silently re-scoped back to
-    // "this robot's own" after the fact.
-    const enabledSourcesRaw = this.state.settingsValuesDict["enabled_image_sources"]
-    const curationRestricted = (enabledSourcesRaw !== undefined && String(enabledSourcesRaw).trim() !== '')
-    if (curationRestricted) {
-      const allowlist = String(enabledSourcesRaw).split(',').map((s) => s.trim()).filter((s) => s !== '')
-      const namespaceScoped = img_topics.filter((topic) => allowlist.includes(topic))
-      const allowlistedElsewhere = image_topics.filter((topic) =>
-        allowlist.includes(topic) && topic !== ownImageTopic && !namespaceScoped.includes(topic))
-      img_topics = namespaceScoped.concat(allowlistedElsewhere)
-    } else {
-      // Empty enabled_image_sources means unrestricted -- Nepi_IF_Sim-
-      // Controls.js's own renderImageSourceCuration shows EVERY candidate as
-      // already checked/enabled for exactly this state, so this dropdown
-      // needs to actually match that: every other discovered topic (not just
-      // a "no topics of our own" fallback) gets offered too. Previously this
-      // only ran when img_topics was completely empty, so a robot that
-      // already publishes its own camera (any Gazebo-based driver) could
-      // never also offer a physical camera the operator left at its
-      // enabled-by-default state -- found live (2026-08-19): nexigo_02/idx/
-      // color_image stayed missing from this dropdown even though the
-      // curation checklist showed it enabled, because sim_rover1 already had
-      // its own raw topics and the old fallback condition never triggered.
-      //
-      // Same color_2d_image/bare-"/image" exclusion as renderImageSourceCuration's
-      // own candidate filter, not just ownImageTopic/zed_node -- without it,
-      // OTHER devices' internal relay-source echoes (e.g. a second robot's
-      // own color_2d_image/robot_view, or app_sim_connector's own bare
-      // color_2d_image topic) got added here as extra, redundant options
-      // alongside the real mirrors below (found live 2026-08-19).
-      for (var j = 0; j < image_topics.length; j++) {
-        const other = image_topics[j]
-        if (other === ownImageTopic || other.includes('zed_node') === true
-            || other.includes('color_2d_image') === true || other.endsWith('/image') === true) {
-          continue
-        }
-        if (!img_topics.includes(other)) {
-          img_topics.push(other)
-        }
+      if (enabledList.length > 0) {
+        // A non-empty allowlist is exhaustive -- everything not explicitly
+        // in it is excluded, matching Nepi_IF_Sim-Controls.js's own
+        // renderImageSourceCuration contract.
+        continue
       }
-    }
-
-    // app_sim_connector's robot_view/scene_view mirrors exist specifically so
-    // this panel doesn't need to know a simulated robot's own raw topic names
-    // (sim_rover1/..., a quadcopter's own namespace, etc.) -- see
-    // sim_connector_app_node.py's commonViewImageCb, which republishes
-    // whichever robot is currently active under these two fixed names. They
-    // live under this device's root, one level above nodeNamespace, not
-    // under nodeNamespace itself, so the scoping loop above never finds
-    // them, and they were previously reachable only via the Sim Connector's
-    // own separate enabled_image_sources curation step.
-    //
-    // When live (this IS a simulator-backed device), the mirrors REPLACE only
-    // the robot's own literal color_2d_image/robot_view + .../scene_view
-    // duplicates -- NOT the whole list. An earlier version of this replaced
-    // img_topics wholesale, which also silently dropped every curation-
-    // allowlisted topic from OUTSIDE the robot's own namespace (found live
-    // 2026-08-19: nexigo_02/idx/color_image, explicitly enabled via the Sim
-    // Connector's own curation checklist, disappeared from this dropdown the
-    // moment a simulator was active) -- exactly the case the allowlist logic
-    // above was written to support. Filtered against the live image_topics
-    // list so a physical (non-simulated) device never gets offered mirrors
-    // that don't actually exist, in which case nothing here changes.
-    const deviceRoot = nodeNamespace.split('/').slice(0, -1).join('/')
-    const simMirrorTopics = [
-      deviceRoot + "/app_sim_connector/robot_view",
-      deviceRoot + "/app_sim_connector/scene_view"
-    ].filter((topic) => image_topics.includes(topic))
-    if (simMirrorTopics.length > 0) {
-      const ownDuplicateTopics = [
-        nodeNamespace + "/color_2d_image/robot_view",
-        nodeNamespace + "/color_2d_image/scene_view"
-      ]
-      // Exclude simMirrorTopics themselves too, not just ownDuplicateTopics --
-      // the unrestricted branch above already adds every other discovered
-      // topic (including these same two mirrors) when nothing is curated, so
-      // without this they were being prepended a second time (found live
-      // 2026-08-19: robot_view/scene_view each appeared twice in the
-      // dropdown).
-      img_topics = simMirrorTopics.concat(
-        img_topics.filter((topic) => !ownDuplicateTopics.includes(topic) && !simMirrorTopics.includes(topic)))
-    }
-
-    // If the currently-active source (this.state.image_source, driven by the
-    // device's own status report -- see statusListener) just fell out of the
-    // computed list -- e.g. the operator unchecked it in the Sim Connector's
-    // curation checklist -- proactively tell the device to go back to "None"
-    // rather than leaving it silently relaying from a topic this dropdown no
-    // longer even offers. Found live (2026-08-19): unchecking nexigo_02 in
-    // the curation list made it disappear from this dropdown, but the
-    // device's OWN image_source param was untouched (curation is a pure RUI/
-    // Settings-list concept; the topic itself is still publishing), so it
-    // kept right on relaying nexigo's feed -- with the Select unable to
-    // match its own bound value against any remaining <Option>, LOOKING like
-    // "None" was selected while the backend silently disagreed.
-    const activeSource = this.state.image_source
-    if (activeSource && activeSource !== 'None' && !img_topics.includes(activeSource)) {
-      const { sendStringMsg } = this.props.ros
-      sendStringMsg(RBXDeviceNamespace + "/set_image_topic", "None")
+      // No curation saved for THIS device -- generalize self-exclusion to
+      // every RBX driver's own relay-pattern topics (not just this
+      // device's own), the same exclusion renderImageSourceCuration
+      // already applies when building candidates: "color_2d_image" and any
+      // bare ".../image" are always an internal per-device echo (idle
+      // placeholders on hardware with no camera, or redundant with the sim
+      // connector's own mirror topics for a sim device) -- never a
+      // meaningful "image source" for ANY device's own picker, own or
+      // another's. Requested live 2026-09-16: "make sure this happens for
+      // every robot device" -- this was previously only self-excluded,
+      // requiring per-device manual curation (as done for ardupilot_ttyUSB0)
+      // to hide every OTHER device's own relay topics too.
+      if (topic.startsWith(deviceBaseNamespace) === true) {
+        continue
+      }
+      if (topic.includes('color_2d_image') === true || topic.endsWith('/image') === true) {
+        continue
+      }
+      img_topics.push(topic)
     }
 
     const img_topics_short = createShortValuesFromNamespaces(img_topics)
@@ -480,9 +463,15 @@ class NepiDeviceRBX extends Component {
     return items
   }
 
-  clearTopicRBXSelection() {
+  clearDeviceSelection() {
     if (this.state.rbxInfoListener) {
       this.state.rbxInfoListener.unsubscribe()
+    }
+    if (this.state.rbxSettingsListener) {
+      this.state.rbxSettingsListener.unsubscribe()
+    }
+    if (this.state.robotLinkListener) {
+      this.state.robotLinkListener.unsubscribe()
     }
     this.setState({
       currentRBXNamespace: null,
@@ -492,25 +481,29 @@ class NepiDeviceRBX extends Component {
       states_list: null,
       modes_list: null,
       actions_list: null,
-      rbxInfoListener: null
+      rbxInfoListener: null,
+      rbxSettingsListener: null,
+      enabled_image_sources: "",
+      robotLinkListener: null,
+      robot_link_status: null
     })
   }
 
-  // Handler for RBX device topic selection
-  onTopicRBXSelected(event) {
+  // Handler for RBX device topic selection. Event-shaped, so it only ever
+  // receives a real DOM event from the Select below; everything else selects
+  // through selectDeviceNamespace().
+  setDeviceSelection(event) {
     var rbx = event.nativeEvent.target.selectedIndex
-    var text = event.nativeEvent.target[rbx].text
-    var value = event.target.value
 
     // Handle the "None" option -- always index 0
     if (rbx === 0) {
-      this.clearTopicRBXSelection()
+      this.clearDeviceSelection()
       return
     }
 
     this.setState({
-      currentRBXNamespace: value,
-      currentRBXNamespaceText: text,
+      currentRBXNamespace: event.target.value,
+      currentRBXNamespaceText: event.nativeEvent.target[rbx].text,
     })
   }
 
@@ -546,14 +539,25 @@ class NepiDeviceRBX extends Component {
   }
 
   onDropdownSelectedAction(event) {
+    // Looked up by VALUE against the full, unfiltered actions_list -- NOT
+    // event.target.selectedIndex (DOM position), which no longer matches
+    // the driver's own action index now that RESET_SIM is filtered out of
+    // this dropdown (see actions_menu_options' own comment). A driver-side
+    // action's real index can differ from its position here even before
+    // this filter (RESET_SIM sits at index 0 for some drivers, a later
+    // index for others -- see each rbx_*_node.py's own RBX_SETUP_ACTIONS
+    // list), so position-based dispatch was never safe to begin with; this
+    // makes it correct regardless of what else this dropdown ever excludes.
+    const actions = this.state.actions_list || []
     this.setState({
       selected_setup_action: event.target.value,
-      selected_setup_action_index: event.target.selectedIndex
+      selected_setup_action_index: actions.indexOf(event.target.value)
     })
   }
 
+
   renderDeviceSelection() {
-    const { rbxDevices, sendStringMsg, sendBoolMsg } = this.props.ros
+    const { rbxDevices, sendStringMsg, sendBoolMsg, sendGeoPointMsg } = this.props.ros
     const NoneOption = <Option>None</Option>
     const deviceSelected = (this.state.currentRBXNamespace != null)
     const has_fake_gps = (this.state.rbx_capabilities !== null) ? (this.state.rbx_capabilities.has_fake_gps === true) : false
@@ -566,12 +570,14 @@ class NepiDeviceRBX extends Component {
 
               <Label title={"Device"}>
                 <Select
-                  onChange={this.onTopicRBXSelected}
+                  onChange={this.setDeviceSelection}
                   value={namespace}
                 >
                   {this.createTopicOptions(Object.keys(rbxDevices))}
                 </Select>
               </Label>
+
+              {this.renderLinkIndicator()}
 
             </Column>
             <Column>
@@ -586,10 +592,10 @@ class NepiDeviceRBX extends Component {
               <Column>
                 <div hidden={(has_fake_gps === false)}>
                   <Label title="Enable Fake GPS">
-                    <Toggle
+                    <AsyncToggle
                       checked={this.state.fake_gps_enabled === true}
                       onClick={() => sendBoolMsg(namespace + "/enable_fake_gps", this.state.fake_gps_enabled === false)}>
-                    </Toggle>
+                    </AsyncToggle>
                   </Label>
                 </div>
 
@@ -609,23 +615,12 @@ class NepiDeviceRBX extends Component {
               <Column>
 
                 <Label title="Image Status Overlay">
-                  <Toggle
+                  <AsyncToggle
                     checked={this.state.image_status_overlay === true}
                     onClick={() => sendBoolMsg(namespace + "/enable_image_overlay", this.state.image_status_overlay === false)}>
-                  </Toggle>
+                  </AsyncToggle>
                 </Label>
 
-                {/* Depth Map deliberately NOT here -- tried putting it on
-                    this generic panel (2026-08-19) reasoning it was device-
-                    agnostic, but it isn't: the colorized feed comes from
-                    camera_rig_controller.py reading Gazebo's own depth
-                    sensor plugin, entirely independent of whatever this
-                    Image_Source dropdown has selected. Toggling it while a
-                    real camera (e.g. nexigo_02) is the selected source has
-                    no effect on that camera at all -- confirmed live, this
-                    is Sim-only for real, not just Sim-first. Stays in
-                    Nepi_IF_Sim-Controls.js exclusively, same reasoning that
-                    already keeps camera_offset_x/y/z out of this panel. */}
                 <Label title="">
                 </Label>
 
@@ -680,6 +675,54 @@ class NepiDeviceRBX extends Component {
               </Column>
             </Columns>
 
+            <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }} />
+            <label style={{ fontWeight: 'bold' }}>
+              {"Home Location"}
+            </label>
+
+            <Columns>
+              <Column>
+
+                <Label title={"latitude"}>
+                  <Input
+                    value={this.state.home_lat}
+                    id="home_lat"
+                    onChange={(event) => onUpdateSetStateValue.bind(this)(event, "home_lat")}
+                    style={{ width: "80%" }}
+                  />
+                </Label>
+
+              </Column>
+              <Column>
+
+                <Label title={"longitude"}>
+                  <Input
+                    value={this.state.home_long}
+                    id="home_long"
+                    onChange={(event) => onUpdateSetStateValue.bind(this)(event, "home_long")}
+                    style={{ width: "80%" }}
+                  />
+                </Label>
+
+              </Column>
+              <Column>
+
+                <Label title={"altitude"}>
+                  <Input
+                    value={this.state.home_alt}
+                    id="home_alt"
+                    onChange={(event) => onUpdateSetStateValue.bind(this)(event, "home_alt")}
+                    style={{ width: "80%" }}
+                  />
+                </Label>
+
+                <ButtonMenu>
+                  <Button onClick={() => sendGeoPointMsg(namespace + "/set_home", this.state.home_lat, this.state.home_long, this.state.home_alt)}>{"Set Home"}</Button>
+                </ButtonMenu>
+
+              </Column>
+            </Columns>
+
           </div>
         </Section>
 
@@ -692,13 +735,6 @@ class NepiDeviceRBX extends Component {
     const current_state = (this.state.rbx_capabilities !== null && this.state.states_list !== null) ? this.state.states_list[this.state.state_index] : "None"
     const current_mode = (this.state.rbx_capabilities !== null && this.state.modes_list !== null) ? this.state.modes_list[this.state.mode_index] : "None"
     const namespace = this.state.currentRBXNamespace
-    // modes_list/states_list are set directly from capabilities' string[]
-    // options -- an empty (but loaded) [] is truthy in JS, so without this
-    // length check these dropdowns rendered blank/empty for robots that
-    // legitimately have no modes/states (e.g. RBX_SIM's rover) instead of
-    // just not showing at all.
-    const has_modes = (this.state.modes_list !== null && this.state.modes_list.length > 0)
-    const has_states = (this.state.states_list !== null && this.state.states_list.length > 0)
     return (
       <React.Fragment>
         <Section title={"Setup Controls"}>
@@ -706,29 +742,26 @@ class NepiDeviceRBX extends Component {
           <Columns>
             <Column>
 
-              <div hidden={!has_modes}>
-                <Label title={"Set Mode"}>
-                  <Select
-                    id="device_mode"
-                    onChange={(event) => onDropdownSelectedSendIndex.bind(this)(event, namespace + "/set_mode")}
-                    value={current_mode}
-                  >
-                    {this.state.modes_list ? this.state.modes_menu : NoneOption}
-                  </Select>
-                </Label>
-              </div>
+              <Label title={"Set Mode"}>
+                <Select
+                  id="device_mode"
+                  onChange={(event) => onDropdownSelectedSendIndex.bind(this)(event, namespace + "/set_mode")}
+                  value={current_mode}
+                >
+                  {this.state.modes_list ? this.state.modes_menu : NoneOption}
+                </Select>
+              </Label>
 
-              <div hidden={!has_states}>
-                <Label title={"Set State"}>
-                  <Select
-                    id="device_state"
-                    onChange={(event) => onDropdownSelectedSendIndex.bind(this)(event, namespace + "/set_state")}
-                    value={current_state}
-                  >
-                    {this.state.states_list ? this.state.states_menu : NoneOption}
-                  </Select>
-                </Label>
-              </div>
+
+              <Label title={"Set State"}>
+                <Select
+                  id="device_state"
+                  onChange={(event) => onDropdownSelectedSendIndex.bind(this)(event, namespace + "/set_state")}
+                  value={current_state}
+                >
+                  {this.state.states_list ? this.state.states_menu : NoneOption}
+                </Select>
+              </Label>
 
             </Column>
             <Column>
@@ -761,35 +794,11 @@ class NepiDeviceRBX extends Component {
       <React.Fragment>
         <Columns>
           <Column equalWidth={false}>
-            {/* This page already renders a full <NepiIFSaveData> panel below
-                (the device-side snapshot/save-data pipeline) -- ImageViewer
-                itself also embeds two more copies of that same panel
-                internally (show_save_controls, default true), and separately
-                its own client-side "Snapshot" (a local PNG download,
-                unrelated to device data recording) duplicated the Snapshot
-                button with an identical label. Both disabled here only;
-                other ImageViewer consumers without their own SaveData panel
-                keep them.
-
-                streamingImageQuality/streamingImageRate override
-                ImageViewer's defaults (JPEG quality 95, up to 20fps) for the
-                live MJPEG stream web_video_server serves straight to the
-                browser -- on the NEPI device's Raspberry Pi hardware, that
-                per-viewer real-time encode (not the VM-side relay, and not
-                this source resolution) was the actual bottleneck behind the
-                "laggy" complaint. The RUI's own quality-selector control for
-                this is dead/commented-out code (Nepi_IF_ImageViewer.js), so
-                overriding the defaults here is the only way to actually
-                change it. */}
             <ImageViewer
               image_topic={this.state.image_topic}
               title={""}
               hideQualitySelector={false}
               show_topic_selector={false}
-              show_browser_save_button={false}
-              show_save_controls={false}
-              streamingImageQuality={50}
-              streamingImageRate={10}
             />
           </Column>
         </Columns>
@@ -829,8 +838,6 @@ class NepiDeviceRBX extends Component {
           {(deviceSelected === true) ?
             <NepiDeviceMessages
               rbxNamespace={namespace}
-              is_local_frame={(this.state.rbx_capabilities !== null) ? (this.state.rbx_capabilities.has_goto_location !== true) : false}
-              has_set_home={(this.state.rbx_capabilities !== null) ? (this.state.rbx_capabilities.has_set_home === true) : false}
               title={"System Information"}
             />
             : null}
@@ -855,22 +862,13 @@ class NepiDeviceRBX extends Component {
             <NepiDeviceControls
               rbxNamespace={namespace}
               title={"Process Controls"}
-              // Passed through so autonomous_movement_enabled/
-              // teleop_movement_enabled (Settings a Sim Connector robot-config
-              // toggle writes to) can hide the corresponding dropdown option
-              // entirely rather than leaving a control visible-but-inert --
-              // capabilities alone only say WHETHER a robot type supports
-              // something, not whether the current deployment wants it
-              // exposed.
-              settingsNamesList={this.state.settingsNamesList}
-              settingsValuesDict={this.state.settingsValuesDict}
             />
             : null}
 
           {(deviceSelected === true) ?
             <NepiIFSettings
               settingsNamespace={namespace + '/settings'}
-              allways_show_settings={true}
+              allways_show_controls={true}
               title={"Device Settings"}
             />
             : null}

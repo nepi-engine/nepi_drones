@@ -1,0 +1,41 @@
+driver:
+  pkg_name: LSX_SIDUS_SS182_SERIAL
+  display_name: Sidus SS182 Serial LED
+  description: Sidus Serial SS182 Driver Interface
+  type: LSX
+  group_id: None
+  NODE_DICT:
+    file_name: lsx_sidus_SS182_serial_node.py
+    class_name: SidusSS182SerialNode
+  DRIVER_DICT:
+    file_name: None
+    class_name: None
+  DISCOVERY_DICT:
+    file_name: lsx_sidus_SS182_serial_discovery.py
+    class_name: SidusSS182SerialDiscovery
+    process: CALL
+    OPTIONS:
+      baud_rate:
+        type: Selection
+        options:
+          - All
+          - '9600'
+        default: All
+        value: All
+
+      start_addr:
+        type: 'String'
+        default: 'A'
+        value: 'A'
+
+      stop_addr:
+        type: 'String'
+        default: 'B'
+        value: 'B'
+
+      system_config:
+        type: Selection
+        options:
+          - 'Standard'
+        default: 'Standard'
+        value: 'Standard'

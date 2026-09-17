@@ -22,7 +22,7 @@ import { inject } from "mobx-react"
 import Slider from "rc-slider"
 import Tooltip from "rc-tooltip"
 import PropTypes from "prop-types"
-import Toggle from "react-toggle"
+import AsyncToggle from "./AsyncToggle"
 
 import Styles from "./Styles"
 import Input from "./Input"
@@ -119,9 +119,14 @@ const styles = Styles.Create({
 // Function for sending updated state through rosbridge
 function sendUpdate(props, new_value, throttle) {
   const noPrefix = (props.topic.startsWith('/'))
-  const comp_name = props.comp_name ? props.comp_name : null
-  if (comp_name != null) {
-    props.ros.sendUpdateFloatMsg(props.topic,props.comp_name,new_value)
+  const comp_name = props.comp_name !== undefined ? props.comp_name : null
+  const is_control = props.is_control !== undefined ? props.is_control : false
+  const comp_index = props.comp_index !== undefined ? props.comp_index : ''
+  if (comp_name != null && is_control === true) {
+    props.ros.sendUpdateControlValue(props.topic, comp_name,new_value, comp_index)
+  }
+  else if (comp_name != null) {
+    props.ros.sendUpdateFloatMsg(props.topic, comp_name,new_value)
   }
   else {
     props.ros.publishValue(
@@ -131,7 +136,7 @@ function sendUpdate(props, new_value, throttle) {
       throttle,
       noPrefix
     )
-}
+  }
 }
 
 // Following constants control the SliderAdjustment acceleration. The logic is
@@ -451,7 +456,7 @@ class RadioButtonAdjustment extends Component {
       <Column>
       <div align={"left"} textAlign={"left"}>
         <Label title={this.props.entries[i]}/>
-        <Toggle checked={this.props.adjustment === i} disabled={this.props.disabled} onClick={() => {sendUpdate(this.props, i, false)}}/>
+        <AsyncToggle checked={this.props.adjustment === i} disabled={this.props.disabled} onClick={() => {sendUpdate(this.props, i, false)}}/>
       </div>
       </Column>      
     )

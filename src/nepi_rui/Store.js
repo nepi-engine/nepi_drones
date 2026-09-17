@@ -30,24 +30,27 @@ const TRIGGER_MASKS = {
   OUTPUT_ENABLED: 0xffffffff,
   DEFAULT: 0x7fffffff
 }
-
+const NEPI_RETRY_MSEC = 500
 const NEPI_TIMEOUT_MSEC = 3000
+const NEPI_CONNECT_RETRIES = 1
+
+const UPDATE_PERIOD = 100 // ms between sending updates
 
 // Order-independent set equality for two string arrays. updateTopicsServices
 // uses this to decide whether the topic/type/service lists actually changed
 // -- a plain .length comparison (what this replaced) misses any case where
 // one topic disappears and a different one appears in the same tick (the
 // count stays identical), which silently skips re-running every device-list
-// refresh (updateRBXDevices/updateIDXDevices/updateImageTopics/etc, all
-// gated on this same check) until some LATER, unrelated topic change happens
-// to produce a length mismatch. Confirmed as the mechanism behind real user
-// reports: a killed sim's robot lingering as a selectable device long after
-// its /rbx/status topic was actually gone, and camera topics not appearing
-// in the image selector. rosbridge's getTopics() also does not guarantee a
-// stable order between calls, so this has to be a Set comparison, not an
-// index-by-index one (which would report "changed" on every single tick
-// even when nothing real changed, reintroducing the cost this guard exists
-// to avoid).
+// refresh (updateIDXDevices/updateSVXDevices/updateRBXDevices/
+// updateImageTopics/etc, all gated on this same check) until some LATER,
+// unrelated topic change happens to produce a length mismatch. Confirmed as
+// the mechanism behind real user reports: a killed sim's robot lingering as a
+// selectable device long after its /rbx/status topic was actually gone, and
+// camera topics not appearing in the image selector. rosbridge's getTopics()
+// also does not guarantee a stable order between calls, so this has to be a
+// Set comparison, not an index-by-index one (which would report "changed" on
+// every single tick even when nothing real changed, reintroducing the cost
+// this guard exists to avoid).
 function sameStringSet(a, b) {
   if (a === b) {
     return true
@@ -67,76 +70,8 @@ function sameStringSet(a, b) {
   return true
 }
 
-
-// TODO: Would be better to query the display_name property of all nodes to generate
-// this dictionary... requires a new SDKNode service to do so
-const NODE_DISPLAY_NAMES = {
-  config_mgr: "Config Manager",
-  nav_pose_mgr: "Nav./Pose/GPS",
-  network_mgr: "Network",
-  ai_detector_mgr: "Classifier",
-  system_mgr: "System",
-  time_mgr: "Time Sync",
-  trigger_mgr: "Triggering",
-  nepi_link_ros_bridge: "NEPI Connect",
-  gpsd_ros_client: "GPSD Client",
-  illumination_mgr: "Illumination",
-  scripts_mgr: "Scripts",
-  app_image_sequencer: "Sequencer"
-}
-
-const UPDATE_PERIOD = 100 // ms between sending updates
-
 let _ruiCryptoKey = null
 
-function displayNameFromNodeName(node_name) {
-  var display_name = NODE_DISPLAY_NAMES[node_name]
-  if (display_name) {
-    return display_name
-  }
-  return node_name
-}
-
-function nodeNameFromDisplayName(display_name) {
-  for( var node_name in NODE_DISPLAY_NAMES ) {
-    if (NODE_DISPLAY_NAMES[node_name] === display_name) {
-      return node_name
-    }
-  }
-  // Don't return anything if we don't find the display name -- callers can check for undefined
-}
-
-export { TRIGGER_MASKS, displayNameFromNodeName, nodeNameFromDisplayName }
-
-/*
-async function apiCall(endpoint) {
-  try {
-    const r = await fetch(`${FLASK_URL}/api/${endpoint}`, {
-      method: "GET"
-    })
-    const json = await r.json()
-    return json
-  } catch (err) {
-    console.error(err)
-  }
-}
-*/
-
-/*
-// gets a file through the flask api and parses it as Json
-async function getFileJson(filename) {
-  try {
-    const r = await fetch(`${FLASK_URL}/files/${filename}`, {
-      method: "GET"
-    })
-    const json = await r.json()
-    return json
-  } catch (err) {
-    console.error(err)
-    return null
-  }
-}
-*/
 
 function getLocalTZ() {
   return Intl.DateTimeFormat().resolvedOptions().timeZone
@@ -183,6 +118,7 @@ class ROSConnectionStore {
       this.rosCheckStarted = false
       this.rosAutoReconnect = false
       this.connectedToRos = false
+      this.connectRetries = 0
 
       this.connectedToNepi = false
 
@@ -424,10 +360,19 @@ class ROSConnectionStore {
       }
 
       if (this.ros != null ) {
-        update_time = (this.connectedToNepi === false) ? 3000 : NEPI_TIMEOUT_MSEC
+        update_time = (this.connectedToNepi === false) ? NEPI_RETRY_MSEC : NEPI_TIMEOUT_MSEC
         if (this.connectedToNepi === true && this.watchdogNepiCounter >= this.watchdogNepiMax ) {
             this.connectedToNepi = false
-            this.destroyROSConnection()
+            //this.connectedToRos = false
+            this.connectRetries = this.connectRetries + 1
+            if (this.connectRetries > NEPI_CONNECT_RETRIES){
+                this.destroyROSConnection()
+            }
+            else {
+              this.checkTopicsServices = true
+              this.topicQueryLock = false
+            }
+            
         }
         this.watchdogNepiCounter++
       }
@@ -507,12 +452,12 @@ class ROSConnectionStore {
                 var newPrefix = this.updatePrefix(this.topicNames, this.topicTypes)
                 var newResetTopics = this.updateResetTopics(this.topicNames, this.topicTypes)
                 var newSaveDataNamespaces = this.updateSaveDataNamespaces(this.topicNames, this.topicTypes)
-                var newAiDetectorNamespaces = this.updateAiDetectorNamespaces(this.topicNames, this.topicTypes)
                 var newImageTopics = this.updateImageTopics(this.topicNames, this.topicTypes)
                 var newMessageTopics = this.updateMessageTopics(this.topicNames, this.topicTypes)
                 var newPointcloudTopics = this.updatePointcloudTopics(this.topicNames, this.topicTypes)
                 this.updateIDXDevices(this.topicNames, this.topicTypes)
                 this.updatePTXDevices(this.topicNames, this.topicTypes)
+                this.updateSVXDevices(this.topicNames, this.topicTypes)
                 this.updateLXSDevices(this.topicNames, this.topicTypes)
                 this.updateRBXDevices(this.topicNames, this.topicTypes)
                 this.updateNPXDevices(this.topicNames, this.topicTypes)        
@@ -522,7 +467,7 @@ class ROSConnectionStore {
                   this.setupRUISettingsListener()    // services
                 }
 
-                if ((this.connectedToNepi === true) && (newPrefix || newResetTopics || newAiDetectorNamespaces || newSaveDataNamespaces || newMessageTopics || newImageTopics || newPointcloudTopics)) {
+                if ((this.connectedToNepi === true) && (newPrefix || newResetTopics || newSaveDataNamespaces || newMessageTopics || newImageTopics || newPointcloudTopics)) {
                   this.initializeSystemListeners()
                 }
 
@@ -562,27 +507,6 @@ class ROSConnectionStore {
         listener.unsubscribe()
       })
       this.resetStates()
-
-      // resetStates() sets rosAutoReconnect = false, and checkROSConnection()
-      // only re-arms its own setTimeout `if (this.rosAutoReconnect)`. Since
-      // App.js starts that loop exactly ONCE on mount, letting it stay false
-      // here permanently killed the reconnect loop: the RUI dropped to
-      // "Connecting" and never came back on its own, no matter how healthy
-      // rosbridge and the device got again, until someone reloaded the page
-      // or the host-side watchdog power-cycled the whole container. That is
-      // the "the RUI keeps disconnecting" failure -- the disconnect itself is
-      // recoverable, but the recovery path was disabling itself. Restore the
-      // flag and re-arm the loop so a teardown is always followed by retries.
-      // (The commented-out line above shows this was already the intent; it
-      // just could not survive resetStates() clobbering the flag.)
-      //
-      // Setting the flag is the WHOLE fix -- deliberately no setTimeout here.
-      // This method's only caller is checkROSConnection() itself, and that
-      // caller's own tail already does `if (this.rosAutoReconnect) setTimeout(
-      // checkROSConnection )` a few lines later. Re-arming here as well would
-      // leave TWO self-rescheduling loops running after one teardown, four
-      // after the next, and so on -- each also re-querying every topic.
-      this.rosAutoReconnect = true
     }
   }
 
@@ -728,18 +652,7 @@ class ROSConnectionStore {
 
   @observable connectedToNepi = false
   @observable hearbeatNepi = false
-  // Ticks of NEPI_TIMEOUT_MSEC (3 s) without a /nepi/device1/status message
-  // before the client declares the device gone and tears the whole websocket
-  // down (see checkROSConnection/destroyROSConnection). Was 5, i.e. a mere
-  // ~15 s stall in that ONE topic dropped every subscription in the RUI.
-  // system_mgr publishes it at only ~1-1.7 Hz measured, and this is a loaded
-  // ARM device -- a CPU spike from Gazebo/SITL/AI work or a slow disk check
-  // inside system_mgr can plausibly starve it past 15 s without anything
-  // actually being wrong. 20 ticks (~60 s) keeps the genuine-outage detection
-  // this is for while no longer firing on ordinary load. Raising it is safe
-  // now that a teardown reliably re-arms the reconnect loop; before that fix
-  // every trip of this counter was effectively permanent.
-  @observable watchdogNepiMax = 20
+  @observable watchdogNepiMax = 5
   @observable watchdogNepiCounter = 0
 
 
@@ -754,19 +667,15 @@ class ROSConnectionStore {
   @observable navPoseCaps = {}
   @observable imageTopics = []
   @observable imageCaps = {}
-  @observable imageDetectionTopics = []
+  @observable imageTargetTopics = []
   @observable depthMapTopics = []
   @observable depthMapCaps = {}
   @observable pointcloudTopics = []
   @observable pointcloudCaps = {}
-  @observable settingCaps = {}
   @observable saveDataNamespaces = []
   @observable saveDataCaps = {}
 
   @observable resetTopics = []
-
-  @observable aiDetectorNamespaces = []
-  @observable aiDetectorCaps = {}
 
 
   @observable navSatFixTopics = []
@@ -774,7 +683,7 @@ class ROSConnectionStore {
   @observable headingTopics = []
   @observable messageTopics = []
 
-  @observable imageFilterDetection = null
+  @observable imageFilterTarget = null
   @observable imageFilterSequencer = null
   @observable imageFilterPTX = null
   @observable targLocalizerImgTopic = null
@@ -783,6 +692,7 @@ class ROSConnectionStore {
 
   @observable idxDevices = {}
   @observable ptxDevices = {}
+  @observable svxDevices = {}
   @observable lsxDevices = {}
   @observable rbxDevices = {}
   @observable npxDevices = {}
@@ -1540,18 +1450,6 @@ class ROSConnectionStore {
 
 
   @action.bound
-  async callSettingsCapabilitiesQueryService(namespace) {
-    this.settingCaps[namespace] = []
-    const response = await this.callService({
-      name: namespace + "/capabilities_query",
-      messageType: "nepi_interfaces/SettingsCapabilitiesQuery",  
-    })
-    if (response != null){
-      this.settingCaps[namespace] = response
-    }
-  }
-
-  @action.bound
   async callImageCapabilitiesQueryService(namespace) {
     const response = await this.callService({
       name: namespace + "/capabilities_query",
@@ -1600,8 +1498,21 @@ class ROSConnectionStore {
     this.ptxDevices[namespace] = response
     }
 
+    
   }
 
+
+  @action.bound
+  async callSVXCapabilitiesQueryService(namespace) {
+
+    const response = await this.callService({
+      name: namespace + "/capabilities_query",
+      messageType: "nepi_interfaces/SVXCapabilitiesQuery",
+    })
+    if (response != null){
+    this.svxDevices[namespace] = response
+    }
+  }
   @action.bound
   async callLSXCapabilitiesQueryService(namespace) {
 
@@ -1678,17 +1589,6 @@ class ROSConnectionStore {
   }
 
 
-    @action.bound
-  async callAiDetectorCapabilitiesQueryService(namespace) {
-    this.aiDetectorCaps[namespace] = []
-      const response = await this.callService({
-        name: namespace + "/detector_info_query",
-        messageType: "nepi_interfaces/SaveDataCapabilitiesQuery",  
-      })
-      if (response != null ) {
-      this.aiDetectorCaps[namespace] = response
-      }
-  }
 
   /*******************************/
   // System Data Update Functions
@@ -1763,37 +1663,6 @@ class ROSConnectionStore {
 
   }
 
-    @action.bound
-  updateAiDetectorNamespaces(topics,types) {
-    // Function for updating image topics list
-    var newAiDetectorNamespaces = []
-    if (this.connectedToNepi === true) {
-      
-      for (var i = 0; i < topics.length; i++) {
-        if (types[i] === "nepi_interfaces/AiDetectorStatus"){
-          newAiDetectorNamespaces.push(topics[i].replace('/status',''))
-        }
-      }
-
-      // sort the save topics for comparison to work
-      newAiDetectorNamespaces.sort()    
-    }  
-    else {
-      newAiDetectorNamespaces = []
-    }
-
-      if (!this.aiDetectorNamespaces.equals(newAiDetectorNamespaces)) {
-        this.aiDetectorNamespaces = newAiDetectorNamespaces
-        for (var i2 = 0; i2 < newAiDetectorNamespaces.length; i2++) {
-              this.callAiDetectorCapabilitiesQueryService(newAiDetectorNamespaces[i2])
-            }
-        return true
-      } else {
-        return false
-      }
-
-  }
-
   @action.bound
   updateMessageTopics(topics,types) {
     // Function for updating image topics list
@@ -1857,42 +1726,27 @@ class ROSConnectionStore {
   updateImageTopics(topics,types) {
     // Function for updating image topics list
     var newImageTopics = []
-    var newImageDetectionTopics = []
+    var newImageTargetTopics = []
     if (this.connectedToNepi === true) {
 
       for (var i = 0; i < topics.length; i++) {
         if (types[i] === "sensor_msgs/Image" && topics[i].indexOf("zed_node") === -1) {
           newImageTopics.push(topics[i])
-          if (topics[i].indexOf('detection_image') !== -1){
-            newImageDetectionTopics.push(topics[i])
+          if (topics[i].indexOf('targets_image') !== -1){
+            newImageTargetTopics.push(topics[i])
           }
         }
       }
 
       // sort the image topics for comparison to work
-      newImageTopics.sort()
-
-      // Drop duplicate topic names. The upstream list (system_mgr's published
-      // topic list, or rosapi getTopics) can carry the same topic more than
-      // once -- a ROS topic that has both a publisher and a subscriber is
-      // reported once per role by pub/sub-oriented listings, the same way
-      // `rostopic list -v` prints it under both headings. Every image selector
-      // built from this then rendered the same camera twice, and because
-      // createShortValuesFromNamespaces shows only the last two path segments
-      // the two entries were visually identical with no way to tell them apart
-      // (reported live 2026-08-12: "There's still two of the same image").
-      // Deduping here rather than in one dropdown fixes every consumer of this
-      // list at once. Sorted first, so equal names are adjacent.
-      newImageTopics = newImageTopics.filter(function (topic, ind, arr) {
-        return ind === 0 || topic !== arr[ind - 1]
-      })
-    }
+      newImageTopics.sort()    
+    }  
     else {
       newImageTopics = []
     }
       if (!this.imageTopics.equals(newImageTopics)) {
         this.imageTopics = newImageTopics
-        this.imageDetectionTopics = newImageDetectionTopics
+        this.imageTargetTopics = newImageTargetTopics
         for (var i2 = 0; i2 < newImageTopics.length; i2++) {
               this.callImageCapabilitiesQueryService(newImageTopics[i2])
             }
@@ -1942,7 +1796,6 @@ class ROSConnectionStore {
         const idx_device_namespace = topics[i].replace("/status","")
         if (!(devices_detected.includes(idx_device_namespace))) {
           this.callIDXCapabilitiesQueryService(idx_device_namespace) // Testing
-          this.callSettingsCapabilitiesQueryService(idx_device_namespace + "/settings")
           const idxDevices = this.idxDevices[idx_device_namespace]
           if (idxDevices) { // Testing
             devices_detected.push(idx_device_namespace)
@@ -1972,7 +1825,6 @@ class ROSConnectionStore {
         const ptx_device_namespace = topics[i].replace("/status","")
         if (!(ptx_devices_detected.includes(ptx_device_namespace))) {
           this.callPTXCapabilitiesQueryService(ptx_device_namespace)
-          this.callSettingsCapabilitiesQueryService(ptx_device_namespace + "/settings")
           const ptxUnit = this.ptxDevices[ptx_device_namespace]
           if (ptxUnit)
           {
@@ -1993,6 +1845,38 @@ class ROSConnectionStore {
     }
     return ptx_devices_changed
   }
+
+
+  @action.bound
+  updateSVXDevices(topics,types) {
+    var svx_devices_changed = false
+    var svx_devices_detected = []
+    for (var i = 0; i < topics.length; i++) {
+      if (topics[i].endsWith("/svx/status")) {
+        const svx_device_namespace = topics[i].replace("/status","")
+        if (!(svx_devices_detected.includes(svx_device_namespace))) {
+          this.callSVXCapabilitiesQueryService(svx_device_namespace)
+          const svxUnit = this.svxDevices[svx_device_namespace]
+          if (svxUnit)
+          {
+            svx_devices_detected.push(svx_device_namespace)
+          }
+        }
+        svx_devices_changed = true
+      }
+    }
+
+    // Now clean out any units that are no longer detected
+    const previously_known = Object.keys(this.svxDevices)
+    for (i = 0; i < previously_known.length; ++i) {
+      if (!(svx_devices_detected.includes(previously_known[i]))) {
+        delete this.svxDevices[previously_known[i]]
+        svx_devices_changed = true
+      }
+    }
+    return svx_devices_changed
+  }
+  
   
   @action.bound
   updateLXSDevices(topics,types) {
@@ -2003,7 +1887,6 @@ class ROSConnectionStore {
         const lsx_device_namespace = topics[i].replace("/status","")
         if (!(lsx_devices_detected.includes(lsx_device_namespace))) {
           this.callLSXCapabilitiesQueryService(lsx_device_namespace)
-          this.callSettingsCapabilitiesQueryService(lsx_device_namespace + "/settings")
           const lsxDevices = this.lsxDevices[lsx_device_namespace]
           if (lsxDevices)
           {
@@ -2034,7 +1917,6 @@ class ROSConnectionStore {
         const rbx_device_namespace = topics[i].replace("/status","")
         if (!(devices_detected.includes(rbx_device_namespace))) {
           this.callRBXCapabilitiesQueryService(rbx_device_namespace)
-          this.callSettingsCapabilitiesQueryService(rbx_device_namespace + "/settings")
           const rbxDevice = this.rbxDevices[rbx_device_namespace]
           if (rbxDevice) {
             devices_detected.push(rbx_device_namespace)
@@ -2059,12 +1941,24 @@ class ROSConnectionStore {
   updateNPXDevices(topics,types) {
     var npx_devices_changed = false
     var devices_detected = []
+    // Apps can embed their own NPXDeviceIF to relay NavPose at their own
+    // namespace (e.g. nepi_app_sim_connector's SimDeviceIF, "exactly the way
+    // device_if_rbx.py does" per its own comment) -- that makes them match
+    // this same "/npx/status" pattern and show up as a phantom NavPose
+    // device in Devices -> NavPose even with no sim attached. Filter out any
+    // namespace containing a known app's own node_name as a path segment
+    // (exact segment match, not substring, so a real device that merely
+    // contains an app's name as a substring is not affected).
+    const app_node_names = (this.apps_status_list || []).map(a => a.node_name).filter(n => n)
     for (var i = 0; i < topics.length; i++) {
       if (topics[i].endsWith("/npx/status")) {
         const npx_device_namespace = topics[i].replace("/status","")
+        const namespace_segments = npx_device_namespace.split("/")
+        if (app_node_names.some(name => namespace_segments.includes(name))) {
+          continue
+        }
         if (!(devices_detected.includes(npx_device_namespace))) {
           this.callNPXCapabilitiesQueryService(npx_device_namespace) // Testing
-          this.callSettingsCapabilitiesQueryService(npx_device_namespace + "/settings")
           const npxSensor = this.npxDevices[npx_device_namespace]
           if (npxSensor) { // Testing
             devices_detected.push(npx_device_namespace)
@@ -2122,6 +2016,20 @@ class ROSConnectionStore {
       return this.addListener({
         name: namespace,
         messageType: msg_type,
+        noPrefix: true,
+        callback: callback,
+
+      })
+    }
+  }
+
+
+  @action.bound
+  setupProcessListener(namespace, callback) {
+    if (namespace) {
+      return this.addListener({
+        name: namespace,
+        messageType: "nepi_interfaces/ProcessStatus",
         noPrefix: true,
         callback: callback,
 
@@ -2191,6 +2099,19 @@ class ROSConnectionStore {
       return this.addListener({
         name: ptxNamespace + "/status",
         messageType: "nepi_interfaces/DevicePTXStatus",
+        noPrefix: true,
+        callback: callback,
+
+      })
+    }
+  }
+
+    @action.bound
+  setupSVXStatusListener(svxNamespace, callback) {
+    if (svxNamespace) {
+      return this.addListener({
+        name: svxNamespace + "/status",
+        messageType: "nepi_interfaces/DeviceSVXStatus",
         noPrefix: true,
         callback: callback,
 
@@ -2292,6 +2213,9 @@ class ROSConnectionStore {
     }
   }
 
+  // A node's settings are a nepi_controls controls set, so the status message
+  // carries the current values AND their capabilities (type, options, bounds,
+  // default) together.  There is no capabilities_query service to call.
   @action.bound
   setupSettingsStatusListener(namespace, callback) {
     if (namespace) {
@@ -2628,6 +2552,21 @@ class ROSConnectionStore {
   }
 
   @action.bound
+  sendUpdateStringArrayMsg(namespace, name, values, name2 = '', name3 = '') {
+    this.publishMessage({
+      name: namespace,
+      messageType: "nepi_interfaces/UpdateStringArray",
+      data: {
+        name: name,
+        name2: name2,
+        name3: name3,
+        value: values
+      },
+      noPrefix: true
+    })
+  }
+
+  @action.bound
   sendStringArrayMsg(namespace,strArray) {
     this.publishMessage({
       name: namespace,
@@ -2646,6 +2585,20 @@ class ROSConnectionStore {
         name: namespace,
         messageType: "std_msgs/Int32",
         data: {data: intVal},
+        noPrefix: true
+      })
+    }
+  }
+
+  @action.bound
+  sendImageSizeMsg(namespace, width_str, height_str) {
+    let widthVal = parseInt(width_str, 10)
+    let heightVal = parseInt(height_str, 10)
+    if (!isNaN(widthVal) && !isNaN(heightVal)) {
+      this.publishMessage({
+        name: namespace,
+        messageType: "nepi_interfaces/ImageSize",
+        data: {image_width: widthVal, image_height: heightVal},
         noPrefix: true
       })
     }
@@ -2838,24 +2791,6 @@ class ROSConnectionStore {
   }
 
   @action.bound
-  // Keyboard-driven teleop velocity -- geometry_msgs/Twist, matching
-  // device_if_rbx.py's set_teleop_velocity topic exactly (a stock ROS message,
-  // not a new nepi_interfaces one, to avoid an interfaces rebuild). Ratios in
-  // [-1,1]; each driver scales them by its own speed-limit Settings.
-  @action.bound
-  sendTeleopVelocityMsg(namespace, linear_x, linear_y, linear_z, angular_z) {
-    this.publishMessage({
-      name: namespace + "/set_teleop_velocity",
-      messageType: "geometry_msgs/Twist",
-      data: {
-        linear: { x: linear_x, y: linear_y, z: linear_z },
-        angular: { x: 0.0, y: 0.0, z: angular_z }
-      },
-      noPrefix: true
-    })
-  }
-
-  @action.bound
   sendFloatGotoPositionMsg(namespace, float1_str,float2_str,float3_str,float4_str) {
     let float1Val = parseFloat(float1_str)
     let float2Val = parseFloat(float2_str)
@@ -2978,7 +2913,7 @@ sendSaveConfigTrigger(namespace) {
 
 
 
-
+@action.bound
   sendMouseClickEventMsg(namespace, image_topic, image_index, mouse_click, click_count, status_msg ) {
     this.publishMessage({
       name: namespace,
@@ -3002,6 +2937,7 @@ sendSaveConfigTrigger(namespace) {
     })
   }
 
+  @action.bound
   sendMouseDragEventMsg(namespace, image_topic, image_index, mouse_drag_start, mouse_drag_stop, status_msg ) {
     this.publishMessage({
       name: namespace,
@@ -3024,6 +2960,7 @@ sendSaveConfigTrigger(namespace) {
     })
   }
 
+  @action.bound
   sendMouseWindowEventMsg(namespace, image_topic, image_index, mouse_window, status_msg ) {
     this.publishMessage({
       name: namespace,
@@ -3037,7 +2974,7 @@ sendSaveConfigTrigger(namespace) {
           drag_event: false, 
           drag_start: {x:0,y:0,r:0,g:0,b:0,a:0},
           drag_stop: {x:0,y:0,r:0,g:0,b:0,a:0},
-          window_event: true, 
+          window_event: true,
           window: mouse_window,
 
           image_status_msg: status_msg
@@ -3047,55 +2984,151 @@ sendSaveConfigTrigger(namespace) {
     })
   }
 
+@action.bound
+  sendMouseScrollEventMsg(namespace, image_topic, image_index, mouse_scroll, scroll_amount, status_msg ) {
+    this.publishMessage({
+      name: namespace,
+      messageType: "nepi_interfaces/ImageMouseEvent",
+      data: {
+          image_topic: image_topic,
+          image_index: image_index,
+          click_event: false,
+          click_count: 0,
+          click: {x:0,y:0,r:0,g:0,b:0,a:0},
+          drag_event: false,
+          drag_start: {x:0,y:0,r:0,g:0,b:0,a:0},
+          drag_stop: {x:0,y:0,r:0,g:0,b:0,a:0},
+          window_event: false,
+          window: {x_min:0, x_max:0, y_min:0, y_max:0},
+          scroll_event: true,
+          scroll: mouse_scroll,
+          scroll_amount: scroll_amount,
+          image_status_msg: status_msg
+      },
+      noPrefix: true
 
+    })
+  }
+
+  @action.bound
+  sendImageCrosshairMsg(namespace, name, x_pixel, y_pixel, x_ratio, y_ratio, x_offset_deg, y_offset_deg, x_offset_pixel, y_offset_pixel, r = 0, g = 255, b = 0, msg_str = '') {
+    this.publishMessage({
+      name: namespace,
+      messageType: "nepi_interfaces/ImageCrosshair",
+      data: { 
+          name: String(name),
+          msg_str: String(msg_str),
+          x_pixel: Math.round(x_pixel),
+          y_pixel: Math.round(y_pixel),
+          x_ratio: Math.round(x_ratio * 100)/100,
+          y_ratio: Math.round(y_ratio * 100)/100,
+          x_offset_pixel: Math.round(x_offset_pixel),
+          y_offset_pixel: Math.round(y_offset_pixel),
+          x_offset_deg: Math.round(x_offset_deg * 100)/100,
+          y_offset_deg: Math.round(y_offset_deg * 100)/100,
+          r: Math.round(r),
+          g: Math.round(g),
+          b: Math.round(b)
+      },
+      noPrefix: true
+
+    })
+  }
 
 ///// System IF Calls
 
-@action.bound
-updateCapSetting(namespace,nameStr,typeStr,optionsStrList,default_value_str) {
-  this.publishMessage({
-    name: namespace + "/update_setting",
-    messageType: "nepi_interfaces/SettingCap",
-    data: {type_str:typeStr,
-      name_str:nameStr,
-      options_list:optionsStrList,
-      default_value_str:default_value_str
-    },
-    noPrefix: true
-  })
-}
 
-@action.bound
-updateSetting(namespace,nameStr,typeStr,valueStr) {
-    this.publishMessage({
-      name: namespace + "/update_setting",
-      messageType: "nepi_interfaces/Setting",
-      data: {type_str:typeStr,
-        name_str:nameStr,
-        value_str:valueStr
-      },
-      noPrefix: true
-    })
-  }
-
-  // Update several settings with a single message.  settingsList is an array
-  // of {nameStr, typeStr, valueStr} entries.  The backend applies each entry
-  // in order.
   @action.bound
-  updateSettings(namespace,settingsList) {
+  sendUpdateControlValue(namespace, nameStr, value, index = -1) {
+       
+    var index_str = String(index)
+    if (index_str === '-1'){
+      index_str = ''
+    }
+
+    var valueStrs = ['']
+    if (Array.isArray(value)) {
+      valueStrs = value.map(val => String(val))
+    }
+    else {
+       valueStrs = [String(value)]
+    }
+    const data = {
+      name: nameStr,
+      value: valueStrs,
+      index: index_str
+    }
+  
+    
     this.publishMessage({
-      name: namespace + "/update_settings",
-      messageType: "nepi_interfaces/Settings",
-      data: {
-        settings: settingsList.map(s => ({
-          type_str: s.typeStr,
-          name_str: s.nameStr,
-          value_str: s.valueStr
-        }))
-      },
+      name: namespace,
+      messageType: "nepi_interfaces/UpdateControl",
+      data: data,
       noPrefix: true
     })
   }
+
+
+  // Update several controls.  controlsList is an array of
+  // {nameStr, typeStr, value} entries, published as one update_control message
+  // each.  The batch "update_controls" topic is retired: the node applied its
+  // entries in a sequential loop anyway, so this is the same behavior without
+  // a second message type to maintain.
+  @action.bound
+  sendUpdateControls(namespace,controlsList) {
+    controlsList.forEach((c) => {
+      this.sendUpdateControlValue(namespace, c.nameStr, c.value)
+    })
+  }
+
+
+  // // A setting update is a typed nepi_interfaces/UpdateControl on
+  // // "<settings_ns>/update_setting".  typeStr is the CONTROL type the status
+  // // message reports ("Menu", "Selection", "Bool", "String", "Int", "Float"),
+  // // and the value goes in the one set_* field that type selects -- the rest
+  // // stay at their message defaults.  Values arrive here already typed, so
+  // // nothing is parsed out of a string on the wire any more.
+  // @action.bound
+  // updateSetting(namespace,nameStr,typeStr,value) {
+  //   const data = {
+  //     name: nameStr,
+  //     display_name: "",
+  //     description: "",
+  //     type: typeStr,
+  //     set_index: 0,
+  //     set_string: "",
+  //     set_strings: [],
+  //     set_int: 0,
+  //     set_float: 0.0,
+  //     set_floats: [],
+  //     set_bool: false
+  //   }
+  //   if (typeStr === "Menu") { data.set_index = parseInt(value, 10) || 0 }
+  //   else if (typeStr === "Selection" || typeStr === "String") { data.set_string = String(value) }
+  //   else if (typeStr === "Selections") { data.set_strings = value }
+  //   else if (typeStr === "Bool") { data.set_bool = (value === true || value === "True") }
+  //   else if (typeStr === "Int") { data.set_int = parseInt(value, 10) || 0 }
+  //   else if (typeStr === "Float" || typeStr === "FloatSlider") { data.set_float = parseFloat(value) || 0.0 }
+  //   else { data.set_string = String(value) }
+  //   this.publishMessage({
+  //     name: namespace + "/update_setting",
+  //     messageType: "nepi_interfaces/UpdateControl",
+  //     data: data,
+  //     noPrefix: true
+  //   })
+  // }
+
+  // // Update several settings.  settingsList is an array of
+  // // {nameStr, typeStr, value} entries, published as one update_setting message
+  // // each.  The batch "update_settings" topic is retired: the node applied its
+  // // entries in a sequential loop anyway, so this is the same behavior without
+  // // a second message type to maintain.
+  // @action.bound
+  // updateSettings(namespace,settingsList) {
+  //   settingsList.forEach((s) => {
+  //     this.updateSetting(namespace, s.nameStr, s.typeStr, s.value)
+  //   })
+  // }
 
  
   @action.bound
