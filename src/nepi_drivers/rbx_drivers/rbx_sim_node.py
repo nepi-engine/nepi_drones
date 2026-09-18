@@ -340,7 +340,7 @@ class SimNode:
   # live here too (OBSTACLE_COURSE_ON/OFF) -- moved to the environment
   # Setting above once a dedicated RUI dropdown made the setup-action version
   # redundant with itself.
-  RBX_SETUP_ACTIONS = ["RESET_SIM", "RETURN_HOME"]
+  RBX_SETUP_ACTIONS = ["RESET_SIM", "RETURN_HOME", "REFRESH_ENVIRONMENT"]
   # Go-actions dropdown (RUI's "selected_go_action" control, wired to
   # setGoActionInd below). Camera view switching used to live here
   # (VIEW_FIRST_PERSON/VIEW_THIRD_PERSON), then moved to a camera_view_mode
@@ -481,12 +481,36 @@ class SimNode:
     # after a device+VM reboot; the SAME launch succeeded instantly once the
     # system had been up a few minutes). Retries a few times with a short
     # backoff before giving up for real.
+    # ROOT CAUSE (found live 2026-09-17, re-diagnosing "the rover doesn't
+    # seem to be able to get detected"): widening the retry window to 20s
+    # made no difference at all -- this was never the documented cold-boot
+    # race. rbx_sim_discovery.py's launchSimDeviceNode writes this param at
+    # an ABSOLUTE path (create_namespace(self.base_namespace, sim_node_name
+    # + "/drv_dict"), e.g. /nepi/device1/sim_rover1/drv_dict -- confirmed
+    # live via `rosparam list`), but this node is launched via
+    # nepi_drvs.launchDriverNode's plain `rosrun nepi_drivers <file>
+    # __name:=<name>` with no `__ns:=`/ROS_NAMESPACE override, so its own
+    # TRUE registered graph name is just /<name> at the ROOT namespace
+    # (confirmed live via `rosnode list` showing bare /sim_rover1, and
+    # nepi_sdk.get_node_namespace() being a thin wrapper over rospy.get_name()
+    # with nothing that remaps it). A relative '~drv_dict' read therefore
+    # resolves against /sim_rover1, not /nepi/device1/sim_rover1 -- looking
+    # in a namespace nothing ever wrote to, hence KeyError('DEVICE_DICT')
+    # on every single attempt, no matter how long this retries.
+    # rbx_ardupilot_node.py's own identical '~drv_dict' read happens to get
+    # away with this today only because it has no retry-then-shutdown
+    # guard around it at all -- it silently proceeds with whatever
+    # (possibly empty) dict it gets back rather than depending on it being
+    # correct. Fixed by reading from the SAME absolute path
+    # launchSimDeviceNode writes to, using self.base_namespace/self.node_name
+    # (already set above) instead of ROS's native relative-name resolution.
     DRV_DICT_READ_RETRIES = 5
     DRV_DICT_READ_RETRY_SEC = 0.5
+    drv_dict_param_name = nepi_sdk.create_namespace(self.base_namespace, self.node_name + '/drv_dict')
     self.drv_dict = dict()
     last_error = None
     for attempt in range(DRV_DICT_READ_RETRIES):
-      self.drv_dict = nepi_sdk.get_param('~drv_dict', dict())
+      self.drv_dict = nepi_sdk.get_param(drv_dict_param_name, dict())
       try:
         self.device_name = self.drv_dict['DEVICE_DICT']['device_name']
         self.device_path = self.drv_dict['DEVICE_DICT']['device_path']
@@ -507,6 +531,10 @@ class SimNode:
     self.sock = None
     self.sock_lock = threading.Lock()
     self.last_telemetry_time = 0.0
+    # See the environment re-sync comment at the top of the bridge-accept
+    # loop (setEnvironmentAction call) for why this is a ONE-SHOT flag, not
+    # re-checked on every reconnect.
+    self._environment_synced_once = False
     self.navpose_dict = copy.deepcopy(nepi_nav.BLANK_NAVPOSE_DICT)
 
     ##############################
@@ -940,6 +968,8 @@ class SimNode:
       return self.resetSimAction()
     elif action == "RETURN_HOME":
       return self.returnHomeAction()
+    elif action == "REFRESH_ENVIRONMENT":
+      return self.refreshEnvironmentAction()
     return False
 
   #######################
@@ -1025,7 +1055,7 @@ class SimNode:
     self.sendLineToBridge({'type': 'reset'}, "Reset sim")
     return True
 
-  def setEnvironmentAction(self, environment_value):
+  def setEnvironmentAction(self, environment_value, force = False):
     # Fire-and-forget over the bridge, same pattern as resetSimAction: the VM
     # side (sim_bridge_node.py) owns the actual Gazebo spawn/delete service
     # calls and its own currently-spawned bookkeeping (environment_models.py's
@@ -1042,9 +1072,20 @@ class SimNode:
     if not connected:
       return False
     model_name = self.ENVIRONMENT_VALUE_TO_MODEL.get(environment_value)
-    self.sendLineToBridge({'type': 'environment', 'model_name': model_name},
+    self.sendLineToBridge({'type': 'environment', 'model_name': model_name, 'force': force},
                           "Environment set to " + environment_value)
     return True
+
+  def refreshEnvironmentAction(self):
+    # Force a live re-spawn of whatever environment is currently selected,
+    # picking up geometry pushed to model.sdf since it was first spawned --
+    # see EnvironmentModelSpawner.set_active_model's own force= docstring.
+    # Triggered by sim_connector_app_node.py (via the standard setup_action
+    # path, same as RESET_SIM/RETURN_HOME) right after it pushes an
+    # environment-dimensions edit, so "save the same custom environment
+    # while it's already live" reaches Gazebo without a full redeploy
+    # (requested live 2026-09-18).
+    return self.setEnvironmentAction(self.settings_dict['environment']['value'], force = True)
 
   #######################
   ### Goto Controller Processes
@@ -1197,7 +1238,26 @@ class SimNode:
       # scanned-model value once a user has explicitly selected one, and
       # that can't happen until after __init__'s bounded wait has already
       # completed.
-      self.setEnvironmentAction(self.settings_dict['environment']['value'])
+      #
+      # Guarded to fire ONCE per process, not on every reconnect -- found
+      # live (2026-09-17): "changing the environment config mid sim or even
+      # before a sim doesnt work - it only summons the flat one." The VM
+      # bridge connection is known to drop and reconnect on its own (a
+      # flaky far-end sim process, unrelated to this driver), and every one
+      # of those reconnects re-ran this same line using whatever
+      # settings_dict['environment']['value'] happened to be at that
+      # moment -- which is correct on the very FIRST connect (see above),
+      # but on every SUBSEQUENT reconnect it was re-asserting a value that
+      # could already be stale relative to an operator's more recent
+      # selection, racing (and usually losing to, since reconnects were
+      # frequent) the RUI's own resend-on-mismatch correction in
+      # Nepi_IF_Sim-Controls.js. Only the first connect after this node
+      # starts needs this defensive push; every later reconnect should
+      # trust settings_dict as the last real user intent instead of
+      # re-broadcasting it blindly.
+      if not self._environment_synced_once:
+        self.setEnvironmentAction(self.settings_dict['environment']['value'])
+        self._environment_synced_once = True
       buf = b''
       while not nepi_sdk.is_shutdown():
         try:

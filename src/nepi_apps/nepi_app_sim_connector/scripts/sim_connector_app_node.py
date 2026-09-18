@@ -94,6 +94,7 @@ import os
 import re
 import socket
 import threading
+import time
 
 import yaml
 
@@ -119,11 +120,11 @@ from nepi_sdk import nepi_nav
 from nepi_sdk import nepi_img
 from nepi_sdk import nepi_system
 
-from std_msgs.msg import Bool, Empty, String, Float32
+from std_msgs.msg import Bool, Empty, String, Float32, Int32
 from sensor_msgs.msg import Image
 from geographic_msgs.msg import GeoPoint
 
-from nepi_interfaces.msg import AxisControls, DeviceRBXStatus, NavPose, Setting
+from nepi_interfaces.msg import AxisControls, DeviceRBXStatus, NavPose, Setting, UpdateControl
 
 from nepi_api.messages_if import MsgIF
 
@@ -631,6 +632,29 @@ class NepiSimConnectorApp:
     # in the background regardless of which one (if any) is selected.
     self.launch_target_installed = {}
     self.launch_target_installed_check_state = {}
+
+    # "New Sim" (2026-09-18: "new sim should literally make a new
+    # window... so there's two or more gazebo windows") -- a SEPARATE,
+    # additive instance slot, deliberately not folded into
+    # selected_launch_target/active_launch_target/launcher_state above.
+    # Those three remain the PRIMARY slot exactly as before (what "Use Open
+    # Sim"/Deploy/redeploy_simulator/Kill all operate on, and what every
+    # existing runLaunch/runStop/runRedeploy/runForceLaunch reference stays
+    # unchanged) -- rewriting that whole state machine to be N-instance-
+    # generic would touch dozens of call sites for a rewrite this app
+    # doesn't need yet. A second concurrent deployment only makes sense
+    # today for gazebo_rover + gazebo_quadcopter (the only two targets
+    # simulator_launch_targets.yaml gives their own GAZEBO_MASTER_URI/
+    # ROS_MASTER_URI -- see that file's own comments on each), so this
+    # tracks an actual_target -> state dict rather than a single scalar,
+    # good enough for "the one other target" without pretending to support
+    # arbitrary N. secondary_launch_lock guards its own thread the same way
+    # launcher_lock guards the primary one, but independently -- a primary
+    # launch/stop in progress must not block a secondary one queuing (they
+    # target different VM processes entirely), and vice versa.
+    self.secondary_launch_lock = threading.Lock()
+    self.secondary_launch_thread = None
+    self.secondary_launch_states = {}   # actual_target -> 'launching'|'installing'|'running'|'failed: ...'
     launcher_config_path = find_config_path()
     if launcher_config_path:
       try:
@@ -643,6 +667,25 @@ class NepiSimConnectorApp:
     self.launcher_status_pub = nepi_sdk.create_publisher(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/launcher_status'),
         SimLauncherStatus, queue_size = 1, latch = True)
+    # Deploying gazebo_quadcopter needs RBX_ARDUPILOT's own discovery
+    # "connection" option set to SITL, not the SERIAL default -- otherwise
+    # ArdupilotDiscovery only ever polls /dev/ttyAMA10 for a physical
+    # autopilot and never even attempts the SITL/MAVLink probe on
+    # 127.0.0.1:5771, so the quadcopter's own gzserver/SITL comes up fine
+    # but never gets detected as an RBX device at all (found live
+    # 2026-09-18: "it killed the rover and launched the quadcopter just
+    # fine, but it didnt get detected by rbx"). Pushed automatically right
+    # before launching that target (see ensureArdupilotSitlConnection,
+    # called from both runLaunch and runLaunchSecondary) so deploying via
+    # the Sim Connector doesn't require the operator to separately know
+    # about and flip a driver-level Devices -> Drivers setting themselves.
+    # Never pushed back to SERIAL automatically -- this app has no way to
+    # know whether a physical ArduPilot is also expected to keep working on
+    # this same device, so reverting on its own could silently break that.
+    self.ardupilot_discovery_update_pub = nepi_sdk.create_publisher(
+        nepi_sdk.create_namespace(self.base_namespace,
+            'drivers_mgr/discovery/RBX_ARDUPILOT/settings/update_setting'),
+        UpdateControl, queue_size = 1)
     nepi_sdk.create_subscriber(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/launch_simulator'),
         String, self.launchSimulatorCb, queue_size = 1)
@@ -680,6 +723,47 @@ class NepiSimConnectorApp:
     nepi_sdk.create_subscriber(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/kill_all_gazebo'),
         Empty, self.killAllGazeboCb, queue_size = 1)
+    # "New Sim" -- launches target_key as a SECOND, independent instance
+    # alongside whatever the primary slot is already running, rather than
+    # replacing it (see secondary_launch_states' own comment for why this is
+    # a separate slot, not a generalized N-instance rewrite). Same payload
+    # shape as launch_simulator (JSON {target_key, robot_config} or a bare
+    # target_key string), parsed with the same parseLaunchPayload.
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/launch_new_simulator'),
+        String, self.launchNewSimulatorCb, queue_size = 1)
+    # Stops one specific secondary instance by its actual_target key (as
+    # reported in secondary_launcher_status) -- NOT the primary slot's own
+    # sim/stop_simulator, which only ever touches active_launch_target.
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/stop_new_simulator'),
+        String, self.stopNewSimulatorCb, queue_size = 1)
+    # JSON-in-String rather than a new .msg field on SimLauncherStatus --
+    # avoids a catkin message-regen for what is, for now, a secondary/
+    # additive status concern (mirrors this app's own established
+    # convention for late-added fields: Robot Link status, save/select
+    # dimension-config payloads). {"active_targets": [...], "states": {...}}
+    self.secondary_launcher_status_pub = nepi_sdk.create_publisher(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/secondary_launcher_status'),
+        String, queue_size = 1, latch = True)
+    # "Environment Config" top-level deploy selector -- moved server-side
+    # (2026-09-18, reported live: "changing the environment mid sim between
+    # flat, obstacle, aerial, etc. doesnt do anything") after tracing the
+    # RUI's own onDeployEnvironmentConfig: it reaches Nepi_IF_Sim-Controls.js's
+    # setEnvironmentSetting only through this.simControlsRef.current.
+    # wrappedInstance, a documented, fragile mobx-react 5.4.2 Injector hop
+    # (see that ref's own long comment in Nepi_IF_Sim.js) -- the exact same
+    # hop the FOV box's live push ALSO used to go through before today's
+    # earlier fix moved FOV's push through this backend instead. Same fix,
+    # same reasoning, applied to the other live control still going through
+    # that ref. name arrives as the operator-facing config display name
+    # (e.g. "Obstacle Course"); translated to the Selection value here,
+    # mirroring setEnvironmentSetting's own translation exactly so a custom
+    # config name that happens to match a real VM-side model directory
+    # (the whole point of that translation) still works.
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/deploy_environment'),
+        String, self.deployEnvironmentCb, queue_size = 1)
     # Lets an operator try their own robot without editing and redeploying
     # sim_connector_app_params.yaml -- independent of self.launcher (that's
     # only auto-launch), so this stays available on every deployment.
@@ -798,6 +882,29 @@ class NepiSimConnectorApp:
     # varies per config for this role only -- see dimension_config_model.
     self.selected_dimension_config = dict()
     self.dimension_config_model = dict()
+    # Which environment dimensions config the TOP "Environment Config"
+    # deploy selector last actually deployed -- deliberately its OWN,
+    # separate field from selected_dimension_config['environment'] (the
+    # EDIT dropdown's own selection; see this file's own long-standing
+    # "these are separate" decoupling). Requested live (2026-09-18): "if
+    # trying to delete the config of something thats currently selected,
+    # it should give a popup saying that environment is currently selected
+    # and cant be deleted." Set in deployEnvironmentCb, checked in
+    # deleteDimensionConfigCb -- server-side enforcement, mirroring how
+    # PROTECTED_DIMENSION_CONFIG_NAMES is already checked both client-side
+    # (an immediate alert) and here (authoritative regardless of client).
+    self.deployed_environment_config_name = ''
+    self.deployed_environment_config_name_pub = nepi_sdk.create_publisher(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/deployed_environment_config_name'),
+        String, queue_size = 1, latch = True)
+    # The RESOLVED model (e.g. "obstacle_course"), not the config display
+    # name -- deployEnvironmentCb's own force-refresh guard needs this to
+    # tell "switching to a genuinely different model" (the Setting update
+    # alone already spawns it correctly) apart from "re-deploying onto the
+    # SAME model that's already live" (the only case that actually needs
+    # force=True, since SettingsIF no-ops an unchanged value before ever
+    # calling setEnvironmentAction).
+    self.deployed_environment_model_name = ''
     self.dimension_config_names_pubs = dict()
     self.dimension_config_selected_pubs = dict()
     # Not latched -- a transient "this just happened" notice for the RUI to
@@ -1281,6 +1388,40 @@ class NepiSimConnectorApp:
     self.robot_configs[key] = entry
     return key
 
+  def findRobotConfigKeyByDisplayName(self, name):
+    for key, entry in self.robot_configs.items():
+      if isinstance(entry, dict) and entry.get('display_name') == name:
+        return key
+    return None
+
+  def deleteRobotConfigByKey(self, key):
+    # Core delete, shared by deleteRobotConfigCb (an operator deleting by
+    # key directly) and deleteDimensionConfigCb's own cascade below (finding
+    # a linked capability entry by display_name) -- returns whether it
+    # actually deleted anything so a cascade caller can stay silent on a
+    # no-op rather than warn about something that was never there.
+    if key in PROTECTED_ROBOT_CONFIG_KEYS or key == UPLOADED_ROBOT_CONFIG_NAME:
+      return False
+    if key not in self.robot_configs:
+      return False
+    path = self.robotConfigPath(key)
+    try:
+      if os.path.exists(path):
+        os.remove(path)
+    except Exception as e:
+      self.msg_if.pub_warn("Failed to delete robot config '" + key + "': " + str(e))
+      return False
+    del self.robot_configs[key]
+    # Falls back to the 4-Wheel Rover, not FACTORY_ROBOT_CONFIG_NAME -- an
+    # operator who just deleted a config they were actively using almost
+    # certainly wants a REAL, capable robot to land on, not the
+    # capability-empty placeholder (the same reasoning setSelectedRobotConfig
+    # itself never applies automatically, since that placeholder is only
+    # ever a fallback for "nothing valid was ever selected").
+    if self.selected_robot_config == key:
+      self.setSelectedRobotConfig('ground_robot_4_wheel')
+    return True
+
   def deleteRobotConfigCb(self, msg):
     key = str(msg.data).strip()
     if not key:
@@ -1291,23 +1432,34 @@ class NepiSimConnectorApp:
     if key not in self.robot_configs:
       self.msg_if.pub_warn("Robot config '" + key + "' not found, cannot delete")
       return
-    path = self.robotConfigPath(key)
-    try:
-      if os.path.exists(path):
-        os.remove(path)
-    except Exception as e:
-      self.msg_if.pub_warn("Failed to delete robot config '" + key + "': " + str(e))
+    # Captured before deleteRobotConfigByKey removes the entry, so the
+    # dimensions-axis cascade below still knows which display_name to look
+    # for (see linkRobotConfigToDimensions -- a custom robot's capability
+    # and dimensions entries are created together under the same
+    # display_name, so they are removed together here too, never leaving
+    # one to orphan as an undeletable "ghost" entry -- reported live
+    # 2026-09-17: a config whose dimensions entry had already been deleted
+    # kept showing up in the Robot Config dropdown and the merged button
+    # row with no way to remove it, since the only delete path on offer was
+    # dimensions-only).
+    entry = self.robot_configs.get(key, dict())
+    display_name = entry.get('display_name') if isinstance(entry, dict) else None
+    if not self.deleteRobotConfigByKey(key):
+      self.msg_if.pub_warn("Failed to delete robot config '" + key + "'")
       return
-    del self.robot_configs[key]
-    # Falls back to the 4-Wheel Rover, not FACTORY_ROBOT_CONFIG_NAME -- an
-    # operator who just deleted a config they were actively using almost
-    # certainly wants a REAL, capable robot to land on, not the
-    # capability-empty placeholder (the same reasoning setSelectedRobotConfig
-    # itself never applies automatically, since that placeholder is only
-    # ever a fallback for "nothing valid was ever selected").
-    if self.selected_robot_config == key:
-      self.setSelectedRobotConfig('ground_robot_4_wheel')
     self.msg_if.pub_info("Deleted robot config '" + key + "'")
+    if display_name and self.sanitizeDimensionConfigName(display_name) not in PROTECTED_DIMENSION_CONFIG_NAMES.get('robot', set()):
+      dim_path = self.dimensionConfigPath('robot', display_name)
+      if os.path.exists(dim_path):
+        try:
+          os.remove(dim_path)
+        except Exception as e:
+          self.msg_if.pub_warn("Failed to delete linked robot dimensions config '" + display_name + "': " + str(e))
+        else:
+          self.publishAvailableDimensionConfigs('robot')
+          if self.selected_dimension_config.get('robot') == self.sanitizeDimensionConfigName(display_name):
+            self.applyDimensionConfigByName('robot', FALLBACK_DIMENSION_CONFIG_NAME['robot'])
+          self.msg_if.pub_info("Deleted linked robot dimensions config: " + display_name)
 
   #**********************
   # Physical-dimension editing (robot chassis/wheel + environment
@@ -1319,6 +1471,61 @@ class NepiSimConnectorApp:
   # doesn't (yet) have the field, e.g. a fresh install or a config saved
   # before this field existed.
   CAMERA_HORIZONTAL_FOV_DEFAULT_DEG = 80.0
+
+  # Same fallback defaults as the RUI's own ROBOT_DIMENSION_FIELDS, used
+  # only when a field is missing from a partial edit (setDimensionsCb lets
+  # a partial edit through -- generate_model_sdf.py fills in its own
+  # defaults for anything unset, so this check does too, rather than
+  # treating "field absent" as "field is zero" and flagging a false
+  # positive against a robot that's actually fine).
+  ROBOT_DIMENSIONS_VIABILITY_DEFAULTS = {
+      'track_width_m': 0.34, 'wheel_width_m': 0.05, 'wheel_radius_m': 0.1,
+      'wheelbase_m': 0.3, 'chassis_width_m': 0.3, 'chassis_length_m': 0.4,
+  }
+
+  def checkRobotDimensionsViable(self, fields):
+    # Authoritative gate, mirrored from the RUI's own client-side
+    # checkRobotDimensionsViable (Nepi_IF_Sim.js) -- requested live
+    # (2026-09-17) after the RUI-only check turned out not to be enough:
+    # "the wheels touching each other still doesnt give a warning. its
+    # deployable on the sim." A client-side check only guards the one path
+    # that calls it; this is the single choke point every robot-dimensions
+    # write actually passes through (setDimensionsCb/saveDimensionConfigCb),
+    # so nothing -- RUI button, a raw rostopic pub, a future caller -- can
+    # persist or push unviable geometry. Same AABB touch test as the RUI:
+    # detached the instant there's a gap on EITHER axis (front-to-back,
+    # wheelbase_m vs chassis_length_m, or side-to-side, track_width_m vs
+    # chassis_width_m); touching/overlapping when the two wheels on one
+    # axle are closer together than their own width. Returns
+    # (True, '') or (False, reason).
+    def get(name):
+      try:
+        return float(fields.get(name, self.ROBOT_DIMENSIONS_VIABILITY_DEFAULTS[name]))
+      except (TypeError, ValueError):
+        return self.ROBOT_DIMENSIONS_VIABILITY_DEFAULTS[name]
+    track_width = get('track_width_m')
+    wheel_width = get('wheel_width_m')
+    wheel_radius = get('wheel_radius_m')
+    wheelbase = get('wheelbase_m')
+    chassis_width = get('chassis_width_m')
+    chassis_length = get('chassis_length_m')
+    if track_width <= wheel_width:
+      return False, "the wheels are touching or overlapping each other"
+    # Front-to-back overlap (same side): the front and rear wheels are two
+    # circles of radius wheel_radius, wheelbase apart center-to-center --
+    # they touch/overlap once that's less than the sum of their radii, i.e.
+    # less than 2x the (shared) radius. Missing entirely before this pass
+    # (2026-09-18, reported live: "overlapping wheels still doesnt get
+    # detected as not viable") -- the only overlap check here was the
+    # side-to-side (track_width vs wheel_width) one above; a short
+    # wheelbase with normal-sized wheels passed straight through.
+    if wheelbase <= 2.0 * wheel_radius:
+      return False, "the front and rear wheels are touching or overlapping each other"
+    gap_along_length = (wheelbase / 2.0 - wheel_radius) - (chassis_length / 2.0)
+    gap_along_width = (track_width / 2.0 - wheel_width / 2.0) - (chassis_width / 2.0)
+    if gap_along_length > 0 or gap_along_width > 0:
+      return False, "the wheels are detached from the chassis"
+    return True, ''
 
   def updateCameraFovFromRobotDimensions(self):
     # Reads camera_horizontal_fov_deg out of the robot dimensions store
@@ -1739,6 +1946,11 @@ class NepiSimConnectorApp:
     if not isinstance(fields, dict):
       self.msg_if.pub_warn("Cannot save " + role + " dimensions config '" + name + "': must be a YAML mapping")
       return
+    if role == 'robot':
+      viable, reason = self.checkRobotDimensionsViable(fields)
+      if not viable:
+        self.msg_if.pub_warn("Cannot save robot dimensions config '" + name + "': not viable -- " + reason)
+        return
     if role == 'environment':
       # A save always carries forward whichever model was active for the
       # config being edited -- the editable fields never include this
@@ -1819,6 +2031,17 @@ class NepiSimConnectorApp:
     if self.sanitizeDimensionConfigName(name) in PROTECTED_DIMENSION_CONFIG_NAMES.get(role, set()):
       self.msg_if.pub_warn("Cannot delete the built-in " + role + " dimensions config '" + name + "'")
       return
+    # Environment only -- robot has no comparable "currently deployed by
+    # name" concept (see deployed_environment_config_name's own comment).
+    # Server-side enforcement of the same rule the RUI's own delete button
+    # checks first, so a deploy started elsewhere (another browser tab, a
+    # raw publish) can't out-race a client that hasn't heard about it yet.
+    if (role == 'environment' and self.deployed_environment_config_name != ''
+        and self.sanitizeDimensionConfigName(name)
+            == self.sanitizeDimensionConfigName(self.deployed_environment_config_name)):
+      self.msg_if.pub_warn(role + " dimensions config '" + name + "' is currently deployed "
+                           "and can't be deleted while it's live -- deploy something else first")
+      return
     path = self.dimensionConfigPath(role, name)
     if not os.path.exists(path):
       self.msg_if.pub_warn(role + " dimensions config '" + name + "' not found, cannot delete")
@@ -1832,6 +2055,16 @@ class NepiSimConnectorApp:
     if self.selected_dimension_config.get(role) == self.sanitizeDimensionConfigName(name):
       self.applyDimensionConfigByName(role, FALLBACK_DIMENSION_CONFIG_NAME[role])
     self.msg_if.pub_info("Deleted " + role + " dimensions config: " + name)
+    # Cascade (robot only): a linked capability config sharing this exact
+    # display_name -- created together by linkRobotConfigToDimensions -- is
+    # removed too, so neither axis can orphan the other into an undeletable
+    # ghost entry (see deleteRobotConfigCb's own cascade for the reverse
+    # direction, and its comment for the reported symptom this fixes).
+    if role == 'robot':
+      linked_key = self.findRobotConfigKeyByDisplayName(name)
+      if linked_key is not None:
+        if self.deleteRobotConfigByKey(linked_key):
+          self.msg_if.pub_info("Deleted linked robot config: " + linked_key)
 
   def setRobotDimensionsCb(self, msg):
     self.setDimensionsCb('robot', msg)
@@ -1855,6 +2088,22 @@ class NepiSimConnectorApp:
       self.msg_if.pub_warn(role + " dimensions must be a YAML mapping of fields (got " +
                            type(fields).__name__ + ")")
       return
+    if role == 'robot':
+      # Checked against the RESULTING geometry (currently-active fields
+      # merged with this edit), not fields alone -- this callback allows a
+      # partial edit (see this method's own docstring), and validating just
+      # the partial dict against bare component defaults could pass or fail
+      # against a hypothetical robot that was never actually requested.
+      try:
+        current_fields = yaml.safe_load(self.readStoredDimensionsYaml('robot') or '')
+      except yaml.YAMLError:
+        current_fields = None
+      merged_fields = dict(current_fields) if isinstance(current_fields, dict) else {}
+      merged_fields.update(fields)
+      viable, reason = self.checkRobotDimensionsViable(merged_fields)
+      if not viable:
+        self.msg_if.pub_warn("Rejected robot dimensions update: not viable -- " + reason)
+        return
     try:
       yaml_text = yaml.safe_dump(fields, default_flow_style = False, sort_keys = False)
     except yaml.YAMLError as e:
@@ -1919,6 +2168,7 @@ class NepiSimConnectorApp:
     self.publishSelectedDimensionConfig(role)
     if role == 'robot':
       self.updateCameraFovFromRobotDimensions()
+    self.pushLiveDimensionsIfConnected(role)
     self.msg_if.pub_info("Updated " + role + " dimensions: " + yaml_text.replace(chr(10), ' '))
 
   def uploadRobotModelSdfCb(self, msg):
@@ -2629,6 +2879,323 @@ class NepiSimConnectorApp:
     self.active_launch_target = ''
     self.publishLauncherStatus()
 
+  def ensureArdupilotSitlConnection(self, actual_target):
+    if actual_target != 'gazebo_quadcopter':
+      return
+    self.ardupilot_discovery_update_pub.publish(UpdateControl(
+        name = 'connection', display_name = '', description = '',
+        value = ['SITL'], index = '', min_bound = '', max_bound = '', options = []))
+
+  # Live dimension edits (2026-09-18, requested live: "changing fov and
+  # environment should happen instantly after hitting enter in the fov box
+  # or changing the dropdown... robot dimensions [geometry] though wouldnt
+  # matter, since you cant really change a robot unless redeploying").
+  # FOV and environment geometry both have a LIVE update path already built
+  # for a different purpose (rbx_sim_node.py's camera_offset_x/y/z Settings,
+  # and EnvironmentModelSpawner's respawn-on-command) that this app's own
+  # dimensions editor never reached before -- pushDirtyDimensions only ever
+  # ran right before a FRESH gzserver launch. This is the same push, fired
+  # immediately from setDimensionsCb instead of only at launch time, plus
+  # the one signal each path still needs to actually re-render: camera_
+  # fov_deg is a Setting (triggers rbx_sim_node.py's own sendCameraSettings
+  # -> live camera respawn with the new FOV baked in, no redeploy);
+  # environment geometry needs an explicit force-respawn afterward (see
+  # REFRESH_ENVIRONMENT's own comment) since re-selecting the SAME
+  # environment name is normally a no-op. Robot chassis/wheel geometry has
+  # no live-respawn equivalent (the spawned rigid-body model would need to
+  # be torn down and rebuilt from scratch either way) -- unchanged, still
+  # deploy-time only via pushDirtyDimensions.
+  REFRESH_ENVIRONMENT_ACTION_INDEX = 2
+
+  def pushLiveDimensionsIfConnected(self, role):
+    if not self.selected_simulator:
+      return
+    if role == 'robot':
+      self.pushLiveCameraFov()
+    elif role == 'environment':
+      actual_target = self.active_launch_target or self.selected_launch_target
+      if actual_target:
+        self.pushDirtyDimensions(actual_target)
+      self.triggerRefreshEnvironment()
+
+  def getOrCreateDynamicPublisher(self, topic, msg_type):
+    # Cached, long-lived publishers for topics whose destination namespace
+    # varies at runtime (self.selected_simulator, whichever RBX device is
+    # currently connected) -- creating a brand-new rospy.Publisher and
+    # publishing on it immediately loses that very first message almost
+    # every time (found live 2026-09-18 chasing why the FOV live-update
+    # never took effect through this path even though the exact same
+    # UpdateControl worked instantly sent directly): a fresh publisher
+    # needs a moment to register with roscore and for the subscriber's own
+    # TCPROS connection to come up, and pypi/rospy does not block a
+    # publish() call to wait for that. Caching means only the FIRST-ever
+    # call for a given topic can still race; every later call (the common
+    # case -- an operator hitting Enter on the FOV box repeatedly, or
+    # editing then re-editing) reuses an already-connected publisher.
+    if not hasattr(self, '_dynamic_pubs'):
+      self._dynamic_pubs = {}
+    pub = self._dynamic_pubs.get(topic)
+    if pub is None:
+      pub = nepi_sdk.create_publisher(topic, msg_type, queue_size = 1)
+      self._dynamic_pubs[topic] = pub
+      # Best-effort short wait for the very first connection on a brand-new
+      # publisher, so even the FIRST live edit after a fresh connect has a
+      # real chance of landing instead of silently vanishing.
+      deadline = time.time() + 1.0
+      while time.time() < deadline and pub.get_num_connections() == 0:
+        time.sleep(0.05)
+    return pub
+
+  def deployEnvironmentCb(self, msg):
+    # name is the operator-facing config display name, e.g. "Obstacle
+    # Course" or a custom "complexcourse" -- EVERY entry the deploy
+    # dropdown lists (built-in or custom) is a real saved file (confirmed
+    # live 2026-09-18: environment_configs/ holds "Flat.yaml", "Obstacle
+    # Course.yaml", "Aerial Obstacle Course.yaml", and any custom names
+    # side by side, no special-casing between them), so resolving through
+    # that file works uniformly for every name rather than guessing the
+    # model from the name's own text the way the old RUI-side
+    # setEnvironmentSetting did. That old guess is exactly why built-ins
+    # worked but a custom config like "complexcourse" didn't: its name
+    # has no relationship to the model directory it actually maps to
+    # (obstacle_course) at all, so guess-from-name could only ever be
+    # right by luck.
+    #
+    # Pushes THIS config's own saved geometry to the VM before flipping the
+    # Setting, so a custom config's own edits (extra obstacles, a
+    # different wall height, etc.) actually reach Gazebo -- reading
+    # self.dimension_config_model/readStoredDimensionsYaml instead would
+    # read whatever's currently active for EDITING, which is a different,
+    # deliberately decoupled concern (see this callback's own comment
+    # history: "changing the environment config in the dropdown also
+    # messed with the dimensions... those are again separate").
+    name = str(msg.data).strip()
+    if not name or not self.selected_simulator:
+      return
+    config_path = self.dimensionConfigPath('environment', name)
+    yaml_text = None
+    if os.path.exists(config_path):
+      try:
+        with open(config_path, 'r') as f:
+          yaml_text = f.read()
+      except Exception as e:
+        self.msg_if.pub_warn("Failed to read environment config '" + name + "' to deploy: " + str(e))
+    if yaml_text is not None:
+      model_name = self.resolveEnvironmentModelFromYaml(yaml_text)
+    else:
+      # No saved file for this exact name -- not reachable from the deploy
+      # dropdown itself (every listed name has one), but kept as a safe
+      # fallback for a raw publish with an arbitrary string: guess the
+      # model from the name's own text, the old behavior.
+      model_name = ('flat_ground' if name in ('Flat', 'Flat Ground') else name.lower())
+    if yaml_text is not None and model_name != ENVIRONMENT_MODEL_NONE:
+      actual_target = self.active_launch_target or self.selected_launch_target
+      if actual_target and self.launcher is not None:
+        try:
+          target = self.launcher.get_target(actual_target)
+          self.launcher.push_dimensions(target, model_name, yaml_text, '')
+        except LauncherError as e:
+          self.msg_if.pub_warn("Failed to push environment config '" + name + "' to the sim VM: " + str(e))
+    self.deployed_environment_config_name = name
+    self.deployed_environment_config_name_pub.publish(String(data = name))
+    setting_value = ('FLAT_GROUND' if model_name == ENVIRONMENT_MODEL_NONE
+                      else re.sub(r'[^A-Z0-9]+', '_', model_name.upper()))
+    pub = self.getOrCreateDynamicPublisher(
+        nepi_sdk.create_namespace(self.selected_simulator, 'settings/update_setting'),
+        UpdateControl)
+    pub.publish(UpdateControl(
+        name = 'environment', display_name = '', description = '',
+        value = [setting_value], index = '', min_bound = '', max_bound = '', options = []))
+    if model_name != ENVIRONMENT_MODEL_NONE and model_name == self.deployed_environment_model_name:
+      # Force a respawn ONLY when re-deploying onto the SAME model that's
+      # already live -- switching between two named configs that map to
+      # the SAME underlying model (e.g. "complexcourse" -> "circlecourse",
+      # both obstacle_course) sends an UNCHANGED Setting value, which
+      # SettingsIF's own update_setting_value short-circuits on ("Setting
+      # allready set") before ever calling setEnvironmentAction -- without
+      # this, that case would push the new geometry to disk but never
+      # actually respawn it, exactly the "just looks like Obstacle Course"
+      # symptom reported live (2026-09-18) for complexcourse/circlecourse's
+      # own extra obstacles.
+      #
+      # Calling this UNCONDITIONALLY (an earlier version of this fix) was
+      # itself the cause of a DIFFERENT symptom reported live right after:
+      # aerial/obstacle_course "flashes in then disappears." Every genuine
+      # switch to a different model already gets a real spawn from the
+      # Setting update just above -- firing a SECOND, forced delete+respawn
+      # moments later (this call) raced Gazebo's own async model teardown
+      # (DeleteModel returning success is not the same as the deletion
+      # having actually finished -- see sim_bridge_node.py's own extensive
+      # comment on the exact same class of race for camera respawns), and
+      # the respawn half of that second, unnecessary cycle could fail
+      # silently while the model it had just deleted never came back.
+      self.triggerRefreshEnvironment()
+    self.deployed_environment_model_name = model_name
+
+  def pushLiveCameraFov(self):
+    pub = self.getOrCreateDynamicPublisher(
+        nepi_sdk.create_namespace(self.selected_simulator, 'settings/update_setting'),
+        UpdateControl)
+    pub.publish(UpdateControl(
+        name = 'camera_fov_deg', display_name = '', description = '',
+        value = [str(self.CAMERA_HORIZONTAL_FOV_DEG)], index = '',
+        min_bound = '', max_bound = '', options = []))
+
+  def triggerRefreshEnvironment(self):
+    # setup_action dispatches by INDEX into RBX_SETUP_ACTIONS -- safe here
+    # specifically because this app both owns the index (rbx_sim_node.py's
+    # own array, kept in sync with REFRESH_ENVIRONMENT_ACTION_INDEX above)
+    # and is the only caller; a device without this action (e.g. the
+    # quadcopter's rbx_ardupilot_node.py, which has no ground obstacle
+    # course to refresh) bounds-checks the index before dispatch and simply
+    # no-ops rather than firing the wrong action.
+    pub = self.getOrCreateDynamicPublisher(
+        nepi_sdk.create_namespace(self.selected_simulator, 'setup_action'), Int32)
+    pub.publish(Int32(data = self.REFRESH_ENVIRONMENT_ACTION_INDEX))
+
+  def publishSecondaryLauncherStatus(self):
+    self.secondary_launcher_status_pub.publish(String(data = json.dumps({
+        'active_targets': [t for t, s in self.secondary_launch_states.items() if s == 'running'],
+        'states': dict(self.secondary_launch_states),
+    })))
+
+  def launchNewSimulatorCb(self, msg):
+    # "New Sim" -- see secondary_launch_states' own __init__ comment for why
+    # this is a separate slot rather than the primary launch/redeploy path.
+    if self.launcher is None:
+      self.msg_if.pub_warn("Simulator auto-launch is not configured on this deployment "
+                           "(no launch-targets config found), ignoring launch request")
+      return
+    target_key, robot_config = self.parseLaunchPayload(msg)
+    # confirmed: the RUI's own answer to "you already have this robot
+    # config open, are you sure you want to open another?" (requested live
+    # 2026-09-18: "if new sim is hit even if the robot being summoned is
+    # the same, it should still work... give a warning... and do it").
+    # Read separately from parseLaunchPayload (whose 2-tuple shape every
+    # OTHER caller of that method already depends on) rather than widening
+    # it -- this field is New Sim's own concern alone.
+    confirmed = False
+    try:
+      payload = json.loads(str(msg.data).strip())
+      if isinstance(payload, dict):
+        confirmed = bool(payload.get('confirmed', False))
+    except ValueError:
+      pass
+    with self.secondary_launch_lock:
+      if self.secondary_launch_thread is not None and self.secondary_launch_thread.is_alive():
+        self.msg_if.pub_warn("A secondary launch/stop is already in progress, ignoring")
+        return
+      self.secondary_launch_thread = threading.Thread(target = self.runLaunchSecondary,
+                                                       args = (target_key,),
+                                                       kwargs = {'robot_config': robot_config,
+                                                                 'confirmed': confirmed})
+      self.secondary_launch_thread.daemon = True
+      self.secondary_launch_thread.start()
+
+  def stopNewSimulatorCb(self, msg):
+    actual_target = str(msg.data).strip()
+    if not actual_target or self.launcher is None:
+      return
+    with self.secondary_launch_lock:
+      if self.secondary_launch_thread is not None and self.secondary_launch_thread.is_alive():
+        self.msg_if.pub_warn("A secondary launch/stop is already in progress, ignoring")
+        return
+      self.secondary_launch_thread = threading.Thread(target = self.runStopSecondary,
+                                                       args = (actual_target,))
+      self.secondary_launch_thread.daemon = True
+      self.secondary_launch_thread.start()
+
+  def runLaunchSecondary(self, target_key, robot_config=None, confirmed=False):
+    # Deliberately simpler than runLaunch below: no live push of a resolved
+    # robot_config back into self.selected_robot_config (that field is the
+    # PRIMARY panel's own shared selection, and there is no separate control
+    # surface for a secondary instance's robot config in this first pass).
+    # robot_config here is used only for resolve_launch_target's own
+    # redirect (e.g. picking gazebo_quadcopter when the rover is already
+    # the primary instance); the launched instance otherwise gets that
+    # target's default.
+    if not robot_config:
+      robot_config = self.launcher.get_default_robot_config(target_key)
+    actual_target = (self.launcher.resolve_launch_target(target_key, robot_config)
+                     if robot_config else target_key)
+
+    # Requested live (2026-09-18): "if new sim is hit even if the robot
+    # being summoned is the same, it should still work. it should just
+    # give a warning... and do it" -- re-hitting New Sim for a target
+    # that's already open AS A SECONDARY instance now redeploys that same
+    # secondary slot in place (stop, then relaunch fresh) instead of
+    # silently no-op'ing, once the RUI's own confirm dialog has answered
+    # yes (confirmed=True). Without confirmed, this just returns -- the RUI
+    # is expected to have asked first; a non-RUI caller (a raw publish)
+    # skipping the prompt entirely is treated the same as "not confirmed
+    # yet" rather than proceeding blind.
+    if actual_target in self.secondary_launch_states:
+      if not confirmed:
+        return
+      self.launcher.stop_secondary(actual_target)
+      del self.secondary_launch_states[actual_target]
+      self.publishSecondaryLauncherStatus()
+    # The PRIMARY-collision case is a real infrastructure limit, not just a
+    # missing confirm step: simulator_launch_targets.yaml only gives
+    # gazebo_rover and gazebo_quadcopter ONE dedicated GAZEBO_MASTER_URI/
+    # ROS_MASTER_URI pair each (see that file's own comments), so there is
+    # no THIRD port pair to launch this same target on again as a second,
+    # genuinely independent window -- confirming the prompt can't change
+    # that, so this stays a hard refusal either way.
+    if actual_target == self.active_launch_target and self.launcher_state == 'running':
+      self.msg_if.pub_warn(actual_target + " is already the PRIMARY instance, and this app "
+                           "only has one extra port pair configured -- use a different "
+                           "target for New Sim, or Use Open Sim to redeploy this one")
+      return
+
+    self.secondary_launch_states[actual_target] = 'launching'
+    self.publishSecondaryLauncherStatus()
+    try:
+      needs_install = not self.launcher.is_installed(actual_target)
+    except LauncherError:
+      needs_install = False
+    if needs_install:
+      self.secondary_launch_states[actual_target] = 'installing'
+      self.publishSecondaryLauncherStatus()
+      try:
+        self.launcher.install(actual_target)
+      except LauncherError as e:
+        self.secondary_launch_states[actual_target] = 'failed: ' + str(e)
+        self.publishSecondaryLauncherStatus()
+        return
+      self.secondary_launch_states[actual_target] = 'launching'
+      self.publishSecondaryLauncherStatus()
+
+    self.pushDirtyDimensions(actual_target)
+    self.ensureArdupilotSitlConnection(actual_target)
+    try:
+      # launch_secondary/wait_until_ready_secondary, NOT launch()/
+      # wait_until_ready() -- those two funnel through deploy_state.yaml's
+      # single desired_target slot, which is exactly what would stop
+      # whatever the PRIMARY slot is running the instant this secondary
+      # target differs from it. See launch_secondary's own comment in
+      # simulator_launcher.py for the live-confirmed root cause.
+      self.launcher.launch_secondary(actual_target)
+      ready = self.launcher.wait_until_ready_secondary(actual_target)
+    except LauncherError as e:
+      self.secondary_launch_states[actual_target] = 'failed: ' + str(e)
+      self.publishSecondaryLauncherStatus()
+      return
+    if not ready:
+      self.launcher.stop_secondary(actual_target)
+      self.secondary_launch_states[actual_target] = 'failed: timed out waiting to become ready'
+      self.publishSecondaryLauncherStatus()
+      return
+    self.secondary_launch_states[actual_target] = 'running'
+    self.publishSecondaryLauncherStatus()
+
+  def runStopSecondary(self, actual_target):
+    if actual_target not in self.secondary_launch_states:
+      return
+    self.launcher.stop_secondary(actual_target)
+    del self.secondary_launch_states[actual_target]
+    self.publishSecondaryLauncherStatus()
+
   def runLaunch(self, target_key, attach=False, robot_config=None):
     # robot_config, when given, is the value the caller's own message
     # carried (see parseLaunchPayload) and takes priority over
@@ -2665,6 +3232,7 @@ class NepiSimConnectorApp:
       self.launcher_state = 'launching'
       self.setLauncherError('')
       self.publishLauncherStatus()
+      self.ensureArdupilotSitlConnection(actual_target)
       try:
         self.launcher.launch(actual_target, attach=True)
         ready = self.launcher.wait_until_ready(actual_target)
@@ -2783,6 +3351,7 @@ class NepiSimConnectorApp:
     # effect. Best-effort (pushDirtyDimensions never raises); a push failure
     # here should not block the launch it's ahead of.
     self.pushDirtyDimensions(actual_target)
+    self.ensureArdupilotSitlConnection(actual_target)
     try:
       self.launcher.launch(actual_target)
       ready = self.launcher.wait_until_ready(actual_target)

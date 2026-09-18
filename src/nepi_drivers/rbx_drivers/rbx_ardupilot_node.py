@@ -974,6 +974,9 @@ class ArdupilotNode:
     # ONLY camera settings out and compressed frames in.
     self.camera_sock = None
     self.camera_sock_lock = threading.Lock()
+    # See the environment re-sync comment in cameraBridgeLoop for why this
+    # is a ONE-SHOT flag, not re-checked on every reconnect.
+    self._environment_synced_once = False
     # CAMERA_STALE_TIMEOUT_SEC's own comment above explains why this is
     # tracked and watched from a separate thread rather than trusted to
     # self-detect from inside cameraBridgeLoop.
@@ -2673,7 +2676,24 @@ class ArdupilotNode:
       # environment model the VM's own environment_models.py last happened
       # to have spawned; re-assert this node's own current Setting value
       # instead.
-      self.setEnvironmentAction(self.settings_dict['environment']['value'])
+      #
+      # Guarded to fire ONCE per process, not on every reconnect -- found
+      # live (2026-09-17), same root cause and fix as rbx_sim_node.py's own
+      # bridge-accept loop: "i could only change the obstacle course once.
+      # it didnt work after." The camera bridge connection to this device
+      # type is known to drop and reconnect on its own (a flaky far-end sim
+      # process), and every one of those reconnects re-ran this line using
+      # whatever settings_dict['environment']['value'] happened to be at
+      # that moment -- correct on the very FIRST connect, but on every
+      # SUBSEQENT reconnect this could race an operator's own more recent
+      # change landing on settings_dict a moment later, re-asserting a
+      # value that's about to be stale. Only the first connect after this
+      # node starts needs this defensive push; every later reconnect
+      # should trust settings_dict as the last real user intent instead of
+      # re-broadcasting it blindly.
+      if not self._environment_synced_once:
+        self.setEnvironmentAction(self.settings_dict['environment']['value'])
+        self._environment_synced_once = True
       buf = b''
       while not nepi_sdk.is_shutdown():
         try:

@@ -66,10 +66,19 @@ LAUNCH_STARTUP_GRACE_SEC = 5
 # own caller (runLaunch) STOPS the simulator on a timeout, so a premature
 # giveup didn't just report failure, it killed a Gazebo that was seconds
 # from actually being ready, forcing a full cold-start retry rather than
-# just a bit more waiting. 20*3=60s comfortably covers the observed range
-# with real margin while still giving up eventually for a target that
-# genuinely never comes up.
-READY_CHECK_ATTEMPTS = 20
+# just a bit more waiting. 20*3=60s comfortably covered the observed range
+# for a steady-state redeploy, but reported live (2026-09-17) still timed
+# out -- and got needlessly stopped by the very code this comment
+# describes -- on a deploy attempted right after BOTH the device and the
+# VM had just rebooted: cold disk caches, cold Python import caches, and
+# Gazebo's own cold asset loading all stack on top of the already-fixed
+# 8s sleep in launch_command, easily pushing total time-to-ready past 60s
+# even though the deploy was genuinely going to succeed (confirmed live:
+# the same target came up fine on its own once ready_check_command was
+# given more time to keep polling). Raised 20*3=60s -> 40*3=120s for more
+# headroom in exactly that cold-boot case, while still giving up
+# eventually for a target that genuinely never comes up.
+READY_CHECK_ATTEMPTS = 40
 READY_CHECK_INTERVAL_SEC = 3
 # An install can mean anything from a pip install to a multi-package apt
 # transaction with a slow mirror -- generous on purpose; this blocks the
@@ -1114,6 +1123,75 @@ class SimulatorLauncher(object):
         proc.kill()
         proc.wait()
 
+  # "New Sim" secondary-slot launch/ready/stop (2026-09-18) -- launch()/
+  # is_ready()/stop() above all funnel a shared_storage target through the
+  # SINGLE desired_target slot in deploy_state.yaml (see
+  # _launch_via_deploy_state's own docstring: "the real, primary deploy
+  # transport now"), so calling them for a SECOND target while the first is
+  # still running just stops the first one -- confirmed live: launching
+  # gazebo_quadcopter as a secondary instance this way silently killed the
+  # already-running gazebo_rover the instant the desired_target changed.
+  # vm_command_watcher.py already has a genuinely per-target-safe path,
+  # though: its 'launch'/'stop' mailbox actions go through
+  # _handleLaunch/self.launch_procs, a dict KEYED BY target_key that already
+  # refuses a duplicate launch of the SAME key while leaving every OTHER key
+  # alone -- launch() just never used it (deploy_state.yaml superseded it
+  # for the primary path). These three methods dispatch through that
+  # existing, already-correct mechanism instead, via the same
+  # _dispatch_shared_storage one-shot request/response protocol
+  # is_installed()/install() already use. Shared-storage only (every
+  # target this app actually ships with uses it) -- an SSH-mode secondary
+  # launch is out of scope for this first pass.
+  def launch_secondary(self, target_key):
+    target = self.get_target(target_key)
+    launch_command = target.get("launch_command", "")
+    if not launch_command:
+      raise LauncherError(
+          "'" + target.get("display_name", target_key) + "' has no launch_command configured.")
+    if target.get("connection_mode") != "shared_storage":
+      raise LauncherError(
+          "'" + target.get("display_name", target_key) + "' is not on the shared_storage "
+          "connection mode -- New Sim only supports that transport today.")
+    device_host = self.config.get("device_bridge_host", "")
+    device_port = self.config.get("device_bridge_port", "")
+    command = launch_command.format(
+        device_bridge_host=device_host, device_bridge_port=device_port)
+    _, status = self._dispatch_shared_storage(
+        target, target_key, "launch", command, LAUNCH_STARTUP_GRACE_SEC)
+    if status.get("state") == "failed":
+      raise LauncherError("Secondary launch failed: " + (status.get("error") or ""))
+
+  def is_ready_secondary(self, target_key):
+    target = self.get_target(target_key)
+    ready_check_command = target.get("ready_check_command")
+    if not ready_check_command:
+      return True
+    try:
+      _, status = self._dispatch_shared_storage(
+          target, target_key, "ready_check", ready_check_command, SSH_CONNECT_TIMEOUT_SEC + 2)
+    except LauncherError:
+      return False
+    return status.get("exit_code") == 0
+
+  def wait_until_ready_secondary(self, target_key, attempts=READY_CHECK_ATTEMPTS,
+                                  interval_sec=READY_CHECK_INTERVAL_SEC):
+    for _ in range(attempts):
+      if self.is_ready_secondary(target_key):
+        return True
+      time.sleep(interval_sec)
+    return False
+
+  def stop_secondary(self, target_key):
+    target = self.get_target(target_key)
+    stop_command = target.get("stop_command")
+    if not stop_command:
+      return
+    try:
+      self._dispatch_shared_storage(
+          target, target_key, "stop", stop_command, SSH_CONNECT_TIMEOUT_SEC + 5)
+    except LauncherError:
+      pass
+
   def kill_all_gazebo(self):
     """Explicit, deliberately blunt escape hatch: kills EVERY gzclient and
     gzserver on each configured target's host, regardless of who started
@@ -1128,6 +1206,17 @@ class SimulatorLauncher(object):
     unrelated Gazebo sessions as a routine side effect (see that target's
     own stop_command comment); this exists ONLY as a manual, explicitly
     operator-initiated action, never automatic.
+
+    Known consequence of "deliberately blunt" now that gazebo_rover and
+    gazebo_quadcopter can run concurrently (2026-09-18, separate
+    GAZEBO_MASTER_URI/ROS_MASTER_URI per target -- see
+    simulator_launch_targets.yaml's own comments on each): this still kills
+    EVERY gzserver/gzclient on the host, including a "New Sim" secondary
+    instance the operator did not ask to stop. Not fixed here -- narrowing
+    this to "just the one target that's actually in the way" would need to
+    know which port that conflict came from, which the caller (a plain
+    "gazebo is already running" refuse-guard failure) does not currently
+    report.
 
     Runs once per unique (host, ssh_user, ssh_port) across every configured
     target rather than just the one the operator happened to have selected

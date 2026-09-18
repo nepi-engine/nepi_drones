@@ -892,8 +892,26 @@ def apply_update_control_msg( controls_dict, msg):
   if index == '':
     index = None
 
+  # "Nothing given" for a list-typed field (value/options) is a genuinely
+  # EMPTY list -- a std_msgs-style string[] that the sender never populated
+  # serializes as [], never as [''] (a one-element list holding an empty
+  # string is a real value: an explicit "clear this String setting to
+  # empty text"). The old `!= ['']` sentinel got this backwards: it treated
+  # every ordinary update's empty `options` array (every caller sends
+  # options=[] unless it's specifically changing the valid-options list
+  # itself) as "please apply an update," which called set_control_options
+  # with an empty list and silently wiped a Selection/Discrete setting's
+  # entire options list on its very first value update -- every later
+  # update for that setting then failed get_clean_value's options-
+  # membership check and returned None. Found live (2026-09-17) tracing
+  # why a Sim Connector environment-config change and a Discrete-typed
+  # settings push both "didn't work": rbx_sim_node.py's own log showed
+  # "Setting update failed: ['environment', None] : can only concatenate
+  # str (not 'NoneType') to str" -- the value looked right on the wire,
+  # but options had already been zeroed out by an earlier, unrelated
+  # update to the same setting.
   value = msg.value
-  if value != ['']:
+  if len(value) > 0:
     value = get_clean_value(controls_dict, name, value)
     if value is not None:
       controls_dict = set_control_value(controls_dict, name, value, index = index)
@@ -907,7 +925,7 @@ def apply_update_control_msg( controls_dict, msg):
     controls_dict = set_control_max_bound(controls_dict, name, max_bound = max_bound)
 
   options = msg.options
-  if options != ['']:
+  if len(options) > 0:
     controls_dict = set_control_options(controls_dict, name, options)
 
   return controls_dict

@@ -264,6 +264,55 @@ function numericDimensionField(fields, fieldDefs, name) {
   return def ? def.default : 0
 }
 
+// Robot chassis/wheel geometry sanity check -- requested live (2026-09-17):
+// "if the wheels are touching each other or if the wheels are ever detached
+// from the bot such that the robot wouldnt actually be viable, it should
+// give an error saying 'this robot isn't viable'... and not let them save
+// the robot config," then again the same day after the first version only
+// checked the side-to-side (track_width_m vs chassis_width_m) relationship
+// and missed the front-to-back one entirely: "it is also still possible to
+// have the base detached from the wheels on the rover... it should simply
+// detect if the wheel and base sprites are touching or not." Rewritten as
+// a real axis-aligned-bounding-box touch test between one wheel and the
+// chassis (all four wheels are mirror images at the same magnitudes, per
+// renderRobotDimensionsDiagram's own wheelPositions, so checking one
+// covers all four): they're detached the instant there's a gap on EITHER
+// axis, front-to-back (wheelbase_m vs chassis_length_m) or side-to-side
+// (track_width_m vs chassis_width_m) -- a gap on just one axis is enough
+// to separate two rectangles entirely, regardless of the other axis.
+function checkRobotDimensionsViable(fields) {
+  const trackWidth = numericDimensionField(fields, ROBOT_DIMENSION_FIELDS, 'track_width_m')
+  const wheelWidth = numericDimensionField(fields, ROBOT_DIMENSION_FIELDS, 'wheel_width_m')
+  const wheelRadius = numericDimensionField(fields, ROBOT_DIMENSION_FIELDS, 'wheel_radius_m')
+  const wheelbase = numericDimensionField(fields, ROBOT_DIMENSION_FIELDS, 'wheelbase_m')
+  const chassisWidth = numericDimensionField(fields, ROBOT_DIMENSION_FIELDS, 'chassis_width_m')
+  const chassisLength = numericDimensionField(fields, ROBOT_DIMENSION_FIELDS, 'chassis_length_m')
+  // Wheel-vs-wheel: the two wheels sharing an axle overlap/touch when the
+  // gap between their centers (track_width_m) is no more than their own
+  // width.
+  if (trackWidth <= wheelWidth) {
+    return { viable: false, reason: "the wheels are touching or overlapping each other" }
+  }
+  // Front-to-back overlap (same side): front and rear wheels are two
+  // circles of radius wheelRadius, wheelbase apart center-to-center -- they
+  // touch/overlap once that's less than 2x the (shared) radius. Missing
+  // entirely before this pass (2026-09-18, reported live: "overlapping
+  // wheels still doesnt get detected as not viable") -- mirrors the
+  // server-side fix in sim_connector_app_node.py's own
+  // checkRobotDimensionsViable.
+  if (wheelbase <= 2 * wheelRadius) {
+    return { viable: false, reason: "the front and rear wheels are touching or overlapping each other" }
+  }
+  // Wheel-vs-chassis AABB gap test, one axis at a time -- positive means a
+  // real gap (detached) on that axis alone.
+  const gapAlongLength = (wheelbase / 2 - wheelRadius) - (chassisLength / 2)
+  const gapAlongWidth = (trackWidth / 2 - wheelWidth / 2) - (chassisWidth / 2)
+  if (gapAlongLength > 0 || gapAlongWidth > 0) {
+    return { viable: false, reason: "the wheels are detached from the chassis" }
+  }
+  return { viable: true }
+}
+
 const DIAGRAM_BG = "#1c1e21"
 
 @inject("ros")
@@ -436,6 +485,13 @@ class NepiIFSim extends Component {
       // brand-new page load shows a real, useful choice instead of forcing
       // one before Deploy/Kill even become relevant.
       environment_deploy_selected_name: 'Flat',
+      // Server-reported "what's actually deployed right now" (see
+      // sim_connector_app_node.py's deployed_environment_config_name
+      // comment) -- checked by onDeleteDimensionConfigClicked, separate
+      // from environment_deploy_selected_name above (this component's own
+      // last pick, which can differ from what's actually live if a
+      // deploy failed or another client changed it).
+      deployed_environment_config_name: '',
       // "Environment Configs" read-only YAML preview dropdown's own state
       // -- deliberately separate from environment_dimensions_config_yaml_text
       // (owned by the Dimensions-editing selector) and from
@@ -515,6 +571,8 @@ class NepiIFSim extends Component {
     this.onDeleteObstacleClicked = this.onDeleteObstacleClicked.bind(this)
     this.onObstacleFieldInputChange = this.onObstacleFieldInputChange.bind(this)
     this.startObstacleDrag = this.startObstacleDrag.bind(this)
+    this.startObstacleRotateDrag = this.startObstacleRotateDrag.bind(this)
+    this.renderRotateHandle = this.renderRotateHandle.bind(this)
     this.renderObstacleFieldRow = this.renderObstacleFieldRow.bind(this)
     this.renderCustomObstacleShape = this.renderCustomObstacleShape.bind(this)
     this.renderCustomObstaclesDiagram = this.renderCustomObstaclesDiagram.bind(this)
@@ -646,6 +704,7 @@ class NepiIFSim extends Component {
       this.state.robotDimensionsConfigNamesListener, this.state.environmentDimensionsConfigNamesListener,
       this.state.robotDimensionsSelectedConfigListener, this.state.environmentDimensionsSelectedConfigListener,
       this.state.robotDimensionsAutosavedListener, this.state.environmentDimensionsAutosavedListener,
+      this.state.deployedEnvironmentConfigListener,
       this.state.environmentDimensionsModelListener]
       .forEach((listener) => { if (listener != null) { listener.unsubscribe() } })
     if (namespace == null || namespace === 'None') {
@@ -654,6 +713,7 @@ class NepiIFSim extends Component {
                       robotDimensionsConfigNamesListener: null, environmentDimensionsConfigNamesListener: null,
                       robotDimensionsSelectedConfigListener: null, environmentDimensionsSelectedConfigListener: null,
                       robotDimensionsAutosavedListener: null, environmentDimensionsAutosavedListener: null,
+                      deployedEnvironmentConfigListener: null,
                       environmentDimensionsModelListener: null })
       return
     }
@@ -706,6 +766,17 @@ class NepiIFSim extends Component {
       namespace + '/environment_dimensions_autosaved', "std_msgs/String",
       (message) => this.showDimensionsAutosaveMsg('environment', message.data)
     )
+    // Which config the TOP "Environment Config" deploy selector actually
+    // has live right now -- deliberately separate from
+    // environment_dimensions_selected_config (the EDIT dropdown's own
+    // selection; see this file's own "these are separate" decoupling).
+    // Read by onDeleteDimensionConfigClicked so deleting whatever's
+    // currently deployed gets a clear warning instead of the generic
+    // built-in-protection one (requested live 2026-09-18).
+    const deployedEnvironmentConfigListener = this.props.ros.setupStatusListener(
+      namespace + '/deployed_environment_config_name', "std_msgs/String",
+      (message) => this.setState({ deployed_environment_config_name: message.data })
+    )
     // Which model the currently-selected environment config targets --
     // drives which curated field set (ENVIRONMENT_DIMENSION_FIELDS_BY_MODEL)
     // is shown/edited. Tops up any of that model's fields not yet present
@@ -745,6 +816,7 @@ class NepiIFSim extends Component {
                     environmentDimensionsSelectedConfigListener: environmentSelectedConfigListener,
                     robotDimensionsAutosavedListener: robotAutosavedListener,
                     environmentDimensionsAutosavedListener: environmentAutosavedListener,
+                    deployedEnvironmentConfigListener: deployedEnvironmentConfigListener,
                     environmentDimensionsModelListener: environmentModelListener,
                     environmentDimensionsViewingYamlListener: environmentDimensionsViewingYamlListener })
     this.props.ros.sendTriggerMsg(namespace + '/get_robot_dimensions')
@@ -982,6 +1054,13 @@ class NepiIFSim extends Component {
       return
     }
     const fields = this.state[role + '_dimensions_fields']
+    if (role === 'robot') {
+      const check = checkRobotDimensionsViable(fields)
+      if (!check.viable) {
+        window.alert("This robot isn't viable: " + check.reason + ".")
+        return
+      }
+    }
     const yamlText = yaml.dump(fields)
     this.props.ros.sendStringMsg(namespace + '/set_' + role + '_dimensions', yamlText)
     // Snapshot for the diagram -- see robot_dimensions_preview_fields'
@@ -1050,18 +1129,18 @@ class NepiIFSim extends Component {
       return
     }
     this.setState({ environment_deploy_selected_name: name })
-    // .wrappedInstance, not the ref itself -- see the ref mount site's own
-    // long comment (2026-09-09) for why: NepiIFSimControls is wrapped in
-    // mobx-react 5.4.2's inject("ros"), whose Injector always attaches ITS
-    // OWN internal ref to the wrapped component and stashes the real
-    // instance on wrappedInstance -- there is no wrappedComponentRef support
-    // in this mobx-react version at all (checked the installed source
-    // directly), so a plain ref here correctly resolves to the Injector,
-    // never to NepiIFSimControls itself.
-    const inner = this.simControlsRef.current && this.simControlsRef.current.wrappedInstance
-    if (inner) {
-      inner.setEnvironmentSetting(name)
-    }
+    // Published straight to the backend's own sim/deploy_environment topic
+    // (2026-09-18, reported live: "changing the environment mid sim...
+    // doesnt do anything") instead of reaching into NepiIFSimControls via
+    // simControlsRef.current.wrappedInstance -- that ref hop is real
+    // (mobx-react 5.4.2's Injector, see the ref's own long-standing
+    // comment elsewhere in this file) but proved unreliable for this
+    // specific action in practice, unlike the FOV box's own live push,
+    // which was moved off the same ref hop earlier today for the same
+    // reason. sim_connector_app_node.py's deployEnvironmentCb does the
+    // exact same name -> Setting-value translation setEnvironmentSetting
+    // used to do, so this is a straight relocation, not a behavior change.
+    this.props.ros.sendStringMsg(this.getSimNamespace() + '/deploy_environment', name)
   }
 
   // Read-only YAML preview for the "Environment Configs" viewer dropdown --
@@ -1109,7 +1188,15 @@ class NepiIFSim extends Component {
     if (namespace == null || namespace === 'None') {
       return
     }
-    const yamlText = yaml.dump(this.state[role + '_dimensions_fields'])
+    const fields = this.state[role + '_dimensions_fields']
+    if (role === 'robot') {
+      const check = checkRobotDimensionsViable(fields)
+      if (!check.viable) {
+        window.alert("This robot isn't viable: " + check.reason + ".")
+        return
+      }
+    }
+    const yamlText = yaml.dump(fields)
     this.props.ros.sendStringMsg(namespace + '/save_' + role + '_dimensions_config',
       JSON.stringify({ name: name, yaml: yamlText }))
   }
@@ -1138,22 +1225,70 @@ class NepiIFSim extends Component {
     }, 3000)
   }
 
-  // Deletes whichever dimensions config is currently selected. A built-in
-  // (PROTECTED_DIMENSION_CONFIG_NAMES) pops an alert rather than silently
-  // no-oping or just staying disabled with no explanation -- requested live
-  // (2026-08-31); deleteDimensionConfigCb enforces the same rule
-  // independently on the device side regardless.
-  onDeleteDimensionConfigClicked(role) {
+  // Deletes `name`. Takes the name explicitly now (2026-09-18) rather than
+  // reading this.state[role + '_dimensions_selected_config'] itself --
+  // that field belongs to the EDIT dropdown in renderDimensionsEditor,
+  // elsewhere on the page, but this button is rendered directly below the
+  // read-only "Environment YAMLs" VIEWER dropdown (viewingName), with
+  // nothing visually connecting it to the edit selector at all. Reading
+  // the edit selection here meant Delete silently acted on whatever was
+  // loaded for editing, not whatever the operator had just picked right
+  // above it to look at -- reported live: picking "complexcourse" in the
+  // viewer, clicking Delete, and getting "'Obstacle Course' is a built-in
+  // config and can't be deleted" (the edit selector's own value, stuck on
+  // the built-in fallback from an earlier unrelated delete). Now the
+  // button's own onClick passes viewingName directly, so it always acts
+  // on the exact name currently shown in the dropdown right above it.
+  // A built-in (PROTECTED_DIMENSION_CONFIG_NAMES) pops an alert rather than
+  // silently no-oping or just staying disabled with no explanation --
+  // requested live (2026-08-31); deleteDimensionConfigCb enforces the same
+  // rule independently on the device side regardless.
+  onDeleteDimensionConfigClicked(role, name) {
     const namespace = this.getSimNamespace()
-    const selected = this.state[role + '_dimensions_selected_config']
-    if (namespace == null || namespace === 'None' || !selected) {
+    if (namespace == null || namespace === 'None' || !name) {
       return
     }
-    if (isProtectedDimensionConfig(role, selected)) {
-      window.alert('"' + selected + '" is a built-in config and can\'t be deleted.')
+    if (isProtectedDimensionConfig(role, name)) {
+      window.alert('"' + name + '" is a built-in config and can\'t be deleted.')
       return
     }
-    this.props.ros.sendStringMsg(namespace + '/delete_' + role + '_dimensions_config', selected)
+    // Requested live (2026-09-18): "if trying to delete the config of
+    // something thats currently selected, it should give a popup saying
+    // that environment is currently selected and cant be deleted."
+    // deployed_environment_config_name is what the backend confirms is
+    // ACTUALLY live right now, regardless of which selector last touched
+    // it.
+    if (role === 'environment' && name === this.state.deployed_environment_config_name) {
+      window.alert('"' + name + '" is the currently deployed environment and can\'t be ' +
+                    'deleted while it\'s live. Deploy a different one first.')
+      return
+    }
+    this.props.ros.sendStringMsg(namespace + '/delete_' + role + '_dimensions_config', name)
+    // Optimistically clears the viewer immediately for environment (its
+    // read-only YAML preview otherwise keeps showing the just-deleted
+    // config's content, with nothing to naturally refresh it, until the
+    // operator happens to pick something else).
+    if (role === 'environment' && name === this.state.environment_dimensions_viewing_config_name) {
+      this.setState({ environment_dimensions_viewing_config_name: '', environment_dimensions_viewing_yaml_text: '' })
+    }
+  }
+
+  // Shared by renderRobotConfigAndDimensionsButtons and
+  // onDeleteMergedRobotConfigClicked -- maps each capability config's
+  // DISPLAY NAME to its raw key (what select_robot_config/delete_robot_config
+  // actually take), same lookup both places build separately before this.
+  getRobotCapabilityByName() {
+    const status_msg = this.state.status_msg
+    const capabilityKeys = (status_msg != null && status_msg.available_robot_configs !== undefined)
+      ? status_msg.available_robot_configs : []
+    const capabilityNames = (status_msg != null && status_msg.available_robot_config_names !== undefined)
+      ? status_msg.available_robot_config_names : []
+    var capabilityByName = {}
+    capabilityKeys.forEach((key, i) => {
+      const display = (capabilityNames[i] !== undefined && capabilityNames[i] !== '') ? capabilityNames[i] : key
+      capabilityByName[display] = key
+    })
+    return capabilityByName
   }
 
   // Delete counterpart for the merged robot button row
@@ -1166,6 +1301,17 @@ class NepiIFSim extends Component {
   // sim_connector_app_node.py) -- popping the same built-in alert for it
   // keeps that consistent with 4-Wheel Rover's own protection instead of
   // silently deleting an unrelated, currently-selected dimensions config.
+  //
+  // Fires BOTH axes' delete when both have an entry under this name (the
+  // common case -- linkRobotConfigToDimensions creates them together), and
+  // whichever ONE axis actually has an entry otherwise. Reported live
+  // 2026-09-17: a config whose dimensions entry had already been removed
+  // (leaving only its capability entry) could never be deleted at all --
+  // this only ever sent delete_robot_dimensions_config, so it just kept
+  // popping "has no saved dimensions entry to delete" forever. The device
+  // side now also cascades a delete on either axis to the other (see
+  // deleteRobotConfigCb/deleteDimensionConfigCb's own cascades), so this
+  // dual-fire is a belt-and-suspenders match to that, not the only fix.
   onDeleteMergedRobotConfigClicked() {
     const namespace = this.getSimNamespace()
     const name = this.state.robot_merged_selected_name
@@ -1176,11 +1322,18 @@ class NepiIFSim extends Component {
       window.alert('"' + name + '" is a built-in config and can\'t be deleted.')
       return
     }
-    if (this.state.robot_dimensions_config_names.indexOf(name) === -1) {
-      window.alert('"' + name + '" has no saved dimensions entry to delete.')
+    const hasDimensions = this.state.robot_dimensions_config_names.indexOf(name) !== -1
+    const capabilityKey = this.getRobotCapabilityByName()[name]
+    if (!hasDimensions && capabilityKey === undefined) {
+      window.alert('"' + name + '" has no saved config to delete.')
       return
     }
-    this.props.ros.sendStringMsg(namespace + '/delete_robot_dimensions_config', name)
+    if (hasDimensions) {
+      this.props.ros.sendStringMsg(namespace + '/delete_robot_dimensions_config', name)
+    }
+    if (capabilityKey !== undefined) {
+      this.props.ros.sendStringMsg(namespace + '/delete_robot_config', capabilityKey)
+    }
   }
 
   // Client-side only, downloads the CURRENTLY EDITED fields (not a fresh
@@ -1347,7 +1500,6 @@ class NepiIFSim extends Component {
     if (status_msg == null) {
       return null
     }
-    const selected = this.state.environment_dimensions_selected_config
     // "Custom Obstacles" excluded here too -- see renderEnvironmentConfigSelector's
     // own comment for why.
     const names = this.state.environment_dimensions_config_names.filter((n) => n !== 'Custom Obstacles')
@@ -1413,7 +1565,11 @@ class NepiIFSim extends Component {
                 change it in the real gazebo window then which can be
                 annoying." */}
             <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
-            <Label title={"Environment Configs"}>
+            {/* Renamed from "Environment Configs" (2026-09-17) -- matches
+                the Robot side's own rename to "Robot YAMLs" for the same
+                reason: disambiguating this read-only YAML-preview picker
+                from the "Environment Config" deploy selector above it. */}
+            <Label title={"Environment YAMLs"}>
               <Select
                 onChange={(event) => this.onViewEnvironmentDimensionsConfigClicked(event.target.value)}
                 value={viewingName}
@@ -1423,7 +1579,7 @@ class NepiIFSim extends Component {
               </Select>
             </Label>
             <ButtonMenu>
-              <Button disabled={!selected} onClick={() => this.onDeleteDimensionConfigClicked('environment')}>
+              <Button disabled={!viewingName} onClick={() => this.onDeleteDimensionConfigClicked('environment', viewingName)}>
                 {"Delete Selected Config"}
               </Button>
             </ButtonMenu>
@@ -1458,24 +1614,12 @@ class NepiIFSim extends Component {
   // switches to its dimensions config, updating both viewers below);
   // "Quadcopter" only has a capability counterpart (its airframe is a
   // vendored third-party model with no dimensions.yaml of its own) so only
-  // that fires. Delete stays scoped to the dimensions axis (see
-  // onDeleteMergedRobotConfigClicked) -- a saved CAPABILITY config has had
-  // no delete affordance in this RUI since its own per-config Delete button
-  // was removed here (2026-08-31); nothing here reintroduces it.
+  // that fires. Delete now fires whichever axis (or both) actually has an
+  // entry under this name -- see onDeleteMergedRobotConfigClicked and
+  // getRobotCapabilityByName, its shared lookup with this method.
   renderRobotConfigAndDimensionsButtons() {
-    const status_msg = this.state.status_msg
-    const capabilityKeys = (status_msg != null && status_msg.available_robot_configs !== undefined)
-      ? status_msg.available_robot_configs : []
-    const capabilityNames = (status_msg != null && status_msg.available_robot_config_names !== undefined)
-      ? status_msg.available_robot_config_names : []
-    var capabilityByName = {}
-    capabilityKeys.forEach((key, i) => {
-      const display = (capabilityNames[i] !== undefined && capabilityNames[i] !== '') ? capabilityNames[i] : key
-      capabilityByName[display] = key
-    })
+    const capabilityByName = this.getRobotCapabilityByName()
     const dimensionNames = this.state.robot_dimensions_config_names
-    const selectedCapabilityKey = this.getSelectedRobotConfig()
-    const selectedDimensionsName = this.state.robot_dimensions_selected_config
 
     var names = []
     var seen = {}
@@ -1492,30 +1636,39 @@ class NepiIFSim extends Component {
     return (
       <React.Fragment>
         <div style={{ borderTop: "1px solid #ffffff", marginTop: Styles.vars.spacing.medium, marginBottom: Styles.vars.spacing.xs }}/>
-        <Label title={"Robot Configs"} labelStyle={{ fontWeight: 'bold' }} />
+        {/* Renamed from "Robot Configs" (2026-09-17), then switched from a
+            row of individual buttons to a dropdown (2026-09-17) -- matching
+            renderEnvironmentConfigSettings's own "Environment YAMLs"
+            selector below exactly (same Label/Select/Delete shape), and
+            requested live so the two sections behave the same way: "just
+            how the environment yamls have a dropdown to select each yaml,
+            it should be the same for the robot yamls section instead of
+            the individual buttons. this way we also dont have to worry
+            about the lighting up part." The individual-button row's
+            highlight (isSelected, keyed off two independently-echoed axes
+            that could each point at a different button) was the source of
+            that glitchiness; a native <Select> has exactly one active
+            value with no separate highlight state to drift out of sync. */}
+        <Label title={"Robot YAMLs"}>
+          <Select
+            onChange={(event) => {
+              const name = event.target.value
+              this.setState({ robot_merged_selected_name: name })
+              if (capabilityByName[name] !== undefined) {
+                this.onViewConfigClicked(capabilityByName[name])
+              }
+              if (dimensionNames.indexOf(name) !== -1) {
+                this.onSelectDimensionConfig('robot', name)
+              }
+            }}
+            value={this.state.robot_merged_selected_name || ''}
+          >
+            <Option key={''} value={''}>{'(None Selected)'}</Option>
+            {names.map((name) => <Option key={name} value={name}>{name}</Option>)}
+          </Select>
+        </Label>
         <ButtonMenu>
-          {names.map((name) => {
-            const isSelected = (capabilityByName[name] !== undefined && capabilityByName[name] === selectedCapabilityKey) ||
-                                (name === selectedDimensionsName)
-            return (
-              <Button
-                key={name}
-                style={isSelected ? { backgroundColor: Styles.vars.colors.blue } : undefined}
-                onClick={() => {
-                  this.setState({ robot_merged_selected_name: name })
-                  if (capabilityByName[name] !== undefined) {
-                    this.onViewConfigClicked(capabilityByName[name])
-                  }
-                  if (dimensionNames.indexOf(name) !== -1) {
-                    this.onSelectDimensionConfig('robot', name)
-                  }
-                }}
-              >
-                {name}
-              </Button>
-            )
-          })}
-          <Button onClick={this.onDeleteMergedRobotConfigClicked}>
+          <Button disabled={!this.state.robot_merged_selected_name} onClick={this.onDeleteMergedRobotConfigClicked}>
             {"Delete Selected Config"}
           </Button>
         </ButtonMenu>
@@ -1838,6 +1991,85 @@ class NepiIFSim extends Component {
     window.addEventListener('pointerup', onUp)
   }
 
+  // Dedicated rotate handle -- requested live (2026-09-17): "you should be
+  // able to easily rotate the walls or things that are added on the viewer
+  // itself" (previously yaw_deg was only reachable through the numeric
+  // "Rotation (deg)" text field, no drag interaction). Unlike
+  // startObstacleDrag's linear axis projection, this tracks an absolute
+  // ANGLE: handleRadius is the handle's own distance from the obstacle's
+  // center (so a given mouse movement sweeps degrees at the same rate the
+  // handle is actually drawn at, not some arbitrary unrelated rate), used
+  // only to seed a start offset at the CURRENT yaw_deg; every subsequent
+  // move adds the same worldPerPixel delta every other handle uses and
+  // takes atan2 of the result directly as the new yaw_deg. World frame is
+  // the standard CCW x-right/y-up frame localToWorldPoint's own rotation
+  // uses, so this needs no extra sign flip beyond the existing
+  // worldDY = -svgDY every drag handle already applies.
+  startObstacleRotateDrag(index, handleRadius, viewBoxWidth, svgScale, event) {
+    event.preventDefault()
+    event.stopPropagation()
+    const svgEl = event.currentTarget.ownerSVGElement
+    const rect = (svgEl != null) ? svgEl.getBoundingClientRect() : null
+    const pixelsPerViewBoxUnit = (rect != null && rect.width > 0) ? (rect.width / viewBoxWidth) : 1
+    const worldPerPixel = 1 / (pixelsPerViewBoxUnit * svgScale)
+    const startClientX = event.clientX
+    const startClientY = event.clientY
+    const obstacle = this.getCustomObstacles()[index] || {}
+    const startYaw = Number(obstacle.yaw_deg) || 0
+    const radius = Math.max(handleRadius, 0.05)
+    const rad0 = (startYaw * Math.PI) / 180
+    const startOffsetX = radius * Math.cos(rad0)
+    const startOffsetY = radius * Math.sin(rad0)
+
+    const onMove = (moveEvent) => {
+      const svgDX = (moveEvent.clientX - startClientX) * worldPerPixel
+      const svgDY = (moveEvent.clientY - startClientY) * worldPerPixel
+      const worldDX = svgDX
+      const worldDY = -svgDY
+      const offsetX = startOffsetX + worldDX
+      const offsetY = startOffsetY + worldDY
+      const yawDeg = (Math.atan2(offsetY, offsetX) * 180) / Math.PI
+      this.setState((prevState) => {
+        const current = Array.isArray(prevState.environment_dimensions_fields.obstacles)
+          ? prevState.environment_dimensions_fields.obstacles : []
+        const next = current.map((o, i) => (i === index) ? { ...o, yaw_deg: yawDeg } : o)
+        return {
+          environment_dimensions_fields: { ...prevState.environment_dimensions_fields, obstacles: next },
+          environment_dimensions_preview_fields: { ...prevState.environment_dimensions_preview_fields, obstacles: next },
+        }
+      })
+    }
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      this.onSaveDimensionsClicked('environment')
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+  }
+
+  // Draws the rotate handle itself (a small circle plus a thin spoke back
+  // to the shape's center, visually distinct from renderDragHandle's square
+  // resize handles) at a LOCAL offset from an obstacle's center -- shared
+  // by wall/triangle in renderCustomObstacleShape below (circles have no
+  // yaw_deg; rotating a circle is a no-op, so it gets no handle at all).
+  renderRotateHandle(centerX, centerY, localYOffset, yawDeg, toX, toY, index, viewW, scale) {
+    const handlePoint = localToWorldPoint(centerX, centerY, yawDeg, 0, localYOffset)
+    const hx = toX(handlePoint.x)
+    const hy = toY(handlePoint.y)
+    return (
+      <React.Fragment>
+        <line x1={toX(centerX)} y1={toY(centerY)} x2={hx} y2={hy}
+              stroke={Styles.vars.colors.grey1} strokeWidth="1" style={{ pointerEvents: 'none' }} />
+        <circle cx={hx} cy={hy} r={5} fill={Styles.vars.colors.white}
+                stroke={DIAGRAM_BG} strokeWidth="1" style={{ cursor: 'grab' }}
+                onPointerDown={(e) => this.startObstacleRotateDrag(index, localYOffset, viewW, scale, e)}>
+          <title>{"Drag to rotate"}</title>
+        </circle>
+      </React.Fragment>
+    )
+  }
+
   // One row of precise numeric inputs per obstacle, alongside the diagram's
   // own drag handles -- typing is more precise than dragging for an exact
   // value, dragging is faster for rough placement; both write to the same
@@ -1855,21 +2087,34 @@ class NepiIFSim extends Component {
     return (
       <div key={index} style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-end',
                                  borderTop: "1px solid " + Styles.vars.colors.grey2,
-                                 paddingTop: Styles.vars.spacing.xs, marginTop: Styles.vars.spacing.xs }}>
+                                 paddingTop: Styles.vars.spacing.small, marginTop: Styles.vars.spacing.small }}>
         <div style={{ width: "90px", fontWeight: 'bold' }}>{typeLabel + " #" + (index + 1)}</div>
         {fieldNames.map((fieldName) => (
-          <div key={fieldName} style={{ width: "110px", marginRight: Styles.vars.spacing.xs }}>
-            <Label title={CUSTOM_OBSTACLE_FIELD_TITLES[fieldName] || fieldName}>
-              <Input
-                id={"Obstacle_" + index + "_" + fieldName}
-                value={o[fieldName]}
-                onChange={(event) => {
-                  const value = event.target.value
-                  this.onObstacleFieldInputChange(index, fieldName, value)
-                }}
-                onKeyDown={(event) => { if (event.key === 'Enter') { this.onSaveDimensionsClicked('environment') } }}
-              />
-            </Label>
+          // Title sits ABOVE the input as its own line, not squeezed beside
+          // it in Label's usual left-label/right-input row -- that shared
+          // component fights a narrow box like this one for width, wrapping
+          // "X (m)" onto two lines that overlapped the next field entirely.
+          // Wider box (130px) and a real gap (spacing.regular, not xs)
+          // between fields fixes the same crowding -- requested live
+          // (2026-09-17): "each text box needs to have enough spacing
+          // between them, and the text indicating what each dimension
+          // number is should be outside the textbox."
+          <div key={fieldName} style={{ width: "130px", marginRight: Styles.vars.spacing.regular,
+                                         marginBottom: Styles.vars.spacing.xs }}>
+            <div style={{ fontSize: "0.8em", color: Styles.vars.colors.grey1,
+                           marginBottom: Styles.vars.spacing.xs, whiteSpace: "nowrap" }}>
+              {CUSTOM_OBSTACLE_FIELD_TITLES[fieldName] || fieldName}
+            </div>
+            <Input
+              id={"Obstacle_" + index + "_" + fieldName}
+              value={o[fieldName]}
+              style={{ width: "100%", boxSizing: "border-box" }}
+              onChange={(event) => {
+                const value = event.target.value
+                this.onObstacleFieldInputChange(index, fieldName, value)
+              }}
+              onKeyDown={(event) => { if (event.key === 'Enter') { this.onSaveDimensionsClicked('environment') } }}
+            />
           </div>
         ))}
         <Button onClick={() => this.onDeleteObstacleClicked(index)}>{"Delete"}</Button>
@@ -1898,6 +2143,7 @@ class NepiIFSim extends Component {
 
     var shape = null
     var resizeHandle = null
+    var rotateHandle = null
     if (type === 'wall') {
       const length = Math.max(Number(o.length_m) || 1, 0.01)
       const thickness = Math.max(Number(o.thickness_m) || 0.2, 0.01)
@@ -1918,6 +2164,7 @@ class NepiIFSim extends Component {
           { field: 'length_m', angleDeg: yawDeg, sign: 1, multiplier: 2, min: 0.05 },
           { field: 'thickness_m', angleDeg: yawDeg + 90, sign: 1, multiplier: 2, min: 0.02 },
           viewW, scale, e))
+      rotateHandle = this.renderRotateHandle(x, y, thickness / 2 + 0.3, yawDeg, toX, toY, index, viewW, scale)
     } else if (type === 'circle') {
       const radius = Math.max(Number(o.radius_m) || 0.5, 0.01)
       shape = (
@@ -1951,6 +2198,7 @@ class NepiIFSim extends Component {
           { field: 'base_m', angleDeg: yawDeg, sign: 1, multiplier: 1, min: 0.05 },
           { field: 'depth_m', angleDeg: yawDeg + 90, sign: 1, multiplier: 2, min: 0.05 },
           viewW, scale, e))
+      rotateHandle = this.renderRotateHandle(x, y, depth / 2 + 0.3, yawDeg, toX, toY, index, viewW, scale)
     } else {
       return null
     }
@@ -1959,6 +2207,7 @@ class NepiIFSim extends Component {
       <g key={index}>
         {shape}
         {resizeHandle}
+        {rotateHandle}
         <circle cx={screenX} cy={screenY - 12} r={6} fill={Styles.vars.colors.red}
                 style={{ cursor: 'pointer' }} onClick={() => this.onDeleteObstacleClicked(index)}>
           <title>{"Delete this obstacle"}</title>
@@ -2320,6 +2569,96 @@ class NepiIFSim extends Component {
     )
   }
 
+  // Side (X-Z) elevation of the same robot -- chassis height and ground
+  // clearance have no top-down representation at all, which is the whole
+  // reason this view exists (see renderSideDiagramSafe's own comment).
+  // base_z (chassis center height) and wheel-axle height both match
+  // generate_model_sdf.py's own pose math exactly (that file's own comment:
+  // "Origin sits at wheel-axle height (wheel_radius_m + chassis_height_m/2)
+  // so the wheels touch the ground plane when the model spawns at z = 0")
+  // -- this is the one diagram in this file where getting that formula
+  // right actually matters, since a wrong one would show the chassis
+  // floating or sunk into the ground rather than just being a cosmetically
+  // off schematic.
+  renderRobotDimensionsSideDiagram(fields) {
+    const get = (name) => Math.max(0, numericDimensionField(fields, ROBOT_DIMENSION_FIELDS, name))
+    const wheelRadius = get('wheel_radius_m')
+    const wheelbase = get('wheelbase_m')
+    const chassisLength = get('chassis_length_m')
+    const chassisHeight = get('chassis_height_m')
+    const baseZ = wheelRadius + chassisHeight / 2
+
+    const boundW = Math.max(chassisLength, wheelbase + 2 * wheelRadius, 0.05)
+    const boundH = Math.max(2 * wheelRadius + chassisHeight, 0.05)
+    const viewW = 280
+    const viewH = 170
+    const pad = 30
+    const scale = Math.min((viewW - 2 * pad) / boundW, (viewH - 2 * pad) / boundH)
+    const cx = viewW / 2
+    // Ground line (z=0) sits near the bottom of the view, leaving room
+    // above for the tallest chassis -- unlike the top view (centered on
+    // the robot's own origin), this one is anchored to a physical
+    // reference (the ground plane), not the model's local origin.
+    const groundY = viewH - pad
+    const toY = (z) => groundY - z * scale
+
+    const frontX = cx + (wheelbase / 2) * scale
+    const rearX = cx - (wheelbase / 2) * scale
+    const wheelR = wheelRadius * scale
+
+    return (
+      <React.Fragment>
+        <svg viewBox={`0 0 ${viewW} ${viewH}`} width="100%" height={viewH}
+             style={{ background: DIAGRAM_BG, borderRadius: 4 }}>
+          <line x1={0} y1={groundY} x2={viewW} y2={groundY}
+                stroke={Styles.vars.colors.grey1} strokeWidth="1" />
+          <rect x={cx - (chassisLength * scale) / 2} y={toY(baseZ) - (chassisHeight * scale) / 2}
+                width={chassisLength * scale} height={chassisHeight * scale}
+                fill="none" stroke={Styles.vars.colors.blue} strokeWidth="2" />
+          <circle cx={frontX} cy={toY(wheelRadius)} r={wheelR} fill={Styles.vars.colors.grey1} />
+          <circle cx={rearX} cy={toY(wheelRadius)} r={wheelR} fill={Styles.vars.colors.grey1} />
+          <polygon fill={Styles.vars.colors.orange} points={
+            (cx + (chassisLength / 2) * scale + 7) + "," + toY(baseZ) + " " +
+            (cx + (chassisLength / 2) * scale - 3) + "," + (toY(baseZ) - 6) + " " +
+            (cx + (chassisLength / 2) * scale - 3) + "," + (toY(baseZ) + 6)
+          } />
+          {/* Drag the chassis corner to resize chassis_length_m/
+              chassis_height_m (shares chassis_length_m with the top view's
+              own resize handle -- dragging either updates both pictures).
+              Drag the front wheel to reposition it (wheelbase_m, mirrored
+              to the rear wheel same as the top view's track_width_m
+              mirroring). Drag the small handle on the front wheel's own
+              edge to resize wheel_radius_m. */}
+          {this.renderDragHandle(
+            cx + (chassisLength * scale) / 2, toY(baseZ) - (chassisHeight * scale) / 2,
+            'nesw-resize', 'Drag to resize chassis length/height',
+            (e) => this.startDimensionDrag('robot', ROBOT_DIMENSION_FIELDS,
+              { field: 'chassis_length_m', sign: 1, multiplier: 2 },
+              { field: 'chassis_height_m', sign: -1, multiplier: 2 },
+              viewW, scale, e)
+          )}
+          <circle cx={frontX} cy={toY(wheelRadius)} r={wheelR} fill="transparent" style={{ cursor: 'move' }}
+                onPointerDown={(e) => this.startDimensionDrag('robot', ROBOT_DIMENSION_FIELDS,
+                  { field: 'wheelbase_m', sign: 1, multiplier: 2 },
+                  null, viewW, scale, e)}>
+            <title>{"Drag to move this wheel (wheelbase)"}</title>
+          </circle>
+          {this.renderDragHandle(
+            frontX + wheelR, toY(wheelRadius),
+            'ew-resize', 'Drag to resize wheel radius',
+            (e) => this.startDimensionDrag('robot', ROBOT_DIMENSION_FIELDS,
+              { field: 'wheel_radius_m', sign: 1, multiplier: 1 },
+              null, viewW, scale, e)
+          )}
+        </svg>
+        <div style={{ fontSize: 11, color: Styles.vars.colors.grey1, marginTop: Styles.vars.spacing.xs }}>
+          {"Ground clearance " + wheelRadius.toFixed(2) + "m · Chassis height " +
+           chassisHeight.toFixed(2) + "m · drag the shapes above to edit"}
+        </div>
+      </React.Fragment>
+    )
+  }
+
   // Top-down schematic of the obstacle course from
   // environment_dimensions_preview_fields. Baffle and ramp placement match
   // generate_model_sdf.py's buildObstacleCourseSdf exactly: each baffle
@@ -2376,6 +2715,70 @@ class NepiIFSim extends Component {
 
     const baffleReach = Math.max(halfCorridor - baffleGap, 0)
 
+    // Each built-in shape below is now draggable, the same
+    // startDimensionDrag mechanism renderRobotDimensionsDiagram's chassis/
+    // wheel handles already use -- requested live (2026-09-17): "the
+    // default walls in the obstacle course should also be moveable, but
+    // just like for the robot, it doesnt replace the default obstacles -
+    // the user needs to save it with a new name for it to show up on the
+    // dropdown." That save-as-only-persists-under-a-new-name behavior needs
+    // no new code here: saveDimensionsAsNamed already refuses to write over
+    // a PROTECTED_DIMENSION_CONFIG_NAMES entry like "Obstacle Course", and
+    // dragging only ever updates the live-editing/preview fields plus the
+    // ACTIVE (unnamed) store via onSaveDimensionsClicked on release -- the
+    // named "Obstacle Course.yaml" file is never touched by either path.
+    const dragCorridorWidth = (sign) => (e) => this.startDimensionDrag('environment', OBSTACLE_COURSE_DIMENSION_FIELDS,
+      null, { field: 'corridor_width_m', sign: sign, multiplier: 2, min: 0.2 }, viewW, scale, e)
+    const dragWallLength = (e) => this.startDimensionDrag('environment', OBSTACLE_COURSE_DIMENSION_FIELDS,
+      { field: 'wall_length_m', sign: 1, multiplier: 1, min: 0.5 }, null, viewW, scale, e)
+    const dragBaffleX = (fieldName) => (e) => this.startDimensionDrag('environment', OBSTACLE_COURSE_DIMENSION_FIELDS,
+      { field: fieldName, sign: 1, multiplier: 1, min: 0 }, null, viewW, scale, e)
+    const dragCourseStartX = (e) => this.startDimensionDrag('environment', OBSTACLE_COURSE_DIMENSION_FIELDS,
+      { field: 'course_start_x_m', sign: 1, multiplier: 1, min: 0 }, null, viewW, scale, e)
+    const dragRampStartX = (e) => this.startDimensionDrag('environment', OBSTACLE_COURSE_DIMENSION_FIELDS,
+      { field: 'ramp_start_x_m', sign: 1, multiplier: 1, min: 0 }, null, viewW, scale, e)
+    const dragWallThickness = (e) => this.startDimensionDrag('environment', OBSTACLE_COURSE_DIMENSION_FIELDS,
+      null, { field: 'wall_thickness_m', sign: -1, multiplier: 1, min: 0.02 }, viewW, scale, e)
+    const dragBaffleThickness = (e) => this.startDimensionDrag('environment', OBSTACLE_COURSE_DIMENSION_FIELDS,
+      { field: 'baffle_thickness_m', sign: 1, multiplier: 2, min: 0.02 }, null, viewW, scale, e)
+
+    // "Deleted" here means the corresponding *_enabled flag goes to 0 --
+    // see buildObstacleCourseSdf's own comment for why these are flags,
+    // not array entries: the two walls/baffles are a hardcoded pair, not
+    // items in the generic 'obstacles' list. Same save-as-only-persists
+    // protection as every other edit (see the comment above these drag
+    // closures) -- deleting one only removes it from the ACTIVE store
+    // until a new name is saved; "Reset to Obstacle Course" restores all
+    // four. Requested live (2026-09-17): "for the preset walls in the
+    // obstacle course, they should also be deleteable, rotatable,
+    // sizeable, not just moveable." Rotation is intentionally not offered
+    // here -- these are always axis-aligned in generate_model_sdf.py's
+    // _wallLink (no pose/yaw parameter at all), so a rotate handle would
+    // let an operator set a value that's silently ignored at deploy time.
+    const isShapeEnabled = (name) => {
+      const v = fields[name]
+      return !(v === 0 || v === '0' || v === false || v === 'False' || v === 'false')
+    }
+    const onDeleteShape = (name) => () => {
+      this.setState((prevState) => ({
+        environment_dimensions_fields: { ...prevState.environment_dimensions_fields, [name]: 0 },
+      }), () => this.onSaveDimensionsClicked('environment'))
+    }
+    const renderDeleteMarker = (screenX, screenY, fieldName, title) => (
+      <React.Fragment>
+        <circle cx={screenX} cy={screenY} r={6} fill={Styles.vars.colors.red}
+                style={{ cursor: 'pointer' }} onClick={onDeleteShape(fieldName)}>
+          <title>{title}</title>
+        </circle>
+        <text x={screenX} y={screenY + 3.5} textAnchor="middle" fontSize="9" fill={Styles.vars.colors.white}
+              style={{ pointerEvents: 'none' }}>{"x"}</text>
+      </React.Fragment>
+    )
+    const leftWallEnabled = isShapeEnabled('left_wall_enabled')
+    const rightWallEnabled = isShapeEnabled('right_wall_enabled')
+    const baffleAEnabled = isShapeEnabled('baffle_a_enabled')
+    const baffleBEnabled = isShapeEnabled('baffle_b_enabled')
+
     return (
       <React.Fragment>
         <svg viewBox={`0 0 ${viewW} ${viewH}`} width="100%" height={viewH}
@@ -2384,24 +2787,70 @@ class NepiIFSim extends Component {
                 fill="#26292d" />
           {(rampEndX > rampStartX) ?
             <rect x={toX(rampStartX)} y={toY(halfCorridor)} width={(rampEndX - rampStartX) * scale}
-                  height={corridorWidth * scale} fill={Styles.vars.colors.blue} opacity="0.18" />
+                  height={corridorWidth * scale} fill={Styles.vars.colors.blue} opacity="0.18"
+                  style={{ cursor: 'ew-resize' }} onPointerDown={dragRampStartX}>
+              <title>{"Drag to move ramp start"}</title>
+            </rect>
           : null}
-          <rect x={toX(0)} y={toY(halfCorridor + wallThickness)} width={wallLength * scale}
-                height={wallThickness * scale} fill={Styles.vars.colors.grey1} />
-          <rect x={toX(0)} y={toY(-halfCorridor)} width={wallLength * scale}
-                height={wallThickness * scale} fill={Styles.vars.colors.grey1} />
-          <rect x={toX(baffleAX - baffleThickness / 2)} y={toY(halfCorridor)}
-                width={baffleThickness * scale} height={baffleReach * scale}
-                fill={Styles.vars.colors.orange} />
-          <rect x={toX(baffleBX - baffleThickness / 2)} y={toY(-baffleGap)}
-                width={baffleThickness * scale} height={baffleReach * scale}
-                fill={Styles.vars.colors.orange} />
-          <circle cx={toX(courseStartX)} cy={toY(0)} r="4" fill={Styles.vars.colors.green} />
+          {leftWallEnabled ?
+            <React.Fragment>
+              <rect x={toX(0)} y={toY(halfCorridor + wallThickness)} width={wallLength * scale}
+                    height={wallThickness * scale} fill={Styles.vars.colors.grey1}
+                    style={{ cursor: 'ns-resize' }} onPointerDown={dragCorridorWidth(-1)}>
+                <title>{"Drag to move this wall (corridor width)"}</title>
+              </rect>
+              {this.renderDragHandle(toX(wallLength / 2), toY(halfCorridor + wallThickness), 'ns-resize',
+                'Drag to resize wall thickness', dragWallThickness)}
+              {this.renderDragHandle(toX(wallLength), toY(halfCorridor + wallThickness / 2), 'ew-resize',
+                'Drag to resize wall length', dragWallLength)}
+              {renderDeleteMarker(toX(wallLength * 0.05), toY(halfCorridor + wallThickness / 2),
+                'left_wall_enabled', 'Delete this wall')}
+            </React.Fragment>
+          : null}
+          {rightWallEnabled ?
+            <React.Fragment>
+              <rect x={toX(0)} y={toY(-halfCorridor)} width={wallLength * scale}
+                    height={wallThickness * scale} fill={Styles.vars.colors.grey1}
+                    style={{ cursor: 'ns-resize' }} onPointerDown={dragCorridorWidth(1)}>
+                <title>{"Drag to move this wall (corridor width)"}</title>
+              </rect>
+              {renderDeleteMarker(toX(wallLength * 0.05), toY(-halfCorridor - wallThickness / 2),
+                'right_wall_enabled', 'Delete this wall')}
+            </React.Fragment>
+          : null}
+          {baffleAEnabled ?
+            <React.Fragment>
+              <rect x={toX(baffleAX - baffleThickness / 2)} y={toY(halfCorridor)}
+                    width={baffleThickness * scale} height={baffleReach * scale}
+                    fill={Styles.vars.colors.orange}
+                    style={{ cursor: 'ew-resize' }} onPointerDown={dragBaffleX('baffle_a_x_m')}>
+                <title>{"Drag to move Baffle A"}</title>
+              </rect>
+              {this.renderDragHandle(toX(baffleAX + baffleThickness / 2), toY(baffleGap), 'ew-resize',
+                'Drag to resize baffle thickness', dragBaffleThickness)}
+              {renderDeleteMarker(toX(baffleAX), toY(baffleGap) - 8, 'baffle_a_enabled', 'Delete Baffle A')}
+            </React.Fragment>
+          : null}
+          {baffleBEnabled ?
+            <React.Fragment>
+              <rect x={toX(baffleBX - baffleThickness / 2)} y={toY(-baffleGap)}
+                    width={baffleThickness * scale} height={baffleReach * scale}
+                    fill={Styles.vars.colors.orange}
+                    style={{ cursor: 'ew-resize' }} onPointerDown={dragBaffleX('baffle_b_x_m')}>
+                <title>{"Drag to move Baffle B"}</title>
+              </rect>
+              {renderDeleteMarker(toX(baffleBX), toY(-baffleGap) + 8, 'baffle_b_enabled', 'Delete Baffle B')}
+            </React.Fragment>
+          : null}
+          <circle cx={toX(courseStartX)} cy={toY(0)} r="6" fill={Styles.vars.colors.green}
+                  style={{ cursor: 'ew-resize' }} onPointerDown={dragCourseStartX}>
+            <title>{"Drag to move course start"}</title>
+          </circle>
           <text x={toX(courseStartX)} y={toY(halfCorridor + wallThickness) - 4} textAnchor="middle"
-                fill={Styles.vars.colors.green} fontSize="9">{"START"}</text>
+                fill={Styles.vars.colors.green} fontSize="9" style={{ pointerEvents: 'none' }}>{"START"}</text>
           {(rampEndX > rampStartX) ?
             <text x={toX((rampStartX + rampEndX) / 2)} y={toY(0) + 3} textAnchor="middle"
-                  fill={Styles.vars.colors.blue} fontSize="10">{"RAMP"}</text>
+                  fill={Styles.vars.colors.blue} fontSize="10" style={{ pointerEvents: 'none' }}>{"RAMP"}</text>
           : null}
           {this.renderObstacleOverlay(toX, toY, scale, viewW)}
         </svg>
@@ -2409,7 +2858,88 @@ class NepiIFSim extends Component {
           {"Corridor " + corridorWidth.toFixed(2) + "m × " + wallLength.toFixed(2) +
            "m · Ramp rises " + rampRise.toFixed(2) + "m over " + run.toFixed(2) +
            "m at " + rampAngleDeg.toFixed(1) + "°, then a " + plateauLength.toFixed(2) +
-           "m plateau"}
+           "m plateau · drag the shapes above to edit"}
+        </div>
+      </React.Fragment>
+    )
+  }
+
+  // Side (X-Z) elevation of the ground obstacle course -- wall/baffle
+  // HEIGHT and the ramp's actual rise/angle have no top-down representation
+  // at all (renderEnvironmentDimensionsDiagram's own comment already calls
+  // this out: "the ramp only has a top-down footprint here... its rise
+  // isn't a top-down-representable quantity"). Requested live (2026-09-18)
+  // alongside the robot's own side view. Ramp profile math (run, ramp_z,
+  // plateau_z, the three x positions) matches generate_model_sdf.py's
+  // buildObstacleCourseSdf exactly, same discipline
+  // renderRobotDimensionsSideDiagram's own comment describes for base_z.
+  // The wall/baffle height bar is drawn along the same X axis as the ramp
+  // for a single readable profile, even though the real walls sit offset
+  // in Y (either side of the corridor, not in the driving path) -- a
+  // schematic simplification in the same spirit as the top view already
+  // showing the ramp as a flat shaded zone with no rise of its own.
+  renderEnvironmentDimensionsSideDiagram(fields) {
+    const get = (name) => Math.max(0, numericDimensionField(fields, OBSTACLE_COURSE_DIMENSION_FIELDS, name))
+    const courseStartX = get('course_start_x_m')
+    const wallLength = get('wall_length_m')
+    const wallHeight = get('wall_height_m')
+    const rampStartX = get('ramp_start_x_m')
+    const rampRise = get('ramp_rise_m')
+    const rampAngleDeg = Math.min(get('ramp_angle_deg'), 89.9)
+    const plateauLength = get('ramp_plateau_length_m')
+
+    const angleRad = (rampAngleDeg * Math.PI) / 180
+    const run = angleRad > 0 ? rampRise / Math.tan(angleRad) : 0
+    const rampPeakX1 = rampStartX + run
+    const rampPeakX2 = rampPeakX1 + plateauLength
+    const rampEndX = rampPeakX2 + run
+
+    const boundW = Math.max(wallLength, rampEndX, 0.5)
+    const boundH = Math.max(wallHeight, rampRise, 0.2) * 1.15
+    const viewW = 280
+    const viewH = 170
+    const pad = 30
+    const scale = Math.min((viewW - 2 * pad) / boundW, (viewH - 2 * pad) / boundH)
+    const groundY = viewH - pad
+    const toX = (x) => pad + x * scale
+    const toY = (z) => groundY - z * scale
+
+    return (
+      <React.Fragment>
+        <svg viewBox={`0 0 ${viewW} ${viewH}`} width="100%" height={viewH}
+             style={{ background: DIAGRAM_BG, borderRadius: 4 }}>
+          <line x1={0} y1={groundY} x2={viewW} y2={groundY}
+                stroke={Styles.vars.colors.grey1} strokeWidth="1" />
+          <rect x={toX(courseStartX)} y={toY(wallHeight)}
+                width={wallLength * scale} height={wallHeight * scale}
+                fill="none" stroke={Styles.vars.colors.orange} strokeWidth="2" />
+          <polyline fill="none" stroke={Styles.vars.colors.blue} strokeWidth="2" points={
+            toX(rampStartX) + "," + toY(0) + " " +
+            toX(rampPeakX1) + "," + toY(rampRise) + " " +
+            toX(rampPeakX2) + "," + toY(rampRise) + " " +
+            toX(rampEndX) + "," + toY(0)
+          } />
+          {/* Drag the wall bar's top edge to resize wall_height_m (applies
+              to both walls and both baffles -- one shared field, see
+              generate_model_sdf.py's own wall_height variable). Drag the
+              ramp's peak to resize ramp_rise_m. */}
+          {this.renderDragHandle(
+            toX(courseStartX + wallLength / 2), toY(wallHeight),
+            'ns-resize', 'Drag to resize wall/baffle height',
+            (e) => this.startDimensionDrag('environment', OBSTACLE_COURSE_DIMENSION_FIELDS,
+              null, { field: 'wall_height_m', sign: 1, multiplier: 1 }, viewW, scale, e)
+          )}
+          {this.renderDragHandle(
+            toX((rampPeakX1 + rampPeakX2) / 2), toY(rampRise),
+            'ns-resize', 'Drag to resize ramp rise',
+            (e) => this.startDimensionDrag('environment', OBSTACLE_COURSE_DIMENSION_FIELDS,
+              null, { field: 'ramp_rise_m', sign: 1, multiplier: 1 }, viewW, scale, e)
+          )}
+        </svg>
+        <div style={{ fontSize: 11, color: Styles.vars.colors.grey1, marginTop: Styles.vars.spacing.xs }}>
+          {"Wall/baffle height " + wallHeight.toFixed(2) + "m · Ramp rises " +
+           rampRise.toFixed(2) + "m at " + rampAngleDeg.toFixed(1) +
+           "° · drag the shapes above to edit"}
         </div>
       </React.Fragment>
     )
@@ -2499,7 +3029,7 @@ class NepiIFSim extends Component {
   // uncaught exception during render unmounts all of React, not just this
   // one panel -- reported live (2026-08-31) as "the whole thing goes black"
   // right after this preview feature shipped.
-  renderDimensionsDiagramSafe(role, previewFields) {
+  renderTopDiagramSafe(role, previewFields) {
     try {
       if (role === 'robot') {
         return this.renderRobotDimensionsDiagram(previewFields)
@@ -2532,6 +3062,57 @@ class NepiIFSim extends Component {
         </div>
       )
     }
+  }
+
+  // Side (elevation) view -- requested live (2026-09-18): "it would also be
+  // good to have a side view of the robot and environments instead of just
+  // a top view, where changing one viewer should update the other too for
+  // each." The sync half of that request needed no new plumbing: both views
+  // read/write the exact same role + '_dimensions_fields'/preview_fields
+  // state via the shared startDimensionDrag mechanism (see that method's
+  // own comment), so a drag on either one already redraws both on the next
+  // render -- this method only had to add the SECOND picture. Robot always
+  // has one; environment only for 'obstacle_course' (the one model whose
+  // side-only information -- wall height, the ramp's actual rise/angle --
+  // renderEnvironmentDimensionsDiagram's own comment explicitly calls out
+  // as NOT top-down-representable). Aerial/custom-obstacles/flat skip it
+  // rather than building three more side renderers for cases with no
+  // comparable side-only information to add.
+  renderSideDiagramSafe(role, previewFields) {
+    try {
+      if (role === 'robot') {
+        return this.renderRobotDimensionsSideDiagram(previewFields)
+      }
+      const model = this.state.environment_dimensions_model
+      if (model === 'obstacle_course') {
+        return this.renderEnvironmentDimensionsSideDiagram(previewFields)
+      }
+      return null
+    } catch (e) {
+      return (
+        <div style={{ fontSize: 11, color: Styles.vars.colors.red, marginTop: Styles.vars.spacing.xs }}>
+          {"Side preview unavailable for the current values (" + e.message + ")"}
+        </div>
+      )
+    }
+  }
+
+  renderDimensionsDiagramSafe(role, previewFields) {
+    const side = this.renderSideDiagramSafe(role, previewFields)
+    return (
+      <Columns>
+        <Column>
+          <div style={{ fontSize: 10, color: Styles.vars.colors.grey1 }}>{"Top View"}</div>
+          {this.renderTopDiagramSafe(role, previewFields)}
+        </Column>
+        {(side !== null) ?
+          <Column>
+            <div style={{ fontSize: 10, color: Styles.vars.colors.grey1 }}>{"Side View"}</div>
+            {side}
+          </Column>
+        : null}
+      </Columns>
+    )
   }
 
   // "Dimensions" dropdown -- loads a saved environment config's numbers
@@ -2626,6 +3207,27 @@ class NepiIFSim extends Component {
               onKeyDown={(event) => { if (event.key === 'Enter') { this.onSaveDimensionConfigAsClicked(role) } }}
             />
           </Label>
+          {/* Re-saves the CURRENTLY EDITED fields back over whichever
+              custom (non-built-in) config is presently active, under the
+              SAME name -- requested live (2026-09-17): "if a certain
+              config that's custom is being edited, there should be a
+              button for save to config that just replaces the old config
+              with that one but the same name instead of having to make a
+              new name for it and new config." setDimensionsCb already
+              auto-saves an edit back to the active custom name silently
+              (see that method's own "Auto-saved" comment) -- this is the
+              same write, just an explicit, discoverable button rather than
+              only a background side effect of the Save Dimensions/drag
+              path. Disabled/hidden with nothing selected or a built-in
+              selected, same guard saveDimensionsAsNamed itself enforces. */}
+          {(this.state[role + '_dimensions_selected_config'] &&
+            !isProtectedDimensionConfig(role, this.state[role + '_dimensions_selected_config'])) ?
+            <ButtonMenu>
+              <Button onClick={() => this.saveDimensionsAsNamed(role, this.state[role + '_dimensions_selected_config'])}>
+                {"Save Config (\"" + this.state[role + '_dimensions_selected_config'] + "\")"}
+              </Button>
+            </ButtonMenu>
+          : null}
           <ButtonMenu>
             <Button onClick={() => this.onSaveDimensionConfigAsClicked(role)}>
               {"Save As New Config"}

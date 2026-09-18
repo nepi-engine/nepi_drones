@@ -86,7 +86,10 @@ class SimDiscovery:
   # dial-out version's own connect timeout of 6s (see its 2026-09-01
   # history) -- HEARTBEAT_MISS_THRESHOLD below is a second, outer layer of
   # debounce on top of this, unchanged from before.
-  HEARTBEAT_LISTEN_TIMEOUT_SEC = 6
+  # Lowered from 6 to 4 (2026-09-18) alongside HEARTBEAT_MISS_THRESHOLD's
+  # own reduction, for the same reason -- see that constant's comment.
+  # Pings every ~2s, so 4 still tolerates exactly one dropped ping.
+  HEARTBEAT_LISTEN_TIMEOUT_SEC = 4
   # Robot slots (Phase 4): one (heartbeat_port, bridge_port) pair plus
   # VM-side identity per simulated robot. Each slot whose heartbeat answers
   # gets its own rbx_sim node wired to its own bridge port -- slots probe
@@ -142,7 +145,16 @@ class SimDiscovery:
   # few-second worst case). Doesn't apply to the OTHER purge condition in
   # checkOnDevice (the rbx node subprocess itself having actually exited) --
   # that's an unambiguous, instantaneous signal with nothing to debounce.
-  HEARTBEAT_MISS_THRESHOLD = 6
+  # Lowered from 6 back to 2 (2026-09-18) -- the reverse-SSH-tunnel jitter
+  # that justified 6 (see the paragraph above) no longer applies at all:
+  # this app now exclusively uses the shared-storage architecture, with no
+  # network hop between the device and the VM's heartbeat listener to drop
+  # or delay a probe. At 6, killing a sim took 20-30s to disappear as a
+  # detected robot (reported live: "whenever a sim is killed, it should
+  # disappear... pretty much instantly. it usually takes around 20-30
+  # seconds"), stacked with HEARTBEAT_LISTEN_TIMEOUT_SEC's own inner
+  # debounce above. 2 still absorbs a single dropped ping without flapping.
+  HEARTBEAT_MISS_THRESHOLD = 2
 
   def __init__(self):
     ############
@@ -150,6 +162,23 @@ class SimDiscovery:
     self.log_name = PKG_NAME.lower() + "_discovery"
     self.logger = nepi_sdk.logger(log_name = self.log_name)
     self.heartbeat_miss_counts = dict()
+    # active_devices_dict/launch_time_dict/dont_retry_list were class-level
+    # only (no self. assignment here) -- same bug already found and fixed
+    # in ArdupilotDiscovery.__init__ (see that class's own comment). Found
+    # live (2026-09-17) tracing "the rover doesn't seem to be able to get
+    # detected": a device_path that ever lands in dont_retry_list (e.g.
+    # from a launch failure hours earlier, in a completely different
+    # SimDiscovery instance/driver restart) stays blacklisted FOREVER,
+    # since a fresh __init__ never got its own clean copies of these to
+    # start from -- only `if self.retry: self.dont_retry_list = []` in
+    # discoveryFunction ever resets it, and only when retry_enabled is
+    # True. Heartbeat listener state (heartbeat_last_seen/heartbeat_lock/
+    # heartbeat_listeners_started) deliberately stays class-level -- see
+    # that state's own comment -- these three are the ones that need a
+    # clean per-instance copy.
+    self.active_devices_dict = dict()
+    self.launch_time_dict = dict()
+    self.dont_retry_list = []
     # One always-on listener per robot slot's heartbeat_port -- started once
     # here, independent of whether any rbx_sim node has been launched yet,
     # since this IS the bootstrap signal discoveryFunction uses to decide

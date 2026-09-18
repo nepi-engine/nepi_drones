@@ -60,6 +60,15 @@ class NepiIFSimLauncher extends Component {
       status_msg: null,
       statusListener: null,
 
+      // sim/secondary_launcher_status -- JSON-in-String, see that
+      // publisher's own comment in sim_connector_app_node.py for why this
+      // is a separate topic rather than a new SimLauncherStatus field.
+      // {"active_targets": [...], "states": {actual_target: state}}.
+      // Tracks "New Sim" instances -- concurrent deployments alongside
+      // whatever the primary slot (status_msg above) is running.
+      secondary_states: {},
+      secondaryStatusListener: null,
+
       // Local dropdown selection, applied on Deploy click -- not published
       // on every change, only Deploy/Kill/Install actually send anything.
       // Only used when this instance isn't given a selected_target prop --
@@ -146,7 +155,10 @@ class NepiIFSimLauncher extends Component {
     if (this.state.statusListener) {
       this.state.statusListener.unsubscribe()
     }
-    this.setState({ statusListener: null })
+    if (this.state.secondaryStatusListener) {
+      this.state.secondaryStatusListener.unsubscribe()
+    }
+    this.setState({ statusListener: null, secondaryStatusListener: null })
     if (this.tickIntervalId !== null) {
       clearInterval(this.tickIntervalId)
       this.tickIntervalId = null
@@ -169,6 +181,25 @@ class NepiIFSimLauncher extends Component {
         this.statusListener
       )
       this.setState({ statusListener: statusListener })
+    }
+    if (this.state.secondaryStatusListener != null) {
+      this.state.secondaryStatusListener.unsubscribe()
+      this.setState({ secondaryStatusListener: null, secondary_states: {} })
+    }
+    if (namespace != null && namespace !== 'None') {
+      var secondaryStatusListener = this.props.ros.setupStatusListener(
+        namespace + '/secondary_launcher_status', "std_msgs/String",
+        (message) => {
+          try {
+            const parsed = JSON.parse(message.data)
+            this.setState({ secondary_states: parsed.states || {} })
+          } catch (e) {
+            // Ignore -- latched topic can briefly hold an empty/default
+            // String before the first real publish.
+          }
+        }
+      )
+      this.setState({ secondaryStatusListener: secondaryStatusListener })
     }
     this.setState({ namespace: namespace })
   }
@@ -256,11 +287,22 @@ class NepiIFSimLauncher extends Component {
   // a model over there, then clicking Deploy, applies both in one action.
   // Nothing here talks to the VM directly.
   //
-  // Also doubles as "Use Open Sim" (same topic, same handler) when the
-  // selected target already matches what's running -- the app node itself
-  // short-circuits to just applying the new model to the already-connected
-  // bridge rather than touching the VM again, so this button never needs to
-  // know which case it's in.
+  // Also doubles as "Use Open Sim" when the selected target already matches
+  // what's running. Routed through sim/redeploy_simulator (not
+  // sim/launch_simulator) so that case is a guaranteed kill-and-relaunch,
+  // not the old short-circuit that just re-pointed the bridge at whatever
+  // was already up without touching the VM -- requested live (2026-09-18):
+  // "use open sim should kill and redeploy the sim with the new settings
+  // set... without creating an extra window." That old short-circuit also
+  // never called pushDirtyDimensions (only a FRESH gzserver launch does --
+  // see that method's own comment in sim_connector_app_node.py), which is
+  // why an environment/robot-dimensions edit made while a sim was already
+  // deployed silently never reached Gazebo: this button looked like it
+  // applied the change but never actually relaunched anything. When
+  // nothing is running yet, redeploySimulatorCb's own runRedeploy skips the
+  // stop and falls straight through to the same runLaunch this used to call
+  // directly, so the plain first-time "Deploy" case (nothing up yet) is
+  // unaffected.
   // 2026-09-08 -- REMOVED the popup this comment used to describe
   // (confirmUnsavedDimensionsOrPrompt, a window.prompt() blocking every
   // launch action whenever a dimensions role had unsaved edits, forcing an
@@ -281,22 +323,84 @@ class NepiIFSimLauncher extends Component {
     const target = this.getSelectedTarget()
     if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
       this.resendRobotConfigIfKnown(namespace)
-      this.props.ros.sendStringMsg(namespace + '/launch_simulator', this.buildLaunchPayload(target))
+      this.props.ros.sendStringMsg(namespace + '/redeploy_simulator', this.buildLaunchPayload(target))
     }
   }
 
-  // "New Sim" -- explicit clean restart: stops whatever is currently
-  // running (if anything) and launches the selected target fresh, even if
-  // that's the very same target that's already up. Distinct from Deploy/
-  // "Use Open Sim" above, which never touches the VM when nothing needs to
-  // change on it.
+  // "New Sim" -- launches the selected target as a genuinely SEPARATE,
+  // concurrent instance alongside whatever the primary slot (Use Open Sim/
+  // Deploy/Kill above) is already running, rather than replacing it.
+  // sim/launch_new_simulator is a distinct topic/thread/state slot from
+  // sim/launch_simulator on the backend (see sim_connector_app_node.py's
+  // secondary_launch_states comment) -- only gazebo_rover and
+  // gazebo_quadcopter actually have their own GAZEBO_MASTER_URI/
+  // ROS_MASTER_URI (simulator_launch_targets.yaml), so this only really
+  // supports one OTHER target running concurrently with the primary one,
+  // not arbitrary N.
   onNewSimClicked() {
     const namespace = this.getSimNamespace()
     const target = this.getSelectedTarget()
-    if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
-      this.resendRobotConfigIfKnown(namespace)
-      this.props.ros.sendStringMsg(namespace + '/redeploy_simulator', this.buildLaunchPayload(target))
+    if (namespace == null || namespace === 'None' || target === 'None' || target === '') {
+      return
     }
+    // Requested live (2026-09-18): "if new sim is hit even if the robot
+    // being summoned is the same, it should still work. it should just
+    // give a warning saying 'you already have this robot config open, are
+    // you sure you want to open another?'... and do it." Checked
+    // client-side against secondary_states (already subscribed for
+    // renderSecondaryInstances below) and the primary status's own
+    // active_launch_target -- an approximation using the selected target
+    // key, not the backend's fully robot_config-resolved actual_target, but
+    // good enough to catch the common "clicked New Sim twice for the same
+    // thing" case this prompt exists for.
+    const status_msg = this.state.status_msg
+    const already_open = (this.state.secondary_states[target] !== undefined)
+      || (status_msg != null && status_msg.active_launch_target === target
+          && status_msg.launcher_state === 'running')
+    if (already_open) {
+      const proceed = window.confirm(
+        "You already have this robot config open. Are you sure you want to open another?")
+      if (!proceed) {
+        return
+      }
+    }
+    this.resendRobotConfigIfKnown(namespace)
+    const payload = JSON.parse(this.buildLaunchPayload(target))
+    payload.confirmed = already_open
+    this.props.ros.sendStringMsg(namespace + '/launch_new_simulator', JSON.stringify(payload))
+  }
+
+  onStopSecondaryClicked(actual_target) {
+    const namespace = this.getSimNamespace()
+    if (namespace != null && namespace !== 'None') {
+      this.props.ros.sendStringMsg(namespace + '/stop_new_simulator', actual_target)
+    }
+  }
+
+  // "Other running instances" -- one line + Stop button per secondary
+  // target currently tracked in secondary_states, regardless of the
+  // primary slot's own selected/active target. Rendered underneath the
+  // main Deploy/Kill/New Sim controls (see render() below), not gated on
+  // busy/deploy_disabled -- stopping a secondary instance is independent
+  // of whatever the primary slot is doing.
+  renderSecondaryInstances() {
+    const entries = Object.entries(this.state.secondary_states)
+    if (entries.length === 0) {
+      return null
+    }
+    return (
+      <div>
+        <Label title={"Other Running Instances"} />
+        {entries.map(([actual_target, state]) => (
+          <Columns key={actual_target}>
+            <Column>{actual_target + ": " + state}</Column>
+            <Column>
+              <Button onClick={() => this.onStopSecondaryClicked(actual_target)}>{"Stop"}</Button>
+            </Column>
+          </Columns>
+        ))}
+      </div>
+    )
   }
 
   onKillClicked() {
@@ -581,6 +685,8 @@ class NepiIFSimLauncher extends Component {
             <Button disabled={busy} onClick={this.onKillClicked}>{"Kill"}</Button>
           </ButtonMenu>
 
+          {this.renderSecondaryInstances()}
+
         </React.Fragment>
       )
     }
@@ -601,6 +707,8 @@ class NepiIFSimLauncher extends Component {
             <Button disabled={busy} onClick={this.onInstallClicked}>{"Install"}</Button>
           </ButtonMenu>
 
+          {this.renderSecondaryInstances()}
+
         </React.Fragment>
       )
     }
@@ -615,6 +723,7 @@ class NepiIFSimLauncher extends Component {
         <ButtonMenu>
           <Button disabled={deploy_disabled} onClick={this.onDeployClicked}>{"Deploy"}</Button>
         </ButtonMenu>
+        {this.renderSecondaryInstances()}
       </React.Fragment>
     )
   }
