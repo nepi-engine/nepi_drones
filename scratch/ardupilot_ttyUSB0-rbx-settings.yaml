@@ -1,0 +1,19 @@
+settings:
+  takeoff_height_m: 5.0
+  takeoff_min_pitch_deg: 10.0
+  motor_count: 4
+  motor_test_max_throttle_percent: 20.0
+  motor_test_timeout_s: 30.0
+  camera_offset_x: 0.0
+  camera_offset_y: 0.0
+  camera_offset_z: 0.0
+  scene_offset_x: 0.0
+  scene_offset_y: 0.0
+  scene_offset_z: 0.0
+  camera_fov_deg: 80.0
+  autonomous_movement_enabled: 'TRUE'
+  teleop_movement_enabled: 'TRUE'
+  camera_controls_enabled: 'TRUE'
+  move_with_manual_enabled: 'FALSE'
+  enabled_image_sources: ''
+  environment: FLAT_GROUND
