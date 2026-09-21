@@ -203,8 +203,8 @@ Robot {
     Camera {
       translation 0.1 0 -0.02
       name "camera"
-      width 160
-      height 120
+      width 640
+      height 480
     }
   ]
   name "quadcopter"

@@ -154,8 +154,8 @@ Robot {
     Camera {
       translation 0.1 0 0.03
       name "camera"
-      width 160
-      height 120
+      width 640
+      height 480
     }
   ]
   boundingObject USE BODY
