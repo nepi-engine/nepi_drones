@@ -450,23 +450,23 @@ class drone_follow_object_mission(object):
     # Builds an UpdateControl directly rather than through nepi_sdk's own
     # nepi_settings.create_msg_from_setting, which still builds the old,
     # stale Setting() message (type_str/name_str/value_str) -- see this
-    # method's own rbx_setting_update_pub comment. Only Float/Int/Bool/
-    # String are handled since settings_update above only ever declares
-    # "Float" entries today; extend here if a future override needs a
-    # different Control type.
+    # method's own rbx_setting_update_pub comment.
+    #
+    # FIXED (2026-09-21): UpdateControl.msg has no per-type set_int/
+    # set_float/set_bool/set_string/type field at all -- it carries every
+    # value, regardless of Control type, as a plain string[] `value` (see
+    # nepi_controls.py's apply_update_control_msg, which just does
+    # get_clean_value(...) on msg.value). The previous version assigned
+    # those nonexistent fields directly, which raises AttributeError on a
+    # real genpy message (slots are fixed to the .msg's declared fields) --
+    # this was never actually reached live before now because rbx_settings_
+    # callback below hung the whole __init__ earlier in a real script run
+    # (its own now-fixed bug), so this one was still latent.
     for setting_name in self.settings_update.keys():
       setting = self.settings_update[setting_name]
       setting_msg = UpdateControl()
       setting_msg.name = setting['name']
-      setting_msg.type = setting['type']
-      if setting['type'] == "Int":
-        setting_msg.set_int = int(setting['value'])
-      elif setting['type'] in ("Float", "FloatSlider", "FloatSliders"):
-        setting_msg.set_float = float(setting['value'])
-      elif setting['type'] in ("Bool", "Toggle", "Trigger"):
-        setting_msg.set_bool = (str(setting['value']) == "TRUE")
-      else:
-        setting_msg.set_string = str(setting['value'])
+      setting_msg.value = [str(setting['value'])]
       self.msg_if.pub_info("Updated setting msg:" + str(setting_msg))
       self.rbx_setting_update_pub.publish(setting_msg)
 
@@ -672,31 +672,29 @@ class drone_follow_object_mission(object):
     self.msg_if.pub_info("RBX initialize process complete")
 
   def rbx_settings_callback(self, msg):
-    # ControlsStatus's per-entry nepi_interfaces/Control carries its value in
-    # ONE of several typed fields depending on its own .type (Menu -> set_index,
-    # Selection/String -> set_string, Selections -> set_strings, Int -> set_int,
-    # Float/FloatSlider/FloatSliders -> set_float, Bool/Trigger -> set_bool) --
-    # see nepi_interfaces/Control.msg's own comment for the full mapping. Mirrors
-    # extractControlValue in the RUI's own Nepi_IF_Sim-Controls.js (same rename,
-    # same fix, same session).
+    # FIXED (2026-09-21): nepi_interfaces/Control has no per-type set_int/
+    # set_float/set_bool/set_string/set_strings/set_index/string_options
+    # fields -- confirmed live, this crashed every single invocation
+    # ("'Control' object has no attribute 'set_float'"), which meant
+    # self.rbx_settings never got set and rbx_initialize's own wait loop
+    # spun on "Waiting for current rbx settings to publish" forever. The
+    # real .msg (see nepi_controls.py's update_status_msg, which builds
+    # these) always carries the current value(s) as plain strings in
+    # `value` (a string[] regardless of type) -- multi-value list types
+    # join with a comma (matching the original Selections/Toggles
+    # handling), everything else (including Menu, whose selected option
+    # text is exactly value[0] -- there is no separate index/options-array
+    # lookup) takes the single first element.
+    LIST_VALUE_TYPES = ("Selections", "Toggles", "IntDouble", "IntTriple", "IntSliders",
+                         "FloatDouble", "FloatTriple", "FloatSliders", "RangeSlider", "ColorRGB")
     settings = dict()
     for i, name in enumerate(msg.controls_name_list):
       control = msg.controls_msg_list[i]
       ctype = control.type
-      if ctype == "Int":
-        value = str(control.set_int)
-      elif ctype in ("Float", "FloatSlider", "FloatSliders"):
-        value = str(control.set_float)
-      elif ctype in ("Selections", "Toggles"):
-        value = ",".join(control.set_strings)
-      elif ctype in ("Bool", "Toggle", "Trigger"):
-        value = "TRUE" if control.set_bool else "FALSE"
-      elif ctype == "Menu":
-        options = control.string_options
-        value = options[control.set_index] if 0 <= control.set_index < len(options) else str(control.set_index)
+      if ctype in LIST_VALUE_TYPES:
+        value = ",".join(control.value)
       else:
-        # Selection, Discrete (legacy alias), String, and any other type.
-        value = control.set_string
+        value = control.value[0] if len(control.value) > 0 else ''
       settings[name] = {"name": name, "type": ctype, "value": value}
     self.rbx_settings = settings
 
