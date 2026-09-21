@@ -38,11 +38,14 @@
 # steps+syncs in a loop for the life of the process, but worth knowing before
 # writing a short-lived test script against this file's classes.
 #
-# SERVER, not client: rbx_mujoco_node.py connects TO this bridge, matching
-# sim_bridge_node.py/webots_rbx_bridge.py's server role. Also serves a tiny
-# heartbeat port matching sim_heartbeat_listener.py's ALIVE-reply contract,
-# since rbx_mujoco_discovery.py needs a real probe, not just a successful
-# connect (same reasoning as the Webots driver's discovery).
+# CLIENT, not server (2026-09-21, direction reversed -- see
+# webots_rbx_bridge.py's own comment for the full reasoning this mirrors
+# exactly): both the heartbeat ping and the bridge connection dial OUT to
+# the NEPI device instead of waiting to be dialed. Confirmed live that this
+# dev VM cannot be reached from the device on any port at all (a bare SSH
+# connect attempt to the VM's real LAN IP times out with no response,
+# classic WSL2-behind-NAT), so the old listen-and-wait model could never
+# have worked here regardless of tunnel/firewall configuration.
 #
 # Model: models/rbx_rover.xml -- 4 independently-actuated wheels (unlike
 # Webots' 2-side-only rbx_rover.wbt), so this bridge converts a single
@@ -73,6 +76,11 @@ DEFAULT_HEARTBEAT_PORT = 9051
 DEFAULT_BRIDGE_PORT = 9056
 ALIVE_REPLY = b"ALIVE\n"
 
+# The NEPI device's own reachable address -- same env var/default as every
+# other VM-side script in this project.
+DEVICE_HOST = os.environ.get('NEPI_DEVICE_SSH_HOST', 'nepi')
+HEARTBEAT_PING_INTERVAL_SEC = 2.0
+
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "rbx_rover.xml")
 
 # Matches rbx_rover.xml's physical spec (also rbx_mujoco_node.py's
@@ -83,6 +91,7 @@ WHEEL_TRACK_M = 0.34
 MAX_WHEEL_RADPS = 15.0
 
 RECONNECT_ACCEPT_TIMEOUT_SEC = 5.0
+RECONNECT_INTERVAL_SEC = 3.0
 SOCKET_TIMEOUT_SEC = 5.0
 TELEMETRY_RATE_HZ = 10.0
 IMAGE_RATE_HZ = 5.0
@@ -140,10 +149,10 @@ class MujocoRbxBridge:
     self._last_image_capture = -999.0
 
     threading.Thread(target = self.heartbeatLoop, daemon = True).start()
-    threading.Thread(target = self.bridgeServerLoop, daemon = True).start()
+    threading.Thread(target = self.bridgeClientLoop, daemon = True).start()
 
-    print("mujoco_rbx_bridge: started, heartbeat on 127.0.0.1:%d, "
-          "bridge on 127.0.0.1:%d" % (self.heartbeat_port, self.bridge_port), flush = True)
+    print("mujoco_rbx_bridge: started, dialing device %s heartbeat %d / "
+          "bridge %d" % (DEVICE_HOST, self.heartbeat_port, self.bridge_port), flush = True)
 
   #**********************
   # Physics loop -- runs on the calling (main) thread, paced to real time
@@ -241,40 +250,37 @@ class MujocoRbxBridge:
     print("mujoco_rbx_bridge: reset to initial pose", flush = True)
 
   #**********************
-  # Heartbeat listener -- matches sim_heartbeat_listener.py's ALIVE-reply contract.
+  # Heartbeat pinger -- matches sim_heartbeat_listener.py exactly (dials the
+  # device instead of waiting to be dialed).
 
   def heartbeatLoop(self):
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", self.heartbeat_port))  # 0.0.0.0: direct-LAN reachable, see sim_bridge_node.py's own bind comment
-    srv.listen(1)
     while True:
       try:
-        conn, _ = srv.accept()
-        try:
-          conn.sendall(ALIVE_REPLY)
-        except Exception:
-          pass
-        finally:
-          conn.close()
-      except Exception as e:
-        print("mujoco_rbx_bridge: heartbeat listener error: %s" % str(e), flush = True)
+        with socket.create_connection((DEVICE_HOST, self.heartbeat_port), timeout = 3) as sock:
+          sock.sendall(ALIVE_REPLY)
+      except Exception:
+        pass
+      time.sleep(HEARTBEAT_PING_INTERVAL_SEC)
 
   #**********************
-  # rbx_mujoco_node.py TCP server -- matches sim_bridge_node.py/
-  # webots_rbx_bridge.py's server role (the RBX node dials in).
+  # rbx_mujoco_node.py TCP client -- dials the device's own listener instead
+  # of waiting to be dialed (2026-09-21, matches webots_rbx_bridge.py's own
+  # bridgeClientLoop).
 
-  def bridgeServerLoop(self):
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", self.bridge_port))  # 0.0.0.0: direct-LAN reachable, see sim_bridge_node.py's own bind comment
-    srv.listen(1)
+  def bridgeClientLoop(self):
     while True:
-      conn, _ = srv.accept()
+      try:
+        conn = socket.create_connection((DEVICE_HOST, self.bridge_port), timeout = 5)
+      except Exception as e:
+        print("mujoco_rbx_bridge: bridge connect to %s:%d failed: %s" %
+              (DEVICE_HOST, self.bridge_port, str(e)), flush = True)
+        time.sleep(RECONNECT_INTERVAL_SEC)
+        continue
       conn.settimeout(SOCKET_TIMEOUT_SEC)
       with self.sock_lock:
         self.sock = conn
-      print("mujoco_rbx_bridge: rbx node connected", flush = True)
+      print("mujoco_rbx_bridge: connected to device bridge at %s:%d" %
+            (DEVICE_HOST, self.bridge_port), flush = True)
 
       sender_stop = threading.Event()
       sender = threading.Thread(target = self.senderLoop, args = (conn, sender_stop), daemon = True)
@@ -303,7 +309,8 @@ class MujocoRbxBridge:
         conn.close()
       except Exception:
         pass
-      print("mujoco_rbx_bridge: rbx node disconnected, waiting for reconnect", flush = True)
+      print("mujoco_rbx_bridge: device bridge connection lost, reconnecting", flush = True)
+      time.sleep(RECONNECT_INTERVAL_SEC)
 
   def senderLoop(self, conn, stop_event):
     last_image = 0.0

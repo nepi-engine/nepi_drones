@@ -35,14 +35,16 @@
 # logic in this file at all, only sensor reading and direct velocity-to-wheel
 # conversion.
 #
-# SERVER, not client: rbx_webots_node.py connects TO this bridge (matching
-# sim_bridge_node.py's server role), the reverse of
-# sim_connector_bridge_webots.py's dial-out-to-the-app model. Also serves a
-# tiny heartbeat port on a second listening socket (matching
-# sim_heartbeat_listener.py exactly) since rbx_webots_discovery.py needs a
-# real ALIVE-reply probe, not just a successful connect, for the same reason
-# documented there (a forwarded port can accept a connection even when
-# nothing real is listening on the far end).
+# CLIENT, not server (2026-09-21, direction reversed -- see
+# sim_heartbeat_listener.py's own docstring for the full reasoning this
+# mirrors exactly): both the heartbeat ping and the bridge connection now
+# DIAL OUT to the NEPI device instead of waiting to be dialed. Confirmed live
+# that this dev VM cannot be reached from the device on any port at all (a
+# bare SSH connect attempt to the VM's real LAN IP times out with no
+# response, matching the classic WSL2-behind-NAT case), so the old
+# listen-and-wait-for-a-tunnel model could never have worked here. Outbound
+# from the VM is never blocked, so dialing the device instead needs no
+# tunnel and no firewall configuration on any OS.
 #
 # Robot: sim_container/bridges/webots/worlds/rbx_rover.wbt -- a copy of
 # sim_connector_rover.wbt with only the controller field changed, same
@@ -57,6 +59,7 @@
 import base64
 import json
 import math
+import os
 import socket
 import sys
 import threading
@@ -71,6 +74,10 @@ DEFAULT_HEARTBEAT_PORT = 9041
 DEFAULT_BRIDGE_PORT = 9046
 ALIVE_REPLY = b'ALIVE\n'
 
+# The NEPI device's own reachable address -- same env var and same default
+# ("nepi") as sim_heartbeat_listener.py/sim_bridge_node.py's own DEVICE_HOST.
+DEVICE_HOST = os.environ.get('NEPI_DEVICE_SSH_HOST', 'nepi')
+
 WHEEL_RADIUS_M = 0.04
 WHEEL_TRACK_M = 0.12
 MAX_WHEEL_RADPS = 8.0
@@ -80,6 +87,10 @@ SOCKET_TIMEOUT_SEC = 5.0
 TELEMETRY_RATE_HZ = 10.0
 IMAGE_RATE_HZ = 5.0
 JPEG_QUALITY = 60
+# Well under rbx_webots_discovery.py's HEARTBEAT_LISTEN_TIMEOUT_SEC (4s) so
+# one dropped ping or one slow connection attempt doesn't read as "gone" --
+# matches sim_heartbeat_listener.py's own PING_INTERVAL_SEC reasoning.
+HEARTBEAT_PING_INTERVAL_SEC = 2.0
 
 
 class WebotsRbxBridge:
@@ -129,10 +140,10 @@ class WebotsRbxBridge:
     self.sock_lock = threading.Lock()
 
     threading.Thread(target = self.heartbeatLoop, daemon = True).start()
-    threading.Thread(target = self.bridgeServerLoop, daemon = True).start()
+    threading.Thread(target = self.bridgeClientLoop, daemon = True).start()
 
-    print("webots_rbx_bridge: controller started, heartbeat on 127.0.0.1:%d, "
-          "bridge on 127.0.0.1:%d" % (self.heartbeat_port, self.bridge_port), flush = True)
+    print("webots_rbx_bridge: controller started, dialing device %s heartbeat %d / "
+          "bridge %d" % (DEVICE_HOST, self.heartbeat_port, self.bridge_port), flush = True)
 
   #**********************
   # Webots simulation-step loop -- runs on the MAIN thread, as Webots requires.
@@ -202,40 +213,44 @@ class WebotsRbxBridge:
       m.setVelocity(right_radps)
 
   #**********************
-  # Heartbeat listener -- matches sim_heartbeat_listener.py exactly.
+  # Heartbeat pinger -- matches sim_heartbeat_listener.py exactly (dials the
+  # device instead of waiting to be dialed). No separate "is the sim really
+  # alive" check needed here the way that file has one for gzserver: this
+  # loop only runs at all while Webots is running this controller, and
+  # Webots kills its controller process the instant the world/simulation
+  # stops, so the process being alive already IS "the sim is alive".
 
   def heartbeatLoop(self):
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(('0.0.0.0', self.heartbeat_port))  # 0.0.0.0: direct-LAN reachable, see sim_bridge_node.py's own bind comment
-    srv.listen(1)
     while True:
       try:
-        conn, _ = srv.accept()
-        try:
-          conn.sendall(ALIVE_REPLY)
-        except Exception:
-          pass
-        finally:
-          conn.close()
-      except Exception as e:
-        print("webots_rbx_bridge: heartbeat listener error: %s" % str(e), flush = True)
+        with socket.create_connection((DEVICE_HOST, self.heartbeat_port), timeout = 3) as sock:
+          sock.sendall(ALIVE_REPLY)
+      except Exception:
+        # Device listener not up yet / momentarily unreachable -- harmless,
+        # matches every other reconnect-style loop in this codebase; just
+        # try again next cycle.
+        pass
+      time.sleep(HEARTBEAT_PING_INTERVAL_SEC)
 
   #**********************
-  # rbx_webots_node.py TCP server -- matches sim_bridge_node.py's server role
-  # (the RBX node dials in, not the other way around).
+  # rbx_webots_node.py TCP client -- matches sim_bridge_node.py's dial-out
+  # role (this bridge dials the device's own listener, not the other way
+  # around).
 
-  def bridgeServerLoop(self):
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(('0.0.0.0', self.bridge_port))  # 0.0.0.0: direct-LAN reachable, see sim_bridge_node.py's own bind comment
-    srv.listen(1)
+  def bridgeClientLoop(self):
     while True:
-      conn, _ = srv.accept()
+      try:
+        conn = socket.create_connection((DEVICE_HOST, self.bridge_port), timeout = 5)
+      except Exception as e:
+        print("webots_rbx_bridge: bridge connect to %s:%d failed: %s" %
+              (DEVICE_HOST, self.bridge_port, str(e)), flush = True)
+        time.sleep(RECONNECT_INTERVAL_SEC)
+        continue
       conn.settimeout(SOCKET_TIMEOUT_SEC)
       with self.sock_lock:
         self.sock = conn
-      print("webots_rbx_bridge: rbx node connected", flush = True)
+      print("webots_rbx_bridge: connected to device bridge at %s:%d" %
+            (DEVICE_HOST, self.bridge_port), flush = True)
 
       sender_stop = threading.Event()
       sender = threading.Thread(target = self.senderLoop, args = (conn, sender_stop), daemon = True)
@@ -264,7 +279,8 @@ class WebotsRbxBridge:
         conn.close()
       except Exception:
         pass
-      print("webots_rbx_bridge: rbx node disconnected, waiting for reconnect", flush = True)
+      print("webots_rbx_bridge: device bridge connection lost, reconnecting", flush = True)
+      time.sleep(RECONNECT_INTERVAL_SEC)
 
   def senderLoop(self, conn, stop_event):
     last_image = 0.0

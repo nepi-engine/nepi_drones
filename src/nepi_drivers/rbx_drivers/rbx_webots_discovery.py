@@ -16,13 +16,18 @@
 # - mailto:nepi@numurus.com
 #
 
-# Discovery for the Webots simulated robot RBX driver. This is rbx_gazebo_discovery.py
-# with only naming changes -- the purge-then-probe-then-launch structure, the
-# heartbeat-with-ALIVE-reply requirement, and the relaunch backoff are all
-# identical, because the underlying problem is identical: a simulator running on
-# a separate host with its own process lifecycle, reachable only through raw TCP
-# ports (a Webots controller has no ROS graph of its own to be visible through
-# either, same as Gazebo's separate ROS master).
+# Discovery for the Webots simulated robot RBX driver.
+#
+# UPDATED (2026-09-21): flipped from dialing a configured host:heartbeat_port
+# to an always-on device-side listener that webots_rbx_bridge.py now dials
+# INTO, mirroring rbx_sim_discovery.py's own 2026-09-08 fix exactly (same
+# root cause: this dev VM cannot be reached at all from the NEPI device on
+# any port -- confirmed live, even a bare SSH connect attempt from the
+# device to the VM's real LAN IP times out with no response -- so the old
+# device-dials-VM model could never have worked here regardless of the
+# `host` Setting's value). No pre-configured address to check any more --
+# whichever peer(s) have actually pinged this port recently are discovered,
+# with zero configuration.
 #
 # Unlike the ardupilot driver there is no companion protocol node to launch: the
 # bridge connection is a plain socket the launched node holds open itself, so
@@ -30,6 +35,7 @@
 
 import os
 import socket
+import threading
 import time
 
 from nepi_sdk import nepi_sdk
@@ -59,10 +65,23 @@ class WebotsDiscovery:
   # Multi-robot worlds are out of scope for this pass.
   DEVICE_ID = 'robot'
 
-  # The heartbeat listener replies with this on every connection.
+  # The heartbeat ping webots_rbx_bridge.py sends.
   ALIVE_REPLY = b'ALIVE'
-  PROBE_TIMEOUT_SEC = 2
-  PROBE_REPLY_BYTES = 16
+
+  # How long a heartbeat ping is considered "recent" and how many misses in a
+  # row before purging -- same values and same reasoning as
+  # rbx_sim_discovery.py's own HEARTBEAT_LISTEN_TIMEOUT_SEC/
+  # HEARTBEAT_MISS_THRESHOLD (webots_rbx_bridge.py pings every 2s too).
+  HEARTBEAT_LISTEN_TIMEOUT_SEC = 4
+  HEARTBEAT_MISS_THRESHOLD = 2
+
+  # Heartbeat listener state -- deliberately class-level, not per-instance:
+  # the listener thread is started once per port and must survive a fresh
+  # WebotsDiscovery instance being constructed (e.g. the driver being
+  # disabled/re-enabled) without losing track of who has pinged recently.
+  heartbeat_last_seen = dict()
+  heartbeat_lock = threading.Lock()
+  heartbeat_listeners_started = set()
 
   ################################################
   def __init__(self):
@@ -70,10 +89,55 @@ class WebotsDiscovery:
     # Create Message Logger
     self.log_name = PKG_NAME.lower() + "_discovery"
     self.logger = nepi_sdk.logger(log_name = self.log_name)
+    self.heartbeat_miss_counts = dict()
+    # Per-instance copies -- see rbx_sim_discovery.py's own __init__ comment
+    # for why these three specifically (not the heartbeat listener state
+    # above) need a fresh copy on every construction: a device_path that
+    # ever lands in dont_retry_list must not stay blacklisted forever across
+    # a driver disable/re-enable cycle.
+    self.active_devices_dict = dict()
+    self.launch_time_dict = dict()
+    self.dont_retry_list = []
     time.sleep(1)
     self.logger.log_info("Starting Initialization")
     self.logger.log_info("Initialization Complete")
 
+  def _startHeartbeatListener(self, port):
+    # Accepts webots_rbx_bridge.py's heartbeat ping, records the sender's IP
+    # and the time, and closes -- no reply needed, matching
+    # rbx_sim_discovery.py's own _startHeartbeatListener exactly.
+    if port in self.heartbeat_listeners_started:
+      return
+    self.heartbeat_listeners_started.add(port)
+
+    def _handle(conn, peer_ip):
+      try:
+        conn.settimeout(3)
+        data = conn.recv(16)
+        if data.startswith(self.ALIVE_REPLY):
+          with self.heartbeat_lock:
+            self.heartbeat_last_seen[(peer_ip, str(port))] = time.time()
+      except Exception:
+        pass
+      finally:
+        try:
+          conn.close()
+        except Exception:
+          pass
+
+    def _acceptLoop():
+      srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+      srv.bind(('0.0.0.0', port))
+      srv.listen(16)
+      while True:
+        try:
+          conn, addr = srv.accept()
+        except Exception:
+          continue
+        threading.Thread(target = _handle, args = (conn, addr[0]), daemon = True).start()
+
+    threading.Thread(target = _acceptLoop, daemon = True).start()
 
   ##########  Drv Standard Discovery Function
   ### Function to try and connect to a Webots instance and also monitor and clean up previously connected devices
@@ -87,8 +151,7 @@ class WebotsDiscovery:
     # Get discovery options
     try:
       options = drv_dict['DISCOVERY_DICT']['OPTIONS']
-      self.host = str(options['host']['value'])
-      self.heartbeat_port = str(options['heartbeat_port']['value'])
+      self.heartbeat_port = int(options['heartbeat_port']['value'])
       self.bridge_port = int(options['bridge_port']['value'])
     except Exception as e:
       self.logger.log_warn("Failed to load options " + str(e))
@@ -99,6 +162,11 @@ class WebotsDiscovery:
     if self.retry == True:
       self.dont_retry_list = []
     ########################
+
+    # One always-on listener for this port -- started here, independent of
+    # whether any rbx_webots node has been launched yet, since this IS the
+    # bootstrap signal this function uses to decide whether to launch one.
+    self._startHeartbeatListener(self.heartbeat_port)
 
     ### Purge Unresponsive Connections
     path_purge_list = []
@@ -112,18 +180,27 @@ class WebotsDiscovery:
       if path_str in self.active_paths_list:
         self.active_paths_list.remove(path_str)
 
-    ### Check the configured Webots instance's heartbeat listener
-    path_str = "WEBOTS_" + self.host + "_" + self.heartbeat_port
-    if path_str not in self.active_paths_list and path_str not in self.dont_retry_list:
-      if self.checkForWebotsDevice(self.host, self.heartbeat_port):
-        self.logger.log_info("Webots heartbeat detected at " + self.host + ":" +
-                             self.heartbeat_port + ". Launching webots rbx node")
+    ### Checking the heartbeat listener for any peer that has pinged recently
+    for ip_addr_str in self._recentPeersForPort(self.heartbeat_port):
+      path_str = "WEBOTS_" + ip_addr_str + "_" + str(self.heartbeat_port)
+      if path_str not in self.active_paths_list and path_str not in self.dont_retry_list:
+        self.logger.log_info("Webots heartbeat detected at " + ip_addr_str + ":" +
+                             str(self.heartbeat_port) + ". Launching webots rbx node")
         success = self.launchWebotsDeviceNode(path_str)
         if success:
           self.active_paths_list.append(path_str)
 
     # Wrap Up
     return self.active_paths_list
+
+  def _recentPeersForPort(self, port):
+    # Every peer IP that has pinged this port recently -- drives the loop
+    # above without any pre-configured address, matching
+    # rbx_sim_discovery.py's own _recentPeersForPort.
+    now = time.time()
+    with self.heartbeat_lock:
+      return [addr for (addr, p), seen in self.heartbeat_last_seen.items()
+              if p == str(port) and (now - seen) < self.HEARTBEAT_LISTEN_TIMEOUT_SEC]
 
 
   ################################################
@@ -140,21 +217,33 @@ class WebotsDiscovery:
     rbx_subproc = device_entry["rbx_subproc"]
 
     purge_node = False
-    # Check that the rbx node process is still running
+    # Check that the rbx node process is still running -- unambiguous and
+    # instantaneous, nothing to debounce here.
     if rbx_subproc is None or rbx_subproc.poll() is not None:
       self.logger.log_warn("Webots rbx node process for " + path_str +
                            " is no longer running... purging from managed list")
       purge_node = True
     else:
-      # Check that the Webots heartbeat listener still answers
-      host_str = device_entry["host"]
-      port_str = device_entry["heartbeat_port"]
-      if self.checkForWebotsDevice(host_str, port_str) == False:
-        self.logger.log_warn("Webots heartbeat no longer answering for " + path_str +
-                             "... purging from managed list")
-        purge_node = True
+      # Check that the Webots heartbeat listener still answers -- see
+      # HEARTBEAT_MISS_THRESHOLD's own comment for why a single miss isn't
+      # purged on the spot.
+      [con_type, ip_addr_str, ip_port_str] = path_str.split("_")
+      if self.checkForWebotsDevice(ip_addr_str, ip_port_str) == False:
+        miss_count = self.heartbeat_miss_counts.get(path_str, 0) + 1
+        self.heartbeat_miss_counts[path_str] = miss_count
+        if miss_count >= self.HEARTBEAT_MISS_THRESHOLD:
+          self.logger.log_warn("Webots heartbeat missed " + str(miss_count) +
+                               " times in a row for " + path_str + "... purging from managed list")
+          purge_node = True
+        else:
+          self.logger.log_warn("Webots heartbeat miss " + str(miss_count) + "/" +
+                               str(self.HEARTBEAT_MISS_THRESHOLD) + " for " + path_str +
+                               " -- not purging yet")
+      else:
+        self.heartbeat_miss_counts[path_str] = 0
 
     if purge_node:
+      self.heartbeat_miss_counts.pop(path_str, None)
       self.killDeviceProcesses(device_entry)
       if path_str in self.active_paths_list:
         self.active_paths_list.remove(path_str)
@@ -175,34 +264,20 @@ class WebotsDiscovery:
 
   ##########  WEBOTS PROCESSES
 
-  def checkForWebotsDevice(self, host_str, port_str):
-    # Probe the Webots-side heartbeat listener and require its ALIVE reply. A
-    # bare successful connect is not sufficient evidence: through a forwarded
-    # port, connect succeeds against the local forwarder even when the far-end
-    # listener is down.
-    found_device = False
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(self.PROBE_TIMEOUT_SEC)
-    try:
-      result = sock.connect_ex((host_str, int(port_str)))
-      if result == 0:
-        reply = sock.recv(self.PROBE_REPLY_BYTES)
-        if reply.startswith(self.ALIVE_REPLY):
-          found_device = True
-    except Exception:
-      found_device = False
-    finally:
-      try:
-        sock.close()
-      except Exception:
-        pass
-    return found_device
+  def checkForWebotsDevice(self, ip_addr_str, ip_port_str):
+    # No dial-out any more (see class comment above) -- just check whether
+    # a heartbeat ping from this address has arrived recently at the
+    # listener _startHeartbeatListener already has running.
+    with self.heartbeat_lock:
+      last_seen = self.heartbeat_last_seen.get((ip_addr_str, str(ip_port_str)), 0)
+    return (time.time() - last_seen) < self.HEARTBEAT_LISTEN_TIMEOUT_SEC
 
 
   def launchWebotsDeviceNode(self, path_str):
     # path_str format: "WEBOTS_<host>_<heartbeat_port>"
     success = False
     launch_id = path_str
+    [con_type, ip_addr_str, ip_port_str] = path_str.split("_")
 
     # Check if should try to launch (backoff to prevent rapid relaunch loops)
     launch_check = True
@@ -218,13 +293,13 @@ class WebotsDiscovery:
     rbx_node_name = nepi_system.get_device_alias(webots_device_name)
 
     # Setup required param server drv_dict for the webots node. This param is
-    # the entire contract between discovery and the node.
+    # the entire contract between discovery and the node. No host/port to
+    # dial out to any more -- the node just listens on bridge_port and
+    # webots_rbx_bridge.py dials in (see rbx_webots_node.py's own bridgeLoop).
     file_name = self.drv_dict['NODE_DICT']['file_name']
     self.drv_dict['DEVICE_DICT'] = {
       'device_name': webots_device_name,
       'device_path': path_str,
-      'host': self.host,
-      'heartbeat_port': int(self.heartbeat_port),
       'bridge_port': self.bridge_port
     }
     dict_param_name = nepi_sdk.create_namespace(self.base_namespace, rbx_node_name + "/drv_dict")
@@ -265,9 +340,6 @@ class WebotsDiscovery:
       device_entry = dict()
       device_entry["rbx_node_name"] = rbx_node_name
       device_entry["rbx_subproc"] = rbx_subproc
-      device_entry["host"] = self.host
-      device_entry["heartbeat_port"] = self.heartbeat_port
-      device_entry["bridge_port"] = self.bridge_port
       self.active_devices_dict[path_str] = device_entry
     else:
       self.logger.log_warn("Failed to launch node: " + rbx_node_name + " with msg: " + str(msg))

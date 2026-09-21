@@ -36,13 +36,16 @@
 # "linear_y","linear_z","angular_z"} -- z is new vs. the rover's telemetry,
 # a real axis this time instead of always zero.
 #
-# SERVER, not client (matches webots_rbx_bridge.py's role, the reverse of
-# sim_connector_bridge_webots.py's dial-out model). Also serves a heartbeat
-# port matching sim_heartbeat_listener.py's ALIVE-reply contract.
+# CLIENT, not server (2026-09-21, matches webots_rbx_bridge.py's own
+# direction-reversal fix -- see that file's module comment for the full
+# reasoning: this dev VM cannot be reached from the NEPI device on any port
+# at all). Dials the device for both the heartbeat ping and the bridge
+# connection instead of waiting to be dialed.
 
 import base64
 import json
 import math
+import os
 import socket
 import sys
 import threading
@@ -57,6 +60,11 @@ DEFAULT_HEARTBEAT_PORT = 9042
 DEFAULT_BRIDGE_PORT = 9047
 ALIVE_REPLY = b'ALIVE\n'
 
+# The NEPI device's own reachable address -- same env var/default as every
+# other VM-side script in this project (sim_heartbeat_listener.py,
+# sim_bridge_node.py, webots_rbx_bridge.py).
+DEVICE_HOST = os.environ.get('NEPI_DEVICE_SSH_HOST', 'nepi')
+
 MAX_LINEAR_MPS = 2.0
 MAX_VERTICAL_MPS = 1.5
 MAX_ANGULAR_RADPS = math.radians(90.0)
@@ -66,6 +74,7 @@ SOCKET_TIMEOUT_SEC = 5.0
 TELEMETRY_RATE_HZ = 10.0
 IMAGE_RATE_HZ = 5.0
 JPEG_QUALITY = 60
+HEARTBEAT_PING_INTERVAL_SEC = 2.0
 
 
 class WebotsRbxBridgeQuadcopter:
@@ -121,10 +130,10 @@ class WebotsRbxBridgeQuadcopter:
     self.sock_lock = threading.Lock()
 
     threading.Thread(target = self.heartbeatLoop, daemon = True).start()
-    threading.Thread(target = self.bridgeServerLoop, daemon = True).start()
+    threading.Thread(target = self.bridgeClientLoop, daemon = True).start()
 
-    print("webots_rbx_bridge_quadcopter: controller started, heartbeat on "
-          "127.0.0.1:%d, bridge on 127.0.0.1:%d" % (self.heartbeat_port, self.bridge_port),
+    print("webots_rbx_bridge_quadcopter: controller started, dialing device %s "
+          "heartbeat %d / bridge %d" % (DEVICE_HOST, self.heartbeat_port, self.bridge_port),
           flush = True)
 
   #**********************
@@ -213,40 +222,38 @@ class WebotsRbxBridgeQuadcopter:
     self.self_node.getField("rotation").setSFRotation(self.spawn_rotation)
 
   #**********************
-  # Heartbeat listener -- matches sim_heartbeat_listener.py exactly.
+  # Heartbeat pinger -- matches sim_heartbeat_listener.py / webots_rbx_bridge.py
+  # exactly (dials the device instead of waiting to be dialed; see that
+  # file's own 2026-09-21 comment for the full reasoning).
 
   def heartbeatLoop(self):
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(('0.0.0.0', self.heartbeat_port))  # 0.0.0.0: direct-LAN reachable, see sim_bridge_node.py's own bind comment
-    srv.listen(1)
     while True:
       try:
-        conn, _ = srv.accept()
-        try:
-          conn.sendall(ALIVE_REPLY)
-        except Exception:
-          pass
-        finally:
-          conn.close()
-      except Exception as e:
-        print("webots_rbx_bridge_quadcopter: heartbeat listener error: %s" % str(e), flush = True)
+        with socket.create_connection((DEVICE_HOST, self.heartbeat_port), timeout = 3) as sock:
+          sock.sendall(ALIVE_REPLY)
+      except Exception:
+        pass
+      time.sleep(HEARTBEAT_PING_INTERVAL_SEC)
 
   #**********************
-  # rbx_webots_quadcopter_node.py TCP server -- matches webots_rbx_bridge.py's
-  # server role (the RBX node dials in, not the other way around).
+  # rbx_webots_quadcopter_node.py TCP client -- dials the device's own
+  # listener instead of waiting to be dialed (2026-09-21, matches
+  # webots_rbx_bridge.py's own bridgeClientLoop).
 
-  def bridgeServerLoop(self):
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(('0.0.0.0', self.bridge_port))  # 0.0.0.0: direct-LAN reachable, see sim_bridge_node.py's own bind comment
-    srv.listen(1)
+  def bridgeClientLoop(self):
     while True:
-      conn, _ = srv.accept()
+      try:
+        conn = socket.create_connection((DEVICE_HOST, self.bridge_port), timeout = 5)
+      except Exception as e:
+        print("webots_rbx_bridge_quadcopter: bridge connect to %s:%d failed: %s" %
+              (DEVICE_HOST, self.bridge_port, str(e)), flush = True)
+        time.sleep(RECONNECT_INTERVAL_SEC)
+        continue
       conn.settimeout(SOCKET_TIMEOUT_SEC)
       with self.sock_lock:
         self.sock = conn
-      print("webots_rbx_bridge_quadcopter: rbx node connected", flush = True)
+      print("webots_rbx_bridge_quadcopter: connected to device bridge at %s:%d" %
+            (DEVICE_HOST, self.bridge_port), flush = True)
 
       sender_stop = threading.Event()
       sender = threading.Thread(target = self.senderLoop, args = (conn, sender_stop), daemon = True)
@@ -275,8 +282,9 @@ class WebotsRbxBridgeQuadcopter:
         conn.close()
       except Exception:
         pass
-      print("webots_rbx_bridge_quadcopter: rbx node disconnected, waiting for reconnect",
+      print("webots_rbx_bridge_quadcopter: device bridge connection lost, reconnecting",
             flush = True)
+      time.sleep(RECONNECT_INTERVAL_SEC)
 
   def senderLoop(self, conn, stop_event):
     last_image = 0.0

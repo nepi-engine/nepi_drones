@@ -24,12 +24,20 @@
 # process lifecycle, reachable only through raw TCP ports (mujoco_rbx_bridge.py
 # has no ROS graph of its own to be visible through, same as Gazebo/Webots).
 #
+# UPDATED (2026-09-21): flipped from dialing a configured host:heartbeat_port
+# to an always-on device-side listener that mujoco_rbx_bridge.py now dials
+# INTO -- same fix, same reasoning, as rbx_webots_discovery.py's own
+# 2026-09-21 update (see that file's module comment for the full writeup:
+# this dev VM cannot be reached from the NEPI device on any port at all,
+# confirmed live).
+#
 # Unlike the ardupilot driver there is no companion protocol node to launch: the
 # bridge connection is a plain socket the launched node holds open itself, so
 # only one process per robot is tracked.
 
 import os
 import socket
+import threading
 import time
 
 from nepi_sdk import nepi_sdk
@@ -59,10 +67,18 @@ class MujocoDiscovery:
   # instance. Multi-robot worlds are out of scope for this pass.
   DEVICE_ID = 'robot'
 
-  # The heartbeat listener replies with this on every connection.
+  # The heartbeat ping mujoco_rbx_bridge.py sends.
   ALIVE_REPLY = b'ALIVE'
-  PROBE_TIMEOUT_SEC = 2
-  PROBE_REPLY_BYTES = 16
+
+  # Same values and same reasoning as rbx_webots_discovery.py's own.
+  HEARTBEAT_LISTEN_TIMEOUT_SEC = 4
+  HEARTBEAT_MISS_THRESHOLD = 2
+
+  # Heartbeat listener state -- deliberately class-level, see
+  # rbx_webots_discovery.py's own comment for why.
+  heartbeat_last_seen = dict()
+  heartbeat_lock = threading.Lock()
+  heartbeat_listeners_started = set()
 
   ################################################
   def __init__(self):
@@ -70,10 +86,47 @@ class MujocoDiscovery:
     # Create Message Logger
     self.log_name = PKG_NAME.lower() + "_discovery"
     self.logger = nepi_sdk.logger(log_name = self.log_name)
+    self.heartbeat_miss_counts = dict()
+    self.active_devices_dict = dict()
+    self.launch_time_dict = dict()
+    self.dont_retry_list = []
     time.sleep(1)
     self.logger.log_info("Starting Initialization")
     self.logger.log_info("Initialization Complete")
 
+  def _startHeartbeatListener(self, port):
+    if port in self.heartbeat_listeners_started:
+      return
+    self.heartbeat_listeners_started.add(port)
+
+    def _handle(conn, peer_ip):
+      try:
+        conn.settimeout(3)
+        data = conn.recv(16)
+        if data.startswith(self.ALIVE_REPLY):
+          with self.heartbeat_lock:
+            self.heartbeat_last_seen[(peer_ip, str(port))] = time.time()
+      except Exception:
+        pass
+      finally:
+        try:
+          conn.close()
+        except Exception:
+          pass
+
+    def _acceptLoop():
+      srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+      srv.bind(('0.0.0.0', port))
+      srv.listen(16)
+      while True:
+        try:
+          conn, addr = srv.accept()
+        except Exception:
+          continue
+        threading.Thread(target = _handle, args = (conn, addr[0]), daemon = True).start()
+
+    threading.Thread(target = _acceptLoop, daemon = True).start()
 
   ##########  Drv Standard Discovery Function
   ### Function to try and connect to a MuJoCo bridge instance and also monitor and clean up previously connected devices
@@ -87,8 +140,7 @@ class MujocoDiscovery:
     # Get discovery options
     try:
       options = drv_dict['DISCOVERY_DICT']['OPTIONS']
-      self.host = str(options['host']['value'])
-      self.heartbeat_port = str(options['heartbeat_port']['value'])
+      self.heartbeat_port = int(options['heartbeat_port']['value'])
       self.bridge_port = int(options['bridge_port']['value'])
     except Exception as e:
       self.logger.log_warn("Failed to load options " + str(e))
@@ -99,6 +151,8 @@ class MujocoDiscovery:
     if self.retry == True:
       self.dont_retry_list = []
     ########################
+
+    self._startHeartbeatListener(self.heartbeat_port)
 
     ### Purge Unresponsive Connections
     path_purge_list = []
@@ -112,18 +166,24 @@ class MujocoDiscovery:
       if path_str in self.active_paths_list:
         self.active_paths_list.remove(path_str)
 
-    ### Check the configured MuJoCo bridge instance's heartbeat listener
-    path_str = "MUJOCO_" + self.host + "_" + self.heartbeat_port
-    if path_str not in self.active_paths_list and path_str not in self.dont_retry_list:
-      if self.checkForMujocoDevice(self.host, self.heartbeat_port):
-        self.logger.log_info("MuJoCo heartbeat detected at " + self.host + ":" +
-                             self.heartbeat_port + ". Launching mujoco rbx node")
+    ### Checking the heartbeat listener for any peer that has pinged recently
+    for ip_addr_str in self._recentPeersForPort(self.heartbeat_port):
+      path_str = "MUJOCO_" + ip_addr_str + "_" + str(self.heartbeat_port)
+      if path_str not in self.active_paths_list and path_str not in self.dont_retry_list:
+        self.logger.log_info("MuJoCo heartbeat detected at " + ip_addr_str + ":" +
+                             str(self.heartbeat_port) + ". Launching mujoco rbx node")
         success = self.launchMujocoDeviceNode(path_str)
         if success:
           self.active_paths_list.append(path_str)
 
     # Wrap Up
     return self.active_paths_list
+
+  def _recentPeersForPort(self, port):
+    now = time.time()
+    with self.heartbeat_lock:
+      return [addr for (addr, p), seen in self.heartbeat_last_seen.items()
+              if p == str(port) and (now - seen) < self.HEARTBEAT_LISTEN_TIMEOUT_SEC]
 
 
   ################################################
@@ -140,21 +200,28 @@ class MujocoDiscovery:
     rbx_subproc = device_entry["rbx_subproc"]
 
     purge_node = False
-    # Check that the rbx node process is still running
     if rbx_subproc is None or rbx_subproc.poll() is not None:
       self.logger.log_warn("MuJoCo rbx node process for " + path_str +
                            " is no longer running... purging from managed list")
       purge_node = True
     else:
-      # Check that the MuJoCo heartbeat listener still answers
-      host_str = device_entry["host"]
-      port_str = device_entry["heartbeat_port"]
-      if self.checkForMujocoDevice(host_str, port_str) == False:
-        self.logger.log_warn("MuJoCo heartbeat no longer answering for " + path_str +
-                             "... purging from managed list")
-        purge_node = True
+      [con_type, ip_addr_str, ip_port_str] = path_str.split("_")
+      if self.checkForMujocoDevice(ip_addr_str, ip_port_str) == False:
+        miss_count = self.heartbeat_miss_counts.get(path_str, 0) + 1
+        self.heartbeat_miss_counts[path_str] = miss_count
+        if miss_count >= self.HEARTBEAT_MISS_THRESHOLD:
+          self.logger.log_warn("MuJoCo heartbeat missed " + str(miss_count) +
+                               " times in a row for " + path_str + "... purging from managed list")
+          purge_node = True
+        else:
+          self.logger.log_warn("MuJoCo heartbeat miss " + str(miss_count) + "/" +
+                               str(self.HEARTBEAT_MISS_THRESHOLD) + " for " + path_str +
+                               " -- not purging yet")
+      else:
+        self.heartbeat_miss_counts[path_str] = 0
 
     if purge_node:
+      self.heartbeat_miss_counts.pop(path_str, None)
       self.killDeviceProcesses(device_entry)
       if path_str in self.active_paths_list:
         self.active_paths_list.remove(path_str)
@@ -175,34 +242,17 @@ class MujocoDiscovery:
 
   ##########  MUJOCO PROCESSES
 
-  def checkForMujocoDevice(self, host_str, port_str):
-    # Probe the MuJoCo-side heartbeat listener and require its ALIVE reply. A
-    # bare successful connect is not sufficient evidence: through a forwarded
-    # port, connect succeeds against the local forwarder even when the far-end
-    # listener is down.
-    found_device = False
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(self.PROBE_TIMEOUT_SEC)
-    try:
-      result = sock.connect_ex((host_str, int(port_str)))
-      if result == 0:
-        reply = sock.recv(self.PROBE_REPLY_BYTES)
-        if reply.startswith(self.ALIVE_REPLY):
-          found_device = True
-    except Exception:
-      found_device = False
-    finally:
-      try:
-        sock.close()
-      except Exception:
-        pass
-    return found_device
+  def checkForMujocoDevice(self, ip_addr_str, ip_port_str):
+    with self.heartbeat_lock:
+      last_seen = self.heartbeat_last_seen.get((ip_addr_str, str(ip_port_str)), 0)
+    return (time.time() - last_seen) < self.HEARTBEAT_LISTEN_TIMEOUT_SEC
 
 
   def launchMujocoDeviceNode(self, path_str):
     # path_str format: "MUJOCO_<host>_<heartbeat_port>"
     success = False
     launch_id = path_str
+    [con_type, ip_addr_str, ip_port_str] = path_str.split("_")
 
     # Check if should try to launch (backoff to prevent rapid relaunch loops)
     launch_check = True
@@ -218,13 +268,13 @@ class MujocoDiscovery:
     rbx_node_name = nepi_system.get_device_alias(mujoco_device_name)
 
     # Setup required param server drv_dict for the mujoco node. This param is
-    # the entire contract between discovery and the node.
+    # the entire contract between discovery and the node. No host/port to
+    # dial out to any more -- the node just listens on bridge_port and
+    # mujoco_rbx_bridge.py dials in (see rbx_mujoco_node.py's own bridgeLoop).
     file_name = self.drv_dict['NODE_DICT']['file_name']
     self.drv_dict['DEVICE_DICT'] = {
       'device_name': mujoco_device_name,
       'device_path': path_str,
-      'host': self.host,
-      'heartbeat_port': int(self.heartbeat_port),
       'bridge_port': self.bridge_port
     }
     dict_param_name = nepi_sdk.create_namespace(self.base_namespace, rbx_node_name + "/drv_dict")
@@ -265,9 +315,6 @@ class MujocoDiscovery:
       device_entry = dict()
       device_entry["rbx_node_name"] = rbx_node_name
       device_entry["rbx_subproc"] = rbx_subproc
-      device_entry["host"] = self.host
-      device_entry["heartbeat_port"] = self.heartbeat_port
-      device_entry["bridge_port"] = self.bridge_port
       self.active_devices_dict[path_str] = device_entry
     else:
       self.logger.log_warn("Failed to launch node: " + rbx_node_name + " with msg: " + str(msg))

@@ -955,13 +955,20 @@ launch_targets:
     # PGID-scoped precision as gazebo_rover's stop_command, for the same
     # reason (never tear down an unrelated instance).
     stop_command: "bash -lc 'f=/tmp/sim_connector_webots_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; true'"
-    # Process existence alone isn't enough (Webots can be up for a while
-    # before its controller script finishes starting) -- the /dev/tcp probe
-    # against the heartbeat port is what proves webots_rbx_bridge.py's
-    # listener thread is actually accepting connections, mirroring
-    # gazebo_rover's own rostopic-based proof that its bridge is really up
-    # rather than just "some process exists".
-    ready_check_command: "bash -lc \"pgrep -f 'webots.*rbx_rover.wbt' > /dev/null && (exec 3<>/dev/tcp/127.0.0.1/9041) 2>/dev/null && exec 3<&-\""
+    # UPDATED (2026-09-21): the /dev/tcp probe against the heartbeat port
+    # stopped proving anything the moment webots_rbx_bridge.py's heartbeat
+    # flipped from listening to dialing OUT to the device (see that file's
+    # own comment for why: this VM cannot be reached from the device at
+    # all, confirmed live, so the old listen-and-wait model could never
+    # actually have worked here) -- the port is no longer bound on this VM,
+    # so the probe would fail even with a perfectly healthy bridge. Process
+    # existence for both the Webots instance and its controller script is
+    # the strongest signal available locally now; real end-to-end proof
+    # (the device actually seeing heartbeats and launching rbx_webots_node)
+    # only exists on the device side, same tradeoff sim_bridge_node.py's own
+    # dial-out direction already accepted for the rover's gazebo_rover
+    # target.
+    ready_check_command: "bash -lc \"pgrep -f 'webots.*rbx_rover.wbt' > /dev/null && pgrep -f webots_rbx_bridge.py > /dev/null\""
     # rbx_rover.wbt's only rover model is the same 4-wheel body as
     # generic_rover.world's (see docs/WEBOTS_RBX_DRIVER_PLAN.md item 4) --
     # WHEEL1-4 in the .wbt, not a 2-wheel body.
@@ -1040,9 +1047,11 @@ launch_targets:
       wait $WEBOTS_PID
       '
     stop_command: "bash -lc 'f=/tmp/sim_connector_webots_quadcopter_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; true'"
-    # Heartbeat port 9042 (quadcopter), not 9041 (rover) -- see
-    # rbx_webots_quadcopter_params.yaml.
-    ready_check_command: "bash -lc \"pgrep -f 'webots.*rbx_quadcopter.wbt' > /dev/null && (exec 3<>/dev/tcp/127.0.0.1/9042) 2>/dev/null && exec 3<&-\""
+    # Process-existence only -- see webots_rover's own ready_check_command
+    # comment for why the /dev/tcp probe against the heartbeat port no
+    # longer proves anything (heartbeat now dials OUT to the device instead
+    # of being bound locally on this VM).
+    ready_check_command: "bash -lc \"pgrep -f 'webots.*rbx_quadcopter.wbt' > /dev/null && pgrep -f webots_rbx_bridge_quadcopter.py > /dev/null\""
     default_robot_config: flight_robot_4_motor
 
   mujoco_rover:
@@ -1108,10 +1117,21 @@ launch_targets:
     # such self-match risk.
     #
     # Session-lifetime process group, same as every other target here.
+    # UPDATED (2026-09-21): the refuse-to-launch guard used to probe
+    # /dev/tcp/127.0.0.1/9051 (the heartbeat port) -- that stopped proving
+    # anything the moment mujoco_rbx_bridge.py's heartbeat flipped from
+    # listening to dialing OUT to the device (see that file's own comment
+    # for why: this VM cannot be reached from the device at all, confirmed
+    # live). A `pgrep -f mujoco_rbx_bridge.py` guard can't replace it either
+    # -- see the ORIGINAL version of this comment, preserved below, for why
+    # that self-matches this exact launch script's own argv. Checking the
+    # recorded pgid file's process-group liveness (kill -0 as a pure
+    # existence probe, no signal actually sent) sidesteps both problems: it
+    # reads a file rather than grepping argv, so it can never self-match.
     launch_command: >-
       bash -lc '
       . $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/nepi_sim_display_env.sh;
-      if (exec 3<>/dev/tcp/127.0.0.1/9051) 2>/dev/null; then exec 3<&-; echo "REFUSING TO LAUNCH: a MuJoCo bridge instance is already running on this host (port 9051 is live). Stop the existing simulation first." >&2; exit 3; fi;
+      if [ -f /tmp/sim_connector_mujoco_launch.pgid ] && kill -0 -$(cat /tmp/sim_connector_mujoco_launch.pgid) 2>/dev/null; then echo "REFUSING TO LAUNCH: a MuJoCo bridge instance is already running on this host. Stop the existing simulation first." >&2; exit 3; fi;
       echo $$ > /tmp/sim_connector_mujoco_launch.pgid;
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/mujoco/mujoco_rbx_bridge.py < /dev/null > /tmp/sim_connector_mujoco_launch.log 2>&1 & MUJOCO_PID=$!;
       wait $MUJOCO_PID
@@ -1119,11 +1139,10 @@ launch_targets:
     # Kills only this launch's own process group -- same PGID-scoped
     # precision as every other target's stop_command.
     stop_command: "bash -lc 'f=/tmp/sim_connector_mujoco_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; true'"
-    # Port-liveness only, no `pgrep -f` -- see launch_command's own comment
-    # for why a text-pattern process check self-matches here. The /dev/tcp
-    # probe against the heartbeat port is real proof mujoco_rbx_bridge.py's
-    # listener thread is actually accepting connections.
-    ready_check_command: "bash -lc \"(exec 3<>/dev/tcp/127.0.0.1/9051) 2>/dev/null && exec 3<&-\""
+    # Process-group liveness via the recorded pgid file -- see
+    # launch_command's own comment above for why this replaced the /dev/tcp
+    # heartbeat-port probe and why a `pgrep -f` text match isn't viable here.
+    ready_check_command: "bash -lc 'f=/tmp/sim_connector_mujoco_launch.pgid; [ -f $f ] && kill -0 -$(cat $f) 2>/dev/null'"
     # rbx_rover.xml has 4 independently-actuated wheels (see that model's own
     # comment) -- ground_robot_4_wheel, same profile Gazebo/Webots rovers use.
     default_robot_config: ground_robot_4_wheel

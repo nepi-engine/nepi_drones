@@ -27,15 +27,12 @@ driver:
     class_name: WebotsDiscovery
     process: CALL
     OPTIONS:
-      # Host serving the Webots bridge (the dev VM running the Webots
-      # controller). 'localhost' covers a same-host case; set a real address
-      # for a Webots instance reached over the network/tunnel.
-      host:
-        type: String
-        options:
-          - ''
-        default: 'localhost'
-        value: 'localhost'
+      # No configured host any more (2026-09-21) -- discovery runs an
+      # always-on listener on heartbeat_port instead, and webots_rbx_bridge.py
+      # dials IN to whichever address this device is reachable at (matching
+      # rbx_sim_params.yaml's own 2026-09-08 fix; a fixed dev-VM address can
+      # never be dialed FROM the device on a WSL2-hosted VM regardless of
+      # what it's set to). See rbx_webots_discovery.py's own module comment.
       # Port the Webots-side heartbeat listener answers on. Discovery requires
       # the ALIVE reply, not merely a successful connect -- same reasoning as
       # the Gazebo driver.

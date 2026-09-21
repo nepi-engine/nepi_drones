@@ -204,7 +204,6 @@ class MujocoNode:
     try:
       self.device_name = self.drv_dict['DEVICE_DICT']['device_name']
       self.device_path = self.drv_dict['DEVICE_DICT']['device_path']
-      self.sim_host = self.drv_dict['DEVICE_DICT']['host']
       self.bridge_port = self.drv_dict['DEVICE_DICT']['bridge_port']
     except Exception as e:
       self.msg_if.pub_warn("Failed to load Device Dict " + str(e))
@@ -588,21 +587,35 @@ class MujocoNode:
   ### Bridge Processes
 
   def bridgeLoop(self):
-    while not nepi_sdk.is_shutdown():
-      sock = None
+    # LISTENS on bridge_port and mujoco_rbx_bridge.py dials in, instead of
+    # this node dialing out to a configured host -- see rbx_webots_node.py's
+    # own 2026-09-21 bridgeLoop comment for the full reasoning this mirrors
+    # exactly (this VM cannot be reached from the device on any port).
+    srv = None
+    while srv is None and not nepi_sdk.is_shutdown():
       try:
-        sock = socket.create_connection((self.sim_host, int(self.bridge_port)),
-                                        timeout = self.SOCKET_TIMEOUT_SEC)
-        sock.settimeout(self.SOCKET_TIMEOUT_SEC)
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(('0.0.0.0', int(self.bridge_port)))
+        srv.listen(1)
       except Exception as e:
-        self.msg_if.pub_warn("Bridge connect to " + str(self.sim_host) + ":" +
-                             str(self.bridge_port) + " failed: " + str(e), throttle_s = 10.0)
+        self.msg_if.pub_warn("Bridge listen on 0.0.0.0:" + str(self.bridge_port) +
+                             " failed: " + str(e))
+        srv = None
         time.sleep(self.RECONNECT_INTERVAL_SEC)
+    if srv is None:
+      return
+    self.msg_if.pub_info("Listening for mujoco bridge on 0.0.0.0:" + str(self.bridge_port))
+
+    while not nepi_sdk.is_shutdown():
+      try:
+        sock, addr = srv.accept()
+        sock.settimeout(self.SOCKET_TIMEOUT_SEC)
+      except Exception:
         continue
       with self.sock_lock:
         self.sock = sock
-      self.msg_if.pub_info("Connected to sim bridge at " + str(self.sim_host) +
-                           ":" + str(self.bridge_port))
+      self.msg_if.pub_info("MuJoCo bridge connected from " + str(addr[0]))
       self.sendCameraSettings()
       self.setEnvironmentAction(self.settings_dict['environment']['value'])
       buf = b''
@@ -626,9 +639,7 @@ class MujocoNode:
         sock.close()
       except Exception:
         pass
-      self.msg_if.pub_warn("Sim bridge connection lost -- retrying in " +
-                           str(self.RECONNECT_INTERVAL_SEC) + "s")
-      time.sleep(self.RECONNECT_INTERVAL_SEC)
+      self.msg_if.pub_warn("MuJoCo bridge connection lost -- waiting for reconnect")
 
   def processBridgeLine(self, line):
     try:
