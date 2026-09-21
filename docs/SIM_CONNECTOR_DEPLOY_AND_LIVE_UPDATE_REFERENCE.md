@@ -335,3 +335,90 @@ the RUI needs rebuilding" first (§7.5).
   log-prefix chains like `rbx_sim_discovery: : rbx_ardupilot_discovery: :`) is
   cosmetic only, left unfixed by explicit time tradeoff.
 - The RUI build-output persistence question in §8 is unresolved.
+- **`sim_control_relay_vm.py`'s device→VM control-signal relays (reset/
+  teardown/start-trigger) take a few seconds to establish after a fresh
+  `gazebo_quadcopter` deploy** (retrying every 2s against "Connection
+  refused" until `rbx_ardupilot_node.py`'s own device-side listeners come
+  up). Starting a follow-mission script within that window can get "Sim
+  target start not reachable... timed out" even though everything is
+  otherwise healthy — not fixed, just noted; retrying the script (or
+  waiting ~5-10s after Deploy before launching it) works.
+
+## 10. A confirmed reboot-recovery procedure (2026-09-21)
+
+The device (`nepi@nepi:2222`) runs its NEPI engine inside an overlayfs
+container (confirmed via `/proc/1/cgroup` + `mount`, containerd-managed).
+**A device reboot resets `/opt/nepi` to whatever was baked into the container
+image**, not to whatever `/mnt/nepi_config/system_cfg` currently holds — §8's
+own "reboot wipes `/opt/nepi` back to `system_cfg`" framing undersells this:
+`system_cfg` is the correct, intact reference copy, but nothing copies it
+into `/opt/nepi` automatically. Every fix in §8's table, including the
+compiled RUI bundle, must be **manually re-applied after every reboot**:
+
+1. Compare file sizes/dates between each `/opt/nepi/...` path and its
+   `system_cfg` mirror (§8's table) — a reverted file is smaller/older.
+2. `cp` every reverted file from its `system_cfg` mirror back to its live
+   `/opt/nepi` path.
+3. Rebuild the RUI: `export NVM_DIR=$HOME/.nvm && . "$NVM_DIR/nvm.sh"` (node
+   14.1.0 via nvm on this device), then `npm run build` in
+   `/opt/nepi/nepi_rui/src/rui_webserver/rui-app`. Confirm
+   `build/index.html` references the new hashed bundle filename — no
+   restart of the RUI webserver process is needed, it serves static files
+   directly off disk.
+4. Restart `nepi_app_sim_connector` via `apps_mgr/update_state`
+   (`nepi_interfaces/UpdateBool`, `value: false` then `value: true` ~15-20s
+   apart) so the running app process picks up the restored Python source
+   (it only loads once, at process start).
+5. Restart `drivers_mgr` (no update_state toggle exists for managers): kill
+   its PID, then `sudo -E env ROS_NAMESPACE=/nepi/device1
+   /opt/nepi/nepi_engine/env.sh nohup python
+   /opt/nepi/nepi_engine/lib/nepi_managers/drivers_mgr.py __name:=drivers_mgr
+   < /dev/null > /tmp/drivers_mgr_restart.log 2>&1 &`. It re-discovers and
+   relaunches every RBX driver node fresh a short while later — confirm via
+   `ps aux` that `rbx_sim_node.py`/`rbx_ardupilot_node.py` have a start time
+   AFTER the file restore, not before.
+
+## 11. `drone_follow_object_mission_script.py` / sim target chair bugs (2026-09-21)
+
+Two more `nepi_interfaces/Control` field-name bugs, same root cause as §7.1's
+`nepi_controls.py` one but in this mission script's own inlined RBX-settings
+code (not shared SDK code, so not covered by that fix):
+
+- **`rbx_settings_callback` referenced nonexistent `Control` fields**
+  (`set_int`/`set_float`/`set_strings`/`set_bool`/`set_index`/
+  `string_options`) — `Control.msg` has none of these, only a plain
+  `string[] value` (see `nepi_controls.py`'s `update_status_msg`, which is
+  what actually builds these messages). Every real invocation raised
+  `AttributeError: 'Control' object has no attribute 'set_float'`, which
+  meant `self.rbx_settings` never got set and the script hung forever on
+  "Waiting for current rbx settings to publish" — it never even reached
+  `rospy.on_shutdown(self.cleanup_actions)`. The identical bug existed in
+  the takeoff-height override's `UpdateControl` builder a few lines earlier
+  (`setting_msg.set_float = ...`/`setting_msg.type = ...`, also invalid).
+  Fixed: both now just read/write `.value` (a `string[]`), matching how
+  every other current-API code in this codebase (`nepi_controls.py`,
+  `sim_connector_app_node.py`'s `UpdateControl` pushes) already does it.
+- **`ai_targeting_controller_ardupilot.py`'s start/teardown triggers were
+  each a one-shot thread**, and teardown called `rospy.signal_shutdown()`
+  afterward, on the assumption a "launch trigger" mechanism
+  (`sim_launch_listener.py`, tied to the older manual
+  `nepi_sitl_dev_env.sh` dev workflow) would relaunch a fresh instance for
+  the next run. That relaunch path is dead in the current Deploy-button
+  flow — confirmed live: stopping the follow script correctly despawned
+  the chair and exited the whole node, but starting the follow script a
+  second time (without redeploying `gazebo_quadcopter`) got a successful-
+  looking local reply but no chair, since nothing was listening on the VM
+  side to spawn one anymore. Fixed by replacing the two one-shot threads
+  with one persistent `triggerLifecycleLoop` that cycles
+  start→spawn→teardown→despawn→repeat for the node's whole lifetime, and by
+  actually clearing `self.target_spawned` in `despawnTargetModel` (never
+  reset before, harmless only while this was a single-cycle-then-exit
+  design).
+
+Verified live end-to-end after both fixes: deploy `gazebo_quadcopter`,
+launch `sim_ai_targeting_bridge_script.py` then
+`drone_follow_object_mission_script.py`, chair spawns, drone takes off and
+tracks it (range converging, live `follow_debug.log` entries), cancel the
+script (chair despawns, drone disarms/teleports home via `RESET_SIM`), then
+launch the follow script again with NO redeploy in between — chair spawns
+again, tracking resumes. Repeated twice with the same clean result each time.
