@@ -93,9 +93,42 @@ ALIVE_REPLY = b'ALIVE\n'
 # ("nepi") as sim_heartbeat_listener.py/sim_bridge_node.py's own DEVICE_HOST.
 DEVICE_HOST = os.environ.get('NEPI_DEVICE_SSH_HOST', 'nepi')
 
-WHEEL_RADIUS_M = 0.04
-WHEEL_TRACK_M = 0.12
-MAX_WHEEL_RADPS = 8.0
+# Read from sim_container/models/generic_rover/dimensions.yaml at startup
+# now (2026-09-21) -- see loadWheelDimensions below -- since
+# generate_rover_wbt.py generates rbx_rover.wbt's actual wheel_radius_m/
+# track_width_m from that same file at launch time, and a mismatch here
+# would scale commanded linear/angular velocity against the WRONG physical
+# wheel size. These two are only the *fallback* if that file can't be read.
+WHEEL_RADIUS_M = 0.1
+WHEEL_TRACK_M = 0.34
+# Generous fixed safety clamp on commanded wheel angular velocity, not a
+# tuning parameter -- the driver's own max_linear_speed_mps Setting is what
+# actually bounds normal commanded speed; this only guards against a
+# pathological lin/ang combination asking for more than any reasonable
+# wheel could produce.
+MAX_WHEEL_RADPS = 20.0
+
+DIMENSIONS_PATH = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..",
+    "models", "generic_rover", "dimensions.yaml"))
+
+
+def loadWheelDimensions():
+    # Best-effort: this bridge has no py_yaml dependency otherwise, and a
+    # missing/malformed file should degrade to the module-level defaults
+    # above rather than crash the whole controller.
+    try:
+        import yaml
+        with open(DIMENSIONS_PATH, "r") as f:
+            dims = yaml.safe_load(f) or {}
+        wheel_radius = float(dims.get("wheel_radius_m", WHEEL_RADIUS_M))
+        wheel_track = float(dims.get("track_width_m", WHEEL_TRACK_M))
+        return wheel_radius, wheel_track
+    except Exception as e:
+        print("webots_rbx_bridge: could not read %s (%s) -- using defaults "
+              "wheel_radius_m=%.3f track_width_m=%.3f" %
+              (DIMENSIONS_PATH, str(e), WHEEL_RADIUS_M, WHEEL_TRACK_M), flush = True)
+        return WHEEL_RADIUS_M, WHEEL_TRACK_M
 
 RECONNECT_INTERVAL_SEC = 3.0
 SOCKET_TIMEOUT_SEC = 5.0
@@ -113,6 +146,7 @@ class WebotsRbxBridge:
   def __init__(self, heartbeat_port, bridge_port):
     self.heartbeat_port = heartbeat_port
     self.bridge_port = bridge_port
+    self.wheel_radius_m, self.wheel_track_m = loadWheelDimensions()
 
     self.robot = Supervisor()
     self.timestep = int(self.robot.getBasicTimeStep())
@@ -298,8 +332,8 @@ class WebotsRbxBridge:
     with self.cmd_lock:
       lin, ang = self.cmd_linear_x, self.cmd_angular_z
 
-    left_radps = (lin - ang * WHEEL_TRACK_M / 2.0) / WHEEL_RADIUS_M
-    right_radps = (lin + ang * WHEEL_TRACK_M / 2.0) / WHEEL_RADIUS_M
+    left_radps = (lin - ang * self.wheel_track_m / 2.0) / self.wheel_radius_m
+    right_radps = (lin + ang * self.wheel_track_m / 2.0) / self.wheel_radius_m
     left_radps = max(-MAX_WHEEL_RADPS, min(MAX_WHEEL_RADPS, left_radps))
     right_radps = max(-MAX_WHEEL_RADPS, min(MAX_WHEEL_RADPS, right_radps))
     for m in self.left_motors:

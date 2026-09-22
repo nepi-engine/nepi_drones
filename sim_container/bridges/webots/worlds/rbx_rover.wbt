@@ -1,13 +1,16 @@
 #VRML_SIM R2023a utf8
-# Same robot as sim_connector_rover.wbt (copied, not re-authored) -- only the
-# controller field differs, pointing at webots_rbx_bridge instead of
-# sim_connector_bridge_webots. This is the world rbx_webots_node.py's bridge
-# connects to (see docs/WEBOTS_RBX_DRIVER_PLAN.md for why these are two
-# separate world/controller pairs rather than one controller serving both
-# protocols: a Webots Robot node has exactly one controller field, so the two
-# NEPI-side consumers -- the sim_connector app's generic protocol and the RBX
-# driver's simple protocol, exactly mirroring Gazebo's two independent
-# bridges -- need two separate world instances, not one shared one).
+# GENERATED FILE -- do not hand-edit. Produced by
+# sim_container/bridges/webots/scripts/generate_rover_wbt.py from
+# sim_container/models/generic_rover/dimensions.yaml at launch time (see
+# simulator_launch_targets.yaml's own webots_rover launch_command). Hand
+# edits are overwritten on the next deploy/dimensions push -- edit
+# dimensions.yaml (or the RUI's robot dimensions editor) instead, or this
+# generator's own physical-relationship comments if the RELATIONSHIP itself
+# (not a specific robot's numbers) needs to change.
+#
+# Same controller/wire-protocol pair as every hand-authored version of this
+# file before it (webots_rbx_bridge.py) -- see that file's own module
+# docstring for the full deploy/protocol design this doesn't change at all.
 
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023a/projects/objects/backgrounds/protos/TexturedBackground.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023a/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
@@ -26,22 +29,13 @@ TexturedBackground {
 }
 TexturedBackgroundLight {
 }
-# Grass appearance (default is a grey checkered Parquetry) -- reported live:
-# the ground should look the same across every sim, grassy like the Gazebo
-# worlds' own Gazebo/Grass ground plane, not grey.
 Floor {
   size 6 6
   appearance Grass {
   }
 }
-# supervisor TRUE (2026-09-21) -- needed for a real RESET_SIM teleport back
-# to the spawn pose, requested live after "the reset_sim button also doesnt
-# work, bringing the robot back to the starting point" -- a plain Robot node
-# can't move/reset itself, only a Supervisor can (see
-# webots_rbx_bridge.py's own resetSim()). Matches rbx_quadcopter.wbt's own
-# Robot node, which was already a Supervisor for the same reason.
 Robot {
-  translation 0 0 0.05
+  translation 0 0 0.100000
   supervisor TRUE
   children [
     DEF BODY Shape {
@@ -51,13 +45,13 @@ Robot {
         metalness 0
       }
       geometry Box {
-        size 0.2 0.1 0.05
+        size 0.400000 0.300000 0.100000
       }
     }
     DEF WHEEL1 HingeJoint {
       jointParameters HingeJointParameters {
         axis 0 1 0
-        anchor 0.05 0.06 0
+        anchor 0.150000 0.170000 0
       }
       device [
         RotationalMotor {
@@ -65,23 +59,24 @@ Robot {
         }
       ]
       endPoint Solid {
-        translation 0.05 0.06 0
+        translation 0.150000 0.170000 0
         rotation 1 0 0 1.5708
         children [
-          DEF WHEEL Shape {
+          DEF WHEEL1_SHAPE Shape {
             appearance PBRAppearance {
               baseColor 0.305882 0.898039 0.25098
               roughness 1
               metalness 0
             }
             geometry Cylinder {
-              height 0.02
-              radius 0.04
+              height 0.050000
+              radius 0.100000
               subdivision 24
             }
           }
         ]
-        boundingObject USE WHEEL
+        name "wheel1_solid"
+        boundingObject USE WHEEL1_SHAPE
         physics Physics {
         }
       }
@@ -89,7 +84,7 @@ Robot {
     DEF WHEEL2 HingeJoint {
       jointParameters HingeJointParameters {
         axis 0 1 0
-        anchor 0.05 -0.06 0
+        anchor 0.150000 -0.170000 0
       }
       device [
         RotationalMotor {
@@ -97,13 +92,24 @@ Robot {
         }
       ]
       endPoint Solid {
-        translation 0.05 -0.06 0
+        translation 0.150000 -0.170000 0
         rotation 1 0 0 1.5708
         children [
-          USE WHEEL
+          DEF WHEEL2_SHAPE Shape {
+            appearance PBRAppearance {
+              baseColor 0.305882 0.898039 0.25098
+              roughness 1
+              metalness 0
+            }
+            geometry Cylinder {
+              height 0.050000
+              radius 0.100000
+              subdivision 24
+            }
+          }
         ]
-        name "solid(1)"
-        boundingObject USE WHEEL
+        name "wheel2_solid"
+        boundingObject USE WHEEL2_SHAPE
         physics Physics {
         }
       }
@@ -111,7 +117,7 @@ Robot {
     DEF WHEEL3 HingeJoint {
       jointParameters HingeJointParameters {
         axis 0 1 0
-        anchor -0.05 0.06 0
+        anchor -0.150000 0.170000 0
       }
       device [
         RotationalMotor {
@@ -119,13 +125,24 @@ Robot {
         }
       ]
       endPoint Solid {
-        translation -0.05 0.06 0
+        translation -0.150000 0.170000 0
         rotation 1 0 0 1.5708
         children [
-          USE WHEEL
+          DEF WHEEL3_SHAPE Shape {
+            appearance PBRAppearance {
+              baseColor 0.305882 0.898039 0.25098
+              roughness 1
+              metalness 0
+            }
+            geometry Cylinder {
+              height 0.050000
+              radius 0.100000
+              subdivision 24
+            }
+          }
         ]
-        name "solid(2)"
-        boundingObject USE WHEEL
+        name "wheel3_solid"
+        boundingObject USE WHEEL3_SHAPE
         physics Physics {
         }
       }
@@ -133,7 +150,7 @@ Robot {
     DEF WHEEL4 HingeJoint {
       jointParameters HingeJointParameters {
         axis 0 1 0
-        anchor -0.05 -0.06 0
+        anchor -0.150000 -0.170000 0
       }
       device [
         RotationalMotor {
@@ -141,13 +158,24 @@ Robot {
         }
       ]
       endPoint Solid {
-        translation -0.05 -0.06 0
+        translation -0.150000 -0.170000 0
         rotation 1 0 0 1.5708
         children [
-          USE WHEEL
+          DEF WHEEL4_SHAPE Shape {
+            appearance PBRAppearance {
+              baseColor 0.305882 0.898039 0.25098
+              roughness 1
+              metalness 0
+            }
+            geometry Cylinder {
+              height 0.050000
+              radius 0.100000
+              subdivision 24
+            }
+          }
         ]
-        name "solid(3)"
-        boundingObject USE WHEEL
+        name "wheel4_solid"
+        boundingObject USE WHEEL4_SHAPE
         physics Physics {
         }
       }
@@ -159,59 +187,43 @@ Robot {
       name "imu"
     }
     DEF ROBOT_CAM Camera {
-      translation 0.1 0 0.03
+      translation 0.200000 0.000000 0.100000
       name "camera"
       width 640
       height 480
+      fieldOfView 1.745329
     }
-    # Depth counterpart to "camera" above, same position/orientation -- a
-    # RangeFinder is Webots' depth-sensor device (no combined RGBD device
-    # exists), matching Gazebo's own <sensor type="depth"> convention of one
-    # sensor producing both a color and a depth stream. Reported live: "webots
-    # doesnt seem to have any scene camera or depth cameras" -- both added
-    # here (2026-09-21) to reach parity with generic_rover/model.sdf's own
-    # camera_link (robot view) + camera_link_chase (scene view), each
-    # color+depth.
     DEF ROBOT_CAM_DEPTH RangeFinder {
-      translation 0.1 0 0.03
+      translation 0.200000 0.000000 0.100000
       name "camera_depth"
       width 640
       height 480
       minRange 0.05
-      maxRange 100
+      maxRange 100.0
     }
-    # Scene/chase view -- rigidly mounted on the rover itself (not a separate
-    # tracking model the way Gazebo's camera_rig is), which is simpler here:
-    # a Webots device listed under a Robot's own children already moves with
-    # that Robot for free, no follow-controller needed. Position/pitch
-    # reproduce generic_rover/model.sdf's own camera_link_chase pose exactly
-    # (-2.5, 0, 1.65, pitched down atan2(1.65, 2.5) = 0.5834 rad so the
-    # rover stays framed from directly behind and above) -- see that file's
-    # own comment for the derivation. Webots' rotation field is axis-angle;
-    # rotating the camera's default forward (local +X) around +Y by a
-    # positive angle tips it toward -Z (downward), which is what a positive
-    # pitch-down needs here.
     DEF SCENE_CAM Camera {
-      translation -2.5 0 1.65
-      rotation 0 1 0 0.5834
+      translation -2.500000 0.000000 1.650000
+      rotation 0 1 0 0.583400
       name "camera_chase"
       width 640
       height 480
+      fieldOfView 1.745329
     }
     DEF SCENE_CAM_DEPTH RangeFinder {
-      translation -2.5 0 1.65
-      rotation 0 1 0 0.5834
+      translation -2.500000 0.000000 1.650000
+      rotation 0 1 0 0.583400
       name "camera_chase_depth"
       width 640
       height 480
       minRange 0.05
-      maxRange 100
+      maxRange 100.0
     }
   ]
+  name "rover"
   boundingObject USE BODY
   physics Physics {
     density -1
-    mass 1
+    mass 5.000000
   }
   controller "webots_rbx_bridge"
 }

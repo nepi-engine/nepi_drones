@@ -942,10 +942,20 @@ launch_targets:
     # not detached with nohup+background-and-forget -- see gazebo_rover's
     # own launch_command comment for why a systemd session teardown would
     # otherwise kill it anyway.
+    # Regenerates rbx_rover.wbt from sim_container/models/generic_rover/
+    # dimensions.yaml before every launch (2026-09-21, requested live:
+    # "robot configs work... robot changing dimensions work... just like
+    # they do in gazebo") -- same "next fresh launch, not live" contract
+    # generate_model_sdf.py's own dimensions editing already has for
+    # Gazebo (pushDirtyDimensions writes that same dimensions.yaml
+    # regardless of which simulator target is active, so it's always
+    # current here too). See generate_rover_wbt.py's own module docstring
+    # for the exact dimension->geometry relationships.
     launch_command: >-
       bash -lc '
       . $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/nepi_sim_display_env.sh;
       if pgrep -x webots > /dev/null; then echo "REFUSING TO LAUNCH: a Webots instance is already running on this host. Stop the existing simulation first." >&2; exit 3; fi;
+      python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/webots/scripts/generate_rover_wbt.py generic_rover;
       echo $$ > /tmp/sim_connector_webots_launch.pgid;
       webots --mode=fast --batch $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/webots/worlds/rbx_rover.wbt < /dev/null > /tmp/sim_connector_webots_launch.log 2>&1 & WEBOTS_PID=$!;
       wait $WEBOTS_PID
