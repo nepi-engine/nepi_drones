@@ -951,13 +951,19 @@ launch_targets:
     # regardless of which simulator target is active, so it's always
     # current here too). See generate_rover_wbt.py's own module docstring
     # for the exact dimension->geometry relationships.
+    # --stdout --stderr (2026-09-22): without these, webots_rbx_bridge.py's
+    # own print() output (including "failed to spawn OBSTACLE_COURSE: ..."
+    # from setObstacleCourseEnabled's own except clause) went nowhere --
+    # confirmed the log file was empty across several real launches while
+    # debugging a live obstacle-course report, purely because these flags
+    # were missing, not because the controller had nothing to say.
     launch_command: >-
       bash -lc '
       . $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/nepi_sim_display_env.sh;
       if pgrep -x webots > /dev/null; then echo "REFUSING TO LAUNCH: a Webots instance is already running on this host. Stop the existing simulation first." >&2; exit 3; fi;
       python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/webots/scripts/generate_rover_wbt.py generic_rover;
       echo $$ > /tmp/sim_connector_webots_launch.pgid;
-      webots --mode=fast --batch $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/webots/worlds/rbx_rover.wbt < /dev/null > /tmp/sim_connector_webots_launch.log 2>&1 & WEBOTS_PID=$!;
+      webots --mode=fast --batch --stdout --stderr $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/webots/worlds/rbx_rover.wbt < /dev/null > /tmp/sim_connector_webots_launch.log 2>&1 & WEBOTS_PID=$!;
       wait $WEBOTS_PID
       '
     # Kills only this launch's own process group (Webots itself, plus the
@@ -1053,7 +1059,7 @@ launch_targets:
       . $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/nepi_sim_display_env.sh;
       if pgrep -x webots > /dev/null; then echo "REFUSING TO LAUNCH: a Webots instance is already running on this host. Stop the existing simulation first." >&2; exit 3; fi;
       echo $$ > /tmp/sim_connector_webots_quadcopter_launch.pgid;
-      webots --mode=fast --batch $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/webots/worlds/rbx_quadcopter.wbt < /dev/null > /tmp/sim_connector_webots_quadcopter_launch.log 2>&1 & WEBOTS_PID=$!;
+      webots --mode=fast --batch --stdout --stderr $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/webots/worlds/rbx_quadcopter.wbt < /dev/null > /tmp/sim_connector_webots_quadcopter_launch.log 2>&1 & WEBOTS_PID=$!;
       wait $WEBOTS_PID
       '
     stop_command: "bash -lc 'f=/tmp/sim_connector_webots_quadcopter_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; true'"
