@@ -265,7 +265,13 @@ class WebotsQuadcopterNode:
 
     ##############################
     # Initialize RBX Settings
-    self.settings_dict = copy.deepcopy(self.FACTORY_SETTINGS)
+    # FIXED (2026-09-22): same bug as rbx_webots_node.py's identical fix --
+    # a bare copy.deepcopy(self.FACTORY_SETTINGS) is missing 'options'/
+    # 'bounds'/'default', so nepi_controls.get_clean_value() raises an
+    # uncaught KeyError: 'options' on every Discrete-typed setting update
+    # (e.g. "environment"). See rbx_ardupilot_node.py's own initSettingsDict
+    # for the full reasoning.
+    self.settings_dict = self.initSettingsDict()
     self.cap_settings = self.getCapSettings()
     self.factory_settings = self.getFactorySettings()
 
@@ -363,6 +369,52 @@ class WebotsQuadcopterNode:
       if setting_name in self.FACTORY_SETTINGS_OVERRIDES:
         settings[setting_name]['value'] = self.FACTORY_SETTINGS_OVERRIDES[setting_name]
     return settings
+
+  def initSettingsDict(self):
+    # Ported from rbx_ardupilot_node.py's own initSettingsDict, same as
+    # rbx_webots_node.py's identical copy -- see that file's own comment
+    # for the full reasoning.
+    init_settings_dict = dict()
+    for setting_name in self.CAP_SETTINGS.keys():
+      cap_setting = self.CAP_SETTINGS[setting_name]
+      setting_type = cap_setting['type']
+      setting_dict = dict()
+      setting_dict['type'] = setting_type
+      if 'options' in cap_setting.keys():
+        try:
+          if setting_type == 'Int':
+            setting_dict['bounds'] = [int(cap_setting['options'][0]), int(cap_setting['options'][1])]
+          elif setting_type == 'Float':
+            setting_dict['bounds'] = [float(cap_setting['options'][0]), float(cap_setting['options'][1])]
+          else:
+            setting_dict['options'] = [str(option) for option in cap_setting['options']]
+        except Exception as e:
+          self.msg_if.pub_warn("Invalid bounds/options for setting: " + setting_name + " : " + str(e))
+
+      default = None
+      if setting_name in self.FACTORY_SETTINGS.keys():
+        default = self.FACTORY_SETTINGS[setting_name]['value']
+      if setting_name in self.FACTORY_SETTINGS_OVERRIDES.keys():
+        default = self.FACTORY_SETTINGS_OVERRIDES[setting_name]
+      if default is None:
+        continue
+      try:
+        if setting_type == 'Int':
+          default = int(float(default))
+        elif setting_type == 'Float':
+          default = float(default)
+        elif setting_type == 'Toggle':
+          default = (str(default) == 'True' or str(default) == 'true')
+        else:
+          default = str(default)
+      except Exception as e:
+        self.msg_if.pub_warn("Invalid factory value for setting: " + setting_name + " : " + str(e))
+        continue
+      setting_dict['default'] = default
+      init_settings_dict[setting_name] = setting_dict
+
+    settings_dict = nepi_controls.create_controls_dict(init_settings_dict)
+    return settings_dict
 
   def getSettings(self):
     # Deep copy, not a bare reference -- see rbx_webots_node.py's identical
