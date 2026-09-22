@@ -46,15 +46,30 @@
 # from the VM is never blocked, so dialing the device instead needs no
 # tunnel and no firewall configuration on any OS.
 #
-# Robot: sim_container/bridges/webots/worlds/rbx_rover.wbt -- a copy of
-# sim_connector_rover.wbt with only the controller field changed, same
-# wheel1-4/GPS/IMU/Camera devices. One camera only, same as that world --
-# SCENE_CAMERA/ROBOT_CAMERA both resolve to it, handled entirely on the
-# rbx_webots_node.py side (this bridge doesn't know or care about camera
-# naming, it just relays whatever frame it captures). RESET and
-# environment_option are honest no-ops here for the same reasons documented
-# in sim_connector_bridge_webots.py: this Robot node is not a Supervisor, and
-# this world has no obstacle-course model.
+# Robot: sim_container/bridges/webots/worlds/rbx_rover.wbt -- started as a
+# copy of sim_connector_rover.wbt with only the controller field changed,
+# same wheel1-4/GPS/IMU devices.
+#
+# UPDATED (2026-09-21): reported live that Webots had no scene (chase) view
+# and no depth cameras at all, unlike every Gazebo world in this project
+# (generic_rover/model.sdf's camera_link + camera_link_chase, each color+
+# depth via a Kinect-style sensor). rbx_rover.wbt now has four camera-family
+# devices -- "camera"/"camera_depth" (robot view) and "camera_chase"/
+# "camera_chase_depth" (scene/chase view, rigidly mounted at the same
+# offset+pitch as camera_link_chase) -- captured and relayed as four
+# separately-tagged image lines ("robot_color"/"robot_depth"/"scene_color"/
+# "scene_depth"), matching sim_bridge_node.py's own wire protocol exactly so
+# rbx_webots_node.py can reuse rbx_sim_node.py's CAMERA_PUB_ATTR routing
+# unchanged. RangeFinder has no color channel, so "depth" frames here are
+# colorized (normalized + a JET colormap) for viewing, same as what Gazebo's
+# camera_rig_controller.py already produces for its own depth topics.
+#
+# Also RESET is a real Supervisor teleport now (reported live: "the
+# reset_sim button also doesnt work, bringing the robot back to the
+# starting point") -- rbx_rover.wbt's Robot node is `supervisor TRUE` as of
+# the same fix, matching rbx_quadcopter.wbt's own Robot node.
+# environment_option stays an honest no-op: this world still has no
+# obstacle-course model.
 
 import base64
 import json
@@ -68,7 +83,7 @@ import time
 import numpy as np
 import cv2
 
-from controller import Robot
+from controller import Supervisor
 
 DEFAULT_HEARTBEAT_PORT = 9041
 DEFAULT_BRIDGE_PORT = 9046
@@ -99,8 +114,15 @@ class WebotsRbxBridge:
     self.heartbeat_port = heartbeat_port
     self.bridge_port = bridge_port
 
-    self.robot = Robot()
+    self.robot = Supervisor()
     self.timestep = int(self.robot.getBasicTimeStep())
+
+    # Supervisor-only: this node's own handle, and its spawn pose -- what
+    # resetSim() below teleports back to. Captured once at startup so it
+    # stays correct even if rbx_rover.wbt's own translation field changes.
+    self.self_node = self.robot.getSelf()
+    self.spawn_translation = list(self.self_node.getField("translation").getSFVec3f())
+    self.spawn_rotation = list(self.self_node.getField("rotation").getSFRotation())
 
     # wheel1/wheel3 = left (anchor y=+0.06), wheel2/wheel4 = right (y=-0.06) --
     # matches the .wbt file's HingeJoint anchors exactly, same grouping
@@ -117,6 +139,38 @@ class WebotsRbxBridge:
     self.imu.enable(self.timestep)
     self.camera = self.robot.getDevice("camera")
     self.camera.enable(self.timestep)
+    self.camera_depth = self.robot.getDevice("camera_depth")
+    self.camera_depth.enable(self.timestep)
+    self.camera_chase = self.robot.getDevice("camera_chase")
+    self.camera_chase.enable(self.timestep)
+    self.camera_chase_depth = self.robot.getDevice("camera_chase_depth")
+    self.camera_chase_depth.enable(self.timestep)
+
+    # Node/field handles for live camera_offset_x/y/z + scene_offset_x/y/z +
+    # camera_fov_deg (2026-09-21, requested live: "make sure the camera
+    # offset stuff works... just like they do in gazebo"). Gazebo achieves
+    # this by respawning the whole rover model with new camera_link poses
+    # (see rbx_sim_node.py's own CAMERA_SETTING_NAMES comment); Webots needs
+    # no respawn at all here -- a Supervisor can write a device node's own
+    # translation/fieldOfView field directly and it takes effect immediately.
+    # DEF names (ROBOT_CAM/ROBOT_CAM_DEPTH/SCENE_CAM/SCENE_CAM_DEPTH) are
+    # rbx_rover.wbt's own, added for exactly this. Factory translations
+    # captured here (not hardcoded) so a future .wbt mount-point change stays
+    # correct automatically, matching self.spawn_translation's own reasoning
+    # above. Rotation (yaw/tilt) is NOT live-adjustable yet -- position
+    # offsets and FOV are the concrete, tested part of this fix; composing a
+    # runtime yaw/tilt delta on top of camera_chase's existing pitch needs
+    # real rotation-matrix composition (scipy.spatial.transform.Rotation),
+    # which is a reasonable follow-up but wasn't verified live this pass.
+    self.robot_cam_translation_field = self.robot.getFromDef("ROBOT_CAM").getField("translation")
+    self.robot_cam_depth_translation_field = self.robot.getFromDef("ROBOT_CAM_DEPTH").getField("translation")
+    self.scene_cam_translation_field = self.robot.getFromDef("SCENE_CAM").getField("translation")
+    self.scene_cam_depth_translation_field = self.robot.getFromDef("SCENE_CAM_DEPTH").getField("translation")
+    self.factory_robot_cam_translation = list(self.robot_cam_translation_field.getSFVec3f())
+    self.factory_scene_cam_translation = list(self.scene_cam_translation_field.getSFVec3f())
+    self.robot_cam_fov_field = self.robot.getFromDef("ROBOT_CAM").getField("fieldOfView")
+    self.scene_cam_fov_field = self.robot.getFromDef("SCENE_CAM").getField("fieldOfView")
+    self.factory_fov_rad = self.robot_cam_fov_field.getSFFloat()
 
     self.pose_lock = threading.Lock()
     self.x_m = 0.0
@@ -133,8 +187,12 @@ class WebotsRbxBridge:
     self.cmd_linear_x = 0.0
     self.cmd_angular_z = 0.0
 
+    # Four named frames (robot_color/robot_depth/scene_color/scene_depth) --
+    # see the module docstring's 2026-09-21 update. One lock/dict for all
+    # four rather than four separate attributes, since they're always
+    # captured and sent together as a batch.
     self.frame_lock = threading.Lock()
-    self.latest_frame = None
+    self.latest_frames = {}
 
     self.sock = None
     self.sock_lock = threading.Lock()
@@ -175,18 +233,55 @@ class WebotsRbxBridge:
 
   def captureFrame(self):
     try:
-      width, height = self.camera.getWidth(), self.camera.getHeight()
-      raw = self.camera.getImage()
-      if raw is None:
-        return
-      arr = np.frombuffer(raw, dtype = np.uint8).reshape((height, width, 4))
-      bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
-      ok, encoded = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-      if ok:
-        with self.frame_lock:
-          self.latest_frame = encoded.tobytes()
+      robot_color = self._captureColorFrame(self.camera)
+      scene_color = self._captureColorFrame(self.camera_chase)
+      robot_depth = self._captureDepthFrame(self.camera_depth)
+      scene_depth = self._captureDepthFrame(self.camera_chase_depth)
     except Exception as e:
       print("webots_rbx_bridge: bad camera frame: %s" % str(e), flush = True)
+      return
+    with self.frame_lock:
+      if robot_color is not None:
+        self.latest_frames["robot_color"] = robot_color
+      if scene_color is not None:
+        self.latest_frames["scene_color"] = scene_color
+      if robot_depth is not None:
+        self.latest_frames["robot_depth"] = robot_depth
+      if scene_depth is not None:
+        self.latest_frames["scene_depth"] = scene_depth
+
+  def _captureColorFrame(self, camera):
+    width, height = camera.getWidth(), camera.getHeight()
+    raw = camera.getImage()
+    if raw is None:
+      return None
+    arr = np.frombuffer(raw, dtype = np.uint8).reshape((height, width, 4))
+    bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+    ok, encoded = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    return encoded.tobytes() if ok else None
+
+  def _captureDepthFrame(self, range_finder):
+    # RangeFinder has no color channel -- getRangeImage() returns a flat
+    # list of meters (inf/nan past maxRange), reshaped to height x width
+    # below. Colorized here (normalize against this device's own min/max
+    # range, then a JET colormap) purely for viewing, matching what Gazebo's
+    # camera_rig_controller.py already produces for its own *_depth topics --
+    # no raw 32FC1 depth_map data product exists in this project any more
+    # (see rbx_sim_node.py's own CAMERA_SETTING_NAMES comment: removed
+    # 2026-09-14, no consumer ever used it).
+    width, height = range_finder.getWidth(), range_finder.getHeight()
+    raw = range_finder.getRangeImage()  # data_type='list' (default) -- plain Python floats
+    if raw is None or len(raw) < width * height:
+      return None
+    arr = np.array(raw, dtype = np.float32).reshape((height, width))
+    min_range, max_range = range_finder.getMinRange(), range_finder.getMaxRange()
+    finite = np.isfinite(arr)
+    clipped = np.where(finite, np.clip(arr, min_range, max_range), max_range)
+    span = max(max_range - min_range, 1e-6)
+    normalized = ((clipped - min_range) / span * 255.0).astype(np.uint8)
+    colorized = cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
+    ok, encoded = cv2.imencode(".jpg", colorized, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    return encoded.tobytes() if ok else None
 
   def normalizeAngle(self, angle_rad):
     while angle_rad > math.pi:
@@ -290,10 +385,14 @@ class WebotsRbxBridge:
 
       if now - last_image >= 1.0 / IMAGE_RATE_HZ:
         with self.frame_lock:
-          frame = self.latest_frame
-        if frame is not None:
+          frames = dict(self.latest_frames)
+        # One line per camera, each tagged -- matches sim_bridge_node.py's
+        # wire protocol exactly (see rbx_sim_node.py's CAMERA_PUB_ATTR),
+        # rather than the old single untagged image line.
+        for camera_name, frame in frames.items():
           self.sendLine(conn, {
               "type": "image",
+              "camera": camera_name,
               "data": base64.b64encode(frame).decode("ascii"),
           })
         last_image = now
@@ -341,14 +440,56 @@ class WebotsRbxBridge:
       return
     msg_type = msg.get("type")
     if msg_type == "camera_settings":
-      pass  # Single camera on this world -- nothing to switch between.
+      self.applyCameraSettings(msg)
     elif msg_type == "reset":
-      # This Robot node is not a Supervisor, so it cannot teleport itself --
-      # an honest, documented gap (see module docstring), not a silent drop.
-      print("webots_rbx_bridge: reset not supported (robot is not a Supervisor)", flush = True)
+      self.resetSim()
     elif msg_type == "environment_option":
       print("webots_rbx_bridge: environment_option not supported on this world, ignoring",
             flush = True)
+
+  def applyCameraSettings(self, msg):
+    # Position offsets are a plain delta from each camera's factory mount
+    # point (matching rbx_sim_node.py's own offset_x/y/z convention), applied
+    # directly to the live translation field -- no respawn needed, unlike
+    # Gazebo. camera_depth/camera_chase_depth (the RangeFinder pair) move
+    # together with their paired Camera so the color/depth views stay
+    # co-located, same as their factory-mounted pairing.
+    try:
+      rx = self.factory_robot_cam_translation[0] + float(msg.get('offset_x', 0.0))
+      ry = self.factory_robot_cam_translation[1] + float(msg.get('offset_y', 0.0))
+      rz = self.factory_robot_cam_translation[2] + float(msg.get('offset_z', 0.0))
+      self.robot_cam_translation_field.setSFVec3f([rx, ry, rz])
+      self.robot_cam_depth_translation_field.setSFVec3f([rx, ry, rz])
+
+      sx = self.factory_scene_cam_translation[0] + float(msg.get('scene_offset_x', 0.0))
+      sy = self.factory_scene_cam_translation[1] + float(msg.get('scene_offset_y', 0.0))
+      sz = self.factory_scene_cam_translation[2] + float(msg.get('scene_offset_z', 0.0))
+      self.scene_cam_translation_field.setSFVec3f([sx, sy, sz])
+      self.scene_cam_depth_translation_field.setSFVec3f([sx, sy, sz])
+
+      if 'fov_deg' in msg:
+        fov_rad = math.radians(float(msg['fov_deg']))
+        self.robot_cam_fov_field.setSFFloat(fov_rad)
+        self.scene_cam_fov_field.setSFFloat(fov_rad)
+    except Exception as e:
+      print("webots_rbx_bridge: failed to apply camera settings: %s" % str(e), flush = True)
+
+  def resetSim(self):
+    # Real Supervisor teleport now (2026-09-21) -- rbx_rover.wbt's Robot node
+    # is `supervisor TRUE` as of the same fix. resetPhysics() clears
+    # accumulated velocity/momentum from the teleport itself, matching
+    # standard Webots practice for repositioning a physics-simulated body
+    # (without it, the body would keep whatever velocity it had the instant
+    # before teleporting and immediately drift again).
+    with self.cmd_lock:
+      self.cmd_linear_x = 0.0
+      self.cmd_angular_z = 0.0
+    for m in self.left_motors + self.right_motors:
+      m.setVelocity(0.0)
+    self.self_node.getField("translation").setSFVec3f(self.spawn_translation)
+    self.self_node.getField("rotation").setSFRotation(self.spawn_rotation)
+    self.self_node.resetPhysics()
+    print("webots_rbx_bridge: reset to spawn pose", flush = True)
 
 
 def main():

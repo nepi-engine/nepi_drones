@@ -51,7 +51,7 @@ import cv2
 from nepi_sdk import nepi_sdk
 from nepi_sdk import nepi_nav
 from nepi_sdk import nepi_utils
-from nepi_sdk import nepi_settings
+from nepi_sdk import nepi_controls
 from nepi_sdk import nepi_img
 
 from std_msgs.msg import UInt32, String
@@ -365,28 +365,35 @@ class WebotsQuadcopterNode:
     return settings
 
   def getSettings(self):
-    return self.settings_dict
+    # Deep copy, not a bare reference -- see rbx_webots_node.py's identical
+    # 2026-09-21 fix comment for the full cross-object mutation hazard this
+    # avoids (SettingsIF assigns whatever this returns directly to its own
+    # self.settings_dict, then mutates it in place).
+    return copy.deepcopy(self.settings_dict)
 
-  def settingUpdateFunction(self, setting):
+  def settingUpdateFunction(self, setting_name, setting_value):
+    # FIXED (2026-09-21): SettingsIF calls setSettingFunction(name, value,
+    # [callback_arg]), not this function's old single combined-dict
+    # argument, and expects a 3-tuple (success, msg, settings_dict) back --
+    # see rbx_webots_node.py's identical fix (same incident, same root
+    # cause: this driver was built from the same stale template).
     success = False
-    setting_str = str(setting)
-    setting_name = setting['name']
-    msg = ""
-    if nepi_settings.check_valid_setting(setting, self.cap_settings):
-      if setting_name in self.settings_dict.keys():
-        self.settings_dict[setting_name]['value'] = setting['value']
-        success = True
-      else:
-        msg = (self.node_name + " Setting name" + setting_str + " is not supported")
-      if success == True:
-        msg = (self.node_name + " UPDATED SETTINGS " + setting_str)
-        if setting_name in self.CAMERA_SETTING_NAMES:
-          self.sendCameraSettings()
-        if setting_name in self.ENVIRONMENT_SETTING_NAMES:
-          self.setEnvironmentAction(setting['value'])
-    else:
-      msg = (self.node_name + " Setting data" + setting_str + " is not valid")
-    return success, msg
+    setting_str = setting_name + ":" + str(setting_value)
+    if setting_name not in self.settings_dict.keys():
+      msg = (self.node_name + " Setting name " + setting_str + " is not supported")
+      return success, msg, copy.deepcopy(self.settings_dict)
+    if nepi_controls.get_clean_value(self.settings_dict, setting_name, setting_value) is None:
+      msg = (self.node_name + " Setting data " + setting_str + " is not valid")
+      return success, msg, copy.deepcopy(self.settings_dict)
+
+    self.settings_dict = nepi_controls.set_control_value(self.settings_dict, setting_name, setting_value)
+    success = True
+    msg = (self.node_name + " UPDATED SETTINGS " + setting_str)
+    if setting_name in self.CAMERA_SETTING_NAMES:
+      self.sendCameraSettings()
+    if setting_name in self.ENVIRONMENT_SETTING_NAMES:
+      self.setEnvironmentAction(setting_value)
+    return success, msg, copy.deepcopy(self.settings_dict)
 
 
   ##########################

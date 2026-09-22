@@ -64,8 +64,11 @@ class MujocoDiscovery:
   node_launch_name = "mujoco"
 
   # Device id for the single robot this driver discovers per MuJoCo bridge
-  # instance. Multi-robot worlds are out of scope for this pass.
-  DEVICE_ID = 'robot'
+  # instance. Multi-robot worlds are out of scope for this pass. "rover1"
+  # (not the generic "robot") matches rbx_sim_discovery.py's own
+  # SIM_ROBOT_SLOTS naming (sim_rover1/sim_rover2) and rbx_webots_discovery.py's
+  # own identical 2026-09-21 fix.
+  DEVICE_ID = 'rover1'
 
   # The heartbeat ping mujoco_rbx_bridge.py sends.
   ALIVE_REPLY = b'ALIVE'

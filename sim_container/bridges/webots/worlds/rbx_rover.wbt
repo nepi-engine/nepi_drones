@@ -34,8 +34,15 @@ Floor {
   appearance Grass {
   }
 }
+# supervisor TRUE (2026-09-21) -- needed for a real RESET_SIM teleport back
+# to the spawn pose, requested live after "the reset_sim button also doesnt
+# work, bringing the robot back to the starting point" -- a plain Robot node
+# can't move/reset itself, only a Supervisor can (see
+# webots_rbx_bridge.py's own resetSim()). Matches rbx_quadcopter.wbt's own
+# Robot node, which was already a Supervisor for the same reason.
 Robot {
   translation 0 0 0.05
+  supervisor TRUE
   children [
     DEF BODY Shape {
       appearance PBRAppearance {
@@ -151,11 +158,54 @@ Robot {
     InertialUnit {
       name "imu"
     }
-    Camera {
+    DEF ROBOT_CAM Camera {
       translation 0.1 0 0.03
       name "camera"
       width 640
       height 480
+    }
+    # Depth counterpart to "camera" above, same position/orientation -- a
+    # RangeFinder is Webots' depth-sensor device (no combined RGBD device
+    # exists), matching Gazebo's own <sensor type="depth"> convention of one
+    # sensor producing both a color and a depth stream. Reported live: "webots
+    # doesnt seem to have any scene camera or depth cameras" -- both added
+    # here (2026-09-21) to reach parity with generic_rover/model.sdf's own
+    # camera_link (robot view) + camera_link_chase (scene view), each
+    # color+depth.
+    DEF ROBOT_CAM_DEPTH RangeFinder {
+      translation 0.1 0 0.03
+      name "camera_depth"
+      width 640
+      height 480
+      minRange 0.05
+      maxRange 100
+    }
+    # Scene/chase view -- rigidly mounted on the rover itself (not a separate
+    # tracking model the way Gazebo's camera_rig is), which is simpler here:
+    # a Webots device listed under a Robot's own children already moves with
+    # that Robot for free, no follow-controller needed. Position/pitch
+    # reproduce generic_rover/model.sdf's own camera_link_chase pose exactly
+    # (-2.5, 0, 1.65, pitched down atan2(1.65, 2.5) = 0.5834 rad so the
+    # rover stays framed from directly behind and above) -- see that file's
+    # own comment for the derivation. Webots' rotation field is axis-angle;
+    # rotating the camera's default forward (local +X) around +Y by a
+    # positive angle tips it toward -Z (downward), which is what a positive
+    # pitch-down needs here.
+    DEF SCENE_CAM Camera {
+      translation -2.5 0 1.65
+      rotation 0 1 0 0.5834
+      name "camera_chase"
+      width 640
+      height 480
+    }
+    DEF SCENE_CAM_DEPTH RangeFinder {
+      translation -2.5 0 1.65
+      rotation 0 1 0 0.5834
+      name "camera_chase_depth"
+      width 640
+      height 480
+      minRange 0.05
+      maxRange 100
     }
   ]
   boundingObject USE BODY

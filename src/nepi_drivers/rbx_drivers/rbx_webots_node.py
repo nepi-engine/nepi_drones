@@ -25,15 +25,15 @@
 # reasons (no arm/disarm, no battery, no WGS84 location).
 #
 # ############################################################################
-# Single-camera, single-topic: this world (rbx_rover.wbt, copied from
-# sim_connector_rover.wbt) has only ONE Camera device with no repositionable
-# rig, unlike Gazebo's generic_rover which has two independently-posed camera
-# links. An earlier version of this driver reported the one camera under two
-# names (SCENE_CAMERA/ROBOT_CAMERA) with a camera_view_mode Setting to
-# "switch" between them, copied from the Gazebo rover's pattern -- but that
-# offered a view that does not exist here (same issue found and fixed in
-# rbx_webots_quadcopter_node.py). Now reported under a single CAMERA_NAME
-# topic, no view-mode Setting. Reference frames/offsets are still
+# UPDATED (2026-09-21): rbx_rover.wbt (copied from sim_connector_rover.wbt,
+# then extended) now has a real second (scene/chase) camera plus a
+# RangeFinder depth pair on both cameras, matching Gazebo's generic_rover
+# two-independently-posed-camera-link model -- see rbx_rover.wbt's own
+# comment for the geometry. Four always-live topics now
+# (robot_color/scene_color/robot_depth/scene_depth), no view-mode Setting,
+# matching rbx_sim_node.py's exact convention. camera_offset_x/y/z and
+# scene_offset_x/y/z are real, live-applied offsets now too (see
+# webots_rbx_bridge.py's applyCameraSettings) -- reference frames are still
 # declarative-only, matching rbx_gazebo_node.py's own gap.
 # ############################################################################
 
@@ -51,7 +51,7 @@ import cv2
 from nepi_sdk import nepi_sdk
 from nepi_sdk import nepi_nav
 from nepi_sdk import nepi_utils
-from nepi_sdk import nepi_settings
+from nepi_sdk import nepi_controls
 from nepi_sdk import nepi_img
 
 from std_msgs.msg import UInt32, String
@@ -73,16 +73,26 @@ FILE_TYPE = 'NODE'
 
 class WebotsNode:
 
-  # This world has exactly one fixed Camera device with no repositionable
-  # rig -- reported under a single honest topic name. An earlier version of
-  # this driver reported it under two names (SCENE_CAMERA/ROBOT_CAMERA) with
-  # a camera_view_mode Setting to "switch" between them, copied from
-  # rbx_sim_node.py's rover pattern -- but the Gazebo rover's two names
-  # correspond to two REAL, independently-posed camera links, while this
-  # world has exactly one, so that Setting was a pure UI fiction offering a
-  # view that does not exist (same issue found and fixed in
-  # rbx_webots_quadcopter_node.py -- see that file's CAMERA_NAME comment).
-  CAMERA_NAME = "robot_camera"
+  # UPDATED (2026-09-21): rbx_rover.wbt now has a REAL second (scene/chase)
+  # camera, rigidly mounted at the same offset generic_rover/model.sdf's own
+  # camera_link_chase uses, plus a RangeFinder depth pair for both -- the
+  # camera_view_mode-Setting mistake this comment used to describe (offering
+  # a view that didn't exist) no longer applies; there are genuinely two
+  # views now, always both live, matching rbx_sim_node.py's own four
+  # always-live topics.
+  ROBOT_COLOR_TOPIC_SUFFIX = "robot_color"
+  SCENE_COLOR_TOPIC_SUFFIX = "scene_color"
+  ROBOT_DEPTH_TOPIC_SUFFIX = "robot_depth"
+  SCENE_DEPTH_TOPIC_SUFFIX = "scene_depth"
+
+  # Which publisher each bridge "camera" tag routes to -- see
+  # rbx_sim_node.py's identical CAMERA_PUB_ATTR for the full reasoning.
+  CAMERA_PUB_ATTR = {
+    "robot_color": "image_pub_robot_color",
+    "scene_color": "image_pub_scene_color",
+    "robot_depth": "image_pub_robot_depth",
+    "scene_depth": "image_pub_scene_depth",
+  }
 
   ROBOT_MAIN_REFERENCE_FRAME = "base_link"
 
@@ -93,20 +103,20 @@ class WebotsNode:
   ENVIRONMENT_OPTIONS = ["FLAT_GROUND", "OBSTACLE_COURSE"]
   OBSTACLE_COURSE_OPTION = "OBSTACLE_COURSE"
 
-  # Ported from rbx_sim_node.py (the Gazebo rover's real, current driver --
-  # see docs/WEBOTS_RBX_DRIVER_PLAN.md's note on this file having been built
-  # from the stale rbx_gazebo_node.py template originally, before RBX_SIM's
-  # camera-offset/capability-toggle Settings existed). Unlike Gazebo's rover,
-  # this world has ONE fixed Camera device, not a repositionable rig or two
-  # independently-posed camera links -- camera_offset_x/y/z are declared here
-  # (kept as an honest "not wired up yet" placeholder, unlike camera_view_mode
-  # and scene_offset_x/y/z, which are gone entirely -- there genuinely is one
-  # real camera that could someday get a repositionable mount, unlike a
-  # second camera that simply does not exist) so the RUI renders the same
-  # offset control surface Gazebo's rover has, but sendCameraSettings below
-  # sends them to webots_rbx_bridge.py as a documented no-op, matching this
-  # driver's existing honest treatment of RESET_SIM/environment.
-  CAMERA_SETTING_NAMES = ("camera_offset_x", "camera_offset_y", "camera_offset_z")
+  # UPDATED (2026-09-21): rbx_rover.wbt now has a real second (scene/chase)
+  # camera plus depth on both (see that file's own comment), and
+  # webots_rbx_bridge.py's applyCameraSettings live-writes each camera's
+  # translation field directly on every change -- no respawn needed, unlike
+  # Gazebo. camera_offset_x/y/z (robot view) and scene_offset_x/y/z (scene
+  # view) are therefore genuinely wired now, not a placeholder. camera_fov_deg
+  # applies to both cameras' fieldOfView, matching rbx_sim_node.py's own
+  # "both cameras share one FOV" convention. yaw/tilt are NOT included yet --
+  # rotating a camera live needs real rotation composition on top of
+  # camera_chase's existing pitch, not just a field write, and wasn't built
+  # in this pass (see webots_rbx_bridge.py's own applyCameraSettings comment).
+  CAMERA_SETTING_NAMES = ("camera_offset_x", "camera_offset_y", "camera_offset_z",
+                          "scene_offset_x", "scene_offset_y", "scene_offset_z",
+                          "camera_fov_deg")
   ENVIRONMENT_SETTING_NAMES = ("environment",)
 
   # Sim Connector's own per-robot-config "customize the capabilities that are
@@ -124,6 +134,10 @@ class WebotsNode:
     camera_offset_x = {"type":"Float","name":"camera_offset_x","options":["-10.0","10.0"]},
     camera_offset_y = {"type":"Float","name":"camera_offset_y","options":["-10.0","10.0"]},
     camera_offset_z = {"type":"Float","name":"camera_offset_z","options":["-10.0","10.0"]},
+    scene_offset_x = {"type":"Float","name":"scene_offset_x","options":["-10.0","10.0"]},
+    scene_offset_y = {"type":"Float","name":"scene_offset_y","options":["-10.0","10.0"]},
+    scene_offset_z = {"type":"Float","name":"scene_offset_z","options":["-10.0","10.0"]},
+    camera_fov_deg = {"type":"Float","name":"camera_fov_deg","options":["10.0","150.0"]},
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]},
     # No fixed options -- the candidate topic set is per-deployment.
@@ -138,14 +152,19 @@ class WebotsNode:
     max_linear_speed_mps = {"type":"Float","name":"max_linear_speed_mps","value":"0.3"},
     max_angular_rate_dps = {"type":"Float","name":"max_angular_rate_dps","value":"45.0"},
     environment = {"type":"Discrete","name":"environment","value":ENVIRONMENT_OPTIONS[0]},
-    # Placeholder factory values, not measured against this world's single
-    # fixed camera pose (there is no physical offset to reproduce here the
-    # way rbx_sim_node.py's values reproduce generic_rover/model.sdf's real
-    # camera_link poses) -- these exist so the RUI's offset inputs have
-    # something sane to show, not because moving them does anything yet.
+    # Real, wired offsets now (2026-09-21) -- zero means "at rbx_rover.wbt's
+    # own factory mount point", same convention as rbx_sim_node.py's values
+    # reproducing generic_rover/model.sdf's real camera_link poses.
     camera_offset_x = {"type":"Float","name":"camera_offset_x","value":"0.0"},
     camera_offset_y = {"type":"Float","name":"camera_offset_y","value":"0.0"},
     camera_offset_z = {"type":"Float","name":"camera_offset_z","value":"0.0"},
+    scene_offset_x = {"type":"Float","name":"scene_offset_x","value":"0.0"},
+    scene_offset_y = {"type":"Float","name":"scene_offset_y","value":"0.0"},
+    scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"0.0"},
+    # 45.0 matches Webots' own Camera default fieldOfView (0.785398 rad),
+    # which rbx_rover.wbt never overrides -- the true factory value, not a
+    # guess.
+    camera_fov_deg = {"type":"Float","name":"camera_fov_deg","value":"45.0"},
     # Both default to enabled: a robot config that never touches these
     # settings behaves exactly as this driver did before this feature existed.
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","value":"TRUE"},
@@ -158,13 +177,10 @@ class WebotsNode:
 
   RBX_STATES = []
   RBX_MODES = []
-  # RESET_SIM is a real setup action here, same as Gazebo's, but the bridge
-  # side is a logged no-op: this world's Robot node is not a Supervisor, so it
-  # cannot teleport itself (matching sim_connector_bridge_webots.py's own
-  # documented RESET gap). Kept in the action list rather than omitted so the
-  # capability surface matches Gazebo's -- the command is honestly accepted
-  # and forwarded, just not honored physically, which is what "return False"
-  # would otherwise misreport (the bridge send itself succeeds).
+  # RESET_SIM is a real setup action, and (2026-09-21) a real physical
+  # teleport too -- rbx_rover.wbt's Robot node is now `supervisor TRUE`,
+  # so webots_rbx_bridge.py's resetSim() actually moves the body back to its
+  # spawn pose instead of logging a no-op.
   RBX_SETUP_ACTIONS = ["RESET_SIM", "RETURN_HOME"]
   RBX_GO_ACTIONS = []
 
@@ -237,13 +253,25 @@ class WebotsNode:
     self.navpose_dict = copy.deepcopy(nepi_nav.BLANK_NAVPOSE_DICT)
 
     ##############################
-    # Image relay. One real camera, one topic -- see the class-level
-    # CAMERA_NAME comment for why this isn't reported under two names.
+    # Image relay. Four always-live topics (robot/scene x color/depth-view),
+    # matching rbx_sim_node.py's exact ROBOT_COLOR_TOPIC_SUFFIX/etc shape --
+    # see this file's own 2026-09-21 module-docstring update for why (rover
+    # gained a real scene/chase camera plus depth on both cameras).
     self.image_topic_name = self.device_name + "/color_2d_image"
-    self.image_pub = nepi_sdk.create_publisher(self.image_topic_name, Image, queue_size = 1)
+    self.robot_color_topic_name = self.image_topic_name + "/" + self.ROBOT_COLOR_TOPIC_SUFFIX
+    self.scene_color_topic_name = self.image_topic_name + "/" + self.SCENE_COLOR_TOPIC_SUFFIX
+    self.robot_depth_topic_name = self.image_topic_name + "/" + self.ROBOT_DEPTH_TOPIC_SUFFIX
+    self.scene_depth_topic_name = self.image_topic_name + "/" + self.SCENE_DEPTH_TOPIC_SUFFIX
+    self.image_pub_robot_color = nepi_sdk.create_publisher(self.robot_color_topic_name, Image, queue_size = 1)
+    self.image_pub_scene_color = nepi_sdk.create_publisher(self.scene_color_topic_name, Image, queue_size = 1)
+    self.image_pub_robot_depth = nepi_sdk.create_publisher(self.robot_depth_topic_name, Image, queue_size = 1)
+    self.image_pub_scene_depth = nepi_sdk.create_publisher(self.scene_depth_topic_name, Image, queue_size = 1)
 
     self.sensor_topics = [
-      (self.image_topic_name + "/" + self.CAMERA_NAME, 'sensor_msgs/Image'),
+      (self.robot_color_topic_name, 'sensor_msgs/Image'),
+      (self.scene_color_topic_name, 'sensor_msgs/Image'),
+      (self.robot_depth_topic_name, 'sensor_msgs/Image'),
+      (self.scene_depth_topic_name, 'sensor_msgs/Image'),
     ]
 
     ##############################
@@ -333,7 +361,7 @@ class WebotsNode:
     time.sleep(1)
 
     self.rbx_if.setCmdTimeoutCb(UInt32(data = self.GOTO_CMD_TIMEOUT_SEC))
-    self.rbx_if.setImageTopicCb(String(data = self.image_topic_name))
+    self.rbx_if.setImageTopicCb(String(data = self.robot_color_topic_name))
 
     controller_interval = float(1) / self.CONTROLLER_RATE_HZ
     nepi_sdk.start_timer_process(controller_interval, self.gotoControlCb)
@@ -357,28 +385,43 @@ class WebotsNode:
     return settings
 
   def getSettings(self):
-    return self.settings_dict
+    # Deep copy, not a bare reference -- SettingsIF assigns whatever this
+    # returns directly to its own self.settings_dict, then mutates individual
+    # entries of it in place; a bare reference would alias the two, matching
+    # the cross-object mutation hazard rbx_ardupilot_node.py's own
+    # getSettings() already documents and rbx_sim_node.py's own copy already
+    # avoids. FIXED (2026-09-21) -- was returning self.settings_dict directly.
+    return copy.deepcopy(self.settings_dict)
 
-  def settingUpdateFunction(self, setting):
+  def settingUpdateFunction(self, setting_name, setting_value):
+    # FIXED (2026-09-21): SettingsIF (system_if.py) calls
+    # setSettingFunction(name, value, [callback_arg]) -- two/three plain
+    # positional args, not the single combined {'name','type','value'} dict
+    # this function's own body used to be written against (confirmed live:
+    # "settingUpdateFunction() takes 2 positional arguments but 3 were
+    # given" on every settings update attempt). Also was returning a 2-tuple
+    # (success, msg) where SettingsIF unpacks 3 (success, msg, settings_dict).
+    # Same incident, same fix, as rbx_ardupilot_node.py's own
+    # settingUpdateFunction and rbx_sim_node.py's (this driver was built from
+    # a stale template that predated that fix -- see
+    # docs/WEBOTS_RBX_DRIVER_PLAN.md's own note on this).
     success = False
-    setting_str = str(setting)
-    setting_name = setting['name']
-    msg = ""
-    if nepi_settings.check_valid_setting(setting, self.cap_settings):
-      if setting_name in self.settings_dict.keys():
-        self.settings_dict[setting_name]['value'] = setting['value']
-        success = True
-      else:
-        msg = (self.node_name + " Setting name" + setting_str + " is not supported")
-      if success == True:
-        msg = (self.node_name + " UPDATED SETTINGS " + setting_str)
-        if setting_name in self.CAMERA_SETTING_NAMES:
-          self.sendCameraSettings()
-        if setting_name in self.ENVIRONMENT_SETTING_NAMES:
-          self.setEnvironmentAction(setting['value'])
-    else:
-      msg = (self.node_name + " Setting data" + setting_str + " is not valid")
-    return success, msg
+    setting_str = setting_name + ":" + str(setting_value)
+    if setting_name not in self.settings_dict.keys():
+      msg = (self.node_name + " Setting name " + setting_str + " is not supported")
+      return success, msg, copy.deepcopy(self.settings_dict)
+    if nepi_controls.get_clean_value(self.settings_dict, setting_name, setting_value) is None:
+      msg = (self.node_name + " Setting data " + setting_str + " is not valid")
+      return success, msg, copy.deepcopy(self.settings_dict)
+
+    self.settings_dict = nepi_controls.set_control_value(self.settings_dict, setting_name, setting_value)
+    success = True
+    msg = (self.node_name + " UPDATED SETTINGS " + setting_str)
+    if setting_name in self.CAMERA_SETTING_NAMES:
+      self.sendCameraSettings()
+    if setting_name in self.ENVIRONMENT_SETTING_NAMES:
+      self.setEnvironmentAction(setting_value)
+    return success, msg, copy.deepcopy(self.settings_dict)
 
 
   ##########################
@@ -503,11 +546,14 @@ class WebotsNode:
     return False
 
   def resetSimAction(self):
-    # Fire-and-forget, same as rbx_gazebo_node.py's -- but see the class-level
-    # RBX_SETUP_ACTIONS note: this world's Robot node is not a Supervisor, so
-    # the bridge logs this and does not actually teleport. Returns True/False
-    # based on whether the command was actually sent, not on whether a physical
-    # reset happened (which this driver has no way to confirm either way).
+    # Fire-and-forget, same as rbx_gazebo_node.py's. UPDATED (2026-09-21):
+    # rbx_rover.wbt's Robot node is now `supervisor TRUE`, so
+    # webots_rbx_bridge.py's resetSim() performs a real teleport back to the
+    # spawn pose (reported live: "the reset_sim button also doesnt work,
+    # bringing the robot back to the starting point"). Still returns
+    # True/False based on whether the command was actually SENT, not on
+    # whether the physical reset completed -- this driver has no ack for
+    # that, same as before.
     self.clearGotoTarget()
     self.sendVelocityCmd(0.0, 0.0)
     with self.sock_lock:
@@ -676,14 +722,19 @@ class WebotsNode:
       self.processTelemetryLine(msg)
 
   def processImageLine(self, msg):
+    # "camera" tag picks which of the four publishers this frame goes to --
+    # see rbx_sim_node.py's identical processImageLine/CAMERA_PUB_ATTR.
     try:
+      camera = msg.get('camera', self.ROBOT_COLOR_TOPIC_SUFFIX)
+      pub_attr = self.CAMERA_PUB_ATTR.get(camera, "image_pub_robot_color")
+      image_pub = getattr(self, pub_attr)
       jpeg_bytes = base64.b64decode(msg['data'])
       arr = np.frombuffer(jpeg_bytes, dtype = np.uint8)
       cv2_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
       if cv2_img is None:
         raise ValueError("cv2.imdecode returned None")
       ros_img = nepi_img.cv2img_to_rosimg(cv2_img, encoding = "bgr8")
-      self.image_pub.publish(ros_img)
+      image_pub.publish(ros_img)
     except Exception as e:
       self.msg_if.pub_warn("Failed to process camera image frame: " + str(e), throttle_s = 5.0)
 
@@ -721,16 +772,18 @@ class WebotsNode:
     self.sendLineToBridge(cmd, "Velocity command")
 
   def sendCameraSettings(self):
-    # No view_mode -- see CAMERA_NAME's own comment, there is nothing to
-    # switch between. offset_x/y/z included for parity with rbx_sim_node.py's
-    # wire shape -- webots_rbx_bridge.py currently logs-and-ignores them
-    # (this world's single fixed Camera device has no repositionable rig),
-    # matching this driver's existing honest treatment of RESET_SIM/environment.
+    # No view_mode -- this world's two cameras are always both live. Real,
+    # applied settings now (2026-09-21) -- webots_rbx_bridge.py's
+    # applyCameraSettings live-writes each field, no respawn needed.
     cmd = {
       'type': 'camera_settings',
       'offset_x': float(self.settings_dict['camera_offset_x']['value']),
       'offset_y': float(self.settings_dict['camera_offset_y']['value']),
       'offset_z': float(self.settings_dict['camera_offset_z']['value']),
+      'scene_offset_x': float(self.settings_dict['scene_offset_x']['value']),
+      'scene_offset_y': float(self.settings_dict['scene_offset_y']['value']),
+      'scene_offset_z': float(self.settings_dict['scene_offset_z']['value']),
+      'fov_deg': float(self.settings_dict['camera_fov_deg']['value']),
     }
     self.sendLineToBridge(cmd, "Camera settings")
 

@@ -62,8 +62,12 @@ class WebotsDiscovery:
   node_launch_name = "webots"
 
   # Device id for the single robot this driver discovers per Webots instance.
-  # Multi-robot worlds are out of scope for this pass.
-  DEVICE_ID = 'robot'
+  # Multi-robot worlds are out of scope for this pass. "rover1" (not the
+  # generic "robot") matches rbx_sim_discovery.py's own SIM_ROBOT_SLOTS
+  # naming (sim_rover1/sim_rover2) -- reported live: "instead of the device
+  # just being webots_robot, it should probably be simrover_1 or something
+  # that shows its a rover, similar to what its like for gazebo."
+  DEVICE_ID = 'rover1'
 
   # The heartbeat ping webots_rbx_bridge.py sends.
   ALIVE_REPLY = b'ALIVE'
