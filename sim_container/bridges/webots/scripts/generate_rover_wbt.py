@@ -247,7 +247,13 @@ TexturedBackground {{
 TexturedBackgroundLight {{
 }}
 Floor {{
-  size 6 6
+  # 1000x1000 (was 6x6) -- reported live (2026-09-22): "the default flat
+  # environment is really small... make sure its almost infinite space."
+  # tileSize stays at the Floor PROTO's own default (0.5x0.5m), so texture
+  # density scales with size automatically -- no visible stretching at the
+  # larger size. Comfortably larger than the obstacle course's own
+  # footprint (course_start_x_m + wall_length_m + ramp run, ~24m default).
+  size 1000 1000
   appearance Grass {{
   }}
 }}
