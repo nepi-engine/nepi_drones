@@ -96,10 +96,13 @@ class WebotsNode:
 
   ROBOT_MAIN_REFERENCE_FRAME = "base_link"
 
-  # This world has no obstacle-course model -- environment options are an
-  # honest no-op on the bridge side (matching sim_connector_bridge_webots.py's
-  # own documented gap), but still declared here so the capability/UI surface
-  # is consistent with the Gazebo driver rather than silently absent.
+  # OBSTACLE_COURSE really spawns/despawns now (2026-09-21) --
+  # webots_rbx_bridge.py's setObstacleCourseEnabled imports/removes a
+  # DEF OBSTACLE_COURSE Solid built from sim_container/models/
+  # obstacle_course/dimensions.yaml (generate_environment_wbt.py), live via
+  # Supervisor, in response to the same wire message this driver already
+  # sends below. sim_connector_bridge_webots.py's own separate world/
+  # protocol pair is unaffected -- its own documented gap stays as-is.
   ENVIRONMENT_OPTIONS = ["FLAT_GROUND", "OBSTACLE_COURSE"]
   OBSTACLE_COURSE_OPTION = "OBSTACLE_COURSE"
 
@@ -564,9 +567,9 @@ class WebotsNode:
     return True
 
   def setEnvironmentAction(self, environment_value):
-    # Fire-and-forget, same as rbx_gazebo_node.py's -- this world has no
-    # obstacle-course model, so the bridge logs this and does not spawn/delete
-    # anything (see the ENVIRONMENT_OPTIONS class comment).
+    # Fire-and-forget, same as rbx_gazebo_node.py's -- the bridge now really
+    # spawns/despawns the obstacle course on this message (see the
+    # ENVIRONMENT_OPTIONS class comment).
     with self.sock_lock:
       connected = self.sock is not None
     if not connected:

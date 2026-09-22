@@ -68,8 +68,12 @@
 # reset_sim button also doesnt work, bringing the robot back to the
 # starting point") -- rbx_rover.wbt's Robot node is `supervisor TRUE` as of
 # the same fix, matching rbx_quadcopter.wbt's own Robot node.
-# environment_option stays an honest no-op: this world still has no
-# obstacle-course model.
+#
+# environment_option now really spawns/despawns an OBSTACLE_COURSE (2026-
+# 09-21, requested live: "environment/fov can be changed on the spot...
+# just like they do in gazebo") -- see setObstacleCourseEnabled and
+# generate_environment_wbt.py's own module docstring for the VRML this
+# builds and the Supervisor import/remove mechanics.
 
 import base64
 import json
@@ -84,6 +88,16 @@ import numpy as np
 import cv2
 
 from controller import Supervisor
+
+# generate_environment_wbt.py is a sibling under .../webots/scripts, not
+# this controller's own directory -- controllers -> webots_rbx_bridge ->
+# controllers -> webots, then into "scripts" (verified with os.path.exists,
+# not just counted by eye -- see generate_rover_wbt.py's own history of
+# getting this exact kind of relative path wrong).
+sys.path.insert(0, os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts")))
+from generate_environment_wbt import buildObstacleCourseVrml, loadDimensions as loadEnvironmentDimensions, \
+    OBSTACLE_COURSE_DEFAULT_DIMENSIONS
 
 DEFAULT_HEARTBEAT_PORT = 9041
 DEFAULT_BRIDGE_PORT = 9046
@@ -478,8 +492,8 @@ class WebotsRbxBridge:
     elif msg_type == "reset":
       self.resetSim()
     elif msg_type == "environment_option":
-      print("webots_rbx_bridge: environment_option not supported on this world, ignoring",
-            flush = True)
+      if msg.get("option") == "OBSTACLE_COURSE":
+        self.setObstacleCourseEnabled(bool(msg.get("enabled", False)))
 
   def applyCameraSettings(self, msg):
     # Position offsets are a plain delta from each camera's factory mount
@@ -524,6 +538,33 @@ class WebotsRbxBridge:
     self.self_node.getField("rotation").setSFRotation(self.spawn_rotation)
     self.self_node.resetPhysics()
     print("webots_rbx_bridge: reset to spawn pose", flush = True)
+
+  def setObstacleCourseEnabled(self, enabled):
+    # Idempotent both ways -- a duplicate enable=True while it's already
+    # spawned, or a duplicate enable=False while it's already gone, is a
+    # no-op rather than a double-spawn/crash-on-missing-node. Root node's
+    # own children field is the spawn target (matches every other
+    # Supervisor importMFNodeFromString example in the Webots docs);
+    # DEF OBSTACLE_COURSE is the single wrapper node generate_environment_
+    # wbt.py's own buildObstacleCourseVrml wraps everything in, so removal
+    # is one getFromDef+remove() regardless of how many wall/baffle/ramp
+    # children it has inside.
+    existing = self.robot.getFromDef("OBSTACLE_COURSE")
+    if enabled:
+      if existing is not None:
+        return
+      try:
+        dims = loadEnvironmentDimensions("obstacle_course", OBSTACLE_COURSE_DEFAULT_DIMENSIONS)
+        vrml = buildObstacleCourseVrml(dims)
+        self.robot.getRoot().getField("children").importMFNodeFromString(-1, vrml)
+        print("webots_rbx_bridge: spawned OBSTACLE_COURSE", flush = True)
+      except Exception as e:
+        print("webots_rbx_bridge: failed to spawn OBSTACLE_COURSE: %s" % str(e), flush = True)
+    else:
+      if existing is None:
+        return
+      existing.remove()
+      print("webots_rbx_bridge: removed OBSTACLE_COURSE", flush = True)
 
 
 def main():
