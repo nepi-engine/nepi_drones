@@ -108,11 +108,22 @@ class MujocoNode:
   # applyCameraSettings writes model.cam_pos/model.cam_fovy directly, no
   # respawn needed (same idea as webots_rbx_bridge.py's Supervisor field
   # writes, simpler here since MuJoCo already exposes these as mutable
-  # per-step model arrays). yaw/tilt not wired yet, same as Webots.
+  # per-step model arrays). yaw/tilt ADDED (2026-09-22) -- requested live:
+  # "the lock scene camera to robot feature... get it working for gazebo
+  # and then the rest." mujoco_rbx_bridge.py's applyCameraSettings now also
+  # writes model.cam_quat, composed the same way rbx_sim_node.py's
+  # scene_offset_yaw/tilt already work for Gazebo.
   CAMERA_SETTING_NAMES = ("camera_offset_x", "camera_offset_y", "camera_offset_z",
+                          "camera_offset_yaw", "camera_offset_tilt",
                           "scene_offset_x", "scene_offset_y", "scene_offset_z",
+                          "scene_offset_yaw", "scene_offset_tilt",
                           "camera_fov_deg")
   ENVIRONMENT_SETTING_NAMES = ("environment",)
+
+  # Factory scene (chase) camera mount: (-2.5, 0, 1.65) relative to the
+  # chassis -- same offset rbx_rover.xml's own scene_camera uses and the
+  # same constants rbx_sim_node.py's own FACTORY_SCENE_TILT_DEG documents.
+  FACTORY_SCENE_TILT_DEG = math.degrees(math.atan2(1.65, 2.5))
 
   # Sim Connector's own per-robot-config "customize the capabilities that are
   # open" toggles -- same mechanism and same names as rbx_sim_node.py's/
@@ -127,9 +138,13 @@ class MujocoNode:
     camera_offset_x = {"type":"Float","name":"camera_offset_x","options":["-10.0","10.0"]},
     camera_offset_y = {"type":"Float","name":"camera_offset_y","options":["-10.0","10.0"]},
     camera_offset_z = {"type":"Float","name":"camera_offset_z","options":["-10.0","10.0"]},
+    camera_offset_yaw = {"type":"Float","name":"camera_offset_yaw","options":["-180.0","180.0"]},
+    camera_offset_tilt = {"type":"Float","name":"camera_offset_tilt","options":["-90.0","90.0"]},
     scene_offset_x = {"type":"Float","name":"scene_offset_x","options":["-10.0","10.0"]},
     scene_offset_y = {"type":"Float","name":"scene_offset_y","options":["-10.0","10.0"]},
     scene_offset_z = {"type":"Float","name":"scene_offset_z","options":["-10.0","10.0"]},
+    scene_offset_yaw = {"type":"Float","name":"scene_offset_yaw","options":["-180.0","180.0"]},
+    scene_offset_tilt = {"type":"Float","name":"scene_offset_tilt","options":["-90.0","90.0"]},
     camera_fov_deg = {"type":"Float","name":"camera_fov_deg","options":["10.0","150.0"]},
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]},
@@ -151,9 +166,13 @@ class MujocoNode:
     camera_offset_x = {"type":"Float","name":"camera_offset_x","value":"0.0"},
     camera_offset_y = {"type":"Float","name":"camera_offset_y","value":"0.0"},
     camera_offset_z = {"type":"Float","name":"camera_offset_z","value":"0.0"},
+    camera_offset_yaw = {"type":"Float","name":"camera_offset_yaw","value":"0.0"},
+    camera_offset_tilt = {"type":"Float","name":"camera_offset_tilt","value":"0.0"},
     scene_offset_x = {"type":"Float","name":"scene_offset_x","value":"0.0"},
     scene_offset_y = {"type":"Float","name":"scene_offset_y","value":"0.0"},
     scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"0.0"},
+    scene_offset_yaw = {"type":"Float","name":"scene_offset_yaw","value":"0.0"},
+    scene_offset_tilt = {"type":"Float","name":"scene_offset_tilt","value":str(FACTORY_SCENE_TILT_DEG)},
     # 60.0 matches rbx_rover.xml's own robot_camera fovy="60" -- the true
     # factory value, not a guess.
     camera_fov_deg = {"type":"Float","name":"camera_fov_deg","value":"60.0"},
@@ -813,9 +832,13 @@ class MujocoNode:
       'offset_x': float(self.settings_dict['camera_offset_x']['value']),
       'offset_y': float(self.settings_dict['camera_offset_y']['value']),
       'offset_z': float(self.settings_dict['camera_offset_z']['value']),
+      'offset_yaw': float(self.settings_dict['camera_offset_yaw']['value']),
+      'offset_tilt': float(self.settings_dict['camera_offset_tilt']['value']),
       'scene_offset_x': float(self.settings_dict['scene_offset_x']['value']),
       'scene_offset_y': float(self.settings_dict['scene_offset_y']['value']),
       'scene_offset_z': float(self.settings_dict['scene_offset_z']['value']),
+      'scene_offset_yaw': float(self.settings_dict['scene_offset_yaw']['value']),
+      'scene_offset_tilt': float(self.settings_dict['scene_offset_tilt']['value']),
       'fov_deg': float(self.settings_dict['camera_fov_deg']['value']),
     }
     self.sendLineToBridge(cmd, "Camera settings")

@@ -106,6 +106,14 @@ class WebotsNode:
   ENVIRONMENT_OPTIONS = ["FLAT_GROUND", "OBSTACLE_COURSE"]
   OBSTACLE_COURSE_OPTION = "OBSTACLE_COURSE"
 
+  # Factory scene (chase) camera mount: (-2.5, 0, 1.65) relative to the
+  # chassis, same offset rbx_rover.wbt's own DEF SCENE_CAM uses and the same
+  # constants rbx_sim_node.py's own FACTORY_SCENE_TILT_DEG documents --
+  # matches so the RUI's "Lock Scene Camera To Robot" feature (which hardcodes
+  # this same mount point client-side) computes the identical factory angle
+  # for either sim.
+  FACTORY_SCENE_TILT_DEG = math.degrees(math.atan2(1.65, 2.5))
+
   # UPDATED (2026-09-21): rbx_rover.wbt now has a real second (scene/chase)
   # camera plus depth on both (see that file's own comment), and
   # webots_rbx_bridge.py's applyCameraSettings live-writes each camera's
@@ -113,12 +121,16 @@ class WebotsNode:
   # Gazebo. camera_offset_x/y/z (robot view) and scene_offset_x/y/z (scene
   # view) are therefore genuinely wired now, not a placeholder. camera_fov_deg
   # applies to both cameras' fieldOfView, matching rbx_sim_node.py's own
-  # "both cameras share one FOV" convention. yaw/tilt are NOT included yet --
-  # rotating a camera live needs real rotation composition on top of
-  # camera_chase's existing pitch, not just a field write, and wasn't built
-  # in this pass (see webots_rbx_bridge.py's own applyCameraSettings comment).
+  # "both cameras share one FOV" convention. yaw/tilt ADDED (2026-09-22) --
+  # requested live: "the lock scene camera to robot feature... get it
+  # working for gazebo and then the rest." webots_rbx_bridge.py's
+  # applyCameraSettings now composes a real rotation from these, matching
+  # rbx_sim_node.py's own scene_offset_yaw/tilt convention (degrees, yaw
+  # about +Z then tilt/pitch about the resulting local Y).
   CAMERA_SETTING_NAMES = ("camera_offset_x", "camera_offset_y", "camera_offset_z",
+                          "camera_offset_yaw", "camera_offset_tilt",
                           "scene_offset_x", "scene_offset_y", "scene_offset_z",
+                          "scene_offset_yaw", "scene_offset_tilt",
                           "camera_fov_deg")
   ENVIRONMENT_SETTING_NAMES = ("environment",)
 
@@ -137,9 +149,13 @@ class WebotsNode:
     camera_offset_x = {"type":"Float","name":"camera_offset_x","options":["-10.0","10.0"]},
     camera_offset_y = {"type":"Float","name":"camera_offset_y","options":["-10.0","10.0"]},
     camera_offset_z = {"type":"Float","name":"camera_offset_z","options":["-10.0","10.0"]},
+    camera_offset_yaw = {"type":"Float","name":"camera_offset_yaw","options":["-180.0","180.0"]},
+    camera_offset_tilt = {"type":"Float","name":"camera_offset_tilt","options":["-90.0","90.0"]},
     scene_offset_x = {"type":"Float","name":"scene_offset_x","options":["-10.0","10.0"]},
     scene_offset_y = {"type":"Float","name":"scene_offset_y","options":["-10.0","10.0"]},
     scene_offset_z = {"type":"Float","name":"scene_offset_z","options":["-10.0","10.0"]},
+    scene_offset_yaw = {"type":"Float","name":"scene_offset_yaw","options":["-180.0","180.0"]},
+    scene_offset_tilt = {"type":"Float","name":"scene_offset_tilt","options":["-90.0","90.0"]},
     camera_fov_deg = {"type":"Float","name":"camera_fov_deg","options":["10.0","150.0"]},
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]},
@@ -161,9 +177,13 @@ class WebotsNode:
     camera_offset_x = {"type":"Float","name":"camera_offset_x","value":"0.0"},
     camera_offset_y = {"type":"Float","name":"camera_offset_y","value":"0.0"},
     camera_offset_z = {"type":"Float","name":"camera_offset_z","value":"0.0"},
+    camera_offset_yaw = {"type":"Float","name":"camera_offset_yaw","value":"0.0"},
+    camera_offset_tilt = {"type":"Float","name":"camera_offset_tilt","value":"0.0"},
     scene_offset_x = {"type":"Float","name":"scene_offset_x","value":"0.0"},
     scene_offset_y = {"type":"Float","name":"scene_offset_y","value":"0.0"},
     scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"0.0"},
+    scene_offset_yaw = {"type":"Float","name":"scene_offset_yaw","value":"0.0"},
+    scene_offset_tilt = {"type":"Float","name":"scene_offset_tilt","value":str(FACTORY_SCENE_TILT_DEG)},
     # 45.0 matches Webots' own Camera default fieldOfView (0.785398 rad),
     # which rbx_rover.wbt never overrides -- the true factory value, not a
     # guess.
@@ -858,9 +878,13 @@ class WebotsNode:
       'offset_x': float(self.settings_dict['camera_offset_x']['value']),
       'offset_y': float(self.settings_dict['camera_offset_y']['value']),
       'offset_z': float(self.settings_dict['camera_offset_z']['value']),
+      'offset_yaw': float(self.settings_dict['camera_offset_yaw']['value']),
+      'offset_tilt': float(self.settings_dict['camera_offset_tilt']['value']),
       'scene_offset_x': float(self.settings_dict['scene_offset_x']['value']),
       'scene_offset_y': float(self.settings_dict['scene_offset_y']['value']),
       'scene_offset_z': float(self.settings_dict['scene_offset_z']['value']),
+      'scene_offset_yaw': float(self.settings_dict['scene_offset_yaw']['value']),
+      'scene_offset_tilt': float(self.settings_dict['scene_offset_tilt']['value']),
       'fov_deg': float(self.settings_dict['camera_fov_deg']['value']),
     }
     self.sendLineToBridge(cmd, "Camera settings")

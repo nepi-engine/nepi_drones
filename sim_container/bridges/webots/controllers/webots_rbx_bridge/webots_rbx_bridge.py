@@ -127,6 +127,46 @@ DIMENSIONS_PATH = os.path.normpath(os.path.join(
     "models", "generic_rover", "dimensions.yaml"))
 
 
+def yawTiltToAxisAngle(yaw_deg, tilt_deg):
+    # Composes R = Rz(yaw) * Ry(tilt) (same fixed-axis roll-pitch-yaw
+    # convention SDF/Gazebo's own <pose> "roll pitch yaw" uses, with
+    # roll always 0 here -- see sim_bridge_node.py's own
+    # _respawnRoverWithCameraOffsetsLocked) into the single axis-angle
+    # Webots' own SFRotation field needs, via the standard rotation-
+    # matrix -> axis-angle formula. Reduces to the pre-existing pure-pitch
+    # "0 1 0 <tilt>" form when yaw=0 (R = Ry(tilt) exactly), matching
+    # SCENE_CAM's own factory rotation in rbx_rover.wbt.
+    yaw = math.radians(yaw_deg)
+    tilt = math.radians(tilt_deg)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    ct, st = math.cos(tilt), math.sin(tilt)
+    # Rz(yaw):            Ry(tilt):
+    #  cy -sy  0            ct  0  st
+    #  sy  cy  0             0  1   0
+    #   0   0  1           -st  0  ct
+    r00, r01, r02 = cy * ct, -sy, cy * st
+    r10, r11, r12 = sy * ct, cy, sy * st
+    r20, r21, r22 = -st, 0.0, ct
+    trace = r00 + r11 + r22
+    angle = math.acos(max(-1.0, min(1.0, (trace - 1.0) / 2.0)))
+    if angle < 1e-6:
+        return [0.0, 1.0, 0.0, 0.0]
+    if angle > math.pi - 1e-6:
+        # 180-degree rotation -- the (R32-R23, R13-R31, R21-R12) formula
+        # degenerates (divides by ~0); not reachable via yaw in
+        # (-180,180]/tilt in [-90,90] short of exact edge values, but
+        # handled rather than left to silently produce garbage.
+        axis_x = math.sqrt(max(0.0, (r00 + 1.0) / 2.0))
+        axis_y = math.sqrt(max(0.0, (r11 + 1.0) / 2.0))
+        axis_z = math.sqrt(max(0.0, (r22 + 1.0) / 2.0))
+        return [axis_x, axis_y, axis_z, angle]
+    denom = 2.0 * math.sin(angle)
+    axis_x = (r21 - r12) / denom
+    axis_y = (r02 - r20) / denom
+    axis_z = (r10 - r01) / denom
+    return [axis_x, axis_y, axis_z, angle]
+
+
 def loadWheelDimensions():
     # Best-effort: this bridge has no py_yaml dependency otherwise, and a
     # missing/malformed file should degrade to the module-level defaults
@@ -205,15 +245,26 @@ class WebotsRbxBridge:
     # rbx_rover.wbt's own, added for exactly this. Factory translations
     # captured here (not hardcoded) so a future .wbt mount-point change stays
     # correct automatically, matching self.spawn_translation's own reasoning
-    # above. Rotation (yaw/tilt) is NOT live-adjustable yet -- position
-    # offsets and FOV are the concrete, tested part of this fix; composing a
-    # runtime yaw/tilt delta on top of camera_chase's existing pitch needs
-    # real rotation-matrix composition (scipy.spatial.transform.Rotation),
-    # which is a reasonable follow-up but wasn't verified live this pass.
+    # above.
+    # Rotation (yaw/tilt) ADDED (2026-09-22) -- requested live: "the lock
+    # scene camera to robot feature... get it working for gazebo and then
+    # the rest." offset_yaw/offset_tilt and scene_offset_yaw/scene_offset_
+    # tilt are ABSOLUTE angles (degrees), not deltas -- same convention
+    # rbx_sim_node.py/sim_bridge_node.py already use for Gazebo (the
+    # driver's own FACTORY_SETTINGS carries the factory tilt directly as
+    # the starting value, not 0 + an add-on). yawTiltToAxisAngle (module
+    # level, below) composes R = Rz(yaw) * Ry(tilt) into the single
+    # axis-angle Webots' own rotation field needs -- reduces to the
+    # existing "0 1 0 <tilt>" pure-pitch form when yaw=0, matching
+    # SCENE_CAM's own factory rotation in rbx_rover.wbt exactly.
     self.robot_cam_translation_field = self.robot.getFromDef("ROBOT_CAM").getField("translation")
     self.robot_cam_depth_translation_field = self.robot.getFromDef("ROBOT_CAM_DEPTH").getField("translation")
+    self.robot_cam_rotation_field = self.robot.getFromDef("ROBOT_CAM").getField("rotation")
+    self.robot_cam_depth_rotation_field = self.robot.getFromDef("ROBOT_CAM_DEPTH").getField("rotation")
     self.scene_cam_translation_field = self.robot.getFromDef("SCENE_CAM").getField("translation")
     self.scene_cam_depth_translation_field = self.robot.getFromDef("SCENE_CAM_DEPTH").getField("translation")
+    self.scene_cam_rotation_field = self.robot.getFromDef("SCENE_CAM").getField("rotation")
+    self.scene_cam_depth_rotation_field = self.robot.getFromDef("SCENE_CAM_DEPTH").getField("rotation")
     self.factory_robot_cam_translation = list(self.robot_cam_translation_field.getSFVec3f())
     self.factory_scene_cam_translation = list(self.scene_cam_translation_field.getSFVec3f())
     self.robot_cam_fov_field = self.robot.getFromDef("ROBOT_CAM").getField("fieldOfView")
@@ -502,18 +553,29 @@ class WebotsRbxBridge:
     # Gazebo. camera_depth/camera_chase_depth (the RangeFinder pair) move
     # together with their paired Camera so the color/depth views stay
     # co-located, same as their factory-mounted pairing.
+    #
+    # offset_yaw/offset_tilt/scene_offset_yaw/scene_offset_tilt are ABSOLUTE
+    # angles (degrees), not deltas -- see this method's own __init__-side
+    # comment. Missing from an older sender is tolerated (.get(..., 0.0)),
+    # same "degrade gracefully" contract fov_deg already had.
     try:
       rx = self.factory_robot_cam_translation[0] + float(msg.get('offset_x', 0.0))
       ry = self.factory_robot_cam_translation[1] + float(msg.get('offset_y', 0.0))
       rz = self.factory_robot_cam_translation[2] + float(msg.get('offset_z', 0.0))
       self.robot_cam_translation_field.setSFVec3f([rx, ry, rz])
       self.robot_cam_depth_translation_field.setSFVec3f([rx, ry, rz])
+      robot_rotation = yawTiltToAxisAngle(float(msg.get('offset_yaw', 0.0)), float(msg.get('offset_tilt', 0.0)))
+      self.robot_cam_rotation_field.setSFRotation(robot_rotation)
+      self.robot_cam_depth_rotation_field.setSFRotation(robot_rotation)
 
       sx = self.factory_scene_cam_translation[0] + float(msg.get('scene_offset_x', 0.0))
       sy = self.factory_scene_cam_translation[1] + float(msg.get('scene_offset_y', 0.0))
       sz = self.factory_scene_cam_translation[2] + float(msg.get('scene_offset_z', 0.0))
       self.scene_cam_translation_field.setSFVec3f([sx, sy, sz])
       self.scene_cam_depth_translation_field.setSFVec3f([sx, sy, sz])
+      scene_rotation = yawTiltToAxisAngle(float(msg.get('scene_offset_yaw', 0.0)), float(msg.get('scene_offset_tilt', 0.0)))
+      self.scene_cam_rotation_field.setSFRotation(scene_rotation)
+      self.scene_cam_depth_rotation_field.setSFRotation(scene_rotation)
 
       if 'fov_deg' in msg:
         fov_rad = math.radians(float(msg['fov_deg']))

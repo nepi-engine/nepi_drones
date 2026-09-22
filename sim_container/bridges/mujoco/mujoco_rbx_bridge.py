@@ -120,6 +120,57 @@ WHEEL_TRACK_M = 0.34
 MAX_WHEEL_RADPS = 15.0
 
 
+def yawTiltToQuat(yaw_deg, tilt_deg):
+    # Both rbx_rover.xml cameras' own factory xyaxes fix local X (right) at
+    # (0,-1,0) and tilt local Y (up) in the XZ plane -- robot_camera's own
+    # "0 -1 0 0 0 1" is exactly this at tilt=0, scene_camera's own
+    # "0 -1 0 0.5514 0 0.8342" is exactly this at tilt=FACTORY_SCENE_TILT_DEG
+    # (rbx_mujoco_node.py's own constant). MuJoCo cameras view along local
+    # -Z, so local Z (back) = X cross Y reproduces "look toward +X" at
+    # yaw=tilt=0, matching Gazebo/Webots' own yaw=0 convention. yaw further
+    # rotates this whole base frame about the parent body's own +Z (up)
+    # axis. Returns MuJoCo's own (w,x,y,z) quaternion convention for
+    # model.cam_quat, via the standard rotation-matrix -> quaternion
+    # formula (Shepperd's method).
+    yaw = math.radians(yaw_deg)
+    tilt = math.radians(tilt_deg)
+    bx = np.array([0.0, -1.0, 0.0])
+    by = np.array([math.sin(tilt), 0.0, math.cos(tilt)])
+    bz = np.cross(bx, by)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
+    x = rz @ bx
+    y = rz @ by
+    z = rz @ bz
+    r = np.column_stack([x, y, z])
+    trace = np.trace(r)
+    if trace > 0:
+        s = math.sqrt(trace + 1.0) * 2
+        w = 0.25 * s
+        qx = (r[2, 1] - r[1, 2]) / s
+        qy = (r[0, 2] - r[2, 0]) / s
+        qz = (r[1, 0] - r[0, 1]) / s
+    elif r[0, 0] > r[1, 1] and r[0, 0] > r[2, 2]:
+        s = math.sqrt(1.0 + r[0, 0] - r[1, 1] - r[2, 2]) * 2
+        w = (r[2, 1] - r[1, 2]) / s
+        qx = 0.25 * s
+        qy = (r[0, 1] + r[1, 0]) / s
+        qz = (r[0, 2] + r[2, 0]) / s
+    elif r[1, 1] > r[2, 2]:
+        s = math.sqrt(1.0 + r[1, 1] - r[0, 0] - r[2, 2]) * 2
+        w = (r[0, 2] - r[2, 0]) / s
+        qx = (r[0, 1] + r[1, 0]) / s
+        qy = 0.25 * s
+        qz = (r[1, 2] + r[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + r[2, 2] - r[0, 0] - r[1, 1]) * 2
+        w = (r[1, 0] - r[0, 1]) / s
+        qx = (r[0, 2] + r[2, 0]) / s
+        qy = (r[1, 2] + r[2, 1]) / s
+        qz = 0.25 * s
+    return np.array([w, qx, qy, qz])
+
+
 def loadWheelDimensions():
     # Best-effort, same reasoning as webots_rbx_bridge.py's identical
     # helper: a missing/malformed dimensions.yaml degrades to the module-
@@ -397,11 +448,24 @@ class MujocoRbxBridge:
     # this every step, so no respawn/reset is needed for it to take effect
     # (simpler than webots_rbx_bridge.py's Supervisor field write, since
     # MuJoCo already exposes this as a mutable per-model array).
+    #
+    # offset_yaw/offset_tilt/scene_offset_yaw/scene_offset_tilt ADDED
+    # (2026-09-22) -- ABSOLUTE angles (degrees), not deltas, same convention
+    # rbx_sim_node.py/sim_bridge_node.py already use for Gazebo. Written
+    # into model.cam_quat via yawTiltToQuat (module level, below), which
+    # reproduces both cameras' own factory xyaxes exactly at yaw=0: (0,-1,0)/
+    # (0,0,1) for robot_camera (tilt=0) and (0,-1,0)/(0.5514,0,0.8342) for
+    # scene_camera (tilt=FACTORY_SCENE_TILT_DEG) -- see that function's own
+    # comment for the derivation.
     try:
       self.model.cam_pos[self.robot_cam_id] = self.factory_robot_cam_pos + np.array([
           float(msg.get('offset_x', 0.0)), float(msg.get('offset_y', 0.0)), float(msg.get('offset_z', 0.0))])
+      self.model.cam_quat[self.robot_cam_id] = yawTiltToQuat(
+          float(msg.get('offset_yaw', 0.0)), float(msg.get('offset_tilt', 0.0)))
       self.model.cam_pos[self.scene_cam_id] = self.factory_scene_cam_pos + np.array([
           float(msg.get('scene_offset_x', 0.0)), float(msg.get('scene_offset_y', 0.0)), float(msg.get('scene_offset_z', 0.0))])
+      self.model.cam_quat[self.scene_cam_id] = yawTiltToQuat(
+          float(msg.get('scene_offset_yaw', 0.0)), float(msg.get('scene_offset_tilt', 0.0)))
       if 'fov_deg' in msg:
         fov_deg = float(msg['fov_deg'])
         self.model.cam_fovy[self.robot_cam_id] = fov_deg
