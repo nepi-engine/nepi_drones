@@ -74,10 +74,25 @@ FILE_TYPE = 'NODE'
 
 class MujocoNode:
 
-  # rbx_rover.xml has exactly one fixed Camera device with no repositionable
-  # rig -- reported under a single honest topic name, same reasoning as
-  # rbx_webots_node.py's own CAMERA_NAME comment.
-  CAMERA_NAME = "robot_camera"
+  # UPDATED (2026-09-21): rbx_rover.xml now has a real second (scene/chase)
+  # camera plus depth rendering on both cameras, matching
+  # rbx_webots_node.py's identical same-day fix (requested live: "get mujoco
+  # to that same point too, with all the same features i asked for with
+  # webots"). Four always-live topics now, matching rbx_sim_node.py's/
+  # rbx_webots_node.py's exact convention.
+  ROBOT_COLOR_TOPIC_SUFFIX = "robot_color"
+  SCENE_COLOR_TOPIC_SUFFIX = "scene_color"
+  ROBOT_DEPTH_TOPIC_SUFFIX = "robot_depth"
+  SCENE_DEPTH_TOPIC_SUFFIX = "scene_depth"
+
+  # Which publisher each bridge "camera" tag routes to -- see
+  # rbx_sim_node.py's/rbx_webots_node.py's identical CAMERA_PUB_ATTR.
+  CAMERA_PUB_ATTR = {
+    "robot_color": "image_pub_robot_color",
+    "scene_color": "image_pub_scene_color",
+    "robot_depth": "image_pub_robot_depth",
+    "scene_depth": "image_pub_scene_depth",
+  }
 
   ROBOT_MAIN_REFERENCE_FRAME = "base_link"
 
@@ -88,11 +103,14 @@ class MujocoNode:
   ENVIRONMENT_OPTIONS = ["FLAT_GROUND", "OBSTACLE_COURSE"]
   OBSTACLE_COURSE_OPTION = "OBSTACLE_COURSE"
 
-  # Ported from rbx_webots_node.py -- camera_offset_x/y/z declared here as an
-  # honest "not wired up yet" placeholder (rbx_rover.xml's one camera is
-  # rigidly mounted, no repositionable rig), matching that driver's identical
-  # gap.
-  CAMERA_SETTING_NAMES = ("camera_offset_x", "camera_offset_y", "camera_offset_z")
+  # Real, live-applied offsets now (2026-09-21) -- mujoco_rbx_bridge.py's
+  # applyCameraSettings writes model.cam_pos/model.cam_fovy directly, no
+  # respawn needed (same idea as webots_rbx_bridge.py's Supervisor field
+  # writes, simpler here since MuJoCo already exposes these as mutable
+  # per-step model arrays). yaw/tilt not wired yet, same as Webots.
+  CAMERA_SETTING_NAMES = ("camera_offset_x", "camera_offset_y", "camera_offset_z",
+                          "scene_offset_x", "scene_offset_y", "scene_offset_z",
+                          "camera_fov_deg")
   ENVIRONMENT_SETTING_NAMES = ("environment",)
 
   # Sim Connector's own per-robot-config "customize the capabilities that are
@@ -108,6 +126,10 @@ class MujocoNode:
     camera_offset_x = {"type":"Float","name":"camera_offset_x","options":["-10.0","10.0"]},
     camera_offset_y = {"type":"Float","name":"camera_offset_y","options":["-10.0","10.0"]},
     camera_offset_z = {"type":"Float","name":"camera_offset_z","options":["-10.0","10.0"]},
+    scene_offset_x = {"type":"Float","name":"scene_offset_x","options":["-10.0","10.0"]},
+    scene_offset_y = {"type":"Float","name":"scene_offset_y","options":["-10.0","10.0"]},
+    scene_offset_z = {"type":"Float","name":"scene_offset_z","options":["-10.0","10.0"]},
+    camera_fov_deg = {"type":"Float","name":"camera_fov_deg","options":["10.0","150.0"]},
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]},
     # No fixed options -- the candidate topic set is per-deployment.
@@ -123,11 +145,17 @@ class MujocoNode:
     max_linear_speed_mps = {"type":"Float","name":"max_linear_speed_mps","value":"0.5"},
     max_angular_rate_dps = {"type":"Float","name":"max_angular_rate_dps","value":"45.0"},
     environment = {"type":"Discrete","name":"environment","value":ENVIRONMENT_OPTIONS[0]},
-    # Placeholder factory values -- rbx_rover.xml's one camera has no
-    # repositionable mount yet, same gap as rbx_webots_node.py's own.
+    # Real, wired offsets now -- zero means "at rbx_rover.xml's own factory
+    # mount point", same convention as rbx_webots_node.py's identical fix.
     camera_offset_x = {"type":"Float","name":"camera_offset_x","value":"0.0"},
     camera_offset_y = {"type":"Float","name":"camera_offset_y","value":"0.0"},
     camera_offset_z = {"type":"Float","name":"camera_offset_z","value":"0.0"},
+    scene_offset_x = {"type":"Float","name":"scene_offset_x","value":"0.0"},
+    scene_offset_y = {"type":"Float","name":"scene_offset_y","value":"0.0"},
+    scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"0.0"},
+    # 60.0 matches rbx_rover.xml's own robot_camera fovy="60" -- the true
+    # factory value, not a guess.
+    camera_fov_deg = {"type":"Float","name":"camera_fov_deg","value":"60.0"},
     # Both default to enabled: a robot config that never touches these
     # settings behaves exactly as this driver did before this feature existed.
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","value":"TRUE"},
@@ -218,13 +246,24 @@ class MujocoNode:
     self.navpose_dict = copy.deepcopy(nepi_nav.BLANK_NAVPOSE_DICT)
 
     ##############################
-    # Image relay. One real camera, one topic -- see the class-level
-    # CAMERA_NAME comment for why this isn't reported under two names.
+    # Image relay. Four always-live topics (robot/scene x color/depth-view),
+    # matching rbx_sim_node.py's/rbx_webots_node.py's exact shape -- see this
+    # file's own 2026-09-21 module-docstring update.
     self.image_topic_name = self.device_name + "/color_2d_image"
-    self.image_pub = nepi_sdk.create_publisher(self.image_topic_name, Image, queue_size = 1)
+    self.robot_color_topic_name = self.image_topic_name + "/" + self.ROBOT_COLOR_TOPIC_SUFFIX
+    self.scene_color_topic_name = self.image_topic_name + "/" + self.SCENE_COLOR_TOPIC_SUFFIX
+    self.robot_depth_topic_name = self.image_topic_name + "/" + self.ROBOT_DEPTH_TOPIC_SUFFIX
+    self.scene_depth_topic_name = self.image_topic_name + "/" + self.SCENE_DEPTH_TOPIC_SUFFIX
+    self.image_pub_robot_color = nepi_sdk.create_publisher(self.robot_color_topic_name, Image, queue_size = 1)
+    self.image_pub_scene_color = nepi_sdk.create_publisher(self.scene_color_topic_name, Image, queue_size = 1)
+    self.image_pub_robot_depth = nepi_sdk.create_publisher(self.robot_depth_topic_name, Image, queue_size = 1)
+    self.image_pub_scene_depth = nepi_sdk.create_publisher(self.scene_depth_topic_name, Image, queue_size = 1)
 
     self.sensor_topics = [
-      (self.image_topic_name + "/" + self.CAMERA_NAME, 'sensor_msgs/Image'),
+      (self.robot_color_topic_name, 'sensor_msgs/Image'),
+      (self.scene_color_topic_name, 'sensor_msgs/Image'),
+      (self.robot_depth_topic_name, 'sensor_msgs/Image'),
+      (self.scene_depth_topic_name, 'sensor_msgs/Image'),
     ]
 
     ##############################
@@ -315,7 +354,7 @@ class MujocoNode:
     time.sleep(1)
 
     self.rbx_if.setCmdTimeoutCb(UInt32(data = self.GOTO_CMD_TIMEOUT_SEC))
-    self.rbx_if.setImageTopicCb(String(data = self.image_topic_name))
+    self.rbx_if.setImageTopicCb(String(data = self.robot_color_topic_name))
 
     controller_interval = float(1) / self.CONTROLLER_RATE_HZ
     nepi_sdk.start_timer_process(controller_interval, self.gotoControlCb)
@@ -662,14 +701,19 @@ class MujocoNode:
       self.processTelemetryLine(msg)
 
   def processImageLine(self, msg):
+    # "camera" tag picks which of the four publishers this frame goes to --
+    # see rbx_sim_node.py's/rbx_webots_node.py's identical processImageLine.
     try:
+      camera = msg.get('camera', self.ROBOT_COLOR_TOPIC_SUFFIX)
+      pub_attr = self.CAMERA_PUB_ATTR.get(camera, "image_pub_robot_color")
+      image_pub = getattr(self, pub_attr)
       jpeg_bytes = base64.b64decode(msg['data'])
       arr = np.frombuffer(jpeg_bytes, dtype = np.uint8)
       cv2_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
       if cv2_img is None:
         raise ValueError("cv2.imdecode returned None")
       ros_img = nepi_img.cv2img_to_rosimg(cv2_img, encoding = "bgr8")
-      self.image_pub.publish(ros_img)
+      image_pub.publish(ros_img)
     except Exception as e:
       self.msg_if.pub_warn("Failed to process camera image frame: " + str(e), throttle_s = 5.0)
 
@@ -707,16 +751,19 @@ class MujocoNode:
     self.sendLineToBridge(cmd, "Velocity command")
 
   def sendCameraSettings(self):
-    # No view_mode -- see CAMERA_NAME's own comment, there is nothing to
-    # switch between. offset_x/y/z included for parity with rbx_sim_node.py's
-    # wire shape -- mujoco_rbx_bridge.py currently logs-and-ignores them
-    # (rbx_rover.xml's single fixed camera has no repositionable rig),
-    # matching this driver's existing honest treatment of environment.
+    # No view_mode -- this model's two cameras are always both live. Real,
+    # applied settings (2026-09-21) -- mujoco_rbx_bridge.py's
+    # applyCameraSettings writes model.cam_pos/model.cam_fovy directly, no
+    # respawn needed.
     cmd = {
       'type': 'camera_settings',
       'offset_x': float(self.settings_dict['camera_offset_x']['value']),
       'offset_y': float(self.settings_dict['camera_offset_y']['value']),
       'offset_z': float(self.settings_dict['camera_offset_z']['value']),
+      'scene_offset_x': float(self.settings_dict['scene_offset_x']['value']),
+      'scene_offset_y': float(self.settings_dict['scene_offset_y']['value']),
+      'scene_offset_z': float(self.settings_dict['scene_offset_z']['value']),
+      'fov_deg': float(self.settings_dict['camera_fov_deg']['value']),
     }
     self.sendLineToBridge(cmd, "Camera settings")
 

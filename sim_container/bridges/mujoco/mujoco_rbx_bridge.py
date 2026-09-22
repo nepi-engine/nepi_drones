@@ -53,10 +53,24 @@
 # webots_rbx_bridge.py's applyCommandedVelocity, just written to 4 actuators
 # instead of 2 motor devices.
 #
-# RESET is genuine here, unlike Webots' honest no-op (that Robot node isn't a
-# Supervisor and can't teleport itself) -- this process owns MuJoCo's physics
-# state directly, so a reset request calls mujoco.mj_resetData and the model
-# is immediately back at its initial pose.
+# RESET is genuine here (unlike Webots' rbx_rover.wbt before its own
+# 2026-09-21 Supervisor fix) -- this process owns MuJoCo's physics state
+# directly, so a reset request calls mujoco.mj_resetData and the model is
+# immediately back at its initial pose.
+#
+# UPDATED (2026-09-21): rbx_rover.xml now has a real second (scene/chase)
+# camera plus depth rendering on both cameras (requested live: "get mujoco
+# to that same point too, with all the same features i asked for with
+# webots" -- see webots_rbx_bridge.py's own identical same-day fix for the
+# full reasoning). Captured/relayed as four separately-tagged image lines
+# ("robot_color"/"robot_depth"/"scene_color"/"scene_depth"), matching
+# sim_bridge_node.py's wire protocol so rbx_mujoco_node.py could reuse
+# rbx_sim_node.py's CAMERA_PUB_ATTR routing unchanged. MuJoCo's Renderer has
+# no combined RGBD mode -- depth frames are colorized (normalize + a JET
+# colormap) for viewing, same as webots_rbx_bridge.py produces. Camera
+# offsets (camera_offset_x/y/z, scene_offset_x/y/z) and camera_fov_deg are
+# real, live-applied writes to model.cam_pos/model.cam_fovy now too -- no
+# respawn needed, simpler even than Webots' Supervisor field writes.
 
 import os
 import base64
@@ -111,6 +125,19 @@ class MujocoRbxBridge:
     mujoco.mj_forward(self.model, self.data)
     self.renderer = mujoco.Renderer(self.model, height = IMAGE_HEIGHT, width = IMAGE_WIDTH)
     self.camera_name = "robot_camera"
+    self.scene_camera_name = "scene_camera"
+
+    # Camera ids + factory mount points for live camera_offset_x/y/z and
+    # scene_offset_x/y/z (2026-09-21, requested live: "make sure the camera
+    # offset stuff works... just like they do in gazebo" -- see
+    # webots_rbx_bridge.py's own identical fix). model.cam_pos/model.cam_fovy
+    # are plain mutable per-model arrays MuJoCo re-reads every step via
+    # mj_kinematics -- no respawn needed, simpler even than Webots'
+    # Supervisor field writes. yaw/tilt not wired yet, same as Webots.
+    self.robot_cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, self.camera_name)
+    self.scene_cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, self.scene_camera_name)
+    self.factory_robot_cam_pos = self.model.cam_pos[self.robot_cam_id].copy()
+    self.factory_scene_cam_pos = self.model.cam_pos[self.scene_cam_id].copy()
 
     # Visible window, same reason Gazebo/Webots pop open their own GUI --
     # needs a real DISPLAY/XAUTHORITY (see module docstring). Failure here
@@ -140,8 +167,10 @@ class MujocoRbxBridge:
     self.cmd_linear_x = 0.0
     self.cmd_angular_z = 0.0
 
+    # Four named frames (robot_color/robot_depth/scene_color/scene_depth) --
+    # see the module docstring's 2026-09-21 update.
     self.frame_lock = threading.Lock()
-    self.latest_frame = None
+    self.latest_frames = {}
 
     self.sock = None
     self.sock_lock = threading.Lock()
@@ -202,15 +231,60 @@ class MujocoRbxBridge:
 
   def captureFrame(self):
     try:
-      self.renderer.update_scene(self.data, camera = self.camera_name)
-      rgb = self.renderer.render()
-      bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-      ok, encoded = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-      if ok:
-        with self.frame_lock:
-          self.latest_frame = encoded.tobytes()
+      robot_color = self._captureColorFrame(self.camera_name)
+      robot_depth = self._captureDepthFrame(self.camera_name)
+      scene_color = self._captureColorFrame(self.scene_camera_name)
+      scene_depth = self._captureDepthFrame(self.scene_camera_name)
     except Exception as e:
       print("mujoco_rbx_bridge: bad camera frame: %s" % str(e), flush = True)
+      return
+    with self.frame_lock:
+      if robot_color is not None:
+        self.latest_frames["robot_color"] = robot_color
+      if scene_color is not None:
+        self.latest_frames["scene_color"] = scene_color
+      if robot_depth is not None:
+        self.latest_frames["robot_depth"] = robot_depth
+      if scene_depth is not None:
+        self.latest_frames["scene_depth"] = scene_depth
+
+  def _captureColorFrame(self, camera_name):
+    self.renderer.disable_depth_rendering()
+    self.renderer.update_scene(self.data, camera = camera_name)
+    rgb = self.renderer.render()
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    ok, encoded = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    return encoded.tobytes() if ok else None
+
+  def _captureDepthFrame(self, camera_name):
+    # MuJoCo's Renderer returns a plain height x width float32 array of
+    # meters once depth rendering is enabled, same scene/camera as the last
+    # update_scene call -- re-called here anyway since _captureColorFrame's
+    # own disable_depth_rendering() call for the OTHER camera runs in
+    # between and Renderer only ever holds one mode/camera at a time.
+    # Colorized (normalize against this model's own camera clipping range,
+    # then a JET colormap) purely for viewing, matching
+    # webots_rbx_bridge.py's identical depth-colorization approach -- no raw
+    # depth data product exists in this project (see rbx_sim_node.py's own
+    # CAMERA_SETTING_NAMES comment: removed 2026-09-14, no consumer ever
+    # used it).
+    self.renderer.update_scene(self.data, camera = camera_name)
+    self.renderer.enable_depth_rendering()
+    depth = self.renderer.render()
+    self.renderer.disable_depth_rendering()
+    # MuJoCo's model.vis.map.znear/zfar are relative multipliers of the
+    # model's own extent, not absolute meters, so a fixed sane depth-view
+    # range is used instead -- matching webots_rbx_bridge.py's own
+    # RangeFinder minRange/maxRange convention (0.05/100), scaled down to
+    # this smaller model's actual scene size.
+    min_range, max_range = 0.05, 20.0
+    finite = np.isfinite(depth)
+    clipped = np.where(finite, np.clip(depth, min_range, max_range), max_range)
+    span = max(max_range - min_range, 1e-6)
+    normalized = ((clipped - min_range) / span * 255.0).astype(np.uint8)
+    colorized = cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
+    ok, encoded = cv2.imencode(".jpg", colorized, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    return encoded.tobytes() if ok else None
 
   def normalizeAngle(self, angle_rad):
     while angle_rad > math.pi:
@@ -248,6 +322,24 @@ class MujocoRbxBridge:
     mujoco.mj_forward(self.model, self.data)
     self._last_x, self._last_y, self._last_yaw, self._last_t = 0.0, 0.0, 0.0, None
     print("mujoco_rbx_bridge: reset to initial pose", flush = True)
+
+  def applyCameraSettings(self, msg):
+    # Position offsets are a plain delta from each camera's factory mount
+    # point, written directly into model.cam_pos -- mj_kinematics re-reads
+    # this every step, so no respawn/reset is needed for it to take effect
+    # (simpler than webots_rbx_bridge.py's Supervisor field write, since
+    # MuJoCo already exposes this as a mutable per-model array).
+    try:
+      self.model.cam_pos[self.robot_cam_id] = self.factory_robot_cam_pos + np.array([
+          float(msg.get('offset_x', 0.0)), float(msg.get('offset_y', 0.0)), float(msg.get('offset_z', 0.0))])
+      self.model.cam_pos[self.scene_cam_id] = self.factory_scene_cam_pos + np.array([
+          float(msg.get('scene_offset_x', 0.0)), float(msg.get('scene_offset_y', 0.0)), float(msg.get('scene_offset_z', 0.0))])
+      if 'fov_deg' in msg:
+        fov_deg = float(msg['fov_deg'])
+        self.model.cam_fovy[self.robot_cam_id] = fov_deg
+        self.model.cam_fovy[self.scene_cam_id] = fov_deg
+    except Exception as e:
+      print("mujoco_rbx_bridge: failed to apply camera settings: %s" % str(e), flush = True)
 
   #**********************
   # Heartbeat pinger -- matches sim_heartbeat_listener.py exactly (dials the
@@ -320,10 +412,13 @@ class MujocoRbxBridge:
 
       if now - last_image >= 1.0 / IMAGE_RATE_HZ:
         with self.frame_lock:
-          frame = self.latest_frame
-        if frame is not None:
+          frames = dict(self.latest_frames)
+        # One line per camera, each tagged -- matches sim_bridge_node.py's/
+        # webots_rbx_bridge.py's wire protocol exactly.
+        for camera_name, frame in frames.items():
           self.sendLine(conn, {
               "type": "image",
+              "camera": camera_name,
               "data": base64.b64encode(frame).decode("ascii"),
           })
         last_image = now
@@ -366,7 +461,7 @@ class MujocoRbxBridge:
       return
     msg_type = msg.get("type")
     if msg_type == "camera_settings":
-      pass  # Single fixed camera on this model -- nothing to switch between.
+      self.applyCameraSettings(msg)
     elif msg_type == "reset":
       self.resetSim()
     elif msg_type == "environment_option":

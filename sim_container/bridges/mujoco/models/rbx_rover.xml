@@ -41,6 +41,23 @@
            (MuJoCo's camera forward convention) aligned to world +X via
            xyaxes: local X=(0,-1,0), local Y=(0,0,1) -> local Z = X x Y = (-1,0,0). -->
       <camera name="robot_camera" pos="0.2 0 0.05" xyaxes="0 -1 0 0 0 1" fovy="60"/>
+      <!-- Scene/chase view -- rigidly mounted on the chassis, same reasoning
+           as robot_camera above (a camera attached to a body moves with it
+           for free, no follow-controller needed). Position/pitch reproduce
+           generic_rover/model.sdf's own camera_link_chase pose exactly
+           (-2.5, 0, 1.65, pitched down atan2(1.65, 2.5) = 0.5834 rad so the
+           rover stays framed from directly behind and above), same offset
+           rbx_rover.wbt's own "camera_chase" Camera uses. xaxis stays
+           (0,-1,0) (pitch doesn't change the camera's left-right axis);
+           yaxis = (sin(0.5834), 0, cos(0.5834)) = (0.5514, 0, 0.8342) tilts
+           local Z (-> viewing direction, since MuJoCo cameras look along
+           local -Z) down by that same angle. Reported live: "webots doesnt
+           seem to have any scene camera or depth cameras" -- MuJoCo gets
+           the identical fix the same day (requested: "get mujoco to that
+           same point too, with all the same features i asked for with
+           webots").
+      -->
+      <camera name="scene_camera" pos="-2.5 0 1.65" xyaxes="0 -1 0 0.5514 0 0.8342" fovy="60"/>
 
       <body name="wheel1" pos="0.15 0.17 0">
         <joint name="wheel1" type="hinge" axis="0 1 0" damping="0.05"/>
