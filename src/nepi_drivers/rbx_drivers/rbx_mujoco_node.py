@@ -96,10 +96,11 @@ class MujocoNode:
 
   ROBOT_MAIN_REFERENCE_FRAME = "base_link"
 
-  # rbx_rover.xml has no obstacle-course model yet -- environment options are
-  # an honest no-op on the bridge side (matching mujoco_rbx_bridge.py's own
-  # documented gap, same as Webots'), but still declared here so the
-  # capability/UI surface is consistent with the Gazebo/Webots drivers.
+  # OBSTACLE_COURSE really toggles now (2026-09-21) --
+  # mujoco_rbx_bridge.py's setObstacleCourseEnabled flips the always-
+  # compiled-in obstacle-course geoms' rgba alpha + contype/conaffinity
+  # live (generate_environment_xml.py), matching Webots' equivalent
+  # spawn/despawn feature.
   ENVIRONMENT_OPTIONS = ["FLAT_GROUND", "OBSTACLE_COURSE"]
   OBSTACLE_COURSE_OPTION = "OBSTACLE_COURSE"
 
@@ -547,9 +548,9 @@ class MujocoNode:
     return True
 
   def setEnvironmentAction(self, environment_value):
-    # Fire-and-forget, same as rbx_webots_node.py's -- rbx_rover.xml has no
-    # obstacle-course model yet, so the bridge logs this and does not spawn/
-    # delete anything (see the ENVIRONMENT_OPTIONS class comment).
+    # Fire-and-forget, same as rbx_webots_node.py's -- the bridge now really
+    # toggles the obstacle course on this message (see the
+    # ENVIRONMENT_OPTIONS class comment).
     with self.sock_lock:
       connected = self.sock is not None
     if not connected:

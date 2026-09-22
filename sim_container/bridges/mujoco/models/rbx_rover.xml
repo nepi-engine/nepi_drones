@@ -1,19 +1,19 @@
 <!--
-  MuJoCo RBX rover model for mujoco_rbx_bridge.py / rbx_mujoco_node.py.
-
-  Physical spec matches sim_container/models/generic_rover/dimensions.yaml
-  (the Gazebo rover's own dimensions), for cross-simulator consistency:
-  wheel_radius_m=0.1, wheel_width_m=0.05, track_width_m=0.34, wheelbase_m=0.3,
-  chassis 0.4x0.3x0.1 (length x width x height).
+  GENERATED FILE -- do not hand-edit. Produced by
+  sim_container/bridges/mujoco/generate_rover_xml.py from
+  sim_container/models/generic_rover/dimensions.yaml (robot) and
+  sim_container/models/obstacle_course/dimensions.yaml (environment,
+  compiled in but disabled by default) at mujoco_rbx_bridge.py's own
+  startup. Hand edits are overwritten on the next launch -- edit
+  dimensions.yaml (or the RUI's dimensions editor) instead, or
+  generate_rover_xml.py/generate_environment_xml.py's own physical-
+  relationship comments if the RELATIONSHIP itself needs to change.
 
   4 independently-actuated wheels (wheel1=front_left, wheel2=front_right,
-  wheel3=rear_left, wheel4=rear_right -- same ordering convention
-  rbx_sim_node.py/rbx_webots_node.py use), unlike Webots' rbx_rover.wbt (only
-  2 independently-drivable sides, a real constraint of Gazebo's diff-drive
-  plugin/Webots' shared-side motors) -- MuJoCo has no such constraint, so
-  rbx_mujoco_node.py exposes 4 motor sliders (matching rbx_sim_node.py's
-  pattern), reduced to a left/right average by motorControlToVelocity, same
-  formula as the Gazebo driver.
+  wheel3=rear_left, wheel4=rear_right), unlike Webots' rbx_rover.wbt (only
+  2 independently-drivable sides) -- MuJoCo has no such constraint, so
+  rbx_mujoco_node.py exposes 4 motor sliders, reduced to a left/right
+  average by motorControlToVelocity, same formula as the Gazebo driver.
 -->
 <mujoco model="rbx_rover">
   <compiler angle="degree" coordinate="local" inertiafromgeom="true"/>
@@ -33,50 +33,46 @@
     <light directional="true" diffuse="0.8 0.8 0.8" pos="0 0 5" dir="0 0 -1"/>
     <geom name="ground" type="plane" size="20 20 0.1" material="grid" friction="1.0 0.005 0.0001"/>
 
-    <!-- Chassis origin height = wheel_radius_m (0.1) so wheel bottoms touch z=0. -->
-    <body name="chassis" pos="0 0 0.1">
+    <geom name="oc_left_wall" type="box" pos="13.000000 3.000000 0.500000"  size="11.000000 0.100000 0.500000" rgba="0.917647 0.482353 0.031373 0" contype="0" conaffinity="0"/>
+    <geom name="oc_right_wall" type="box" pos="13.000000 -3.000000 0.500000"  size="11.000000 0.100000 0.500000" rgba="0.917647 0.482353 0.031373 0" contype="0" conaffinity="0"/>
+    <geom name="oc_baffle_a" type="box" pos="8.000000 1.700000 0.500000"  size="0.100000 1.300000 0.500000" rgba="0.917647 0.482353 0.031373 0" contype="0" conaffinity="0"/>
+    <geom name="oc_baffle_b" type="box" pos="14.000000 -1.700000 0.500000"  size="0.100000 1.300000 0.500000" rgba="0.917647 0.482353 0.031373 0" contype="0" conaffinity="0"/>
+    <geom name="oc_ramp_up" type="box" pos="18.995522 0.000000 0.175000" euler="0 -9.970000 0" size="1.010786 3.000000 0.060000" rgba="0.882353 0.803922 0.070588 0" contype="0" conaffinity="0"/>
+    <geom name="oc_ramp_plateau" type="box" pos="20.491044 0.000000 0.350000"  size="0.500000 3.000000 0.060000" rgba="0.882353 0.803922 0.070588 0" contype="0" conaffinity="0"/>
+    <geom name="oc_ramp_down" type="box" pos="21.986566 0.000000 0.175000" euler="0 9.970000 0" size="1.010786 3.000000 0.060000" rgba="0.882353 0.803922 0.070588 0" contype="0" conaffinity="0"/>
+
+    <!-- Chassis origin height = wheel_radius_m so wheel bottoms touch z=0. -->
+    <body name="chassis" pos="0 0 0.100000">
       <freejoint name="chassis_free"/>
-      <geom name="chassis_geom" type="box" size="0.2 0.15 0.05" mass="4.0" rgba="0.2 0.5 0.8 1"/>
-      <!-- Forward-facing camera at the front edge of the chassis. Local -Z
+      <geom name="chassis_geom" type="box" size="0.200000 0.150000 0.050000" mass="5.000000" rgba="0.2 0.5 0.8 1"/>
+      <!-- Forward-facing camera at the chassis' own front-top edge. Local -Z
            (MuJoCo's camera forward convention) aligned to world +X via
            xyaxes: local X=(0,-1,0), local Y=(0,0,1) -> local Z = X x Y = (-1,0,0). -->
-      <camera name="robot_camera" pos="0.2 0 0.05" xyaxes="0 -1 0 0 0 1" fovy="60"/>
-      <!-- Scene/chase view -- rigidly mounted on the chassis, same reasoning
-           as robot_camera above (a camera attached to a body moves with it
-           for free, no follow-controller needed). Position/pitch reproduce
-           generic_rover/model.sdf's own camera_link_chase pose exactly
-           (-2.5, 0, 1.65, pitched down atan2(1.65, 2.5) = 0.5834 rad so the
-           rover stays framed from directly behind and above), same offset
-           rbx_rover.wbt's own "camera_chase" Camera uses. xaxis stays
-           (0,-1,0) (pitch doesn't change the camera's left-right axis);
-           yaxis = (sin(0.5834), 0, cos(0.5834)) = (0.5514, 0, 0.8342) tilts
-           local Z (-> viewing direction, since MuJoCo cameras look along
-           local -Z) down by that same angle. Reported live: "webots doesnt
-           seem to have any scene camera or depth cameras" -- MuJoCo gets
-           the identical fix the same day (requested: "get mujoco to that
-           same point too, with all the same features i asked for with
-           webots").
-      -->
-      <camera name="scene_camera" pos="-2.5 0 1.65" xyaxes="0 -1 0 0.5514 0 0.8342" fovy="60"/>
+      <camera name="robot_camera" pos="0.200000 0 0.050000" xyaxes="0 -1 0 0 0 1" fovy="100.000000"/>
+      <!-- Scene/chase view -- fixed offset regardless of chassis size (same
+           reasoning generate_rover_wbt.py's own SCENE_CAM_POS documents).
+           yaxis = (sin(0.5834), 0, cos(0.5834)) tilts local Z (viewing
+           direction) down so the rover stays framed from behind/above. -->
+      <camera name="scene_camera" pos="-2.500000 0.000000 1.650000" xyaxes="0 -1 0 0.5514 0 0.8342" fovy="100.000000"/>
 
-      <body name="wheel1" pos="0.15 0.17 0">
+      <body name="wheel1" pos="0.150000 0.170000 0">
         <joint name="wheel1" type="hinge" axis="0 1 0" damping="0.05"/>
-        <geom name="wheel1_geom" type="cylinder" size="0.1 0.025" euler="90 0 0"
+        <geom name="wheel1_geom" type="cylinder" size="0.100000 0.025000" euler="90 0 0"
               mass="0.5" rgba="0.1 0.1 0.1 1" friction="1.2 0.005 0.0001"/>
       </body>
-      <body name="wheel2" pos="0.15 -0.17 0">
+      <body name="wheel2" pos="0.150000 -0.170000 0">
         <joint name="wheel2" type="hinge" axis="0 1 0" damping="0.05"/>
-        <geom name="wheel2_geom" type="cylinder" size="0.1 0.025" euler="90 0 0"
+        <geom name="wheel2_geom" type="cylinder" size="0.100000 0.025000" euler="90 0 0"
               mass="0.5" rgba="0.1 0.1 0.1 1" friction="1.2 0.005 0.0001"/>
       </body>
-      <body name="wheel3" pos="-0.15 0.17 0">
+      <body name="wheel3" pos="-0.150000 0.170000 0">
         <joint name="wheel3" type="hinge" axis="0 1 0" damping="0.05"/>
-        <geom name="wheel3_geom" type="cylinder" size="0.1 0.025" euler="90 0 0"
+        <geom name="wheel3_geom" type="cylinder" size="0.100000 0.025000" euler="90 0 0"
               mass="0.5" rgba="0.1 0.1 0.1 1" friction="1.2 0.005 0.0001"/>
       </body>
-      <body name="wheel4" pos="-0.15 -0.17 0">
+      <body name="wheel4" pos="-0.150000 -0.170000 0">
         <joint name="wheel4" type="hinge" axis="0 1 0" damping="0.05"/>
-        <geom name="wheel4_geom" type="cylinder" size="0.1 0.025" euler="90 0 0"
+        <geom name="wheel4_geom" type="cylinder" size="0.100000 0.025000" euler="90 0 0"
               mass="0.5" rgba="0.1 0.1 0.1 1" friction="1.2 0.005 0.0001"/>
       </body>
     </body>

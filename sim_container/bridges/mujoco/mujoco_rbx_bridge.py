@@ -22,6 +22,17 @@
 # relayed camera frames out, plus {"type":"camera_settings"/"reset"/
 # "environment_option"} handled below.
 #
+# UPDATED (2026-09-21, "get mujoco to that same point too, with all the
+# same features i asked for with webots"): rbx_rover.xml is now a
+# GENERATED file (generate_rover_xml.py, run once here at startup from
+# sim_container/models/generic_rover/dimensions.yaml), and
+# environment_option really toggles an OBSTACLE_COURSE now -- see
+# setObstacleCourseEnabled. Unlike Webots' Supervisor import/remove, the
+# obstacle-course geoms are compiled into rbx_rover.xml from the start
+# (generate_environment_xml.py) and toggled live via each geom's rgba
+# alpha + contype/conaffinity, since a compiled MjModel can't have bodies
+# added/removed at runtime -- see that generator's own module docstring.
+#
 # Unlike Gazebo/Webots, there is no separate simulator binary here -- MuJoCo
 # is a plain Python physics library, so this SAME process owns the physics
 # loop AND serves the bridge/heartbeat sockets. It DOES need a real DISPLAY/
@@ -86,6 +97,9 @@ import cv2
 import mujoco
 import mujoco.viewer
 
+import generate_rover_xml
+from generate_environment_xml import OBSTACLE_COURSE_GEOM_NAMES
+
 DEFAULT_HEARTBEAT_PORT = 9051
 DEFAULT_BRIDGE_PORT = 9056
 ALIVE_REPLY = b"ALIVE\n"
@@ -97,12 +111,27 @@ HEARTBEAT_PING_INTERVAL_SEC = 2.0
 
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "rbx_rover.xml")
 
-# Matches rbx_rover.xml's physical spec (also rbx_mujoco_node.py's
-# MOTOR_WHEEL_BASE_M/MOTOR_MAX_LINEAR_MPS -- this conversion has to agree
-# with the driver's own).
+# Fallback only, if generic_rover/dimensions.yaml can't be read at startup
+# (see loadWheelDimensions below) -- matches rbx_rover.xml's own factory
+# defaults (also rbx_mujoco_node.py's MOTOR_WHEEL_BASE_M/
+# MOTOR_MAX_LINEAR_MPS, which this conversion has to agree with).
 WHEEL_RADIUS_M = 0.1
 WHEEL_TRACK_M = 0.34
 MAX_WHEEL_RADPS = 15.0
+
+
+def loadWheelDimensions():
+    # Best-effort, same reasoning as webots_rbx_bridge.py's identical
+    # helper: a missing/malformed dimensions.yaml degrades to the module-
+    # level defaults above rather than crashing the whole bridge.
+    try:
+        dims = generate_rover_xml.loadDimensions("generic_rover", generate_rover_xml.DEFAULT_DIMENSIONS)
+        return float(dims["wheel_radius_m"]), float(dims["track_width_m"])
+    except Exception as e:
+        print("mujoco_rbx_bridge: could not read dimensions.yaml (%s) -- using defaults "
+              "wheel_radius_m=%.3f track_width_m=%.3f" %
+              (str(e), WHEEL_RADIUS_M, WHEEL_TRACK_M), flush = True)
+        return WHEEL_RADIUS_M, WHEEL_TRACK_M
 
 RECONNECT_ACCEPT_TIMEOUT_SEC = 5.0
 RECONNECT_INTERVAL_SEC = 3.0
@@ -120,12 +149,33 @@ class MujocoRbxBridge:
     self.heartbeat_port = heartbeat_port
     self.bridge_port = bridge_port
 
+    # Regenerate rbx_rover.xml from the current dimensions.yaml files before
+    # every launch -- "next launch, not live" contract, identical to
+    # generate_rover_wbt.py's own for Webots (see generate_rover_xml.py's
+    # module docstring for why MuJoCo can't do this live). Calling
+    # generate_rover_xml.main() directly would misread sys.argv -- that's
+    # THIS process's own heartbeat/bridge port argv, not a model name -- so
+    # this replicates main()'s body instead of calling it.
+    generate_rover_xml.regenerate("generic_rover")
+    self.wheel_radius_m, self.wheel_track_m = loadWheelDimensions()
+
     self.model = mujoco.MjModel.from_xml_path(MODEL_PATH)
     self.data = mujoco.MjData(self.model)
     mujoco.mj_forward(self.model, self.data)
     self.renderer = mujoco.Renderer(self.model, height = IMAGE_HEIGHT, width = IMAGE_WIDTH)
     self.camera_name = "robot_camera"
     self.scene_camera_name = "scene_camera"
+
+    # Obstacle-course geoms are always compiled into the model (disabled by
+    # default -- see generate_environment_xml.py's own docstring for why a
+    # compiled MjModel can't have them added/removed at runtime, unlike
+    # Webots). setObstacleCourseEnabled toggles these ids' visibility/
+    # collision live instead of spawning/removing anything.
+    self.obstacle_course_geom_ids = [
+        mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
+        for name in OBSTACLE_COURSE_GEOM_NAMES
+    ]
+    self.obstacle_course_enabled = False
 
     # Camera ids + factory mount points for live camera_offset_x/y/z and
     # scene_offset_x/y/z (2026-09-21, requested live: "make sure the camera
@@ -301,8 +351,8 @@ class MujocoRbxBridge:
     with self.cmd_lock:
       lin, ang = self.cmd_linear_x, self.cmd_angular_z
 
-    left_radps = (lin - ang * WHEEL_TRACK_M / 2.0) / WHEEL_RADIUS_M
-    right_radps = (lin + ang * WHEEL_TRACK_M / 2.0) / WHEEL_RADIUS_M
+    left_radps = (lin - ang * self.wheel_track_m / 2.0) / self.wheel_radius_m
+    right_radps = (lin + ang * self.wheel_track_m / 2.0) / self.wheel_radius_m
     left_radps = max(-MAX_WHEEL_RADPS, min(MAX_WHEEL_RADPS, left_radps))
     right_radps = max(-MAX_WHEEL_RADPS, min(MAX_WHEEL_RADPS, right_radps))
     # wheel1=front_left, wheel2=front_right, wheel3=rear_left, wheel4=rear_right
@@ -322,6 +372,24 @@ class MujocoRbxBridge:
     mujoco.mj_forward(self.model, self.data)
     self._last_x, self._last_y, self._last_yaw, self._last_t = 0.0, 0.0, 0.0, None
     print("mujoco_rbx_bridge: reset to initial pose", flush = True)
+
+  def setObstacleCourseEnabled(self, enabled):
+    # Idempotent both ways, same reasoning as webots_rbx_bridge.py's own.
+    # geom_rgba/contype/conaffinity live on the MODEL (not mjData), so
+    # resetSim's mj_resetData never touches this -- a sim reset doesn't
+    # silently remove the course, matching Gazebo/Webots' own behavior
+    # (RESET_SIM only teleports the robot, never touches the environment).
+    if enabled == self.obstacle_course_enabled:
+      return
+    alpha = 1.0 if enabled else 0.0
+    contype = 1 if enabled else 0
+    for gid in self.obstacle_course_geom_ids:
+      self.model.geom_rgba[gid][3] = alpha
+      self.model.geom_contype[gid] = contype
+      self.model.geom_conaffinity[gid] = contype
+    self.obstacle_course_enabled = enabled
+    print("mujoco_rbx_bridge: obstacle course %s" % ("enabled" if enabled else "disabled"),
+          flush = True)
 
   def applyCameraSettings(self, msg):
     # Position offsets are a plain delta from each camera's factory mount
@@ -465,9 +533,8 @@ class MujocoRbxBridge:
     elif msg_type == "reset":
       self.resetSim()
     elif msg_type == "environment_option":
-      # Honest no-op for this pass -- no obstacle-course MJCF model built
-      # yet, same documented gap as webots_rbx_bridge.py's own.
-      print("mujoco_rbx_bridge: environment_option not supported yet, ignoring", flush = True)
+      if msg.get("option") == "OBSTACLE_COURSE":
+        self.setObstacleCourseEnabled(bool(msg.get("enabled", False)))
 
 
 def main():
