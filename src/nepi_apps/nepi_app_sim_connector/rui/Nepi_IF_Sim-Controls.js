@@ -1766,11 +1766,21 @@ class NepiIFSimControls extends Component {
     // silently never took effect, independent of the backend
     // settingUpdateFunction bugs fixed separately in rbx_sim_node.py /
     // rbx_ardupilot_node.py.
+    // FIXED (2026-09-22): 'type' is not a UpdateControl.msg field (see this
+    // function's own comment above, which already correctly documented the
+    // real field list without 'type' -- the data object below just never
+    // got updated to match). Confirmed live: rosbridge_websocket's own log
+    // rejected every publish through this function with "Message type
+    // nepi_interfaces/UpdateControl does not have a field type", so NO
+    // setting update sent from the real browser RUI ever reached the
+    // driver -- environment/obstacle-course toggle, camera offsets, "Lock
+    // Scene Camera To Robot", capability toggles, all of it -- while a
+    // direct rospy publish (bypassing rosbridge's stricter validation)
+    // looked completely fine, which is exactly why this stayed hidden.
     const data = {
       name: name,
       display_name: "",
       description: "",
-      type: type,
       value: [],
       index: "",
       min_bound: "",
