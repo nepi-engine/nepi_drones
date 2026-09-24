@@ -285,7 +285,9 @@ launch_targets:
       source /opt/ros/noetic/setup.bash;
       . $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/nepi_sim_display_env.sh;
       export GAZEBO_MODEL_PATH=$HOME/nepi_engine_ws/nepi_drones/sim_container/models:$GAZEBO_MODEL_PATH;
+      export GAZEBO_PLUGIN_PATH=$HOME/nepi_engine_ws/nepi_drones/sim_container/nepi_gazebo_plugins/build/devel/lib:$GAZEBO_PLUGIN_PATH;
       export GAZEBO_MASTER_URI=http://localhost:11345;
+      for p in $(pgrep -x gzclient 2>/dev/null); do ppid=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d " "); if [ -n "$ppid" ] && ps -o cmd= -p "$ppid" 2>/dev/null | grep -q generic_rover.world; then kill -9 "$p" 2>/dev/null; fi; done;
       if timeout 1 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/11345" 2>/dev/null; then echo "REFUSING TO LAUNCH: a gzserver is already running on this target's own port (11345). Stop the existing rover simulation first." >&2; exit 3; fi;
       pkill -f "[a]i_targeting_controller_ardupilot.py" 2>/dev/null;
       echo $$ > /tmp/sim_connector_launch.pgid;
@@ -318,6 +320,7 @@ launch_targets:
       source /opt/ros/noetic/setup.bash;
       . $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/nepi_sim_display_env.sh;
       export GAZEBO_MODEL_PATH=$HOME/nepi_engine_ws/nepi_drones/sim_container/models:$GAZEBO_MODEL_PATH;
+      export GAZEBO_PLUGIN_PATH=$HOME/nepi_engine_ws/nepi_drones/sim_container/nepi_gazebo_plugins/build/devel/lib:$GAZEBO_PLUGIN_PATH;
       pkill -f "[a]i_targeting_controller_ardupilot.py" 2>/dev/null;
       echo $$ > /tmp/sim_connector_launch.pgid;
       rostopic list > /dev/null 2>&1 || {{ nohup roscore < /dev/null > /tmp/sim_connector_roscore_launch.log 2>&1 & until rostopic list > /dev/null 2>&1; do sleep 1; done; }};
@@ -368,7 +371,7 @@ launch_targets:
     # gzserver AND gzclient as children of this same launch's process group,
     # confirmed via ps -o pid,pgid) -- the scoped gzserver pkill right after
     # is the only belt-and-suspenders still needed for the server half.
-    stop_command: "bash -lc 'f=/tmp/sim_connector_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; pkill -f [s]im_bridge_node.py 2>/dev/null; pkill -f [s]im_heartbeat_listener.py 2>/dev/null; pkill -f [c]amera_rig_controller.py 2>/dev/null; pkill -f \"[g]zserver .*generic_rover\\.world\" 2>/dev/null; true'"
+    stop_command: "bash -lc 'f=/tmp/sim_connector_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; pkill -f [s]im_bridge_node.py 2>/dev/null; pkill -f [s]im_heartbeat_listener.py 2>/dev/null; pkill -f [c]amera_rig_controller.py 2>/dev/null; pkill -f \"[g]zserver .*generic_rover\\.world\" 2>/dev/null; for p in $(pgrep -x gzclient 2>/dev/null); do ppid=$(ps -o ppid= -p $p 2>/dev/null | tr -d \" \"); if [ -n \"$ppid\" ] && ps -o cmd= -p $ppid 2>/dev/null | grep -q generic_rover.world; then kill -9 $p 2>/dev/null; fi; done; true'"
     # Verifies THIS target's own world is up, not just that some gazebo is.
     # Two earlier versions were both false-positive-prone: process existence
     # alone missed gzserver spinning on "No ROS master", and a bare

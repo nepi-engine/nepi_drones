@@ -123,6 +123,13 @@ from gazebo_msgs.srv import SpawnModel, DeleteModel, GetWorldProperties
 # in sim_connector_bridge_gazebo.py; this is the shared, generalized version,
 # see docs/SCAN_TO_SIM_ENVIRONMENT_PLAN.md section 7).
 import environment_models
+# Also a sibling module -- reused here (not just invoked as a standalone
+# script the way push_dimensions on the device side does) so a live
+# wheel_independence toggle (see applyWheelIndependenceSetting) can rebuild
+# generic_rover/model.sdf from whatever dimensions.yaml already has on disk
+# with just that one field overridden, without shelling out to a subprocess
+# or duplicating buildRoverSdf's own SDF-generation logic here.
+import generate_model_sdf
 
 PKG_NAME = 'SIM_BRIDGE'  # Use in display menus
 FILE_TYPE = 'NODE'
@@ -173,6 +180,9 @@ ROVER_MODEL_NAME_CUSTOM = 'generic_rover_demo_custom'
 SPAWN_MODEL_SERVICE = '/gazebo/spawn_sdf_model'
 DELETE_MODEL_SERVICE = '/gazebo/delete_model'
 GET_WORLD_PROPERTIES_SERVICE = '/gazebo/get_world_properties'
+# See _respawnRoverWithCameraOffsetsLocked's own comment on why this gets
+# called defensively after every respawn.
+UNPAUSE_PHYSICS_SERVICE = '/gazebo/unpause_physics'
 # Resets every model in the world (poses, linear/angular velocities, AND
 # each joint's own position/velocity) back to its spawn state -- see
 # resetRover's own comment for why this replaced a pose-only teleport.
@@ -229,6 +239,12 @@ OLD_CAMERA_SERVICE_NAMES = ('/rover/camera/set_parameters', '/rover/camera_chase
 ROVER_MODEL_SDF_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), '..', 'models',
     'generic_rover', 'model.sdf')
+# Parent of ROVER_MODEL_SDF_PATH's own 'generic_rover' -- generate_model_sdf's
+# loadDimensions/buildRoverSdf both want the models dir + model name
+# separately, not a single model.sdf path.
+SIM_MODELS_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'models')
+ROVER_MODEL_DIR_NAME = 'generic_rover'
 # Same directory-relative-to-this-file convention as ROVER_MODEL_SDF_PATH
 # above, for the world file _recoverDeadGzserver relaunches gzserver
 # against -- see that method's own comment for why gzserver sometimes
@@ -264,6 +280,22 @@ CAMERA_WATCHDOG_PERIOD_SEC = 3.0
 # mistaken for a dead one.
 CAMERA_DEAD_THRESHOLD_SEC = 3.0
 RESPAWN_GRACE_SEC = 12.0
+# Confirmed live (2026-09-23): _recoverDeadGzserver's own re-entrancy guard
+# (_recovering_gzserver) only blocks a SECOND recovery from starting while
+# one is already in flight -- it gets cleared as soon as each attempt
+# finishes, successful or not, so a camera that's still dead after a
+# recovery (bad rendering state, an overloaded host, anything the kill+
+# relaunch doesn't actually fix) just gets caught by the next watchdog tick
+# and recovered again, forever. That is the exact "keeps killing and
+# launching the sims" loop reported live: gzserver/gzclient killed and
+# relaunched every ~10s with no end condition, until this bridge's own
+# connection to the device dropped and the LAST relaunched gzserver was
+# never tracked or killed by anything again (vm_command_watcher.py's own
+# launch tracking is a different process and was never involved). This cap
+# makes the watchdog's own already-documented intent -- "leave it broken
+# and loud rather than silently spin" -- actually persistent across
+# separate attempts, not just within one.
+MAX_GZSERVER_RECOVERY_ATTEMPTS = 3
 # Settle time after gzserver's own process exists before trusting its
 # services/models -- same value and reasoning as every existing launch
 # script's own post-boot sleep (nepi_sitl_dev_env.sh, sim_rover_dev_env.sh,
@@ -394,7 +426,19 @@ class SimBridgeNode:
     # topics that must never be mistaken for the sensors actually dying.
     self.last_robot_raw_frame_time = time.time()
     self.last_scene_raw_frame_time = time.time()
-    self.last_respawn_time = 0.0
+    # Was 0.0 -- meant a cold launch got NO grace at all (now - 0.0 is
+    # always past RESPAWN_GRACE_SEC), even though a cold gzserver+rover
+    # spawn is the same kind of brief, normal gap this grace period exists
+    # to cover for a respawn. Confirmed live (2026-09-23) as part of what
+    # let the camera watchdog fire within 3s of this node's own
+    # construction, on a VM that just happened to be slower than usual to
+    # render a first frame -- kicking off the recovery-loop bug described
+    # at MAX_GZSERVER_RECOVERY_ATTEMPTS above. Starting the clock at
+    # construction time instead gives a cold launch the same
+    # RESPAWN_GRACE_SEC grace a respawn already gets.
+    self.last_respawn_time = time.time()
+    self._gzserver_recovery_attempts = 0
+    self._gzserver_recovery_gave_up = False
     self.robot_raw_sub = rospy.Subscriber(ROBOT_RAW_IMAGE_TOPIC, Image,
                                           lambda msg: setattr(self, 'last_robot_raw_frame_time', time.time()))
     self.scene_raw_sub = rospy.Subscriber(SCENE_RAW_IMAGE_TOPIC, Image,
@@ -447,6 +491,18 @@ class SimBridgeNode:
                     ROVER_MODEL_SDF_PATH + ": " + str(e) +
                     " -- camera offset changes will be ignored")
       self.rover_sdf_template = None
+    # Starting state matches whatever's actually baked into the SDF just
+    # loaded above (the model.sdf on disk at boot -- itself last generated
+    # from dimensions.yaml's own wheel_independence_enabled field, see
+    # generate_model_sdf.py's ROVER_DEFAULT_DIMENSIONS) rather than
+    # re-reading dimensions.yaml separately, so this can never disagree with
+    # what's actually live. See applyWheelIndependenceSetting for the live,
+    # capability-driven toggle (2026-09-23 -- requested live: this should be
+    # a general Devices -> Robots capability switch, not something only
+    # reachable by baking it into a robot config's dimensions ahead of a
+    # fresh deploy) -- that method is what changes this from here on.
+    self.wheel_independence_enabled = bool(
+        self.rover_sdf_template and 'crab_steer_controller' in self.rover_sdf_template)
     self.applied_camera_offsets = FACTORY_CAMERA_OFFSETS
 
     # Which Gazebo model name is CURRENTLY live -- starts as ROVER_MODEL_NAME
@@ -561,6 +617,23 @@ class SimBridgeNode:
     # no goto in progress -- a zero Twist here means "hold position", not just
     # "no active command yet". See holdStill() for why that needs enforcing
     # at the model level, not just left to the diff-drive plugin's wheel motors.
+    #
+    # Skipped entirely under wheel independence (2026-09-23, requested live:
+    # "the base moved with the wheels on wheel independence - the base
+    # should not move, only the wheels" -- confirmed live as THIS mechanism
+    # fighting crab_steer_plugin's own hold). This ModelState-teleport hold
+    # was written for the diff_drive case, where nothing else was keeping
+    # the model still at rest. crab_steer_plugin.cpp now does that itself
+    # every physics tick (SetLinearVel(0)/SetAngularVel with its own active
+    # yaw-hold, see that file's OnUpdate) -- a SEPARATE, periodic hard
+    # teleport to a self.held_pose captured at some earlier, possibly stale
+    # moment (this only re-captures when cmd_vel transitions to zero, which
+    # for a manual motor command can be many ticks after the rover's real
+    # orientation last changed) fights that continuous velocity-based hold
+    # instead of reinforcing it -- confirmed live: exactly this combination
+    # produced a rotation nothing had actually commanded.
+    if self.wheel_independence_enabled:
+      return
     if msg.linear.x == 0.0 and msg.linear.y == 0.0 and msg.angular.z == 0.0:
       if self.held_pose is None:
         self.held_pose = self.captureCurrentPose()
@@ -829,6 +902,49 @@ class SimBridgeNode:
         return
       time.sleep(DELETE_CONFIRM_POLL_INTERVAL_SEC)
 
+  def applyWheelIndependenceSetting(self, enabled):
+    # Live counterpart of dimensions.yaml's own wheel_independence_enabled
+    # field (generate_model_sdf.py's ROVER_DEFAULT_DIMENSIONS) -- that field
+    # only ever took effect at the NEXT fresh deploy (whatever a robot
+    # config's dimensions.yaml says gets baked into model.sdf once, at
+    # push_dimensions time), so turning it on meant creating/editing a robot
+    # config ahead of time. Requested live (2026-09-23): this should be a
+    # general Devices -> Robots capability switch instead, that "just works"
+    # on the ALREADY-RUNNING rover -- including the plain default one nobody
+    # customized -- and flips back to today's normal skid-steer behavior
+    # when turned off. Same "respawn with a rebuilt SDF" mechanism
+    # respawnRoverWithCameraOffsets already uses for camera offset/FOV
+    # changes, just rebuilding the WHOLE model (buildRoverSdf regenerates
+    # every wheel joint/link and the crab_steer_controller plugin block,
+    # not just a couple of <pose>/<horizontal_fov> values a regex can patch
+    # in place) rather than text-substituting the existing template.
+    enabled = bool(enabled)
+    if enabled == self.wheel_independence_enabled:
+      return  # Already live -- e.g. a redundant resend of the same value.
+    try:
+      dims = generate_model_sdf.loadDimensions(
+          ROVER_MODEL_DIR_NAME, SIM_MODELS_DIR, generate_model_sdf.ROVER_DEFAULT_DIMENSIONS)
+      dims['wheel_independence_enabled'] = 1.0 if enabled else 0.0
+      new_sdf = generate_model_sdf.buildRoverSdf(dims)
+    except Exception as e:
+      rospy.logerr(PKG_NAME + ": Failed to rebuild rover SDF for "
+                   "wheel_independence_enabled=" + str(enabled) + ": " + str(e))
+      return
+    self.rover_sdf_template = new_sdf
+    self.wheel_independence_enabled = enabled
+    # Forces the respawn below to actually run even though the CAMERA
+    # offsets themselves haven't changed -- respawnRoverWithCameraOffsets'
+    # own dedup check only compares the requested offsets against
+    # self.applied_camera_offsets, which says nothing about which SDF
+    # template (wheel-independence on or off) they were last baked into.
+    # Capture the real, currently-applied offsets first (so they get
+    # re-baked into the just-rebuilt template, same as any other respawn),
+    # THEN clear self.applied_camera_offsets so it can never equal what's
+    # about to be requested and the dedup check is guaranteed to fail.
+    current_offsets = self.applied_camera_offsets
+    self.applied_camera_offsets = None
+    self.respawnRoverWithCameraOffsets(current_offsets)
+
   def respawnRoverWithCameraOffsets(self, offsets):
     # Thin wrapper: see camera_respawn_inflight_lock's own comment for why
     # this needs to be a genuine mutex around the whole respawn, not just
@@ -968,6 +1084,26 @@ class SimBridgeNode:
     self.rover_model_name = new_name
     self.applied_camera_offsets = offsets
     self.held_pose = None  # Stale anchor from before the respawn -- see resetRover.
+    # Explicit, defensive unpause (2026-09-24, requested live: launched a
+    # wheel-independence robot config, "its being detected but no images
+    # are coming in and none of the manual or auton controls are working")
+    # -- confirmed live: /gazebo/get_physics_properties reported pause=True
+    # immediately after exactly this kind of respawn, with sim_time frozen
+    # at the exact moment SpawnModel's own success log fired, and manually
+    # calling unpause_physics fixed everything instantly (images, cmd_vel,
+    # all of it -- the whole world had simply stopped stepping). gzserver's
+    # own spawn_sdf_model service handler is documented to pause the world
+    # during entity insertion and restore whatever pause state was active
+    # before the call -- but that restore is Gazebo's own internal
+    # bookkeeping, not something this script controls, and it did not
+    # reliably happen here. Rather than depend on that restore, force the
+    # world back to running after every respawn -- a redundant unpause on a
+    # world that was never actually paused is a harmless no-op.
+    try:
+      rospy.wait_for_service(UNPAUSE_PHYSICS_SERVICE, timeout=GAZEBO_SERVICE_WAIT_SEC)
+      rospy.ServiceProxy(UNPAUSE_PHYSICS_SERVICE, Empty)()
+    except Exception as e:
+      rospy.logwarn(PKG_NAME + ": Post-respawn unpause_physics failed: " + str(e))
     rospy.loginfo(PKG_NAME + ": Applied camera offsets, robot=(%.2f,%.2f,%.2f,yaw=%.1f,tilt=%.1f) "
                   "scene=(%.2f,%.2f,%.2f,yaw=%.1f,tilt=%.1f), fov=%.1fdeg, model now '%s'"
                   % (offsets + (new_name,)))
@@ -1015,6 +1151,11 @@ class SimBridgeNode:
     robot_stale = now - self.last_robot_raw_frame_time > CAMERA_DEAD_THRESHOLD_SEC
     scene_stale = now - self.last_scene_raw_frame_time > CAMERA_DEAD_THRESHOLD_SEC
     if not (robot_stale or scene_stale):
+      # Healthy tick -- a prior recovery (if any) actually worked, so let a
+      # FUTURE dead-camera episode get its own fresh set of attempts rather
+      # than staying permanently given-up-on from an unrelated past failure.
+      self._gzserver_recovery_attempts = 0
+      self._gzserver_recovery_gave_up = False
       return
     if self._recovering_gzserver:
       # Already inside a recovery's own re-applying respawn (see
@@ -1026,9 +1167,28 @@ class SimBridgeNode:
                             PKG_NAME + ": Cameras still dead after a gzserver recovery attempt "
                             "-- not retrying again automatically")
       return
+    if self._gzserver_recovery_gave_up:
+      # See MAX_GZSERVER_RECOVERY_ATTEMPTS's own comment -- already spent
+      # every attempt on this dead-camera episode with no lasting fix, so
+      # keep saying so instead of relaunching gzserver again forever.
+      rospy.logerr_throttle(CAMERA_WATCHDOG_PERIOD_SEC,
+                            PKG_NAME + ": Cameras still dead after " +
+                            str(MAX_GZSERVER_RECOVERY_ATTEMPTS) + " gzserver recovery attempts "
+                            "-- giving up automatic recovery; a fresh Deploy is needed")
+      return
+    self._gzserver_recovery_attempts += 1
+    if self._gzserver_recovery_attempts > MAX_GZSERVER_RECOVERY_ATTEMPTS:
+      self._gzserver_recovery_gave_up = True
+      rospy.logerr(PKG_NAME + ": Camera watchdog: no frame on " +
+                   ("robot " if robot_stale else "") + ("scene " if scene_stale else "") +
+                   "view for over " + str(CAMERA_DEAD_THRESHOLD_SEC) + "s -- already tried " +
+                   str(MAX_GZSERVER_RECOVERY_ATTEMPTS) + " gzserver recovery attempts, giving up")
+      return
     rospy.logerr(PKG_NAME + ": Camera watchdog: no frame on " +
                  ("robot " if robot_stale else "") + ("scene " if scene_stale else "") +
-                 "view for over " + str(CAMERA_DEAD_THRESHOLD_SEC) + "s -- restarting gzserver to recover")
+                 "view for over " + str(CAMERA_DEAD_THRESHOLD_SEC) + "s -- restarting gzserver to recover "
+                 "(attempt " + str(self._gzserver_recovery_attempts) + "/" +
+                 str(MAX_GZSERVER_RECOVERY_ATTEMPTS) + ")")
     self._recoverDeadGzserver()
 
   def _recoverDeadGzserver(self):
@@ -1200,8 +1360,12 @@ class SimBridgeNode:
         if cmd.get('type') == 'environment':
           self.env_spawner.set_active_model(cmd.get('model_name'), force = bool(cmd.get('force', False)))
           continue
+        if cmd.get('type') == 'wheel_independence':
+          self.applyWheelIndependenceSetting(cmd.get('enabled', False))
+          continue
         twist = Twist()
         twist.linear.x = float(cmd.get('linear_x', 0.0))
+        twist.linear.y = float(cmd.get('linear_y', 0.0))
         twist.angular.z = float(cmd.get('angular_z', 0.0))
         self.nepi_cmd_pub.publish(twist)
 

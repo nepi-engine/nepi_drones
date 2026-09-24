@@ -240,30 +240,36 @@ def buildRoverSdf(dims):
     wheel_diameter = wheel_radius * 2.0
 
     # Disabled (default): EXACTLY today's plugin, unchanged. Enabled:
-    # libgazebo_ros_planar_move (stock Gazebo plugin, real body-frame x/y/yaw
-    # kinematics from the same cmd_vel Twist -- unlike diff_drive it natively
-    # understands linear.y) drives the actual motion, and
     # nepi_crab_steer_plugin (nepi_gazebo_plugins package, this repo's own)
-    # purely animates the 4 wheel corners to visually steer+spin in a way
-    # consistent with that motion. Two independent cmd_vel subscribers on
-    # one topic is fine.
+    # drives the actual body motion itself (real body-frame x/y/yaw
+    # kinematics from the same cmd_vel Twist, unlike diff_drive natively
+    # understanding linear.y) AND publishes odometry, AND animates the 4
+    # wheel corners to visually steer+spin in a way consistent with that
+    # motion -- see crab_steer_plugin.cpp's own header comment ("Why this
+    # plugin drives the body itself, not libgazebo_ros_planar_move",
+    # 2026-09-23): that stock plugin crashed gzserver outright on every
+    # respawn (confirmed live under gdb -- SIGABRT inside its own
+    # GazeboRosPlanarMove::QueueThread), so it is no longer used here at
+    # all, for either job it used to do.
     if wheel_independence_enabled:
+        # x/y attributes: this wheel's own body-frame offset from base_link's
+        # origin (matching wheel_links' own pose computation above) -- lets
+        # the plugin compute each wheel's own tangential velocity during a
+        # rotation (v_wheel = v_center + omega x r) instead of driving every
+        # wheel identically, which is only correct for pure translation. See
+        # crab_steer_plugin.cpp's own OnUpdate comment for why that mattered.
         wheel_plugin_entries = "\n".join(
-            f'      <wheel steerJoint="{name}_steer_joint" spinJoint="{name}_joint"/>'
-            for name, _x, _y in ROVER_WHEELS
+            f'      <wheel steerJoint="{name}_steer_joint" spinJoint="{name}_joint" '
+            f'x="{x_sign * x_off}" y="{y_sign * y_off}"/>'
+            for name, x_sign, y_sign in ROVER_WHEELS
         )
-        drive_plugin_block = f"""    <plugin name="planar_move_controller" filename="libgazebo_ros_planar_move.so">
+        drive_plugin_block = f"""    <plugin name="crab_steer_controller" filename="libnepi_crab_steer_plugin.so">
       <robotNamespace>/rover</robotNamespace>
       <commandTopic>cmd_vel</commandTopic>
       <odometryTopic>odom</odometryTopic>
       <odometryFrame>odom</odometryFrame>
       <odometryRate>30.0</odometryRate>
       <robotBaseFrame>base_link</robotBaseFrame>
-    </plugin>
-
-    <plugin name="crab_steer_controller" filename="libnepi_crab_steer_plugin.so">
-      <robotNamespace>/rover</robotNamespace>
-      <commandTopic>cmd_vel</commandTopic>
       <wheelRadius>{wheel_radius}</wheelRadius>
 {wheel_plugin_entries}
     </plugin>"""

@@ -4,10 +4,14 @@
   <version>0.0.1</version>
   <description>
     Gazebo model plugins for NEPI simulated robots. First plugin:
-    nepi_crab_steer_plugin, a purely kinematic per-wheel steering+spin
-    animator for the 4-wheel rover's "wheel independence" (crab-steering)
-    dimension option -- additive alongside the stock libgazebo_ros_planar_move
-    plugin, which handles the rover's actual body-frame translation physics.
+    nepi_crab_steer_plugin, for the 4-wheel rover's "wheel independence"
+    (crab-steering) dimension option -- drives the rover's actual body-frame
+    translation physics and publishes its odometry itself (2026-09-23:
+    dropped the stock libgazebo_ros_planar_move plugin this used to run
+    alongside for that job -- it crashed gzserver outright on every respawn,
+    see crab_steer_plugin.cpp's own header comment), in addition to its
+    original job of animating the 4 wheel corners to visually steer+spin
+    consistent with that motion.
     See sim_container/scripts/generate_model_sdf.py's buildRoverSdf for the
     SDF wiring that references this plugin's built .so.
   </description>
@@ -18,10 +22,12 @@
 
   <build_depend>roscpp</build_depend>
   <build_depend>geometry_msgs</build_depend>
+  <build_depend>nav_msgs</build_depend>
   <build_depend>gazebo_dev</build_depend>
   <build_depend>gazebo_ros</build_depend>
 
   <exec_depend>roscpp</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
   <exec_depend>gazebo_ros</exec_depend>
 </package>

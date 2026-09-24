@@ -91,8 +91,8 @@
         <surface>
           <friction>
             <ode>
-              <mu>1.5</mu>
-              <mu2>0.2</mu2>
+              <mu>0.05</mu>
+              <mu2>0.05</mu2>
               <fdir1>1 0 0</fdir1>
             </ode>
           </friction>
@@ -135,8 +135,8 @@
         <surface>
           <friction>
             <ode>
-              <mu>1.5</mu>
-              <mu2>0.2</mu2>
+              <mu>0.05</mu>
+              <mu2>0.05</mu2>
               <fdir1>1 0 0</fdir1>
             </ode>
           </friction>
@@ -179,8 +179,8 @@
         <surface>
           <friction>
             <ode>
-              <mu>1.5</mu>
-              <mu2>0.2</mu2>
+              <mu>0.05</mu>
+              <mu2>0.05</mu2>
               <fdir1>1 0 0</fdir1>
             </ode>
           </friction>
@@ -223,8 +223,8 @@
         <surface>
           <friction>
             <ode>
-              <mu>1.5</mu>
-              <mu2>0.2</mu2>
+              <mu>0.05</mu>
+              <mu2>0.05</mu2>
               <fdir1>1 0 0</fdir1>
             </ode>
           </friction>
@@ -244,9 +244,78 @@
       </visual>
     </link>
 
+    <link name="front_left_wheel_hub">
+      <pose>0.150000 0.170000 0.100000 0 0 0</pose>
+      <inertial>
+        <mass>0.05</mass>
+        <inertia>
+          <ixx>0.00001</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.00001</iyy>
+          <iyz>0</iyz>
+          <izz>0.00001</izz>
+        </inertia>
+      </inertial>
+    </link>
+
+    <link name="front_right_wheel_hub">
+      <pose>0.150000 -0.170000 0.100000 0 0 0</pose>
+      <inertial>
+        <mass>0.05</mass>
+        <inertia>
+          <ixx>0.00001</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.00001</iyy>
+          <iyz>0</iyz>
+          <izz>0.00001</izz>
+        </inertia>
+      </inertial>
+    </link>
+
+    <link name="rear_left_wheel_hub">
+      <pose>-0.150000 0.170000 0.100000 0 0 0</pose>
+      <inertial>
+        <mass>0.05</mass>
+        <inertia>
+          <ixx>0.00001</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.00001</iyy>
+          <iyz>0</iyz>
+          <izz>0.00001</izz>
+        </inertia>
+      </inertial>
+    </link>
+
+    <link name="rear_right_wheel_hub">
+      <pose>-0.150000 -0.170000 0.100000 0 0 0</pose>
+      <inertial>
+        <mass>0.05</mass>
+        <inertia>
+          <ixx>0.00001</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.00001</iyy>
+          <iyz>0</iyz>
+          <izz>0.00001</izz>
+        </inertia>
+      </inertial>
+    </link>
+
+
+    <joint name="front_left_wheel_steer_joint" type="revolute">
+      <parent>base_link</parent>
+      <child>front_left_wheel_hub</child>
+      <axis>
+        <xyz>0 0 1</xyz>
+        <use_parent_model_frame>true</use_parent_model_frame>
+      </axis>
+    </joint>
 
     <joint name="front_left_wheel_joint" type="revolute">
-      <parent>base_link</parent>
+      <parent>front_left_wheel_hub</parent>
       <child>front_left_wheel</child>
       <axis>
         <xyz>0 1 0</xyz>
@@ -254,8 +323,17 @@
       </axis>
     </joint>
 
-    <joint name="front_right_wheel_joint" type="revolute">
+    <joint name="front_right_wheel_steer_joint" type="revolute">
       <parent>base_link</parent>
+      <child>front_right_wheel_hub</child>
+      <axis>
+        <xyz>0 0 1</xyz>
+        <use_parent_model_frame>true</use_parent_model_frame>
+      </axis>
+    </joint>
+
+    <joint name="front_right_wheel_joint" type="revolute">
+      <parent>front_right_wheel_hub</parent>
       <child>front_right_wheel</child>
       <axis>
         <xyz>0 1 0</xyz>
@@ -263,8 +341,17 @@
       </axis>
     </joint>
 
-    <joint name="rear_left_wheel_joint" type="revolute">
+    <joint name="rear_left_wheel_steer_joint" type="revolute">
       <parent>base_link</parent>
+      <child>rear_left_wheel_hub</child>
+      <axis>
+        <xyz>0 0 1</xyz>
+        <use_parent_model_frame>true</use_parent_model_frame>
+      </axis>
+    </joint>
+
+    <joint name="rear_left_wheel_joint" type="revolute">
+      <parent>rear_left_wheel_hub</parent>
       <child>rear_left_wheel</child>
       <axis>
         <xyz>0 1 0</xyz>
@@ -272,8 +359,17 @@
       </axis>
     </joint>
 
-    <joint name="rear_right_wheel_joint" type="revolute">
+    <joint name="rear_right_wheel_steer_joint" type="revolute">
       <parent>base_link</parent>
+      <child>rear_right_wheel_hub</child>
+      <axis>
+        <xyz>0 0 1</xyz>
+        <use_parent_model_frame>true</use_parent_model_frame>
+      </axis>
+    </joint>
+
+    <joint name="rear_right_wheel_joint" type="revolute">
+      <parent>rear_right_wheel_hub</parent>
       <child>rear_right_wheel</child>
       <axis>
         <xyz>0 1 0</xyz>
@@ -442,43 +538,18 @@
       <child>camera_link_chase</child>
     </joint>
 
-    <plugin name="diff_drive_controller" filename="libgazebo_ros_diff_drive.so">
+    <plugin name="crab_steer_controller" filename="libnepi_crab_steer_plugin.so">
       <robotNamespace>/rover</robotNamespace>
       <commandTopic>cmd_vel</commandTopic>
       <odometryTopic>odom</odometryTopic>
       <odometryFrame>odom</odometryFrame>
-      <odometrySource>world</odometrySource>
+      <odometryRate>30.0</odometryRate>
       <robotBaseFrame>base_link</robotBaseFrame>
-      <!-- Repeated leftJoint/rightJoint tags: gazebo_ros_diff_drive drives
-           every listed left-side joint identically and every right-side
-           joint identically, exactly the skid-steer pattern the front/rear
-           axle pairs need. -->
-      <leftJoint>front_left_wheel_joint</leftJoint>
-      <leftJoint>rear_left_wheel_joint</leftJoint>
-      <rightJoint>front_right_wheel_joint</rightJoint>
-      <rightJoint>rear_right_wheel_joint</rightJoint>
-      <wheelSeparation>0.340000</wheelSeparation>
-      <wheelDiameter>0.200000</wheelDiameter>
-      <wheelTorque>25.0</wheelTorque>
-      <!-- 0.0 here means UNLIMITED (libgazebo_ros_diff_drive's own
-           documented meaning: no cap on how fast the plugin's internal PID
-           target can change per step), reported live: "if you change
-           motor controls too rapidly, ex: putting to 100% and then -100%
-           after 5 seconds, it starts going crazy and randomly glitching
-           out." A 100% to -100% command was a literal step-function
-           velocity reversal with the full 25 N*m of wheelTorque applied
-           instantly to chase it, exactly the kind of single-timestep delta
-           that diverges ODE's constraint solver. Capped instead of left
-           unlimited; RESET_SIM "helping" was never fixing the physics,
-           just teleporting the model back to clear the diverged state
-           (see rbx_sim_node.py's resetSimAction), this fixes the actual
-           cause. -->
-      <wheelAcceleration>3.0</wheelAcceleration>
-      <updateRate>30.0</updateRate>
-      <publishOdomTF>true</publishOdomTF>
-      <publishWheelTF>false</publishWheelTF>
-      <publishWheelJointState>false</publishWheelJointState>
-      <legacyMode>false</legacyMode>
+      <wheelRadius>0.1</wheelRadius>
+      <wheel steerJoint="front_left_wheel_steer_joint" spinJoint="front_left_wheel_joint" x="0.15" y="0.17"/>
+      <wheel steerJoint="front_right_wheel_steer_joint" spinJoint="front_right_wheel_joint" x="0.15" y="-0.17"/>
+      <wheel steerJoint="rear_left_wheel_steer_joint" spinJoint="rear_left_wheel_joint" x="-0.15" y="0.17"/>
+      <wheel steerJoint="rear_right_wheel_steer_joint" spinJoint="rear_right_wheel_joint" x="-0.15" y="-0.17"/>
     </plugin>
 
   </model>

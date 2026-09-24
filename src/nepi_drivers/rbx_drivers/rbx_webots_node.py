@@ -395,6 +395,12 @@ class WebotsNode:
 
     self.rbx_if.setCmdTimeoutCb(UInt32(data = self.GOTO_CMD_TIMEOUT_SEC))
     self.rbx_if.setImageTopicCb(String(data = self.robot_color_topic_name))
+    # Same "deterministic per-instance behavior regardless of what a
+    # previous run left in config" rationale as the image-topic override
+    # just above -- see rbx_sim_node.py's own copy of this line for the
+    # full incident writeup (a corrupted persisted enabled_image_sources
+    # value silently disabled every camera by default on every launch).
+    self.rbx_if.settings_if.update_setting_value('enabled_image_sources', '')
 
     controller_interval = float(1) / self.CONTROLLER_RATE_HZ
     nepi_sdk.start_timer_process(controller_interval, self.gotoControlCb)

@@ -1171,7 +1171,7 @@ class NepiDeviceControls extends Component {
                     />
                   </Label>
 
-                  <Label title={"Left -> Y (m)"}>
+                  <Label title={"Right -> Y (m)"}>
                     <Input
                       value={this.state.y_meters}
                       id="y_meters"
@@ -1203,7 +1203,17 @@ class NepiDeviceControls extends Component {
 
                   <ButtonMenu>
                     <Button onClick={() => this.state.autonomous_ready ?
-                      sendFloatGotoPositionMsg(namespace + "/goto_position", this.state.x_meters, this.state.y_meters, this.state.z_meters, this.state.yaw_deg_position) :
+                      // Negated (2026-09-23, requested live: "y should be to
+                      // right, not left when positive") -- this field's own
+                      // label above now reads "Right -> Y", but the
+                      // GotoPosition message's own y_meters field is still
+                      // the platform-wide body-frame convention (y+ = left,
+                      // see device_if_rbx.py's GotoPosition docstring), left
+                      // unchanged everywhere outside this page. Flipping the
+                      // sign right here is what makes a positive value typed
+                      // into this field actually go right, without touching
+                      // that shared convention.
+                      sendFloatGotoPositionMsg(namespace + "/goto_position", this.state.x_meters, -this.state.y_meters, this.state.z_meters, this.state.yaw_deg_position) :
                       this.doNothing()
                     }>{"Send"}</Button>
                   </ButtonMenu>

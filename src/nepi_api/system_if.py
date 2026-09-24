@@ -3684,7 +3684,16 @@ class SettingsIF:
                 for setting_name in init_settings_values_dict.keys():
                     if setting_name in init_settings_dict.keys():
                         setting_value = init_settings_values_dict[setting_name]
-                        init_settings_dict = nepi_controls.set_control_value(init_settings_dict, setting_name, setting_value, setting_value)
+                        # setting_value was previously passed twice here -- the second
+                        # copy landed in set_control_value's own 'index' positional slot,
+                        # which is meant for a per-element update on a List-type control's
+                        # own value. For a plain (non-list) setting whose persisted string
+                        # happens to parse as a positive int (e.g. an Int-type setting
+                        # persisted as "1"), that stray index silently indexed into and
+                        # overwrote an element of the CURRENT (pre-update) value instead of
+                        # replacing it outright -- found while tracing a corrupted
+                        # enabled_image_sources persisted value.
+                        init_settings_dict = nepi_controls.set_control_value(init_settings_dict, setting_name, setting_value)
         else:
             init_settings_dict = dict()
 

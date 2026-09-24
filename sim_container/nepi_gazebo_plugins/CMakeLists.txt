@@ -4,13 +4,14 @@ project(nepi_gazebo_plugins)
 find_package(catkin REQUIRED COMPONENTS
   roscpp
   geometry_msgs
+  nav_msgs
   gazebo_dev
   gazebo_ros
 )
 find_package(gazebo REQUIRED)
 
 catkin_package(
-  CATKIN_DEPENDS roscpp geometry_msgs gazebo_ros
+  CATKIN_DEPENDS roscpp geometry_msgs nav_msgs gazebo_ros
 )
 
 include_directories(

@@ -166,6 +166,9 @@ class SimNode:
   # RESET_SIM/RETURN_HOME. Modeled as a Setting instead: one clean value, one
   # place it lives.
   ENVIRONMENT_SETTING_NAMES = ("environment",)
+  # See CAP_SETTINGS/FACTORY_SETTINGS' own wheel_independence_enabled entry
+  # and setWheelIndependenceAction below.
+  WHEEL_INDEPENDENCE_SETTING_NAMES = ("wheel_independence_enabled",)
 
   # Which control SURFACES this deployment wants exposed, as opposed to which
   # ones this robot TYPE structurally supports (that's still
@@ -275,6 +278,20 @@ class SimNode:
     autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
     camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]},
     move_with_manual_enabled = {"type":"Discrete","name":"move_with_manual_enabled","options":["TRUE","FALSE"]},
+    # A general Devices -> Robots capability switch (requested live,
+    # 2026-09-23), not a per-robot-config dimensions field -- works on the
+    # already-running rover, default one included, and flips back to normal
+    # skid-steer the instant it's turned off. See
+    # sim_bridge_node.py's applyWheelIndependenceSetting for the actual
+    # respawn-with-rebuilt-SDF mechanism this drives. Deliberately
+    # independent of the OLDER dimensions.yaml wheel_independence_enabled
+    # field (generate_model_sdf.py) the same way camera_fov_deg is
+    # deliberately independent of the dimensions-yaml camera_horizontal_
+    # fov_deg field above -- that field still exists unchanged and still
+    # only affects what a FRESH deploy's model.sdf starts with; this
+    # Setting always starts FALSE regardless (see FACTORY_SETTINGS below)
+    # and is the only thing that can change it on an already-running rover.
+    wheel_independence_enabled = {"type":"Discrete","name":"wheel_independence_enabled","options":["TRUE","FALSE"]},
     # No fixed options -- the candidate topic set is per-deployment.
     enabled_image_sources = {"type":"String","name":"enabled_image_sources"}
   )
@@ -314,6 +331,11 @@ class SimNode:
     # the rover directly before this Setting existed, so TRUE preserves
     # that exact prior behavior for anyone who never touches this toggle.
     move_with_manual_enabled = {"type":"Discrete","name":"move_with_manual_enabled","value":"TRUE"},
+    # FALSE -- today's exact skid-steer behavior byte-for-byte, matching a
+    # robot config that never touches this. See CAP_SETTINGS' own entry for
+    # why this deliberately does NOT inherit dimensions.yaml's own
+    # wheel_independence_enabled starting value.
+    wheel_independence_enabled = {"type":"Discrete","name":"wheel_independence_enabled","value":"FALSE"},
     # Empty = unrestricted -- see the CAPABILITY_SETTING_NAMES comment above.
     enabled_image_sources = {"type":"String","name":"enabled_image_sources","value":""}
   )
@@ -738,6 +760,26 @@ class SimNode:
     ## camera topic.
     self.rbx_if.setImageTopicCb(String(data = self.robot_color_topic_name))
 
+    ## Same "deterministic per-instance behavior regardless of what a
+    ## previous run left in config" rationale as the image-topic override
+    ## just above, for enabled_image_sources specifically (requested live,
+    ## 2026-09-24: "all of the camera images for sim connector are by
+    ## default disabled for some reason every time a new sim is launched -
+    ## make sure they're all enabled by default"). Confirmed live: this
+    ## Setting's own persisted param value had somehow become a malformed,
+    ## non-empty string (a stray control-dict-shaped fragment prepended to
+    ## a stale, partial topic allowlist) -- since empty is this Setting's
+    ## only "unrestricted, show everything" value (see CAP_SETTINGS' own
+    ## comment and both Nepi_IF_Sim-Controls.js's and NepiDeviceRBX.js's
+    ## own "empty means unrestricted" handling), ANY non-empty persisted
+    ## value -- corrupted or not -- silently narrows the camera list down
+    ## to whatever happened to be saved, which is exactly the "all disabled"
+    ## symptom reported. Going through settings_if.update_setting_value
+    ## (not settingUpdateFunction directly) so this is indistinguishable
+    ## from a real operator-issued update: settings_dict, the persisted
+    ## param, and the next status publish all stay in sync.
+    self.rbx_if.settings_if.update_setting_value('enabled_image_sources', '')
+
     ## Start the closed-loop goto controller
     controller_interval = float(1) / self.CONTROLLER_RATE_HZ
     nepi_sdk.start_timer_process(controller_interval, self.gotoControlCb)
@@ -859,6 +901,8 @@ class SimNode:
       self.sendCameraSettings()
     if setting_name in self.ENVIRONMENT_SETTING_NAMES:
       self.setEnvironmentAction(setting_value)
+    if setting_name in self.WHEEL_INDEPENDENCE_SETTING_NAMES:
+      self.setWheelIndependenceAction(setting_value)
     return success, msg, copy.deepcopy(self.settings_dict)
 
   ##########################
@@ -949,10 +993,23 @@ class SimNode:
     # the same way from the same navpose source. z is ignored: the rover
     # moves in the ground plane (z stays 0, matching a z=0 offset input).
     self.msg_if.pub_info("Recieved Position setpoint command: " + str(point_enu_m))
+    # yaw_locked (2026-09-23, requested live: "position changes keep the
+    # base locked to whatever angle they're at while moving the wheels")
+    # -- with wheel independence on, a POSITION command never rotates the
+    # base at all, not even once the position is reached (gotoControlCb's
+    # own final-yaw phase skips convergence entirely when this is set,
+    # same as it already does for a None yaw_deg -- see RETURN_HOME's own
+    # goto_target). orientation_enu_deg is still recorded (not discarded)
+    # in case a future caller wants it, just never converged toward while
+    # this flag is set. A gotoPose call (see that method's own goto_target)
+    # never sets this -- "changing the yaw angle should simply rotate the
+    # base" always goes through unaffected, wheel independence or not.
+    wheel_independence_on = self.settings_dict['wheel_independence_enabled']['value'] == 'TRUE'
     with self.goto_target_lock:
       self.goto_target = {'x_m': self.navpose_dict['x_m'] + point_enu_m.x,
                           'y_m': self.navpose_dict['y_m'] + point_enu_m.y,
-                          'yaw_deg': orientation_enu_deg[2]}
+                          'yaw_deg': orientation_enu_deg[2],
+                          'yaw_locked': wheel_independence_on}
 
   def getNavPoseCb(self):
     return self.navpose_dict
@@ -1076,6 +1133,21 @@ class SimNode:
                           "Environment set to " + environment_value)
     return True
 
+  def setWheelIndependenceAction(self, setting_value):
+    # Fire-and-forget over the bridge, same pattern as setEnvironmentAction:
+    # sim_bridge_node.py's applyWheelIndependenceSetting owns the actual
+    # rebuild-SDF-and-respawn work and its own currently-applied bookkeeping
+    # (self.wheel_independence_enabled there), so this side just needs a
+    # live connection to send the request on. setting_value is this
+    # Setting's own Discrete option string ("TRUE"/"FALSE").
+    with self.sock_lock:
+      connected = self.sock is not None
+    if not connected:
+      return False
+    self.sendLineToBridge({'type': 'wheel_independence', 'enabled': (setting_value == 'TRUE')},
+                          "Wheel independence set to " + setting_value)
+    return True
+
   def refreshEnvironmentAction(self):
     # Force a live re-spawn of whatever environment is currently selected,
     # picking up geometry pushed to model.sdf since it was first spawned --
@@ -1111,7 +1183,13 @@ class SimNode:
       target = self.goto_target
 
     lin = 0.0
+    lin_y = 0.0
     ang = 0.0
+    # Read fresh every tick, not cached from when a goto/manual command
+    # started -- an operator can flip this mid-command and both the goto
+    # drive phase below and the manual-motor branch should honor it on
+    # their very next tick either way.
+    wheel_independence_on = self.settings_dict['wheel_independence_enabled']['value'] == 'TRUE'
     if target is not None:
       cur_x = self.navpose_dict['x_m']
       cur_y = self.navpose_dict['y_m']
@@ -1130,20 +1208,37 @@ class SimNode:
       dist = math.hypot(dx, dy)
 
       if dist > tol_m:
-        # Drive phase: point at the target, drive when roughly aligned
-        bearing_err = self.normalizeAngle(math.atan2(dy, dx) - cur_yaw_rad)
-        ang = max(-max_ang, min(max_ang, self.GOTO_KP_ANG * bearing_err))
-        if abs(bearing_err) < self.GOTO_TURN_GATE_RAD:
-          lin = max(0.0, min(max_lin, self.GOTO_KP_LIN * dist))
+        if wheel_independence_on:
+          # Holonomic drive phase (requested live, 2026-09-23: "position
+          # changes keep the base locked to whatever angle they're at
+          # while moving the wheels") -- translate straight at the target
+          # in the body frame; ang stays 0.0 (base yaw untouched) the
+          # whole way there, unlike the turn-then-drive shape below. World-
+          # frame (dx,dy) rotated by -cur_yaw_rad into the body frame
+          # crab_steer_plugin.cpp's own OnUpdate expects (that plugin
+          # rotates a body-frame cmd_vel by +yaw right back into world
+          # frame -- see its own comment).
+          speed = min(max_lin, self.GOTO_KP_LIN * dist)
+          scale = speed / dist if dist > 0.0 else 0.0
+          lin = (dx * math.cos(cur_yaw_rad) + dy * math.sin(cur_yaw_rad)) * scale
+          lin_y = (-dx * math.sin(cur_yaw_rad) + dy * math.cos(cur_yaw_rad)) * scale
+        else:
+          # Drive phase: point at the target, drive when roughly aligned
+          bearing_err = self.normalizeAngle(math.atan2(dy, dx) - cur_yaw_rad)
+          ang = max(-max_ang, min(max_ang, self.GOTO_KP_ANG * bearing_err))
+          if abs(bearing_err) < self.GOTO_TURN_GATE_RAD:
+            lin = max(0.0, min(max_lin, self.GOTO_KP_LIN * dist))
       else:
-        # Final yaw phase (skipped if no yaw goal)
+        # Final yaw phase (skipped if no yaw goal, or if this goto's own
+        # yaw_locked says a position command should never rotate the base
+        # at all -- see gotoPosition's own comment)
         yaw_err = 0.0
-        if target['yaw_deg'] is not None:
+        if target['yaw_deg'] is not None and not target.get('yaw_locked', False):
           yaw_err = self.normalizeAngle(math.radians(target['yaw_deg']) - cur_yaw_rad)
         if abs(yaw_err) > tol_rad:
           ang = max(-max_ang, min(max_ang, self.GOTO_KP_ANG * yaw_err))
         else:
-          # Target reached: clear (lin/ang stay 0.0 -- rover stops)
+          # Target reached: clear (lin/lin_y/ang stay 0.0 -- rover stops)
           self.clearGotoTarget()
           self.msg_if.pub_info("Goto target reached")
     elif any(self.motor_ratios) and self.settings_dict['move_with_manual_enabled']['value'] == 'TRUE':
@@ -1163,7 +1258,17 @@ class SimNode:
       # properly"); only whether that ratio also drives the rover's body
       # velocity is what this toggle controls.
       lin, ang = self.motorControlToVelocity()
-    self.sendVelocityCmd(lin, ang)
+      if wheel_independence_on:
+        # Base stays locked to whatever angle it's at under wheel
+        # independence, same as a position goto's own yaw_locked -- a
+        # manual differential motor ratio is a skid-steer "turn" gesture
+        # that has no meaning here (requested live, 2026-09-23, after
+        # watching this exact case rotate the base: "the base should not
+        # move, only the wheels"). Only an explicit gotoPose (the "Yaw
+        # Deg"/Pose control, or the pose phase above) can ever rotate the
+        # base while wheel independence is on.
+        ang = 0.0
+    self.sendVelocityCmd(lin, ang, lin_y)
 
   def motorControlToVelocity(self):
     # [0]=front_left, [1]=front_right, [2]=rear_left, [3]=rear_right --
@@ -1174,6 +1279,14 @@ class SimNode:
     max_lin = float(self.settings_dict['max_linear_speed_mps']['value'])
     lin = (left + right) / 2.0 * max_lin
     ang = (right - left) / self.MOTOR_WHEEL_BASE_M * max_lin
+    # Clamped to max_angular_rate_dps -- same bound gotoControlCb's own turn
+    # phase already respects, just missing here (confirmed live, 2026-09-23:
+    # with max_linear_speed_mps raised to 3.0 on this device, full-opposite
+    # motor ratios computed -7.5 rad/s here -- over a full revolution per
+    # second, with nothing capping it before it reached
+    # sendVelocityCmd/the sim bridge).
+    max_ang = math.radians(float(self.settings_dict['max_angular_rate_dps']['value']))
+    ang = max(-max_ang, min(max_ang, ang))
     return lin, ang
 
   def normalizeAngle(self,angle_rad):
@@ -1400,8 +1513,13 @@ class SimNode:
 
     self.last_telemetry_time = now
 
-  def sendVelocityCmd(self, linear_x, angular_z):
-    cmd = {'linear_x': linear_x, 'angular_z': angular_z}
+  def sendVelocityCmd(self, linear_x, angular_z, linear_y = 0.0):
+    # linear_y (2026-09-23): only ever nonzero from gotoControlCb's own
+    # wheel-independence drive phase -- see that method's own comment.
+    # Every other caller keeps sending plain (linear_x, angular_z), which
+    # sim_bridge_node.py's cmdCb already treats a missing linear_y as 0.0,
+    # so this is additive and changes nothing for a skid-steer rover.
+    cmd = {'linear_x': linear_x, 'angular_z': angular_z, 'linear_y': linear_y}
     self.sendLineToBridge(cmd, "Velocity command")
 
   def sendCameraSettings(self):

@@ -1183,6 +1183,12 @@ class ArdupilotNode:
     ## any of the other five topics (SITL only) any time via the ordinary
     ## Image Source dropdown.
     self.rbx_if.setImageTopicCb(String(data = self.robot_color_topic_name))
+    ## Same "deterministic per-instance behavior regardless of what a
+    ## previous run left in config" rationale as the image-topic override
+    ## just above -- see rbx_sim_node.py's own copy of this line for the
+    ## full incident writeup (a corrupted persisted enabled_image_sources
+    ## value silently disabled every camera by default on every launch).
+    self.rbx_if.settings_if.update_setting_value('enabled_image_sources', '')
 
     ## Start goto setpoint check/send loop
     setpoint_pub_interval = float(1) / self.SETPOINT_PUBLISH_RATE_HZ
