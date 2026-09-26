@@ -18,20 +18,27 @@
 
 # MuJoCo bridge for rbx_mujoco_node.py -- the RBX-driver "simple protocol"
 # path, same shape as sim_bridge_node.py (Gazebo) and webots_rbx_bridge.py
-# (Webots): raw velocity in ({"linear_x","angular_z"}), bare telemetry +
-# relayed camera frames out, plus {"type":"camera_settings"/"reset"/
-# "environment_option"} handled below.
+# (Webots): raw velocity in ({"linear_x","linear_y","angular_z"}), bare
+# telemetry + relayed camera frames out, plus {"type":"camera_settings"/
+# "reset"/"set_environment"/"refresh_environment"/"wheel_independence"}
+# handled below.
 #
 # UPDATED (2026-09-21, "get mujoco to that same point too, with all the
 # same features i asked for with webots"): rbx_rover.xml is now a
 # GENERATED file (generate_rover_xml.py, run once here at startup from
-# sim_container/models/generic_rover/dimensions.yaml), and
-# environment_option really toggles an OBSTACLE_COURSE now -- see
-# setObstacleCourseEnabled. Unlike Webots' Supervisor import/remove, the
-# obstacle-course geoms are compiled into rbx_rover.xml from the start
-# (generate_environment_xml.py) and toggled live via each geom's rgba
-# alpha + contype/conaffinity, since a compiled MjModel can't have bodies
-# added/removed at runtime -- see that generator's own module docstring.
+# sim_container/models/generic_rover/dimensions.yaml). Unlike Webots'
+# Supervisor import/remove, every environment's geoms are compiled into
+# rbx_rover.xml from the start (generate_environment_xml.py) and
+# setEnvironment picks exactly one live via each geom's rgba alpha +
+# contype/conaffinity, since a compiled MjModel can't have bodies added/
+# removed at runtime -- see that generator's own module docstring.
+#
+# UPDATED (2026-09-25, "make mujoco the main sim, test everything"):
+# added the crab-steer swerve modules (see generate_rover_xml.py), a
+# CUSTOM_OBSTACLES environment alongside OBSTACLE_COURSE, and
+# refreshEnvironment -- a live rebuild of model/data (_bindModel) so an
+# edited environment dimensions config takes effect without a relaunch,
+# preserving the rover's own pose/velocity across the rebuild.
 #
 # Unlike Gazebo/Webots, there is no separate simulator binary here -- MuJoCo
 # is a plain Python physics library, so this SAME process owns the physics
@@ -98,6 +105,7 @@ import mujoco
 import mujoco.viewer
 
 import generate_rover_xml
+import generate_environment_xml
 from generate_environment_xml import OBSTACLE_COURSE_GEOM_NAMES
 
 DEFAULT_HEARTBEAT_PORT = 9051
@@ -118,6 +126,23 @@ MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", 
 WHEEL_RADIUS_M = 0.1
 WHEEL_TRACK_M = 0.34
 MAX_WHEEL_RADPS = 15.0
+
+WHEEL_NAMES = [name for name, _x, _y in generate_rover_xml.ROVER_WHEELS]
+# Below this wheel ground speed a wheel keeps its last steer angle instead
+# of re-deriving atan2(~0, ~0), so it doesn't flick straight on every pause.
+STEER_HOLD_SPEED_MPS = 0.01
+STEER_ALIGN_GATE_RAD = math.radians(25.0)
+# Rate limit on the steer command. Snapping all four wheels 90 degrees at
+# once with a stiff steer actuator kicks the chassis ~6.5 degrees in yaw from
+# the reaction torque; 20 rad/s cuts that to ~2.6 while a 90-degree swing
+# still takes under 0.1 s.
+STEER_SLEW_RADPS = 20.0
+# Same active heading hold as crab_steer_plugin.cpp (Gazebo): with no
+# rotation commanded, servo back to the heading captured when rotation
+# stopped, capped so the correction can never spin the rover.
+YAW_HOLD_EPS = 0.01
+YAW_HOLD_KP = 2.0
+MAX_YAW_HOLD_RATE = 1.0
 
 
 def yawTiltToQuat(yaw_deg, tilt_deg):
@@ -207,38 +232,13 @@ class MujocoRbxBridge:
     # generate_rover_xml.main() directly would misread sys.argv -- that's
     # THIS process's own heartbeat/bridge port argv, not a model name -- so
     # this replicates main()'s body instead of calling it.
-    generate_rover_xml.regenerate("generic_rover")
-    self.wheel_radius_m, self.wheel_track_m = loadWheelDimensions()
-
-    self.model = mujoco.MjModel.from_xml_path(MODEL_PATH)
-    self.data = mujoco.MjData(self.model)
-    mujoco.mj_forward(self.model, self.data)
-    self.renderer = mujoco.Renderer(self.model, height = IMAGE_HEIGHT, width = IMAGE_WIDTH)
     self.camera_name = "robot_camera"
     self.scene_camera_name = "scene_camera"
-
-    # Obstacle-course geoms are always compiled into the model (disabled by
-    # default -- see generate_environment_xml.py's own docstring for why a
-    # compiled MjModel can't have them added/removed at runtime, unlike
-    # Webots). setObstacleCourseEnabled toggles these ids' visibility/
-    # collision live instead of spawning/removing anything.
-    self.obstacle_course_geom_ids = [
-        mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
-        for name in OBSTACLE_COURSE_GEOM_NAMES
-    ]
-    self.obstacle_course_enabled = False
-
-    # Camera ids + factory mount points for live camera_offset_x/y/z and
-    # scene_offset_x/y/z (2026-09-21, requested live: "make sure the camera
-    # offset stuff works... just like they do in gazebo" -- see
-    # webots_rbx_bridge.py's own identical fix). model.cam_pos/model.cam_fovy
-    # are plain mutable per-model arrays MuJoCo re-reads every step via
-    # mj_kinematics -- no respawn needed, simpler even than Webots'
-    # Supervisor field writes. yaw/tilt not wired yet, same as Webots.
-    self.robot_cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, self.camera_name)
-    self.scene_cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, self.scene_camera_name)
-    self.factory_robot_cam_pos = self.model.cam_pos[self.robot_cam_id].copy()
-    self.factory_scene_cam_pos = self.model.cam_pos[self.scene_cam_id].copy()
+    self.wheel_radius_m, self.wheel_track_m = loadWheelDimensions()
+    self.current_environment = "FLAT_GROUND"
+    self.last_camera_settings = None
+    self.held_yaw = None
+    self._bindModel(initial = True)
 
     # Visible window, same reason Gazebo/Webots pop open their own GUI --
     # needs a real DISPLAY/XAUTHORITY (see module docstring). Failure here
@@ -247,11 +247,7 @@ class MujocoRbxBridge:
     # all work identically either way, so a missing display shouldn't take
     # the whole simulator down.
     self.viewer = None
-    try:
-      self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
-    except Exception as e:
-      print("mujoco_rbx_bridge: could not open a viewer window (%s) -- "
-            "continuing headless" % str(e), flush = True)
+    self._openViewer()
 
     self.pose_lock = threading.Lock()
     self.x_m = 0.0
@@ -259,6 +255,8 @@ class MujocoRbxBridge:
     self.yaw_rad = 0.0
     self.lin_mps = 0.0
     self.ang_radps = 0.0
+    self.vx_world = 0.0
+    self.vy_world = 0.0
     self._last_x, self._last_y, self._last_yaw, self._last_t = 0.0, 0.0, 0.0, None
 
     # Commanded velocity, set directly by the RBX driver's own closed-loop
@@ -266,6 +264,7 @@ class MujocoRbxBridge:
     # same reasoning as webots_rbx_bridge.py.
     self.cmd_lock = threading.Lock()
     self.cmd_linear_x = 0.0
+    self.cmd_linear_y = 0.0
     self.cmd_angular_z = 0.0
 
     # Four named frames (robot_color/robot_depth/scene_color/scene_depth) --
@@ -288,6 +287,109 @@ class MujocoRbxBridge:
   # Physics loop -- runs on the calling (main) thread, paced to real time
   # (MuJoCo has no built-in blocking step-and-wait the way Webots' robot.step()
   # provides, so this does its own wall-clock pacing).
+
+  def _bindModel(self, initial):
+    # Regenerate rbx_rover.xml from the current dimensions.yaml files, then
+    # (re)build model/data and re-resolve every id/handle that lives on this
+    # specific MjModel instance. Called once at construction and again by
+    # refreshEnvironment, which is why every one of those handles has to be
+    # re-derived here rather than assumed to still be valid.
+    generate_rover_xml.regenerate("generic_rover")
+    self.model = mujoco.MjModel.from_xml_path(MODEL_PATH)
+    self.data = mujoco.MjData(self.model)
+    mujoco.mj_forward(self.model, self.data)
+    self.renderer = mujoco.Renderer(self.model, height = IMAGE_HEIGHT, width = IMAGE_WIDTH)
+
+    # Obstacle-course / custom-obstacles geoms are always compiled into the
+    # model (see generate_environment_xml.py's own docstring for why a
+    # compiled MjModel can't have geoms added/removed at runtime); setEnvironment
+    # toggles visibility/collision live instead of spawning/removing anything.
+    self.obstacle_course_geom_ids = [
+        mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
+        for name in OBSTACLE_COURSE_GEOM_NAMES
+    ]
+    self.custom_obstacles_geom_ids = [
+        mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
+        for name in generate_environment_xml.CUSTOM_OBSTACLES_GEOM_NAMES
+    ]
+    self.aerial_obstacle_course_geom_ids = [
+        mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
+        for name in generate_environment_xml.AERIAL_OBSTACLE_COURSE_GEOM_NAMES
+    ]
+    # Compiled colliding (see generate_environment_xml.py's _boxGeom for
+    # why); force all off, then setEnvironment (called by our own caller --
+    # __init__ for a fresh FLAT_GROUND start, refreshEnvironment to restore
+    # whatever was selected) applies the real state.
+    self._setGeomGroupEnabled(self.obstacle_course_geom_ids, False)
+    self._setGeomGroupEnabled(self.custom_obstacles_geom_ids, False)
+    self._setGeomGroupEnabled(self.aerial_obstacle_course_geom_ids, False)
+
+    # Camera ids + factory mount points for live camera_offset_x/y/z and
+    # scene_offset_x/y/z (2026-09-21, requested live: "make sure the camera
+    # offset stuff works... just like they do in gazebo" -- see
+    # webots_rbx_bridge.py's own identical fix). model.cam_pos/model.cam_fovy
+    # are plain mutable per-model arrays MuJoCo re-reads every step via
+    # mj_kinematics -- no respawn needed, simpler even than Webots'
+    # Supervisor field writes. yaw/tilt not wired yet, same as Webots.
+    self.robot_cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, self.camera_name)
+    self.scene_cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, self.scene_camera_name)
+    self.factory_robot_cam_pos = self.model.cam_pos[self.robot_cam_id].copy()
+    self.factory_scene_cam_pos = self.model.cam_pos[self.scene_cam_id].copy()
+
+    # Per-wheel swerve module handles (see generate_rover_xml.py): spin and
+    # steer actuator ids, the steer joint's qpos address, and the module's
+    # (x, y) offset in the chassis frame, all read from the compiled model so
+    # they always match whatever dimensions.yaml generated.
+    def _id(obj, name):
+      return mujoco.mj_name2id(self.model, obj, name)
+    self.wheels = []
+    for name in WHEEL_NAMES:
+      steer_body = _id(mujoco.mjtObj.mjOBJ_BODY, name + "_steer")
+      self.wheels.append({
+          'spin_act': _id(mujoco.mjtObj.mjOBJ_ACTUATOR, name + "_vel"),
+          'steer_act': _id(mujoco.mjtObj.mjOBJ_ACTUATOR, name + "_steer_pos"),
+          'steer_qadr': self.model.jnt_qposadr[_id(mujoco.mjtObj.mjOBJ_JOINT, name + "_steer")],
+          'x': float(self.model.body_pos[steer_body][0]),
+          'y': float(self.model.body_pos[steer_body][1]),
+          'steer_target': 0.0,
+          'steer_cmd': 0.0,
+      })
+    self.steer_range_rad = generate_rover_xml.STEER_RANGE_RAD
+
+    if initial:
+      # Starting mode comes from the launched robot config's dimensions
+      # (e.g. crabrover has wheel_independence_enabled: 1); reported back in
+      # telemetry so rbx_mujoco_node.py's Setting matches, and still
+      # switchable live afterward by that Setting. Not re-read on a live
+      # refresh -- that would silently revert an operator's own live toggle.
+      try:
+        dims = generate_rover_xml.loadDimensions("generic_rover", generate_rover_xml.DEFAULT_DIMENSIONS)
+        self.wheel_independence = bool(int(float(dims.get("wheel_independence_enabled", 0))))
+      except (TypeError, ValueError):
+        self.wheel_independence = False
+      print("mujoco_rbx_bridge: starting with wheel independence %s" %
+            ("on" if self.wheel_independence else "off"), flush = True)
+
+  def _openViewer(self):
+    # Visible window, same reason Gazebo/Webots pop open their own GUI --
+    # needs a real DISPLAY/XAUTHORITY (see module docstring). Failure here
+    # (no X server reachable, e.g. a genuinely headless deployment) degrades
+    # to a warning, not a crash: the physics loop, bridge, and camera relay
+    # all work identically either way, so a missing display shouldn't take
+    # the whole simulator down. Also (re)called by refreshEnvironment: a
+    # passive viewer is bound to one specific model/data pair at creation,
+    # so a rebuilt model needs a fresh window, not a mutation of the old one.
+    if self.viewer is not None:
+      try:
+        self.viewer.close()
+      except Exception:
+        pass
+      self.viewer = None
+    try:
+      self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
+    except Exception as e:
+      print("mujoco_rbx_bridge: could not open a viewer window (%s) -- "
+            "continuing headless" % str(e), flush = True)
 
   def run(self):
     next_tick = time.time()
@@ -315,16 +417,21 @@ class MujocoRbxBridge:
 
     lin_mps = 0.0
     ang_radps = 0.0
+    vx_world = 0.0
+    vy_world = 0.0
     if self._last_t is not None:
       dt = now - self._last_t
       if dt > 1e-6:
-        lin_mps = math.hypot(x - self._last_x, y - self._last_y) / dt
+        vx_world = (x - self._last_x) / dt
+        vy_world = (y - self._last_y) / dt
+        lin_mps = math.hypot(vx_world, vy_world)
         ang_radps = self.normalizeAngle(yaw - self._last_yaw) / dt
     self._last_x, self._last_y, self._last_yaw, self._last_t = x, y, yaw, now
 
     with self.pose_lock:
       self.x_m, self.y_m, self.yaw_rad = x, y, yaw
       self.lin_mps, self.ang_radps = lin_mps, ang_radps
+      self.vx_world, self.vy_world = vx_world, vy_world
 
     if now - self._last_image_capture >= 1.0 / IMAGE_RATE_HZ:
       self._last_image_capture = now
@@ -400,17 +507,72 @@ class MujocoRbxBridge:
     # self-healing-against-dropped-packets design every other bridge here
     # relies on. This just converts to per-wheel velocity and writes ctrl.
     with self.cmd_lock:
-      lin, ang = self.cmd_linear_x, self.cmd_angular_z
+      lin, lin_y, ang = self.cmd_linear_x, self.cmd_linear_y, self.cmd_angular_z
+      wheel_independence = self.wheel_independence
+
+    if wheel_independence:
+      self.applySwerveVelocity(lin, lin_y, ang)
+      return
 
     left_radps = (lin - ang * self.wheel_track_m / 2.0) / self.wheel_radius_m
     right_radps = (lin + ang * self.wheel_track_m / 2.0) / self.wheel_radius_m
     left_radps = max(-MAX_WHEEL_RADPS, min(MAX_WHEEL_RADPS, left_radps))
     right_radps = max(-MAX_WHEEL_RADPS, min(MAX_WHEEL_RADPS, right_radps))
     # wheel1=front_left, wheel2=front_right, wheel3=rear_left, wheel4=rear_right
-    self.data.ctrl[0] = left_radps
-    self.data.ctrl[1] = right_radps
-    self.data.ctrl[2] = left_radps
-    self.data.ctrl[3] = right_radps
+    # Straight ahead (0, or +-pi reversed if that's where the wheel already
+    # is after crab mode) -- so switching modes never swings a wheel round.
+    for w, radps in zip(self.wheels, (left_radps, right_radps, left_radps, right_radps)):
+      self.driveWheel(w, 0.0, radps * self.wheel_radius_m, force_steer = True)
+
+  def driveWheel(self, w, theta, speed, force_steer = False):
+    # Point wheel w along theta (chassis frame) and roll it at speed (m/s,
+    # signed). Of the equivalent angles (theta, or theta +- pi with the wheel
+    # reversed), takes the one nearest the wheel's current angle that is
+    # still inside the joint's range, so a wheel never swings the long way
+    # round and a 180-degree direction change is a reverse, not a half-turn.
+    current = float(self.data.qpos[w['steer_qadr']])
+    if force_steer or abs(speed) > STEER_HOLD_SPEED_MPS:
+      best, best_sign = None, 1.0
+      for cand, sign in ((theta, 1.0), (theta + math.pi, -1.0), (theta - math.pi, -1.0)):
+        if abs(cand) > self.steer_range_rad:
+          continue
+        if best is None or abs(cand - current) < abs(best - current):
+          best, best_sign = cand, sign
+      w['steer_target'] = best
+      speed = best_sign * speed
+    else:
+      # Nearly stopped: hold the last angle instead of re-deriving it from
+      # a ~zero vector, so wheels don't flick straight on every pause.
+      speed = 0.0
+    # Don't push while the wheel is still well off its target angle, or it
+    # drives the chassis the wrong way during the swing.
+    err = abs(w['steer_target'] - current)
+    alignment = math.cos(err) if err < STEER_ALIGN_GATE_RAD else 0.0
+    radps = speed * alignment / self.wheel_radius_m
+    step = STEER_SLEW_RADPS * self.model.opt.timestep
+    w['steer_cmd'] += max(-step, min(step, w['steer_target'] - w['steer_cmd']))
+    self.data.ctrl[w['steer_act']] = w['steer_cmd']
+    self.data.ctrl[w['spin_act']] = max(-MAX_WHEEL_RADPS, min(MAX_WHEEL_RADPS, radps))
+
+  def applySwerveVelocity(self, vx, vy, vyaw):
+    # Crab steer: body-frame (vx, vy, vyaw) -> each wheel's own required
+    # ground velocity v = v_body + omega x r, r = the module's (x, y) offset.
+    # The chassis is never driven directly -- it moves only because the
+    # wheels push it, so it still collides with obstacles like any body.
+    qw, qx, qy, qz = self.data.qpos[3:7]
+    yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+    if abs(vyaw) < YAW_HOLD_EPS:
+      if self.held_yaw is None:
+        self.held_yaw = yaw
+      err = self.normalizeAngle(self.held_yaw - yaw)
+      vyaw = max(-MAX_YAW_HOLD_RATE, min(MAX_YAW_HOLD_RATE, YAW_HOLD_KP * err))
+    else:
+      self.held_yaw = None
+
+    for w in self.wheels:
+      wvx = vx - vyaw * w['y']
+      wvy = vy + vyaw * w['x']
+      self.driveWheel(w, math.atan2(wvy, wvx), math.hypot(wvx, wvy))
 
   def resetSim(self):
     # Genuine reset -- see module docstring. Clears commanded velocity and
@@ -418,31 +580,89 @@ class MujocoRbxBridge:
     # lin/ang spike computed against the pre-reset pose.
     with self.cmd_lock:
       self.cmd_linear_x = 0.0
+      self.cmd_linear_y = 0.0
       self.cmd_angular_z = 0.0
+    self.held_yaw = None
+    for w in self.wheels:
+      w['steer_target'] = 0.0
+      w['steer_cmd'] = 0.0
     mujoco.mj_resetData(self.model, self.data)
     mujoco.mj_forward(self.model, self.data)
     self._last_x, self._last_y, self._last_yaw, self._last_t = 0.0, 0.0, 0.0, None
     print("mujoco_rbx_bridge: reset to initial pose", flush = True)
 
-  def setObstacleCourseEnabled(self, enabled):
-    # Idempotent both ways, same reasoning as webots_rbx_bridge.py's own.
+  def _setGeomGroupEnabled(self, geom_ids, enabled):
+    # Idempotent, same reasoning as webots_rbx_bridge.py's own toggle.
     # geom_rgba/contype/conaffinity live on the MODEL (not mjData), so
     # resetSim's mj_resetData never touches this -- a sim reset doesn't
-    # silently remove the course, matching Gazebo/Webots' own behavior
-    # (RESET_SIM only teleports the robot, never touches the environment).
-    if enabled == self.obstacle_course_enabled:
-      return
+    # silently remove/restore the environment, matching Gazebo/Webots' own
+    # behavior (RESET_SIM only teleports the robot, never the environment).
     alpha = 1.0 if enabled else 0.0
     contype = 1 if enabled else 0
-    for gid in self.obstacle_course_geom_ids:
+    for gid in geom_ids:
       self.model.geom_rgba[gid][3] = alpha
       self.model.geom_contype[gid] = contype
       self.model.geom_conaffinity[gid] = contype
-    self.obstacle_course_enabled = enabled
-    print("mujoco_rbx_bridge: obstacle course %s" % ("enabled" if enabled else "disabled"),
-          flush = True)
+
+  def setEnvironment(self, environment_value):
+    # Exactly one environment geom group visible/colliding at a time --
+    # rbx_mujoco_node.py's own environment Setting is a single-select, same
+    # as every other simulator here. Idempotent early-return -- the device
+    # now resends this periodically as a connection-drop self-heal (see
+    # rbx_mujoco_node.py's settingsResyncCb), not just on a real change.
+    if environment_value == self.current_environment:
+      return
+    self.current_environment = environment_value
+    self._setGeomGroupEnabled(self.obstacle_course_geom_ids,
+                              environment_value == "OBSTACLE_COURSE")
+    self._setGeomGroupEnabled(self.custom_obstacles_geom_ids,
+                              environment_value == "CUSTOM_OBSTACLES")
+    self._setGeomGroupEnabled(self.aerial_obstacle_course_geom_ids,
+                              environment_value == "AERIAL_OBSTACLE_COURSE")
+    print("mujoco_rbx_bridge: environment set to %s" % environment_value, flush = True)
+
+  def refreshEnvironment(self):
+    # Live edits to the environment dimensions (Obstacle Course's walls/
+    # baffles/ramp, or the Custom Obstacles list) only reach the compiled
+    # geoms by rebuilding the model -- see generate_environment_xml.py's
+    # own docstring. Rebuilds a fresh MjModel/MjData and re-resolves every
+    # id/handle that pointed into the old one (_bindModel), but keeps the
+    # rover's current pose/velocity and commanded state, so this reads as
+    # "the environment changed," not an unexpected RESET_SIM.
+    saved_environment = self.current_environment
+    old_qpos, old_qvel = self.data.qpos.copy(), self.data.qvel.copy()
+    old_cmd = (self.cmd_linear_x, self.cmd_linear_y, self.cmd_angular_z)
+    old_wheel_state = [(w['steer_target'], w['steer_cmd']) for w in self.wheels]
+    self._bindModel(initial = False)
+    # _bindModel force-disables every environment geom group on the fresh
+    # model, but setEnvironment below is now idempotent (see its own
+    # comment) and would otherwise treat "still saved_environment" as
+    # "nothing to do" and skip re-enabling them -- forcing a mismatch here
+    # guarantees the reapply actually runs.
+    self.current_environment = None
+    if self.data.qpos.shape == old_qpos.shape and self.data.qvel.shape == old_qvel.shape:
+      self.data.qpos[:] = old_qpos
+      self.data.qvel[:] = old_qvel
+      mujoco.mj_forward(self.model, self.data)
+    if len(old_wheel_state) == len(self.wheels):
+      for w, (target, cmd) in zip(self.wheels, old_wheel_state):
+        w['steer_target'], w['steer_cmd'] = target, cmd
+    with self.cmd_lock:
+      self.cmd_linear_x, self.cmd_linear_y, self.cmd_angular_z = old_cmd
+    self.setEnvironment(saved_environment)
+    if self.last_camera_settings is not None:
+      self.applyCameraSettings(self.last_camera_settings)
+    self._openViewer()
+    print("mujoco_rbx_bridge: environment refreshed", flush = True)
 
   def applyCameraSettings(self, msg):
+    # Cached so refreshEnvironment can reapply it after rebuilding the
+    # model -- _bindModel recomputes factory_robot_cam_pos/
+    # factory_scene_cam_pos from the FRESH model's own un-offset XML
+    # values, so without this a refresh silently snapped both cameras
+    # back to their factory position/FOV, discarding whatever offset was
+    # live at the time.
+    self.last_camera_settings = dict(msg)
     # Position offsets are a plain delta from each camera's factory mount
     # point, written directly into model.cam_pos -- mj_kinematics re-reads
     # this every step, so no respawn/reset is needed for it to take effect
@@ -561,11 +781,18 @@ class MujocoRbxBridge:
     with self.pose_lock:
       x_m, y_m, yaw_rad = self.x_m, self.y_m, self.yaw_rad
       lin_mps, ang_radps = self.lin_mps, self.ang_radps
+      vx_world, vy_world = self.vx_world, self.vy_world
+    with self.cmd_lock:
+      wheel_independence = self.wheel_independence
     # Matches sim_bridge_node.py/webots_rbx_bridge.py's bare-telemetry shape
     # exactly: x/y/yaw plus linear_x/angular_z, no "type" key.
     return {
         "x": x_m, "y": y_m, "yaw": yaw_rad,
         "linear_x": lin_mps, "angular_z": ang_radps,
+        # Extra keys (rbx_mujoco_node.py reads them if present): real
+        # world-frame velocity, and the current crab-steer mode.
+        "vx_world": vx_world, "vy_world": vy_world,
+        "wheel_independence": wheel_independence,
     }
 
   def sendLine(self, conn, line_dict):
@@ -589,16 +816,26 @@ class MujocoRbxBridge:
     if "linear_x" in msg and "type" not in msg:
       with self.cmd_lock:
         self.cmd_linear_x = float(msg.get("linear_x", 0.0))
+        self.cmd_linear_y = float(msg.get("linear_y", 0.0))
         self.cmd_angular_z = float(msg.get("angular_z", 0.0))
       return
     msg_type = msg.get("type")
-    if msg_type == "camera_settings":
+    if msg_type == "wheel_independence":
+      enabled = bool(msg.get("enabled", False))
+      with self.cmd_lock:
+        changed = (enabled != self.wheel_independence)
+        self.wheel_independence = enabled
+      if changed:
+        self.held_yaw = None
+        print("mujoco_rbx_bridge: wheel independence %s" % ("on" if enabled else "off"), flush = True)
+    elif msg_type == "camera_settings":
       self.applyCameraSettings(msg)
     elif msg_type == "reset":
       self.resetSim()
-    elif msg_type == "environment_option":
-      if msg.get("option") == "OBSTACLE_COURSE":
-        self.setObstacleCourseEnabled(bool(msg.get("enabled", False)))
+    elif msg_type == "set_environment":
+      self.setEnvironment(msg.get("environment", "FLAT_GROUND"))
+    elif msg_type == "refresh_environment":
+      self.refreshEnvironment()
 
 
 def main():

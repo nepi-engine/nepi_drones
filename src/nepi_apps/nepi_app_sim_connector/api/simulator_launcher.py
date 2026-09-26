@@ -571,6 +571,23 @@ class SimulatorLauncher(object):
   def _deploy_state_path(self, os_instance_id):
     return os.path.join(VM_COMMANDS_STORAGE_DIR, os_instance_id, DEPLOY_STATE_FILENAME)
 
+  def find_running_target(self):
+    """Return the target key a shared-storage watcher reports as launching
+    or running, or '' if none -- for when this process has no memory of a
+    launch (e.g. the app restarted while the simulator kept running)."""
+    seen = set()
+    for target in self.config["launch_targets"].values():
+      if not target or target.get('connection_mode') != 'shared_storage':
+        continue
+      os_instance_id = target.get('os_instance_id', '')
+      if not os_instance_id or os_instance_id in seen:
+        continue
+      seen.add(os_instance_id)
+      status = self._read_deploy_state(os_instance_id).get('status', {})
+      if status.get('state') in ('launching', 'running') and status.get('running_target'):
+        return status['running_target']
+    return ''
+
   def _read_deploy_state(self, os_instance_id):
     try:
       with open(self._deploy_state_path(os_instance_id), 'r') as f:
@@ -592,7 +609,8 @@ class SimulatorLauncher(object):
       raise LauncherError("Could not reach the shared-storage mailbox for OS instance '" +
                            os_instance_id + "': " + str(e))
     doc = self._read_deploy_state(os_instance_id)
-    doc['control'] = {'desired_target': target_key, 'last_updated': time.time()}
+    request_token = time.time()
+    doc['control'] = {'desired_target': target_key, 'last_updated': request_token}
     doc['target'] = {
         'launch_command': launch_command,
         'stop_command': stop_command,
@@ -602,6 +620,7 @@ class SimulatorLauncher(object):
     with open(tmp, 'w') as f:
       yaml.safe_dump(doc, f, default_flow_style=False, sort_keys=False)
     os.replace(tmp, path)
+    return request_token
 
   def _launch_via_deploy_state(self, target, target_key, command, timeout_sec):
     """Requests target_key as the desired deploy state, then polls
@@ -620,12 +639,23 @@ class SimulatorLauncher(object):
           "'" + target.get('display_name', target_key) + "' is set to the shared_storage "
           "connection mode but has no os_instance_id -- select a shared_storage OS "
           "instance for it first.")
-    self._write_deploy_desired(os_instance_id, target_key, launch_command=command,
-                               stop_command=target.get('stop_command', ''),
-                               ready_check_command=target.get('ready_check_command', ''))
+    request_token = self._write_deploy_desired(
+        os_instance_id, target_key, launch_command=command,
+        stop_command=target.get('stop_command', ''),
+        ready_check_command=target.get('ready_check_command', ''))
     deadline = time.time() + timeout_sec + SHARED_STORAGE_POLL_GRACE_SEC
     while time.time() < deadline:
       status = self._read_deploy_state(os_instance_id).get('status', {})
+      # Only trust a status the watcher wrote for THIS request. Without this,
+      # relaunching a target whose previous run had died (e.g. its Gazebo
+      # window closed) immediately read that run's leftover 'failed' status
+      # and reported a false launch failure while the new launch was in fact
+      # coming up fine. A watcher too old to echo handled_update falls back
+      # to the previous match-on-target-only behavior.
+      handled = status.get('handled_update')
+      if handled is not None and abs(float(handled) - request_token) > 1e-3:
+        time.sleep(SHARED_STORAGE_POLL_INTERVAL_SEC)
+        continue
       if status.get('running_target') == target_key:
         state = status.get('state')
         if state == 'failed':
@@ -1057,7 +1087,7 @@ class SimulatorLauncher(object):
       # actually running; this is just reading that same answer back.
       os_instance_id = target.get('os_instance_id', '')
       status = self._read_deploy_state(os_instance_id).get('status', {})
-      if status.get('running_target') != target_key:
+      if status.get('running_target') != target_key or status.get('state') != 'running':
         return False
       return bool(status.get('ready', False))
     try:
@@ -1249,6 +1279,12 @@ class SimulatorLauncher(object):
       # process's session, and it resists SIGTERM even directly).
       pkill_script = (
           "pkill -x gzclient 2>/dev/null; pkill -x gzserver 2>/dev/null; "
+          # A stray mujoco_rbx_bridge.py (its own launch_command's
+          # "REFUSING TO LAUNCH: a MuJoCo bridge instance is already
+          # running" guard is a pgid-file check -- this is the same
+          # escape hatch for whatever left an orphan behind that pgid
+          # file's own PID no longer matches).
+          "pkill -f \"[m]ujoco_rbx_bridge.py\" 2>/dev/null; "
           "pkill -f \"[s]im_bridge_node.py\" 2>/dev/null; "
           "pkill -f \"[s]im_heartbeat_listener.py\" 2>/dev/null; "
           "pkill -f \"[c]amera_rig_controller.py\" 2>/dev/null; "

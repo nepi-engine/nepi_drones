@@ -124,7 +124,9 @@ from std_msgs.msg import Bool, Empty, String, Float32, Int32
 from sensor_msgs.msg import Image
 from geographic_msgs.msg import GeoPoint
 
-from nepi_interfaces.msg import AxisControls, DeviceRBXStatus, NavPose, Setting, UpdateControl
+from nepi_interfaces.msg import AxisControls, DeviceRBXStatus, GotoLocation, GotoPose, \
+    GotoPosition, MotorControl, NavPose, Setting, UpdateControl
+from geographic_msgs.msg import GeoPoint
 
 from nepi_api.messages_if import MsgIF
 
@@ -275,10 +277,13 @@ LEGACY_DEFAULT_DIMENSION_CONFIG_NAME = 'Default'
 DIMENSIONS_STORAGE_DIR = '/mnt/nepi_storage/databases/nepi_app_sim_connector/dimensions'
 
 # Default target used to push dimensions on app startup, before any
-# simulator has been launched/selected this session -- gazebo_rover is the
-# primary, always-available Gazebo target on this VM, matching the same
-# fallback several other code paths already use.
-DEFAULT_DIMENSIONS_PUSH_TARGET = 'gazebo_rover'
+# simulator has been launched/selected this session -- mujoco_rover is the
+# primary, always-available target on this VM (2026-09-25, "make mujoco
+# the main sim"). Purely which os_instance mailbox to write to
+# (_push_dimensions_shared_storage writes dimensions.yaml and regenerates
+# every simulator's own model from it regardless of which target name is
+# passed here), so this rename has no behavioral effect by itself.
+DEFAULT_DIMENSIONS_PUSH_TARGET = 'mujoco_rover'
 
 # Phone-scan (Stray Scanner) uploads land here, device-side -- same
 # persistent-storage category as DIMENSIONS_STORAGE_DIR above, so an upload
@@ -336,20 +341,24 @@ BRIDGE_RECV_BYTES = 4096
 
 STATUS_PUBLISH_RATE_HZ = 1.0
 
-# Text that identifies launch_command's own "a gzserver is already running"
-# refuse-to-launch guard (both gazebo_rover and gazebo_quadcopter's
-# launch_command raise this exact wording -- see simulator_launch_targets.yaml)
-# so runLaunch can offer the operator a real choice (attach to what's
-# already there, or force past it) instead of just reporting a generic
-# failure. Matched on the wording those two guards actually share, not on
-# any structured error code -- LauncherError carries plain text by design
-# (see its own docstring), and inventing a second, parallel signal just for
-# this one case isn't worth it while only these two targets can ever raise it.
-GAZEBO_ALREADY_RUNNING_ERROR_SIGNATURE = "a gzserver is already running"
+# Text that identifies a launch_command's own "already running" refuse-to-
+# launch guard (gazebo_rover/gazebo_quadcopter's "a gzserver is already
+# running", mujoco_rover's "a MuJoCo bridge instance is already running" --
+# see simulator_launch_targets.yaml) so runLaunch can offer the operator a
+# real choice (force past it, or clear it with Kill All) instead of just
+# reporting a generic failure. Matched on the wording these guards actually
+# share, not on any structured error code -- LauncherError carries plain
+# text by design (see its own docstring). "Gazebo" in the name is legacy --
+# this now covers any target's own guard.
+ALREADY_RUNNING_ERROR_SIGNATURES = (
+    "a gzserver is already running",
+    "a mujoco bridge instance is already running",
+)
 
 
 def isGazeboConflictError(error_message):
-  return GAZEBO_ALREADY_RUNNING_ERROR_SIGNATURE in str(error_message).lower()
+  message = str(error_message).lower()
+  return any(signature in message for signature in ALREADY_RUNNING_ERROR_SIGNATURES)
 
 
 #########################################
@@ -456,6 +465,7 @@ class NepiSimConnectorApp:
     self.sim_device_subs = dict()      # status topic -> subscriber handle
     self.sim_device_info = dict()      # status topic -> dict(name, source, time)
     self.selected_simulator = ""
+    self.rbx_forward_pubs = dict()      # (namespace, topic_name) -> publisher, see forwardToRbx
 
     ##############################
     # Common four-topic mirror -- a stable, simulator-agnostic viewing point
@@ -2540,7 +2550,14 @@ class NepiSimConnectorApp:
       self.sim_device_info[topic] = dict(
           device_name = msg.device_name,
           data_source_description = msg.data_source_description,
-          time = nepi_utils.get_time())
+          time = nepi_utils.get_time(),
+          # Cached so forwardToSelectedSimulator's own readiness checks (see
+          # isBridgeConnected/autonomousControlsReady) can answer for the
+          # selected RBX device without a fresh round-trip -- this status
+          # message is the only thing this app ever receives from it.
+          ready = msg.ready,
+          manual_control_mode_ready = msg.manual_control_mode_ready,
+          autonomous_control_mode_ready = msg.autonomous_control_mode_ready)
 
   def getAvailableSimulators(self):
     # Returns two parallel lists (namespaces, display names) -- the same
@@ -2730,17 +2747,23 @@ class NepiSimConnectorApp:
     # Confirmed live as the actual mechanism behind repeated "stop reports
     # idle but the process is still there" reports this session -- matches
     # the same active-or-selected fallback stop_target already uses below.
-    if self.launcher is None or not (self.active_launch_target or self.selected_launch_target):
+    if self.launcher is None:
+      return
+    # active_launch_target -- the target with real SSH-launched processes
+    # -- may differ from selected_launch_target when the current robot
+    # config redirected the launch elsewhere (see runLaunch); falls back
+    # to selected_launch_target for the ordinary, unredirected case, and
+    # last to whatever the shared-storage watcher says is running: after an
+    # app restart both are '' even though the simulator is still up, and
+    # Stop was then a silent no-op.
+    stop_target = (self.active_launch_target or self.selected_launch_target
+                   or self.launcher.find_running_target())
+    if not stop_target:
       return
     with self.launcher_lock:
       if self.launcher_thread is not None and self.launcher_thread.is_alive():
         self.msg_if.pub_warn("A launch/stop is already in progress, ignoring")
         return
-      # active_launch_target -- the target with real SSH-launched processes
-      # -- may differ from selected_launch_target when the current robot
-      # config redirected the launch elsewhere (see runLaunch); falls back
-      # to selected_launch_target for the ordinary, unredirected case.
-      stop_target = self.active_launch_target or self.selected_launch_target
       self.launcher_thread = threading.Thread(target = self.runStop, args = (stop_target,))
       self.launcher_thread.daemon = True
       self.launcher_thread.start()
@@ -2781,8 +2804,15 @@ class NepiSimConnectorApp:
     # the VM. Skipping runStop here because launcher_state said 'idle' left
     # the real orphan alive, so runLaunch below hit the launch script's own
     # "already running" refuse-guard instead of actually redeploying.
-    if (self.launcher_state == 'running' or self.active_launch_target) and (self.active_launch_target or self.selected_launch_target):
-      self.runStop(self.active_launch_target or self.selected_launch_target)
+    # Same watcher fallback as stopSimulatorCb: after an app restart this
+    # node has no memory of the running sim, and "redeploy" silently reused
+    # it instead of starting fresh.
+    running_target = self.active_launch_target or self.selected_launch_target
+    if not (self.launcher_state == 'running' or self.active_launch_target):
+      running_target = ''
+    running_target = running_target or self.launcher.find_running_target()
+    if running_target:
+      self.runStop(running_target)
       if self.launcher_state == 'failed':
         return  # runStop already published the failure; nothing more to do
     self.runLaunch(target_key, robot_config=robot_config)
@@ -3297,8 +3327,13 @@ class NepiSimConnectorApp:
     # instead (switching to a robot config that needs a different
     # world/bridge while "Gazebo" stays picked), this is NOT a reuse --
     # falls through to a real (re)launch below.
+    # is_ready() re-checks that it's really still up: launcher_state is only
+    # this node's own memory of the last launch, and nothing moves it off
+    # 'running' if the simulator dies afterward (e.g. its Gazebo window is
+    # closed) -- without this, re-deploying after that was a silent no-op.
     if (self.launcher_state == 'running' and self.selected_launch_target == target_key
-        and self.active_launch_target == actual_target):
+        and self.active_launch_target == actual_target
+        and self.launcher.is_ready(actual_target)):
       if pre_launch_robot_config:
         resolved_config = self.launcher.resolve_robot_config(actual_target, pre_launch_robot_config)
         self.setSelectedRobotConfig(resolved_config)
@@ -3563,7 +3598,58 @@ class NepiSimConnectorApp:
   #**********************
   # Connection health
 
+  # RBX forwarding -- the app's own Sim Connector control surface
+  # (setMotorControlRatio/gotoPosition/gotoPose/gotoLocation/goHome/goStop/
+  # setHome/setSetupActionInd below) was built against SimDeviceIF's generic
+  # bridge protocol (sendLineToBridge, port 9030), which only a dedicated
+  # bridge script (e.g. the ArduPilot quadcopter one) ever dials into.
+  # Confirmed live: every simulator this app discovers (rover or
+  # quadcopter -- see SIM_DEVICE_STATUS_MSG_TYPES, DeviceRBXStatus only) is
+  # itself an RBX device with its own working goto/motor/home topics
+  # (that's what Devices -> Robots already talks to), so a selected
+  # simulator is forwarded to directly instead: no consumer ever depended
+  # on the bridge path once a real RBX device was selected, and this makes
+  # the Sim Connector's own panel work for the first time for a rover sim.
+  # Falls back to the legacy bridge path when nothing is selected (kept
+  # for whatever, if anything, still relies on it).
+  def forwardToRbx(self, topic_name, msg, description):
+    namespace = self.selected_simulator
+    if not namespace:
+      return False
+    pub = self.rbx_forward_pubs.get((namespace, topic_name))
+    if pub is None:
+      try:
+        pub = nepi_sdk.create_publisher(namespace + "/" + topic_name, type(msg), queue_size = 1)
+      except Exception as e:
+        self.msg_if.pub_warn("Could not create RBX forwarding publisher for " +
+                             description + ": " + str(e), throttle_s = 5.0)
+        return False
+      self.rbx_forward_pubs[(namespace, topic_name)] = pub
+      # A fresh publisher needs a moment to connect before publish() reaches
+      # a subscriber -- same one-time settle this app's own node_if-based
+      # publishers get implicitly from being created well before first use.
+      nepi_sdk.sleep(0.3)
+    try:
+      pub.publish(msg)
+    except Exception as e:
+      self.msg_if.pub_warn("Failed to forward " + description.lower() + " to " +
+                           namespace + ": " + str(e))
+      return False
+    return True
+
+  def getSelectedSimDeviceInfo(self):
+    topic = self.selected_simulator
+    if not topic:
+      return None
+    if not topic.endswith("/status"):
+      topic = topic + "/status"
+    with self.sim_scan_lock:
+      return self.sim_device_info.get(topic)
+
   def isBridgeConnected(self):
+    info = self.getSelectedSimDeviceInfo()
+    if info is not None:
+      return bool(info.get("manual_control_mode_ready", False))
     with self.client_lock:
       return self.client_conn is not None
 
@@ -3576,6 +3662,9 @@ class NepiSimConnectorApp:
     # Goto commands need a live bridge AND fresh telemetry, since a setpoint is
     # computed against the current pose. A direct motor command does not, which
     # is why manual control gates on connection alone.
+    info = self.getSelectedSimDeviceInfo()
+    if info is not None:
+      return bool(info.get("autonomous_control_mode_ready", False))
     if not self.isBridgeConnected():
       return False
     age = self.getTelemetryAge()
@@ -3590,6 +3679,10 @@ class NepiSimConnectorApp:
       self.msg_if.pub_warn("Motor control ignored: motor index " + str(motor_ind) + " out of range")
       return
     self.motor_ratios[motor_ind] = max(0.0, min(1.0, speed_ratio))
+    if self.forwardToRbx("set_motor_control",
+                         MotorControl(motor_ind = motor_ind, speed_ratio = self.motor_ratios[motor_ind]),
+                         "Motor control"):
+      return
     self.sendLineToBridge({'type': 'motor_control', 'motor_ind': motor_ind,
                           'speed_ratio': self.motor_ratios[motor_ind]}, "Motor control")
 
@@ -3600,16 +3693,31 @@ class NepiSimConnectorApp:
     with self.goto_target_lock:
       self.goto_target = {'x_meters': msg.x_meters, 'y_meters': msg.y_meters,
                           'z_meters': msg.z_meters, 'yaw_deg': msg.yaw_deg}
+    if self.forwardToRbx("goto_position", msg, "Goto position"):
+      return
     self.sendLineToBridge({'type': 'goto_position', 'x_meters': msg.x_meters,
                            'y_meters': msg.y_meters, 'z_meters': msg.z_meters,
                            'yaw_deg': msg.yaw_deg}, "Goto position")
 
   def gotoPose(self, attitude_enu_degs):
+    # This app's own SimDeviceIF already converted whatever the caller sent
+    # into ENU (see device_if_sim.py's gotoPoseCb); the target RBX device's
+    # own /goto_pose does the identical NED->ENU conversion internally
+    # (device_if_rbx.py's setpoint_attitude_ned), so it has to be handed
+    # back NED here, or forwarding would double-apply the 90-yaw flip.
+    if self.selected_simulator:
+      yaw_ned_deg = nepi_nav.convert_yaw_enu2ned(attitude_enu_degs[2])
+      msg = GotoPose(roll_deg = attitude_enu_degs[0], pitch_deg = attitude_enu_degs[1],
+                     yaw_deg = yaw_ned_deg)
+      if self.forwardToRbx("goto_pose", msg, "Goto pose"):
+        return
     self.sendLineToBridge({'type': 'goto_pose', 'roll_deg': attitude_enu_degs[0],
                            'pitch_deg': attitude_enu_degs[1],
                            'yaw_deg': attitude_enu_degs[2]}, "Goto pose")
 
   def gotoLocation(self, msg):
+    if self.forwardToRbx("goto_location", msg, "Goto location"):
+      return
     self.sendLineToBridge({'type': 'goto_location', 'lat': msg.lat, 'long': msg.long,
                            'altitude_meters': msg.altitude_meters,
                            'yaw_deg': msg.yaw_deg}, "Goto location")
@@ -3625,15 +3733,20 @@ class NepiSimConnectorApp:
     self.home_x_m = geo_point.latitude
     self.home_y_m = geo_point.longitude
     self.home_z_m = geo_point.altitude
+    self.forwardToRbx("set_home", geo_point, "Set home")
     return True
 
   def goHome(self):
+    if self.forwardToRbx("go_home", Empty(), "Go home"):
+      return True
     self.sendLineToBridge({'type': 'go_home'}, "Go home")
     return self.isBridgeConnected()
 
   def goStop(self):
     with self.goto_target_lock:
       self.goto_target = None
+    if self.forwardToRbx("go_stop", Empty(), "Go stop"):
+      return True
     self.sendLineToBridge({'type': 'go_stop'}, "Go stop")
     return self.isBridgeConnected()
 
@@ -3641,6 +3754,14 @@ class NepiSimConnectorApp:
     actions = self.profile['setup_actions']
     if action_ind < 0 or action_ind >= len(actions):
       return False
+    # Forwarded by index, not name -- the profile's own action label
+    # (e.g. crabrover's "RESET") is not always spelled the same as the
+    # target device's own action list (rbx_mujoco_node.py's "RESET_SIM"),
+    # matching this codebase's own established index-based convention
+    # rather than a name lookup this app has no reliable way to do (it
+    # never sees the target device's own setup_action_options).
+    if self.forwardToRbx("setup_action", Int32(data = action_ind), "Setup action"):
+      return True
     self.sendLineToBridge({'type': 'setup_action', 'action': actions[action_ind]},
                           "Setup action")
     return self.isBridgeConnected()
@@ -3649,6 +3770,8 @@ class NepiSimConnectorApp:
     actions = self.profile['go_actions']
     if action_ind < 0 or action_ind >= len(actions):
       return False
+    if self.forwardToRbx("go_action", Int32(data = action_ind), "Go action"):
+      return True
     self.sendLineToBridge({'type': 'go_action', 'action': actions[action_ind]}, "Go action")
     return self.isBridgeConnected()
 

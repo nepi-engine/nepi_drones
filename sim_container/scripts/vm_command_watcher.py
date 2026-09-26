@@ -363,7 +363,8 @@ class Watcher(object):
       _, stderr = self.deploy_proc.communicate()
       self._writeDeployStatus(self.deploy_running_target,
                                'exited' if rc == 0 else 'failed',
-                               error=('' if rc == 0 else (stderr or '').strip()))
+                               error=('' if rc == 0 else (stderr or '').strip()),
+                               ready=False)
       self.deploy_proc = None
       self.deploy_running_target = ''
       self.deploy_running_stop_command = ''
@@ -382,6 +383,15 @@ class Watcher(object):
           self._startDeployTarget(desired_target_key, target)
         else:
           self._writeDeployStatus('', 'idle')
+      elif desired_target_key:
+        # Already running the desired target -- nothing to launch, but still
+        # write a status so it carries this request's handled_update and the
+        # device's launch poll (which ignores statuses from older requests)
+        # sees an answer.
+        self._writeDeployStatus(self.deploy_running_target, 'running',
+                                 pid=(self.deploy_proc.pid if self.deploy_proc else 0))
+      else:
+        self._writeDeployStatus('', 'idle')
 
     # Periodic readiness probe once something is actually running -- lets
     # the device poll is_ready() by reading status.ready instead of
@@ -470,6 +480,10 @@ class Watcher(object):
     status['pid'] = pid
     status['last_error'] = error
     status['service_last_seen'] = time.time()
+    # Echo of control.last_updated for the request this status answers --
+    # lets the device tell a fresh result from one left over by an earlier
+    # request (see simulator_launcher.py's _launch_via_deploy_state).
+    status['handled_update'] = self.deploy_last_seen_update
     if ready is not None:
       status['ready'] = ready
     state_doc['status'] = status

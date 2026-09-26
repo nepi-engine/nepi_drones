@@ -33,13 +33,34 @@
     <light directional="true" diffuse="0.8 0.8 0.8" pos="0 0 5" dir="0 0 -1"/>
     <geom name="ground" type="plane" size="20 20 0.1" material="grid" friction="1.0 0.005 0.0001"/>
 
-    <geom name="oc_left_wall" type="box" pos="13.000000 3.000000 0.500000"  size="11.000000 0.100000 0.500000" rgba="0.917647 0.482353 0.031373 0" contype="0" conaffinity="0"/>
-    <geom name="oc_right_wall" type="box" pos="13.000000 -3.000000 0.500000"  size="11.000000 0.100000 0.500000" rgba="0.917647 0.482353 0.031373 0" contype="0" conaffinity="0"/>
-    <geom name="oc_baffle_a" type="box" pos="8.000000 1.700000 0.500000"  size="0.100000 1.300000 0.500000" rgba="0.917647 0.482353 0.031373 0" contype="0" conaffinity="0"/>
-    <geom name="oc_baffle_b" type="box" pos="14.000000 -1.700000 0.500000"  size="0.100000 1.300000 0.500000" rgba="0.917647 0.482353 0.031373 0" contype="0" conaffinity="0"/>
-    <geom name="oc_ramp_up" type="box" pos="18.995522 0.000000 0.175000" euler="0 -9.970000 0" size="1.010786 3.000000 0.060000" rgba="0.882353 0.803922 0.070588 0" contype="0" conaffinity="0"/>
-    <geom name="oc_ramp_plateau" type="box" pos="20.491044 0.000000 0.350000"  size="0.500000 3.000000 0.060000" rgba="0.882353 0.803922 0.070588 0" contype="0" conaffinity="0"/>
-    <geom name="oc_ramp_down" type="box" pos="21.986566 0.000000 0.175000" euler="0 9.970000 0" size="1.010786 3.000000 0.060000" rgba="0.882353 0.803922 0.070588 0" contype="0" conaffinity="0"/>
+    <geom name="oc_left_wall" type="box" pos="13.000000 3.000000 0.500000"  size="11.000000 0.100000 0.500000" rgba="0.917647 0.482353 0.031373 0" contype="1" conaffinity="1"/>
+    <geom name="oc_right_wall" type="box" pos="13.000000 -3.000000 0.500000"  size="11.000000 0.100000 0.500000" rgba="0.917647 0.482353 0.031373 0" contype="1" conaffinity="1"/>
+    <geom name="oc_baffle_a" type="box" pos="8.000000 1.700000 0.500000"  size="0.100000 1.300000 0.500000" rgba="0.917647 0.482353 0.031373 0" contype="1" conaffinity="1"/>
+    <geom name="oc_baffle_b" type="box" pos="14.000000 -1.700000 0.500000"  size="0.100000 1.300000 0.500000" rgba="0.917647 0.482353 0.031373 0" contype="1" conaffinity="1"/>
+    <geom name="oc_ramp_up" type="box" pos="18.995522 0.000000 0.175000" euler="0 -9.970000 0" size="1.010786 3.000000 0.060000" rgba="0.882353 0.803922 0.070588 0" contype="1" conaffinity="1"/>
+    <geom name="oc_ramp_plateau" type="box" pos="20.491044 0.000000 0.350000"  size="0.500000 3.000000 0.060000" rgba="0.882353 0.803922 0.070588 0" contype="1" conaffinity="1"/>
+    <geom name="oc_ramp_down" type="box" pos="21.986566 0.000000 0.175000" euler="0 9.970000 0" size="1.010786 3.000000 0.060000" rgba="0.882353 0.803922 0.070588 0" contype="1" conaffinity="1"/>
+
+    <geom name="custom_obs_0" type="box" pos="2.000000 0.000000 0.500000" euler="0 0 0.000000" size="1.000000 0.100000 0.500000" rgba="0.6 0.2 0.2 0" contype="1" conaffinity="1"/>
+    <geom name="custom_obs_1" type="cylinder" pos="3.500000 0.000000 0.500000" size="0.500000 0.500000" rgba="0.6 0.2 0.2 0" contype="1" conaffinity="1"/>
+    <geom name="custom_obs_2" type="box" pos="5.000000 0.000000 0.500000" euler="0 0 0.000000" size="0.500000 0.500000 0.500000" rgba="0.6 0.2 0.2 0" contype="1" conaffinity="1"/>
+
+    <geom name="gate_0_top" type="box" pos="3.000000 0.000000 3.075000"  size="0.075000 1.150000 0.075000" rgba="0.85 0.15 0.15 0" contype="1" conaffinity="1"/>
+    <geom name="gate_0_bottom" type="box" pos="3.000000 0.000000 0.925000"  size="0.075000 1.150000 0.075000" rgba="0.85 0.15 0.15 0" contype="1" conaffinity="1"/>
+    <geom name="gate_0_left" type="box" pos="3.000000 1.075000 2.000000"  size="0.075000 0.075000 1.000000" rgba="0.85 0.15 0.15 0" contype="1" conaffinity="1"/>
+    <geom name="gate_0_right" type="box" pos="3.000000 -1.075000 2.000000"  size="0.075000 0.075000 1.000000" rgba="0.85 0.15 0.15 0" contype="1" conaffinity="1"/>
+    <geom name="gate_1_top" type="box" pos="9.000000 0.000000 4.075000"  size="0.075000 1.150000 0.075000" rgba="0.85 0.15 0.15 0" contype="1" conaffinity="1"/>
+    <geom name="gate_1_bottom" type="box" pos="9.000000 0.000000 1.925000"  size="0.075000 1.150000 0.075000" rgba="0.85 0.15 0.15 0" contype="1" conaffinity="1"/>
+    <geom name="gate_1_left" type="box" pos="9.000000 1.075000 3.000000"  size="0.075000 0.075000 1.000000" rgba="0.85 0.15 0.15 0" contype="1" conaffinity="1"/>
+    <geom name="gate_1_right" type="box" pos="9.000000 -1.075000 3.000000"  size="0.075000 0.075000 1.000000" rgba="0.85 0.15 0.15 0" contype="1" conaffinity="1"/>
+    <geom name="gate_2_top" type="box" pos="15.000000 0.000000 5.075000"  size="0.075000 1.150000 0.075000" rgba="0.85 0.15 0.15 0" contype="1" conaffinity="1"/>
+    <geom name="gate_2_bottom" type="box" pos="15.000000 0.000000 2.925000"  size="0.075000 1.150000 0.075000" rgba="0.85 0.15 0.15 0" contype="1" conaffinity="1"/>
+    <geom name="gate_2_left" type="box" pos="15.000000 1.075000 4.000000"  size="0.075000 0.075000 1.000000" rgba="0.85 0.15 0.15 0" contype="1" conaffinity="1"/>
+    <geom name="gate_2_right" type="box" pos="15.000000 -1.075000 4.000000"  size="0.075000 0.075000 1.000000" rgba="0.85 0.15 0.15 0" contype="1" conaffinity="1"/>
+    <geom name="gate_3_top" type="box" pos="21.000000 0.000000 6.075000"  size="0.075000 1.150000 0.075000" rgba="0.85 0.15 0.15 0" contype="1" conaffinity="1"/>
+    <geom name="gate_3_bottom" type="box" pos="21.000000 0.000000 3.925000"  size="0.075000 1.150000 0.075000" rgba="0.85 0.15 0.15 0" contype="1" conaffinity="1"/>
+    <geom name="gate_3_left" type="box" pos="21.000000 1.075000 5.000000"  size="0.075000 0.075000 1.000000" rgba="0.85 0.15 0.15 0" contype="1" conaffinity="1"/>
+    <geom name="gate_3_right" type="box" pos="21.000000 -1.075000 5.000000"  size="0.075000 0.075000 1.000000" rgba="0.85 0.15 0.15 0" contype="1" conaffinity="1"/>
 
     <!-- Chassis origin height = wheel_radius_m so wheel bottoms touch z=0. -->
     <body name="chassis" pos="0 0 0.100000">
@@ -55,33 +76,75 @@
            direction) down so the rover stays framed from behind/above. -->
       <camera name="scene_camera" pos="-2.500000 0.000000 1.650000" xyaxes="0 -1 0 0.5514 0 0.8342" fovy="100.000000"/>
 
-      <body name="wheel1" pos="0.150000 0.170000 0">
-        <joint name="wheel1" type="hinge" axis="0 1 0" damping="0.05"/>
-        <geom name="wheel1_geom" type="cylinder" size="0.100000 0.025000" euler="90 0 0"
-              mass="0.5" rgba="0.1 0.1 0.1 1" friction="1.2 0.005 0.0001"/>
+      <body name="wheel1_steer" pos="0.150000 0.170000 0">
+        <joint name="wheel1_steer" type="hinge" axis="0 0 1" damping="15.0"
+               range="-189.076 189.076" limited="true"
+               armature="0.1"/>
+        <geom name="wheel1_hub" type="sphere" size="0.025000" mass="0.2"
+              contype="0" conaffinity="0" rgba="0.6 0.6 0.6 1"/>
+        <body name="wheel1" pos="0 0 0">
+          <joint name="wheel1" type="hinge" axis="0 1 0" damping="0.05"/>
+          <geom name="wheel1_geom" type="cylinder" size="0.100000 0.025000" euler="90 0 0"
+                mass="0.5" rgba="0.1 0.1 0.1 1" friction="1.2 0.005 0.0001"/>
+        </body>
       </body>
-      <body name="wheel2" pos="0.150000 -0.170000 0">
-        <joint name="wheel2" type="hinge" axis="0 1 0" damping="0.05"/>
-        <geom name="wheel2_geom" type="cylinder" size="0.100000 0.025000" euler="90 0 0"
-              mass="0.5" rgba="0.1 0.1 0.1 1" friction="1.2 0.005 0.0001"/>
+      <body name="wheel2_steer" pos="0.150000 -0.170000 0">
+        <joint name="wheel2_steer" type="hinge" axis="0 0 1" damping="15.0"
+               range="-189.076 189.076" limited="true"
+               armature="0.1"/>
+        <geom name="wheel2_hub" type="sphere" size="0.025000" mass="0.2"
+              contype="0" conaffinity="0" rgba="0.6 0.6 0.6 1"/>
+        <body name="wheel2" pos="0 0 0">
+          <joint name="wheel2" type="hinge" axis="0 1 0" damping="0.05"/>
+          <geom name="wheel2_geom" type="cylinder" size="0.100000 0.025000" euler="90 0 0"
+                mass="0.5" rgba="0.1 0.1 0.1 1" friction="1.2 0.005 0.0001"/>
+        </body>
       </body>
-      <body name="wheel3" pos="-0.150000 0.170000 0">
-        <joint name="wheel3" type="hinge" axis="0 1 0" damping="0.05"/>
-        <geom name="wheel3_geom" type="cylinder" size="0.100000 0.025000" euler="90 0 0"
-              mass="0.5" rgba="0.1 0.1 0.1 1" friction="1.2 0.005 0.0001"/>
+      <body name="wheel3_steer" pos="-0.150000 0.170000 0">
+        <joint name="wheel3_steer" type="hinge" axis="0 0 1" damping="15.0"
+               range="-189.076 189.076" limited="true"
+               armature="0.1"/>
+        <geom name="wheel3_hub" type="sphere" size="0.025000" mass="0.2"
+              contype="0" conaffinity="0" rgba="0.6 0.6 0.6 1"/>
+        <body name="wheel3" pos="0 0 0">
+          <joint name="wheel3" type="hinge" axis="0 1 0" damping="0.05"/>
+          <geom name="wheel3_geom" type="cylinder" size="0.100000 0.025000" euler="90 0 0"
+                mass="0.5" rgba="0.1 0.1 0.1 1" friction="1.2 0.005 0.0001"/>
+        </body>
       </body>
-      <body name="wheel4" pos="-0.150000 -0.170000 0">
-        <joint name="wheel4" type="hinge" axis="0 1 0" damping="0.05"/>
-        <geom name="wheel4_geom" type="cylinder" size="0.100000 0.025000" euler="90 0 0"
-              mass="0.5" rgba="0.1 0.1 0.1 1" friction="1.2 0.005 0.0001"/>
+      <body name="wheel4_steer" pos="-0.150000 -0.170000 0">
+        <joint name="wheel4_steer" type="hinge" axis="0 0 1" damping="15.0"
+               range="-189.076 189.076" limited="true"
+               armature="0.1"/>
+        <geom name="wheel4_hub" type="sphere" size="0.025000" mass="0.2"
+              contype="0" conaffinity="0" rgba="0.6 0.6 0.6 1"/>
+        <body name="wheel4" pos="0 0 0">
+          <joint name="wheel4" type="hinge" axis="0 1 0" damping="0.05"/>
+          <geom name="wheel4_geom" type="cylinder" size="0.100000 0.025000" euler="90 0 0"
+                mass="0.5" rgba="0.1 0.1 0.1 1" friction="1.2 0.005 0.0001"/>
+        </body>
       </body>
     </body>
   </worldbody>
+
+  <!-- MuJoCo only auto-excludes DIRECT parent/child contacts; each wheel is a
+       grandchild of the chassis (via its steer body) and overlaps the chassis
+       box, so exclude those pairs explicitly. -->
+  <contact>
+    <exclude body1="chassis" body2="wheel1"/>
+    <exclude body1="chassis" body2="wheel2"/>
+    <exclude body1="chassis" body2="wheel3"/>
+    <exclude body1="chassis" body2="wheel4"/>
+  </contact>
 
   <actuator>
     <velocity name="wheel1_vel" joint="wheel1" kv="8" ctrlrange="-15 15"/>
     <velocity name="wheel2_vel" joint="wheel2" kv="8" ctrlrange="-15 15"/>
     <velocity name="wheel3_vel" joint="wheel3" kv="8" ctrlrange="-15 15"/>
     <velocity name="wheel4_vel" joint="wheel4" kv="8" ctrlrange="-15 15"/>
+    <position name="wheel1_steer_pos" joint="wheel1_steer" kp="1000.0" ctrlrange="-3.3 3.3"/>
+    <position name="wheel2_steer_pos" joint="wheel2_steer" kp="1000.0" ctrlrange="-3.3 3.3"/>
+    <position name="wheel3_steer_pos" joint="wheel3_steer" kp="1000.0" ctrlrange="-3.3 3.3"/>
+    <position name="wheel4_steer_pos" joint="wheel4_steer" kp="1000.0" ctrlrange="-3.3 3.3"/>
   </actuator>
 </mujoco>

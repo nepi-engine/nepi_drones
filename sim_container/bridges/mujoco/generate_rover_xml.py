@@ -36,12 +36,15 @@ own docstring for why), toggled live by mujoco_rbx_bridge.py flipping
 each geom's rgba alpha + contype/conaffinity instead of spawning/removing
 nodes.
 
-NOT ported: wheel_independence_enabled (Gazebo's crab-steer plugin) --
-same scope decision generate_rover_wbt.py's own docstring documents;
-rbx_rover.xml already exposes 4 independently-actuated wheel motors
-regardless (a MuJoCo capability with no Gazebo/Webots equivalent, per
-this file's own pre-existing module comment), so this field has no
-effect on the body this generator produces either way.
+Wheel independence (crab steering): every wheel is a swerve module -- a
+"<name>_steer" body on a vertical hinge (position actuator) carrying the
+wheel body and its spin hinge (velocity actuator). Always generated, so
+mujoco_rbx_bridge.py switches between skid-steer (steer held at 0) and
+crab steer live on rbx_mujoco_node.py's wheel_independence_enabled Setting,
+no regeneration needed; dimensions.yaml's own wheel_independence_enabled
+field is not read here. Unlike Gazebo's crab_steer_plugin (kinematic
+chassis), the chassis stays a free dynamic body pushed only by wheel
+contact forces, so it still collides with and reacts to obstacles.
 
 Physical relationships mirror generate_rover_wbt.py's own as closely as
 MuJoCo's box-half-extent/local-child-body convention allows:
@@ -83,8 +86,9 @@ import sys
 
 import yaml
 
-from generate_environment_xml import buildObstacleCourseGeomsXml, \
-    loadDimensions as loadEnvironmentDimensions, OBSTACLE_COURSE_DEFAULT_DIMENSIONS
+from generate_environment_xml import buildObstacleCourseGeomsXml, buildCustomObstaclesGeomsXml, \
+    buildAerialObstacleCourseGeomsXml, loadDimensions as loadEnvironmentDimensions, \
+    OBSTACLE_COURSE_DEFAULT_DIMENSIONS, CUSTOM_OBSTACLES_DEFAULT_DIMENSIONS
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "models"))
@@ -114,6 +118,19 @@ ROVER_WHEELS = [
 
 WHEEL_MASS_KG = 0.5
 WHEEL_DAMPING = 0.05
+STEER_HUB_MASS_KG = 0.2
+# Armature (rotor inertia) is what lets the steer actuator be stiff: the bare
+# steer assembly is ~0.0015 kg*m^2, and at a 2 ms timestep a kp much above
+# ~100 on that inertia goes numerically unstable (wheels jitter to random
+# angles and the rover stalls -- confirmed by sweep). With armature 0.1 this
+# kp/damping steers into place in well under 0.1 s and holds against ground
+# contact loads.
+STEER_KP = 1000.0
+STEER_DAMPING = 15.0
+STEER_ARMATURE = 0.1
+# A little over +-pi so the bridge's nearest-equivalent-angle choice (see
+# mujoco_rbx_bridge.py's applyCommandedVelocity) always has room to land.
+STEER_RANGE_RAD = 3.3
 SCENE_CAM_POS = (-2.5, 0.0, 1.65)
 
 
@@ -133,7 +150,8 @@ def loadDimensions(model_name, defaults):
     return dims
 
 
-def buildRoverXml(dims, obstacle_course_geoms_xml):
+def buildRoverXml(dims, obstacle_course_geoms_xml, custom_obstacles_geoms_xml = "",
+                   aerial_obstacle_course_geoms_xml = ""):
     wheel_radius = dims["wheel_radius_m"]
     wheel_width = dims["wheel_width_m"]
     track_width = dims["track_width_m"]
@@ -151,16 +169,35 @@ def buildRoverXml(dims, obstacle_course_geoms_xml):
     for name, x_sign, y_sign in ROVER_WHEELS:
         x = x_sign * x_off
         y = y_sign * y_off
-        wheel_blocks.append(f"""      <body name="{name}" pos="{x:.6f} {y:.6f} 0">
-        <joint name="{name}" type="hinge" axis="0 1 0" damping="{WHEEL_DAMPING}"/>
-        <geom name="{name}_geom" type="cylinder" size="{wheel_radius:.6f} {wheel_width / 2.0:.6f}" euler="90 0 0"
-              mass="{WHEEL_MASS_KG}" rgba="0.1 0.1 0.1 1" friction="1.2 0.005 0.0001"/>
+        # Steer body sits at the wheel center (the vertical steering axis
+        # passes through the contact patch, so steering doesn't drag the
+        # wheel sideways). Its hub geom exists only to give the body
+        # inertia -- contype/conaffinity 0, so it never collides.
+        wheel_blocks.append(f"""      <body name="{name}_steer" pos="{x:.6f} {y:.6f} 0">
+        <joint name="{name}_steer" type="hinge" axis="0 0 1" damping="{STEER_DAMPING}"
+               range="{-math.degrees(STEER_RANGE_RAD):.3f} {math.degrees(STEER_RANGE_RAD):.3f}" limited="true"
+               armature="{STEER_ARMATURE}"/>
+        <geom name="{name}_hub" type="sphere" size="{wheel_width / 2.0:.6f}" mass="{STEER_HUB_MASS_KG}"
+              contype="0" conaffinity="0" rgba="0.6 0.6 0.6 1"/>
+        <body name="{name}" pos="0 0 0">
+          <joint name="{name}" type="hinge" axis="0 1 0" damping="{WHEEL_DAMPING}"/>
+          <geom name="{name}_geom" type="cylinder" size="{wheel_radius:.6f} {wheel_width / 2.0:.6f}" euler="90 0 0"
+                mass="{WHEEL_MASS_KG}" rgba="0.1 0.1 0.1 1" friction="1.2 0.005 0.0001"/>
+        </body>
       </body>""")
     wheels_xml = "\n".join(wheel_blocks)
 
+    contact_excludes = "\n".join(
+        f'    <exclude body1="chassis" body2="{name}"/>' for name, _, _ in ROVER_WHEELS)
+
+    # Spin actuators first (ctrl indices 0-3, unchanged from before steering
+    # existed), then the four steer position actuators (4-7).
     actuator_blocks = "\n".join(
-        f'    <velocity name="{name}_vel" joint="{name}" kv="8" ctrlrange="-15 15"/>'
-        for name, _, _ in ROVER_WHEELS)
+        [f'    <velocity name="{name}_vel" joint="{name}" kv="8" ctrlrange="-15 15"/>'
+         for name, _, _ in ROVER_WHEELS] +
+        [f'    <position name="{name}_steer_pos" joint="{name}_steer" kp="{STEER_KP}" '
+         f'ctrlrange="{-STEER_RANGE_RAD} {STEER_RANGE_RAD}"/>'
+         for name, _, _ in ROVER_WHEELS])
 
     return f"""<!--
   GENERATED FILE -- do not hand-edit. Produced by
@@ -199,6 +236,10 @@ def buildRoverXml(dims, obstacle_course_geoms_xml):
 
 {obstacle_course_geoms_xml}
 
+{custom_obstacles_geoms_xml}
+
+{aerial_obstacle_course_geoms_xml}
+
     <!-- Chassis origin height = wheel_radius_m so wheel bottoms touch z=0. -->
     <body name="chassis" pos="0 0 {wheel_radius:.6f}">
       <freejoint name="chassis_free"/>
@@ -217,6 +258,13 @@ def buildRoverXml(dims, obstacle_course_geoms_xml):
     </body>
   </worldbody>
 
+  <!-- MuJoCo only auto-excludes DIRECT parent/child contacts; each wheel is a
+       grandchild of the chassis (via its steer body) and overlaps the chassis
+       box, so exclude those pairs explicitly. -->
+  <contact>
+{contact_excludes}
+  </contact>
+
   <actuator>
 {actuator_blocks}
   </actuator>
@@ -232,7 +280,11 @@ def regenerate(model_name):
     dims = loadDimensions(model_name, DEFAULT_DIMENSIONS)
     env_dims = loadEnvironmentDimensions("obstacle_course", OBSTACLE_COURSE_DEFAULT_DIMENSIONS)
     obstacle_course_geoms_xml = buildObstacleCourseGeomsXml(env_dims)
-    xml_text = buildRoverXml(dims, obstacle_course_geoms_xml)
+    custom_dims = loadEnvironmentDimensions("custom_obstacles", CUSTOM_OBSTACLES_DEFAULT_DIMENSIONS)
+    custom_obstacles_geoms_xml = buildCustomObstaclesGeomsXml(custom_dims)
+    aerial_obstacle_course_geoms_xml = buildAerialObstacleCourseGeomsXml()
+    xml_text = buildRoverXml(dims, obstacle_course_geoms_xml, custom_obstacles_geoms_xml,
+                              aerial_obstacle_course_geoms_xml)
     with open(OUTPUT_PATH, "w") as f:
         f.write(xml_text)
     print("generate_rover_xml: wrote %s from %s dimensions" % (OUTPUT_PATH, model_name), flush=True)

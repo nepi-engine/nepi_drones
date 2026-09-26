@@ -1098,6 +1098,11 @@ class NepiIFSimControls extends Component {
     // rbx_ardupilot_node.py so far, not every RBX sim driver, so showing it
     // unconditionally in preview mode would be a guess, not a confirmed fact.
     const has_move_with_manual_toggle = settingsKnown && settings.includes("move_with_manual_enabled")
+    // Same "only known drivers, no unconfirmed guess" reasoning as
+    // move_with_manual_enabled above -- rbx_sim_node.py (Gazebo) and
+    // rbx_mujoco_node.py both declare it, rbx_webots_node.py/
+    // rbx_webots_quadcopter_node.py/rbx_ardupilot_node.py do not.
+    const has_wheel_independence_toggle = settingsKnown && settings.includes("wheel_independence_enabled")
 
     // Reset Sim -- moved here from the generic Devices -> Robots "Setup
     // Actions" dropdown (requested live 2026-09-14: "the reset_sim command
@@ -1132,7 +1137,7 @@ class NepiIFSimControls extends Component {
 
     if (has_autonomous_toggle === false && has_camera_toggle === false
         && has_image_curation === false && has_reset_sim === false
-        && has_move_with_manual_toggle === false) {
+        && has_move_with_manual_toggle === false && has_wheel_independence_toggle === false) {
       return null
     }
 
@@ -1200,6 +1205,24 @@ class NepiIFSimControls extends Component {
                 <Toggle
                   checked={values["move_with_manual_enabled"] !== "FALSE"}
                   onClick={() => setToggle("move_with_manual_enabled", values["move_with_manual_enabled"] === "FALSE")}
+                />
+              )
+            : null}
+          </Column>
+          <Column>
+            {/* Live crab-steer toggle -- previously only reachable through
+                Devices -> Robots' generic Settings panel, requested live
+                (2026-09-25, "make mujoco the main sim, test everything"):
+                enabling/disabling crab walk from the Sim Connector panel
+                itself. Checked -> wheels steer independently and the base
+                holds its heading unless explicitly rotated (gotoPose);
+                unchecked -> ordinary skid-steer. */}
+            {(has_wheel_independence_toggle === true) ?
+              this.renderCompactToggle(
+                "Wheel Independence",
+                <Toggle
+                  checked={values["wheel_independence_enabled"] !== "FALSE"}
+                  onClick={() => setToggle("wheel_independence_enabled", values["wheel_independence_enabled"] === "FALSE")}
                 />
               )
             : null}

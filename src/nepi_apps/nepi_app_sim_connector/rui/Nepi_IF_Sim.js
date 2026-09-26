@@ -1356,6 +1356,15 @@ class NepiIFSim extends Component {
     URL.revokeObjectURL(url)
   }
 
+  // Only Gazebo targets ever read an uploaded model.sdf (see
+  // uploadRobotModelSdfCb/uploadEnvironmentModelSdfCb, device-side) --
+  // MuJoCo and Webots both generate their own model from the dimensions
+  // editor above and never look at this file, so the button is a dead
+  // end there rather than just unhelpful.
+  selectedTargetUsesModelSdf() {
+    return this.state.selected_launch_target.startsWith('gazebo_')
+  }
+
   onUploadModelSdfClicked(role) {
     const ref = (role === 'robot') ? this.uploadRobotSdfInputRef : this.uploadEnvironmentSdfInputRef
     if (ref.current != null) {
@@ -3180,7 +3189,9 @@ class NepiIFSim extends Component {
           />
           <ButtonMenu>
             <Button onClick={() => this.onDownloadDimensionsClicked(role)}>{"Download Dimensions (YAML)"}</Button>
-            <Button onClick={() => this.onUploadModelSdfClicked(role)}>{"Upload Raw model.sdf"}</Button>
+            {this.selectedTargetUsesModelSdf() ?
+              <Button onClick={() => this.onUploadModelSdfClicked(role)}>{"Upload Raw model.sdf"}</Button>
+            : null}
             {/* Requested live (2026-09-04): "the reset config should be
                 reset dimensions instead there in the robot and environment
                 dimensions editing area" -- moved here from the config-

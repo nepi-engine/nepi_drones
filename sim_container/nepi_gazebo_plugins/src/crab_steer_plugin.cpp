@@ -12,8 +12,7 @@
 // static wheels.
 //
 // base_link is kinematic, not dynamic (2026-09-23) -- see Load's own
-// SetKinematic(true) comment and OnUpdate's own explicit-pose-integration
-// comment. The chassis is immune to gravity/contact forces and passes
+// SetKinematic(true) comment. The chassis is immune to gravity/contact forces and passes
 // straight through static obstacles as a result (an accepted, explicitly
 // requested tradeoff, "for now"); the wheels are ordinary dynamic links and
 // still physically react to the ground and anything the rover's path runs
@@ -113,8 +112,8 @@ public:
       // OnUpdate's own commanded velocity: "it still needs to react to
       // objects while being independent... as long as the wheels mainly
       // react to the objects, its fine for now"). A kinematic link ignores
-      // gravity and any contact/friction force acting ON it -- it can only
-      // be moved by this plugin's own explicit commands below -- which
+      // gravity and any contact/friction force acting ON it -- it moves only
+      // by the velocity OnUpdate sets on it every tick -- which
       // removes the last of the residual wheel-ground-reaction coupling
       // the yaw-hold correction further down was only ever a partial
       // band-aid for. Accepted tradeoff, exactly as requested: the chassis
@@ -346,27 +345,10 @@ private:
     }
     base_link_->SetAngularVel(ignition::math::Vector3d(0.0, 0.0, commanded_vyaw));
 
-    // A kinematic link (see Load's own SetKinematic(true) comment) is not
-    // advanced by the dynamics engine the way a normal link is -- the two
-    // SetLinearVel/SetAngularVel calls above still record a velocity (so
-    // PublishOdometry's own WorldLinearVel/WorldAngularVel reads below stay
-    // meaningful, and so anything this chassis bumps into computes a sane
-    // contact response), but this plugin has to advance the chassis's own
-    // pose itself, once per physics step, by explicitly integrating that
-    // same commanded velocity. GetMaxStepSize() is this world's fixed
-    // physics timestep -- OnUpdate fires exactly once per step, so this is
-    // the correct dt, not a measured wall/sim-time delta. Constructed flat
-    // (roll = pitch = 0) rather than carrying over whatever roll/pitch the
-    // read-back pose had -- with the chassis no longer a dynamics body,
-    // nothing should ever be tilting it in the first place, so this keeps
-    // that explicit instead of accidental.
-    const double dt = model_->GetWorld()->Physics()->GetMaxStepSize();
-    const double new_yaw = yaw + commanded_vyaw * dt;
-    ignition::math::Pose3d new_pose(
-        pose.Pos() + ignition::math::Vector3d(world_vx * dt, world_vy * dt, 0.0),
-        ignition::math::Quaterniond(0.0, 0.0, new_yaw));
-    base_link_->SetWorldPose(new_pose);
-
+    // No explicit SetWorldPose integration here: ODE advances a kinematic
+    // link by the velocity set above on its own. Doing both (tried
+    // 2026-09-23) applied every motion twice -- measured 90 deg/s against a
+    // 45 deg/s max_angular_rate_dps cap, and doubled translation speed too.
     PublishOdometry(pose);
 
     // Per-wheel tangential velocity, not one shared (speed, angle) applied

@@ -3684,6 +3684,14 @@ class SettingsIF:
                 for setting_name in init_settings_values_dict.keys():
                     if setting_name in init_settings_dict.keys():
                         setting_value = init_settings_values_dict[setting_name]
+                        # Pre-controls-refactor config files persisted each setting as a
+                        # {'name','type','value'} dict, not a bare value. Numeric/Selection
+                        # settings reject that dict on validation, but a String setting
+                        # accepts str(dict) -- which is how enabled_image_sources became
+                        # "{'name': 'enabled_image_sources', ...}" after config_mgr fell
+                        # back to a legacy sim_ALL-rbx-settings.yaml and then re-saved it.
+                        if isinstance(setting_value, dict) and 'value' in setting_value:
+                            setting_value = setting_value['value']
                         # setting_value was previously passed twice here -- the second
                         # copy landed in set_control_value's own 'index' positional slot,
                         # which is meant for a per-element update on a List-type control's
