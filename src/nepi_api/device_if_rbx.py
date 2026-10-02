@@ -2158,6 +2158,12 @@ class RBXRobotIF:
         # set True at the end of __init__, so this guard makes those calls no-op.
         if self.ready == False:
             return
+        # The navpose belongs to the NPX child, not to this class, so mirror its
+        # topic or DeviceRBXStatus.navpose_topic stays empty and a consumer
+        # holding only the RBX device cannot find the robot's pose. Copied on
+        # every publish: NPX creates its NavPoseIF late, on first telemetry.
+        if self.npx_if is not None:
+            self.status_msg.navpose_topic = self.npx_if.status_msg.navpose_topic
         self.status_msg.device_name = self.device_name
         if self.getBatteryPercentFunction is not None:
           self.rbx_battery = self.getBatteryPercentFunction()

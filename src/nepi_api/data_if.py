@@ -1517,9 +1517,11 @@ class NavPoseIF:
                 msg.x_m = np_dict['x_m']
                 msg.y_m = np_dict['y_m']
                 msg.z_m = np_dict['z_m']
-                msg.x_m_per_sec = np_dict['x_m_per_sec']
-                msg.y_m_per_sec = np_dict['y_m_per_sec']
-                msg.z_m_per_sec = np_dict['z_m_per_sec']
+                # The component msg has no velocity flag, so -999 is the flag:
+                # nepi_nav.update_navpose_dict_from_msg reads it back that way.
+                msg.x_m_per_sec = np_dict['x_m_per_sec'] if np_dict['has_velocity'] else -999
+                msg.y_m_per_sec = np_dict['y_m_per_sec'] if np_dict['has_velocity'] else -999
+                msg.z_m_per_sec = np_dict['z_m_per_sec'] if np_dict['has_velocity'] else -999
                 self.node_if.publish_pub(pub_name,msg)
 
             if self.pub_altitude == True:

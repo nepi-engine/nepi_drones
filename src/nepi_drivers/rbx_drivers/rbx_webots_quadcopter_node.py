@@ -801,6 +801,10 @@ class WebotsQuadcopterNode:
     self.navpose_dict['x_m_per_sec'] = lin_x_mps
     self.navpose_dict['y_m_per_sec'] = lin_y_mps
     self.navpose_dict['z_m_per_sec'] = lin_z_mps
+    # A real velocity from the sim, so say so: NavPose.has_velocity defaults
+    # False and gates x/y/z_m_per_sec on its own.
+    self.navpose_dict['has_velocity'] = True
+    self.navpose_dict['time_velocity'] = now
 
     self.navpose_dict['has_orientation'] = True
     self.navpose_dict['time_orientation'] = now

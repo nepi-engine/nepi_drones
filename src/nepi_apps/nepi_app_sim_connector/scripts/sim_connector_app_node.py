@@ -2450,6 +2450,9 @@ class NepiSimConnectorApp:
       nd['x_m'] = msg.x_m
       nd['y_m'] = msg.y_m
       nd['z_m'] = msg.z_m
+    if msg.has_velocity:
+      nd['has_velocity'] = True
+      nd['time_velocity'] = msg.time_velocity
       nd['x_m_per_sec'] = msg.x_m_per_sec
       nd['y_m_per_sec'] = msg.y_m_per_sec
       nd['z_m_per_sec'] = msg.z_m_per_sec
@@ -3931,6 +3934,10 @@ class NepiSimConnectorApp:
       nd['x_m'] = float(telem.get('x_m', nd['x_m']))
       nd['y_m'] = float(telem.get('y_m', nd['y_m']))
       nd['z_m'] = float(telem.get('z_m', nd['z_m']))
+
+    if any(k in telem for k in ('x_m_per_sec', 'y_m_per_sec', 'z_m_per_sec')):
+      nd['has_velocity'] = True
+      nd['time_velocity'] = now
       nd['x_m_per_sec'] = float(telem.get('x_m_per_sec', nd['x_m_per_sec']))
       nd['y_m_per_sec'] = float(telem.get('y_m_per_sec', nd['y_m_per_sec']))
       nd['z_m_per_sec'] = float(telem.get('z_m_per_sec', nd['z_m_per_sec']))
