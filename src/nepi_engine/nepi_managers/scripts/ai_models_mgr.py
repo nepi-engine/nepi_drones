@@ -95,14 +95,14 @@ class AIDetectorManager:
 
         ##############################  
         # Create Msg Class
-        self.msg_if = MsgIF(log_name = None)
+        self.msg_if = MsgIF()
         self.msg_if.pub_info("Starting IF Initialization Processes")
         
         
         ##############################
         # Get for System Folders
         self.msg_if.pub_info("Waiting for system folders")
-        system_folders = nepi_system.get_system_folders(log_name_list = [self.node_name])
+        system_folders = nepi_system.get_system_folders()
         #self.msg_if.pub_warn("Got system folders: " + str(system_folders))
 
         self.aifs_param_folder = system_folders['aifs_param']
@@ -121,7 +121,7 @@ class AIDetectorManager:
         config_folders = nepi_system.get_config_folders()
 
         # self.msg_if.pub_info("Waiting for driver manager to start")
-        # active_drivers = nepi_system.get_active_drivers(log_name_list = [self.node_name])
+        # active_drivers = nepi_system.get_active_drivers()
         # nepi_sdk.sleep(5) # Some extra time for drivers to load
         
        

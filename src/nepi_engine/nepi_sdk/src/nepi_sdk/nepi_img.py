@@ -55,8 +55,7 @@ from nepi_sdk import nepi_sdk
 from nepi_sdk import nepi_utils
 
 from nepi_sdk.nepi_sdk import logger as Logger
-log_name = "nepi_img"
-logger = Logger(log_name = log_name)
+logger = Logger()
 
 
 STANDARD_IMAGE_SIZES = ['630 x 900','720 x 1080','955 x 600','1080 x 1440','1024 x 768 ','1980 x 2520','2048 x 1536','2580 x 2048','3648 x 2736']
@@ -1221,7 +1220,7 @@ def rgb_to_hex(rgb_tuple):
 ###########################################
 ### Image saving functions
 
-def read_image_file(file_path, log_name_list = []):
+def read_image_file(file_path):
     cv2_img = None
     if os.path.exists(file_path):
         try:
@@ -1229,21 +1228,21 @@ def read_image_file(file_path, log_name_list = []):
             if cv2_img is not None:
                 success = True
         except Exception as e:
-            logger.log_warn("Failed to get cv2_img from file: " + file_path + " " + str(e), log_name_list = log_name_list, throttle_s = 5.0)
+            logger.log_warn("Failed to get cv2_img from file: " + file_path + " " + str(e), throttle_s = 5.0)
     else:
-        logger.log_warn("Failed to find image file: " + file_path, log_name_list = log_name_list, throttle_s = 5.0)
+        logger.log_warn("Failed to find image file: " + file_path, throttle_s = 5.0)
     return cv2_img
 
-def write_image_file(file_path,cv2_img, log_name_list = []):
+def write_image_file(file_path,cv2_img):
     success = False
     path = os.path.dirname(file_path)
     if os.path.exists(path):
         try:
             success = cv2.imwrite(file_path, cv2_img)
         except Exception as e:
-            logger.log_warn("Failed to write image to file: " + file_path + " " + str(e), log_name_list = log_name_list, throttle_s = 5.0)
+            logger.log_warn("Failed to write image to file: " + file_path + " " + str(e), throttle_s = 5.0)
     else:
-        logger.log_warn("Failed to find file path: " + path, log_name_list = log_name_list, throttle_s = 5.0)
+        logger.log_warn("Failed to find file path: " + path, throttle_s = 5.0)
     return success
 
 

@@ -85,7 +85,7 @@ class ScriptsManager(object):
 
         ##############################  
         # Create Msg Class
-        self.msg_if = MsgIF(log_name = None)
+        self.msg_if = MsgIF()
         self.msg_if.pub_info("Starting IF Initialization Processes")
 
 
@@ -94,7 +94,7 @@ class ScriptsManager(object):
         ##############################
         # Get for System Folders
         self.msg_if.pub_info("Waiting for user folders")
-        user_folders = nepi_system.get_user_folders(log_name_list = [self.node_name])
+        user_folders = nepi_system.get_user_folders()
         #self.msg_if.pub_warn("Got user folders: " + str(user_folders))
 
         if 'nepi_scripts' in user_folders.keys():

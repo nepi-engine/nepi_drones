@@ -320,8 +320,7 @@ class ArdupilotDiscovery:
   def __init__(self):
     ############
     # Create Message Logger
-    self.log_name = PKG_NAME.lower() + "_discovery"
-    self.logger = nepi_sdk.logger(log_name = self.log_name)
+    self.logger = nepi_sdk.logger()
     time.sleep(1)
     self.logger.log_info("Starting Initialization")
 
@@ -357,18 +356,6 @@ class ArdupilotDiscovery:
     self.available_paths_list = available_paths_list
     self.active_paths_list = active_paths_list
     self.base_namespace = base_namespace
-
-    # Re-derive the log name from this driver entry's own pkg_name (e.g.
-    # "RBX_ARDUPILOT" vs "RBX_ARDUPILOT_SITL") the first time it's seen,
-    # rather than the module-level PKG_NAME constant every instance of this
-    # class would otherwise share -- with two concurrent driver entries
-    # now possible (see __init__'s comment), identical log names would
-    # make their log lines indistinguishable from each other.
-    drv_pkg_name = drv_dict.get('pkg_name', PKG_NAME)
-    wanted_log_name = drv_pkg_name.lower() + "_discovery"
-    if wanted_log_name != self.log_name:
-      self.log_name = wanted_log_name
-      self.logger = nepi_sdk.logger(log_name = self.log_name)
 
     ########################
     # Get discovery options

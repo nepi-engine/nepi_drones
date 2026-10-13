@@ -91,8 +91,7 @@ class WebotsDiscovery:
   def __init__(self):
     ############
     # Create Message Logger
-    self.log_name = PKG_NAME.lower() + "_discovery"
-    self.logger = nepi_sdk.logger(log_name = self.log_name)
+    self.logger = nepi_sdk.logger()
     self.heartbeat_miss_counts = dict()
     # Per-instance copies -- see rbx_sim_discovery.py's own __init__ comment
     # for why these three specifically (not the heartbeat listener state

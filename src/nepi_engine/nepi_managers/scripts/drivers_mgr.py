@@ -129,14 +129,14 @@ class NepiDriversMgr(object):
 
         ##############################  
         # Create Msg Class
-        self.msg_if = MsgIF(log_name = None)
+        self.msg_if = MsgIF()
         self.msg_if.pub_info("Starting IF Initialization Processes")
 
 
         ##############################
         # Get for System Folders
         self.msg_if.pub_info("Waiting for system folders")
-        system_folders = nepi_system.get_system_folders(log_name_list = [self.node_name])
+        system_folders = nepi_system.get_system_folders()
         #self.msg_if.pub_warn("Got system folders: " + str(system_folders))
 
         self.drivers_param_folder = system_folders['drivers_param']
@@ -154,7 +154,7 @@ class NepiDriversMgr(object):
         ##############################
         # Wait for System Info
         self.msg_if.pub_info("Waiting for nepi config info")
-        self.nepi_config = nepi_system.get_nepi_config(log_name_list = [self.node_name])
+        self.nepi_config = nepi_system.get_nepi_config()
         #self.msg_if.pub_warn("Got NEPI config: " + str(self.nepi_config))
 
         ##############################
@@ -428,7 +428,7 @@ class NepiDriversMgr(object):
 
         if do_updates == True:
           self.refresh()
-          nepi_system.set_active_drivers(drivers_active_list, log_name_list = [self.node_name])
+          nepi_system.set_active_drivers(drivers_active_list)
           nepi_sdk.set_param('active_drivers', drivers_active_list)
           nepi_system.set_devices_alias_dict(self.devices_alias_dict)
           if self.node_if is not None:
@@ -537,7 +537,7 @@ class NepiDriversMgr(object):
 
 
   def updaterDriversCb(self,_):
-    self.nepi_config = nepi_system.get_nepi_config(log_name_list = [self.node_name])
+    self.nepi_config = nepi_system.get_nepi_config()
     #self.msg_if.pub_warn("Got NEPI config: " + str(self.nepi_config))
 
 
@@ -793,7 +793,7 @@ class NepiDriversMgr(object):
     last_drivers_active_list = copy.deepcopy(self.drivers_active_list)
     self.drivers_active_list = drivers_active_list
     if last_drivers_active_list != drivers_active_list:
-      nepi_system.set_active_drivers(drivers_active_list, log_name_list = [self.node_name])
+      nepi_system.set_active_drivers(drivers_active_list)
       nepi_sdk.set_param('active_drivers', drivers_active_list)
       self.needs_config_save = True
     #self.publish_status()

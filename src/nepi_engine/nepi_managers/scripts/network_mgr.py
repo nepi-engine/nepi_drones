@@ -159,7 +159,7 @@ class NetworkMgr:
 
         ##############################  
         # Create Msg Class
-        self.msg_if = MsgIF(log_name = None)
+        self.msg_if = MsgIF()
         self.msg_if.pub_info("Starting IF Initialization Processes")
         
         ##############################
@@ -708,7 +708,7 @@ class NetworkMgr:
 
 
     def get_nepi_system_config(self):
-        return nepi_system.get_nepi_config(log_name_list = [self.node_name])
+        return nepi_system.get_nepi_config()
 
     def get_primary_ip_addr(self):
         primary_ip_addr = self.nepi_config['NEPI_STATIC_IP']

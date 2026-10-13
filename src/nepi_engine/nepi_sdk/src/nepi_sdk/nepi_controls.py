@@ -32,8 +32,7 @@ from nepi_interfaces.msg import Control, ControlsStatus, UpdateControl
 
 
 from nepi_sdk.nepi_sdk import logger as Logger
-log_name = "nepi_controls"
-logger = Logger(log_name = log_name)
+logger = Logger()
 
 
 #########################

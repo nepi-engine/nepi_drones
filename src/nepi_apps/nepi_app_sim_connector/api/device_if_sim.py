@@ -175,8 +175,6 @@ class SimDeviceIF:
                setSelectedRobotConfigFunction = None,
                data_source_description = 'simulator',
                data_ref_description = 'simulator',
-               log_name = None,
-               log_name_list = [],
                msg_if = None
                ):
     ####  IF INIT SETUP ####
@@ -192,11 +190,7 @@ class SimDeviceIF:
       self.msg_if = msg_if
     else:
       self.msg_if = MsgIF()
-    self.log_name_list = copy.deepcopy(log_name_list)
-    self.log_name_list.append(self.class_name)
-    if log_name is not None:
-      self.log_name_list.append(log_name)
-    self.msg_if.pub_info("Starting IF Initialization Processes", log_name_list = self.log_name_list)
+    self.msg_if.pub_info("Starting IF Initialization Processes")
 
     ##############################
     # Initialize Class Variables
@@ -335,7 +329,7 @@ class SimDeviceIF:
     ##################################################
     ### Node Class Setup
 
-    self.msg_if.pub_info("Starting Node IF Initialization", log_name_list = self.log_name_list)
+    self.msg_if.pub_info("Starting Node IF Initialization")
 
     self.CONFIGS_DICT = {
         'init_callback': self.initCb,
@@ -517,7 +511,6 @@ class SimDeviceIF:
         services_dict = self.SRVS_DICT,
         pubs_dict = self.PUBS_DICT,
         subs_dict = self.SUBS_DICT,
-        log_name_list = self.log_name_list,
         msg_if = self.msg_if
     )
 
@@ -536,14 +529,13 @@ class SimDeviceIF:
     # connects after this point therefore publishes a NavPose whose has_* flags
     # are all False. Same behavior as every RBX driver today.
     if self.getNavPoseCb is not None:
-      self.msg_if.pub_info("Starting NPX Device IF Initialization", log_name_list = self.log_name_list)
+      self.msg_if.pub_info("Starting NPX Device IF Initialization")
       self.npx_if = NPXDeviceIF(self.device_info,
           node_namespace = self.node_namespace,
           data_source_description = self.data_source_description,
           data_ref_description = self.data_ref_description,
           getNavPoseCb = self.getNavPoseCb,
           max_navpose_update_rate = self.navpose_update_rate,
-          log_name_list = self.log_name_list,
           msg_if = self.msg_if)
 
     ##############################
@@ -562,7 +554,7 @@ class SimDeviceIF:
     self.publishInfo()
     self.publish_status()
 
-    self.msg_if.pub_info("IF Initialization Complete", log_name_list = self.log_name_list)
+    self.msg_if.pub_info("IF Initialization Complete")
 
   #**********************
   # Public capability re-derivation
@@ -716,7 +708,7 @@ class SimDeviceIF:
         sensor_topics = self.getAvailableSensorTopicsFunction() or []
       except Exception as e:
         self.msg_if.pub_warn("getAvailableSensorTopicsFunction failed: " + str(e),
-                             throttle_s = 5.0, log_name_list = self.log_name_list)
+                             throttle_s = 5.0)
         sensor_topics = []
 
     sensor_topic_msgs = []
@@ -755,7 +747,7 @@ class SimDeviceIF:
       options = self.getAvailableEnvironmentOptionsFunction() or []
     except Exception as e:
       self.msg_if.pub_warn("getAvailableEnvironmentOptionsFunction failed: " + str(e),
-                           throttle_s = 5.0, log_name_list = self.log_name_list)
+                           throttle_s = 5.0)
       return
     with self.caps_lock:
       self.caps_report.available_environment_options = list(options)
@@ -797,8 +789,7 @@ class SimDeviceIF:
     try:
       navpose_dict = self.getNavPoseCb()
     except Exception as e:
-      self.msg_if.pub_warn("getNavPoseCb failed: " + str(e), throttle_s = 5.0,
-                           log_name_list = self.log_name_list)
+      self.msg_if.pub_warn("getNavPoseCb failed: " + str(e), throttle_s = 5.0)
       return
     if navpose_dict is None:
       return
@@ -823,8 +814,7 @@ class SimDeviceIF:
       self.current_location_amsl_geo = [amsl_dict['latitude'], amsl_dict['longitude'],
                                         amsl_dict['altitude_m']]
     except Exception as e:
-      self.msg_if.pub_warn("Failed to update current navpose: " + str(e), throttle_s = 5.0,
-                           log_name_list = self.log_name_list)
+      self.msg_if.pub_warn("Failed to update current navpose: " + str(e), throttle_s = 5.0)
 
   #**********************
   # Query service callbacks
@@ -960,7 +950,7 @@ class SimDeviceIF:
         simulators, simulator_names = self.getAvailableSimulatorsFunction()
       except Exception as e:
         self.msg_if.pub_warn("getAvailableSimulatorsFunction failed: " + str(e),
-                             throttle_s = 5.0, log_name_list = self.log_name_list)
+                             throttle_s = 5.0)
         simulators, simulator_names = [], []
     self.status_msg.available_simulators = list(simulators)
     self.status_msg.available_simulator_names = list(simulator_names)
@@ -977,7 +967,7 @@ class SimDeviceIF:
         robot_configs, robot_config_names = self.getAvailableRobotConfigsFunction()
       except Exception as e:
         self.msg_if.pub_warn("getAvailableRobotConfigsFunction failed: " + str(e),
-                             throttle_s = 5.0, log_name_list = self.log_name_list)
+                             throttle_s = 5.0)
         robot_configs, robot_config_names = [], []
     self.status_msg.available_robot_configs = list(robot_configs)
     self.status_msg.available_robot_config_names = list(robot_config_names)
@@ -993,8 +983,7 @@ class SimDeviceIF:
     try:
       value = getter()
     except Exception as e:
-      self.msg_if.pub_warn("Selection getter failed: " + str(e), throttle_s = 5.0,
-                           log_name_list = self.log_name_list)
+      self.msg_if.pub_warn("Selection getter failed: " + str(e), throttle_s = 5.0)
       return ""
     return "" if value is None else str(value)
 
@@ -1022,14 +1011,14 @@ class SimDeviceIF:
     Args:
         err_str (str): Calm, specific description of what happened.
     """
-    self.msg_if.pub_warn(err_str, log_name_list = self.log_name_list)
+    self.msg_if.pub_warn(err_str)
     self.status_msg.last_error_message = err_str
 
   #**********************
   # Selector command callbacks
 
   def selectSimulatorCb(self, msg):
-    self.msg_if.pub_info("Received select simulator message", log_name_list = self.log_name_list)
+    self.msg_if.pub_info("Received select simulator message")
     if self.setSelectedSimulatorFunction is None:
       self.update_error_msg("Ignoring select_simulator, no simulator selection function")
       return
@@ -1037,7 +1026,7 @@ class SimDeviceIF:
     self.publish_status()
 
   def selectRobotConfigCb(self, msg):
-    self.msg_if.pub_info("Received select robot config message", log_name_list = self.log_name_list)
+    self.msg_if.pub_info("Received select robot config message")
     if self.setSelectedRobotConfigFunction is None:
       self.update_error_msg("Ignoring select_robot_config, no robot config selection function")
       return
@@ -1049,7 +1038,7 @@ class SimDeviceIF:
   # New-for-sim command callbacks
 
   def setActiveImageTopicCb(self, msg):
-    self.msg_if.pub_info("Received set active image topic message", log_name_list = self.log_name_list)
+    self.msg_if.pub_info("Received set active image topic message")
     self.active_image_topic = msg.data
     if self.node_if is not None:
       self.node_if.set_param('active_image_topic', msg.data)
@@ -1059,7 +1048,7 @@ class SimDeviceIF:
     self.publishInfo()
 
   def setCameraViewModeCb(self, msg):
-    self.msg_if.pub_info("Received set camera view mode message", log_name_list = self.log_name_list)
+    self.msg_if.pub_info("Received set camera view mode message")
     if self.setCameraViewModeFunction is None:
       self.update_error_msg("Ignoring set_camera_view_mode, no camera view control")
       return
@@ -1071,7 +1060,7 @@ class SimDeviceIF:
     self.publishInfo()
 
   def setEnvironmentOptionCb(self, msg):
-    self.msg_if.pub_info("Received set environment option message", log_name_list = self.log_name_list)
+    self.msg_if.pub_info("Received set environment option message")
     if self.setEnvironmentOptionFunction is None:
       self.update_error_msg("Ignoring set_environment_option, no environment controls")
       return

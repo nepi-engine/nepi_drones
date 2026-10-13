@@ -169,9 +169,8 @@ MIRRORED_TOPICS = {
 
 
 class RobotLinkRelay:
-  def __init__(self, msg_if, log_name_list = None):
+  def __init__(self, msg_if):
     self.msg_if = msg_if
-    self.log_name_list = log_name_list if log_name_list is not None else []
     self.lock = threading.Lock()
 
     self.sim_namespace = ""
@@ -303,12 +302,10 @@ class RobotLinkRelay:
         new_pubs['setup_action'] = pub
         new_subs['setup_action'] = sub
       else:
-        self.msg_if.pub_warn("Robot link: failed to wire setup_action relay, continuing without it",
-                             log_name_list = self.log_name_list)
+        self.msg_if.pub_warn("Robot link: failed to wire setup_action relay, continuing without it")
     else:
       self.msg_if.pub_info("Robot link: no common setup actions between sim and physical robot "
-                          "(or capabilities_query unavailable), TAKEOFF/LAUNCH will not be mirrored",
-                          log_name_list = self.log_name_list)
+                          "(or capabilities_query unavailable), TAKEOFF/LAUNCH will not be mirrored")
 
     self._wire_mavlink_relay(sim_caps, phys_caps, new_subs, new_pubs)
 
@@ -317,7 +314,7 @@ class RobotLinkRelay:
     self.enabled = True
     self.last_error = ""
     self.msg_if.pub_info("Robot link enabled: " + self.sim_namespace + " -> " +
-                        self.physical_namespace, log_name_list = self.log_name_list)
+                        self.physical_namespace)
 
   def _query_capabilities(self, namespace):
     # Short, bounded wait -- a driver with no capabilities_query service (or
@@ -326,13 +323,12 @@ class RobotLinkRelay:
     # means setup_action/setpoint mirroring is skipped for this link, logged
     # by each caller.
     service_name = namespace + '/capabilities_query'
-    found = nepi_sdk.wait_for_service(service_name, timeout = 3, log_name_list = self.log_name_list)
+    found = nepi_sdk.wait_for_service(service_name, timeout = 3)
     if not found:
       return None
-    service = nepi_sdk.connect_service(service_name, RBXCapabilitiesQuery,
-                                       log_name_list = self.log_name_list)
+    service = nepi_sdk.connect_service(service_name, RBXCapabilitiesQuery)
     return nepi_sdk.call_service(service, RBXCapabilitiesQueryRequest(),
-                                 verbose = False, log_name_list = self.log_name_list)
+                                 verbose = False)
 
   def _wire_mavlink_relay(self, sim_caps, phys_caps, new_subs, new_pubs):
     # See MAVLINK_SETPOINT_TOPICS' own module-level comment for why this
@@ -340,16 +336,14 @@ class RobotLinkRelay:
     # RC_CHANNELS_OVERRIDE) don't work for mirroring in-flight behavior.
     if sim_caps is None or phys_caps is None:
       self.msg_if.pub_info("Robot link: capabilities_query unavailable for sim or physical robot, "
-                          "in-flight setpoint mirroring will not be wired",
-                          log_name_list = self.log_name_list)
+                          "in-flight setpoint mirroring will not be wired")
       return
     sim_node_name = str(sim_caps.device_node_name)
     phys_node_name = str(phys_caps.device_node_name)
     if not sim_node_name.startswith('ardupilot_') or not phys_node_name.startswith('ardupilot_'):
       self.msg_if.pub_info("Robot link: in-flight setpoint mirroring only supports ArduPilot on "
                           "both ends (device_node_name " + sim_node_name + " / " + phys_node_name +
-                          "), skipping",
-                          log_name_list = self.log_name_list)
+                          "), skipping")
       return
 
     # rbx_ardupilot_discovery.py's own launchDeviceNode names the ardupilot
@@ -378,8 +372,7 @@ class RobotLinkRelay:
                                        self._cacheAndRelayMavlinkSetpointCb, queue_size = 5,
                                        callback_args = (topic_key,))
       if pub is None or sub is None:
-        self.msg_if.pub_warn("Robot link: failed to wire mavlink setpoint relay topic: " + topic_name,
-                             log_name_list = self.log_name_list)
+        self.msg_if.pub_warn("Robot link: failed to wire mavlink setpoint relay topic: " + topic_name)
         if pub is not None:
           try:
             pub.unregister()
@@ -423,8 +416,7 @@ class RobotLinkRelay:
       new_pubs['state_mirror:set_mode'] = mode_pub
       new_subs['state_mirror:state'] = state_sub
     else:
-      self.msg_if.pub_warn("Robot link: failed to wire arm/mode state mirror, continuing without it",
-                           log_name_list = self.log_name_list)
+      self.msg_if.pub_warn("Robot link: failed to wire arm/mode state mirror, continuing without it")
       for p in (state_pub, mode_pub):
         if p is not None:
           try:
@@ -454,15 +446,14 @@ class RobotLinkRelay:
     was_enabled = self.enabled
     self.enabled = False
     if was_enabled:
-      self.msg_if.pub_info("Robot link disabled: " + reason, log_name_list = self.log_name_list)
+      self.msg_if.pub_info("Robot link disabled: " + reason)
 
   def _relay_cb(self, msg, args):
     topic_name, pub = args
     try:
       pub.publish(msg)
     except Exception as e:
-      self.msg_if.pub_warn("Robot link relay failed on " + topic_name + ": " + str(e),
-                           log_name_list = self.log_name_list, throttle_s = 5.0)
+      self.msg_if.pub_warn("Robot link relay failed on " + topic_name + ": " + str(e), throttle_s = 5.0)
 
   def _cacheAndRelayMavlinkSetpointCb(self, msg, args):
     # Immediate relay (low latency while the sim is actively moving) AND
@@ -487,8 +478,7 @@ class RobotLinkRelay:
         out.header.stamp = nepi_sdk.get_msg_stamp()
       pub.publish(out)
     except Exception as e:
-      self.msg_if.pub_warn("Robot link relay failed on " + topic_key + ": " + str(e),
-                           log_name_list = self.log_name_list, throttle_s = 5.0)
+      self.msg_if.pub_warn("Robot link relay failed on " + topic_key + ": " + str(e), throttle_s = 5.0)
 
   def _mavlinkStreamCb(self, timer):
     if not self.enabled:
@@ -521,8 +511,7 @@ class RobotLinkRelay:
         try:
           state_pub.publish(Int32(data = phys_index))
         except Exception as e:
-          self.msg_if.pub_warn("Robot link state-mirror failed publishing set_state: " + str(e),
-                               log_name_list = self.log_name_list, throttle_s = 5.0)
+          self.msg_if.pub_warn("Robot link state-mirror failed publishing set_state: " + str(e), throttle_s = 5.0)
     mode_name = str(msg.mode)
     if mode_name != self._last_sim_mode:
       self._last_sim_mode = mode_name
@@ -531,8 +520,7 @@ class RobotLinkRelay:
         try:
           mode_pub.publish(Int32(data = phys_index))
         except Exception as e:
-          self.msg_if.pub_warn("Robot link state-mirror failed publishing set_mode: " + str(e),
-                               log_name_list = self.log_name_list, throttle_s = 5.0)
+          self.msg_if.pub_warn("Robot link state-mirror failed publishing set_mode: " + str(e), throttle_s = 5.0)
 
   def _relay_setup_action_cb(self, msg, args):
     sim_index_to_phys_index, pub = args
@@ -545,8 +533,7 @@ class RobotLinkRelay:
     try:
       pub.publish(Int32(data = phys_index))
     except Exception as e:
-      self.msg_if.pub_warn("Robot link relay failed on setup_action: " + str(e),
-                           log_name_list = self.log_name_list, throttle_s = 5.0)
+      self.msg_if.pub_warn("Robot link relay failed on setup_action: " + str(e), throttle_s = 5.0)
 
   def get_status_dict(self):
     with self.lock:

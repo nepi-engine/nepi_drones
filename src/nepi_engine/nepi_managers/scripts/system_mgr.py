@@ -247,7 +247,7 @@ class SystemMgrNode():
 
         ##############################  
         # Create Msg Class
-        self.msg_if = MsgIF(log_name = None)
+        self.msg_if = MsgIF()
         self.msg_if.pub_info("Starting IF Initialization Processes")
 
 
@@ -425,7 +425,7 @@ class SystemMgrNode():
         #self.msg_if.pub_warn("Stored user folders: " + str(self.user_folders))
 
         self.msg_if.pub_info("Waiting for user folders")
-        user_folders = nepi_system.get_user_folders(log_name_list = [self.node_name])
+        user_folders = nepi_system.get_user_folders()
         #self.msg_if.pub_warn("Got user folders: " + str(user_folders))
         
         self.msg_if.pub_warn("Storing System Folders")
@@ -433,7 +433,7 @@ class SystemMgrNode():
         #self.msg_if.pub_warn("Stored System Folders: " + str(self.system_folders))
 
         self.msg_if.pub_info("Waiting for system folders")
-        system_folders = nepi_system.get_system_folders(log_name_list = [self.node_name])
+        system_folders = nepi_system.get_system_folders()
         #self.msg_if.pub_warn("Got system folders: " + str(system_folders))
 
 
@@ -774,7 +774,7 @@ class SystemMgrNode():
 
         ###############################
         # Setup System Settings IF Class ####################
-        self.msg_if.pub_debug("Starting Settings IF Initialization", log_name_list = [self.node_name])
+        self.msg_if.pub_debug("Starting Settings IF Initialization")
         system_settings_ns = self.base_namespace
 
         self.system_settings_if = SettingsIF(namespace = system_settings_ns,
@@ -856,7 +856,6 @@ class SystemMgrNode():
                                 data_products = self.data_products_list,
                                 factory_rate_dict = factory_data_rates,
                                 factory_filename_dict = factory_filename_dict,
-                                log_name_list = [self.node_name],
                                 msg_if = self.msg_if
                         )
 

@@ -86,8 +86,7 @@ class WebotsQuadcopterDiscovery:
   def __init__(self):
     ############
     # Create Message Logger
-    self.log_name = PKG_NAME.lower() + "_discovery"
-    self.logger = nepi_sdk.logger(log_name = self.log_name)
+    self.logger = nepi_sdk.logger()
     self.heartbeat_miss_counts = dict()
     self.active_devices_dict = dict()
     self.launch_time_dict = dict()

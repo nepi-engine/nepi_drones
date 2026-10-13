@@ -331,9 +331,6 @@ the RUI needs rebuilding" first (§7.5).
   too. See §3.
 - No genuine THIRD concurrent instance — only rover+quadcopter have their own
   port pair.
-- `nepi_sdk.logger`'s `log_name_list=[]` mutable-default-argument bug (glued
-  log-prefix chains like `rbx_sim_discovery: : rbx_ardupilot_discovery: :`) is
-  cosmetic only, left unfixed by explicit time tradeoff.
 - The RUI build-output persistence question in §8 is unresolved.
 - **`sim_control_relay_vm.py`'s device→VM control-signal relays (reset/
   teardown/start-trigger) take a few seconds to establish after a fresh
