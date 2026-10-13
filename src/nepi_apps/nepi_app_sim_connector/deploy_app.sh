@@ -9,10 +9,7 @@
 ##
 
 #    NEPI_TARGET_IP: Target IP address/hostname
-     NEPI_TARGET_IP=192.168.179.103
-     if [[ -n $NEPI_TARGET_IP ]]; then
-        NEPI_TARGET_IP=${NEPI_IP}
-     fi
+     NEPI_TARGET_IP=${NEPI_IP:-192.168.179.103}
 
     nepi_user_build=nepihost
     nepi_user_live=nepi

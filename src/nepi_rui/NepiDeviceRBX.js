@@ -32,7 +32,7 @@ import Styles from "./Styles"
 import NepiDeviceControls from "./NepiDeviceRBX-Controls"
 import NepiDeviceMessages from "./NepiDeviceRBX-Info"
 
-import NepiDeviceInfo from "./Nepi_IF_DeviceInfo"
+import Toggle from "react-toggle"
 import ImageViewer from "./Nepi_IF_ImageViewer"
 import NepiIFSettings from "./Nepi_IF_Settings"
 import NepiIFSaveData from "./Nepi_IF_SaveData"
@@ -59,6 +59,8 @@ class NepiDeviceRBX extends Component {
       rbx_capabilities: null,
 
       device_name: null,
+      show_device_name_options: false,
+      device_name_input: null,
       serial_num: null,
       hw_version: null,
       sw_version: null,
@@ -523,9 +525,12 @@ class NepiDeviceRBX extends Component {
 
   sendErrorBounds() {
     const { sendErrorBoundsMsg } = this.props.ros
-    const max_m = this.state.error_bound_m
-    const max_d = this.state.error_bound_deg
-    const min_stab = this.state.error_stabilize_s
+    const max_m = parseFloat(this.state.error_bound_m)
+    const max_d = parseFloat(this.state.error_bound_deg)
+    const min_stab = parseFloat(this.state.error_stabilize_s)
+    if (isNaN(max_m) || isNaN(max_d) || isNaN(min_stab)) {
+      return
+    }
     const namespace = this.state.currentRBXNamespace + "/set_goto_error_bounds"
     sendErrorBoundsMsg(namespace, max_m, max_d, min_stab)
   }
@@ -807,6 +812,62 @@ class NepiDeviceRBX extends Component {
   }
 
 
+  // Replaces the engine's Nepi_IF_DeviceInfo here. That component only
+  // subscribes when its namespace prop CHANGES after mount, and this page
+  // mounts it with the namespace already set, so it never subscribed and the
+  // name stayed blank. The name comes from this page's own /info listener
+  // (infoListener) instead. Rename and reset are kept, same topics.
+  renderDeviceName() {
+    const { sendStringMsg, sendTriggerMsg } = this.props.ros
+    const namespace = this.state.currentRBXNamespace
+    const device_name = (this.state.device_name != null) ? this.state.device_name : ""
+    const name_input = (this.state.device_name_input != null) ? this.state.device_name_input : device_name
+    const BAD_NAME_CHAR_LIST = [" ","/","'","-","$","#"]
+    return (
+      <Section title={"Device Name"}>
+        <Columns>
+          <Column>
+            <Label title={"Device_Name"}>
+              <Input disabled value={device_name} />
+            </Label>
+          </Column>
+          <Column>
+          </Column>
+          <Column>
+            <Label title={"Show Advanced Options"}>
+              <Toggle
+                checked={this.state.show_device_name_options === true}
+                onClick={() => this.setState({ show_device_name_options: !this.state.show_device_name_options })}
+              />
+            </Label>
+            <div hidden={this.state.show_device_name_options !== true}>
+              <Label title={"Update Device Name"}>
+                <Input
+                  value={name_input}
+                  style={{ color: (name_input !== device_name) ? Styles.vars.colors.red : Styles.vars.colors.black }}
+                  onChange={(event) => this.setState({ device_name_input: event.target.value })}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      const value = event.target.value
+                      if (BAD_NAME_CHAR_LIST.every((c) => value.indexOf(c) === -1)) {
+                        sendStringMsg(namespace + "/update_device_name", value)
+                      }
+                      this.setState({ device_name_input: null })
+                    }
+                  }}
+                />
+              </Label>
+              <ButtonMenu>
+                <Button onClick={() => sendTriggerMsg(namespace + "/reset_device_name")}>{"Reset Device Name"}</Button>
+              </ButtonMenu>
+            </div>
+          </Column>
+        </Columns>
+      </Section>
+    )
+  }
+
+
   render() {
     const deviceSelected = (this.state.currentRBXNamespace != null)
     const namespace = this.state.currentRBXNamespace
@@ -814,16 +875,7 @@ class NepiDeviceRBX extends Component {
       <Columns>
         <Column>
 
-          {(deviceSelected === true) ?
-            <NepiDeviceInfo
-              deviceNamespace={namespace}
-              status_topic={"/info"}
-              status_msg_type={"nepi_interfaces/DeviceRBXInfo"}
-              name_update_topic={"/update_device_name"}
-              name_reset_topic={"/reset_device_name"}
-              title={"Device Info"}
-            />
-            : null}
+          {(deviceSelected === true) ? this.renderDeviceName() : null}
 
           {this.renderImageViewer()}
 

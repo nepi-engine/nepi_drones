@@ -57,7 +57,8 @@ from pygeodesy.ellipsoidalKarney import LatLon
 from nepi_interfaces.msg import DeviceRBXInfo, DeviceRBXStatus 
 from nepi_interfaces.msg import AxisControls, ErrorBounds
 from nepi_interfaces.msg import MotorControl
-from nepi_interfaces.msg import GotoPose, GotoPosition, GotoLocation, MotorControl, GotoErrors
+from nepi_interfaces.msg import MotorStatus, MotorsStatus
+from nepi_interfaces.msg import GotoPose, GotoPosition, GotoLocation, GotoVelocity, MotorControl, GotoErrors
 
 from nepi_interfaces.srv import DeviceInfoQuery, DeviceInfoQueryResponse, DeviceInfoQueryRequest
 
@@ -198,14 +199,14 @@ class RBXRobotIF:
     sys_navpose_dict = copy.deepcopy(nepi_nav.BLANK_NAVPOSE_DICT)
 
     ### IF Initialization
-    def __init__(self, device_info, capSettings, 
-                 factorySettings, settingUpdateFunction, getSettingsFunction,
+    def __init__(self, device_info,
                  axisControls,getBatteryPercentFunction,
                  states,getStateIndFunction,setStateIndFunction,
                  modes,getModeIndFunction,setModeIndFunction,
                  checkStopFunction,
                  setup_actions, setSetupActionIndFunction,
                  go_actions, setGoActionIndFunction,
+                 getSettingsFunction=None, setSettingFunction=None, 
                  data_source_description = 'control_system',
                  data_ref_description = 'control_system',
                  getHomeFunction=None,setHomeFunction=None,
@@ -217,6 +218,7 @@ class RBXRobotIF:
                  autonomousControlsReadyFunction=None,
                  goHomeFunction=None, goStopFunction=None, 
                  gotoPoseFunction=None, gotoPositionFunction=None, gotoLocationFunction=None,
+                 gotoVelocityFunction=None,
                  getNavPoseCb=None,
                  navpose_update_rate = 10,
                 log_name = None,
@@ -350,6 +352,7 @@ class RBXRobotIF:
           axis_controls.roll = False
           axis_controls.pitch = False
           axis_controls.yaw = False
+          axisControls = axis_controls
         self.caps_report.control_support = axisControls
         
         self.caps_report.state_options = states
@@ -469,6 +472,12 @@ class RBXRobotIF:
         else:
             self.caps_report.has_goto_location = True
 
+        self.gotoVelocityFunction = gotoVelocityFunction
+        if self.gotoVelocityFunction is None:
+            self.caps_report.has_goto_velocity = False
+        else:
+            self.caps_report.has_goto_velocity = True
+
         self.status_msg.cmd_success = False
 
 
@@ -566,6 +575,13 @@ class RBXRobotIF:
                 'msg': String,
                 'qsize': 1,
                 'latch': True
+            },
+            'motor_status_pub': {
+                'namespace': self.namespace,
+                'topic': 'motor_status',
+                'msg': MotorsStatus,
+                'qsize': 10,
+                'latch': False
             }
         }
      
@@ -710,6 +726,14 @@ class RBXRobotIF:
                 'callback': self.gotoPoseCb, 
                 'callback_args': ()
             },
+            'goto_velocity': {
+                'namespace': self.namespace,
+                'topic': 'goto_velocity',
+                'msg': GotoVelocity,
+                'qsize': None,
+                'callback': self.gotoVelocityCb, 
+                'callback_args': ()
+            },
             'go_stop': {
                 'namespace': self.namespace,
                 'topic': 'go_stop',
@@ -826,34 +850,27 @@ class RBXRobotIF:
         self.msg_if.pub_info("Starting Image IF Initialization", log_name_list = self.log_name_list)
         self.image_if = ImageIF(namespace = self.node_namespace, log_name = 'image',
                         log_name_list = self.log_name_list,
-                            msg_if = self.msg_if
+                        msg_if = self.msg_if,
+                        node_if = self.node_if
                         )
 
 
 
-        # Setup System IF Classes ####################
-        self.msg_if.pub_info("Starting Settings IF Initialization", log_name_list = self.log_name_list)
-        settings_ns = self.namespace
+        ###############################
+        # Setup Settings IF Class ####################
+        self.getSettingsFunction = getSettingsFunction
+        self.setSettingFunction = setSettingFunction
+        if self.getSettingsFunction is not None and self.setSettingFunction is not None:
+            self.msg_if.pub_debug("Starting Settings IF Initialization", log_name_list = self.log_name_list)
+            settings_ns = self.namespace
 
-        # SettingsIF's current __init__ takes getSettingsFunction/
-        # setSettingFunction directly -- no settings_dict/capSettings/
-        # factorySettings kwargs exist any more (that bundling predates the
-        # controls-system refactor; capability info now comes from
-        # getSettingsFunction's own nepi_controls-based return value, same
-        # as every other SettingsIF caller in this codebase). Confirmed
-        # live: this call's old settings_dict= kwarg crashed every RBX
-        # device (rover sim and the physical ArduPilot alike) with
-        # "TypeError: __init__() got an unexpected keyword argument
-        # 'settings_dict'" before ever reaching Settings IF init, let alone
-        # discovery. capSettings/factorySettings are accepted above only
-        # for this constructor's own backward-compatible call signature --
-        # neither is consumed anywhere in this class any more.
-        self.settings_if = SettingsIF(namespace = settings_ns,
-                        getSettingsFunction = getSettingsFunction,
-                        setSettingFunction = settingUpdateFunction,
-                        log_name_list = self.log_name_list,
-                            msg_if = self.msg_if
-                        )
+            self.settings_if = SettingsIF(namespace = settings_ns,
+                            getSettingsFunction=self.getSettingsFunction, 
+                            setSettingFunction=self.setSettingFunction, 
+                            log_name_list = self.log_name_list,
+                            msg_if = self.msg_if,
+                            node_if = self.node_if
+                            )
 
         
         # Setup Save Data IF Class ####################
@@ -872,13 +889,14 @@ class RBXRobotIF:
             'add_node_name': True
             }
 
-        sd_namespace = self.namespace
+        sd_namespace = self.node_namespace
         self.save_data_if = SaveDataIF(data_products = self.data_products_list,
                                 factory_rate_dict = factory_data_rates,
                                 factory_filename_dict = factory_filename_dict,
                                 namespace = sd_namespace,
                         log_name_list = self.log_name_list,
-                            msg_if = self.msg_if
+                        msg_if = self.msg_if,
+                        node_if = self.node_if
                         )
 
         ####################
@@ -891,7 +909,8 @@ class RBXRobotIF:
         # self.navpose_if = ConnectNavPosesIF(namespace = np_namespace,
         #                             save_data_if = self.save_data_if,
         #                         log_name_list = self.log_name_list,
-        #                         msg_if = self.msg_if)
+        #                         msg_if = self.msg_if,
+        #                   node_if = self.node_if)
 
 
         #####################
@@ -929,8 +948,10 @@ class RBXRobotIF:
                 getNavPoseCb = self.getNavPoseCb,
                 max_navpose_update_rate = self.navpose_update_rate,
                 log_name_list = self.log_name_list,
-                            msg_if = self.msg_if
-                )
+                            msg_if = self.msg_if)
+                            # msg_if = self.msg_if,
+                            # node_if = self.node_if
+                            # )
 
         ####################################
         # The aggregated system 'navposes' (NavPoses) topic that navposesSysCb
@@ -953,8 +974,16 @@ class RBXRobotIF:
 
     def initCb(self, do_updates = False):
       if self.node_if is not None:
-        ########   ADD INIT FROM PARAMS
-        pass
+        # cmd_timeout, max_error_m, max_error_deg, stabilized_sec, image_source and
+        # image_status_overlay are read straight from the param at their point of use
+        # (publishInfo, the image updater), so they need nothing here. navpose_frame
+        # is the exception: it is only ever held in this attribute, and it selects
+        # which system navpose frame feeds sys_navpose_dict and therefore the
+        # current_* values the goto/setpoint accuracy checks use. Without this read
+        # a restart silently reverted the robot to the default frame.
+        navpose_frame = self.node_if.get_param('navpose_frame')
+        if navpose_frame is not None:
+            self.navpose_frame = navpose_frame
       if do_updates == True:
         pass
       self.publish_status()
@@ -1414,6 +1443,53 @@ class RBXRobotIF:
 
 
 
+    ### Callback to start rbx goto velocity process
+    #
+    # STRUCTURALLY DIFFERENT from gotoPoseCb and gotoPositionCb above, and this
+    # is the thing a later reader will get wrong. Those two call
+    # setpoint_attitude_ned / setpoint_position_local_body, which are BLOCKING
+    # CONVERGENCE LOOPS: they hold a target and compare it against the live
+    # navpose until the error is inside bounds or cmd_timeout expires.
+    #
+    # goto_velocity has no target to converge on. It is OPEN LOOP. The injected
+    # gotoVelocityFunction owns the timing and is expected to block for
+    # duration_s, and NOTHING IN THIS CLASS MEASURES THE RESULT -- the errors are
+    # zeroed on entry and never updated, and cmd_success is whatever the driver
+    # function returned, not a verdict on where the robot ended up. A device is
+    # expected to stop itself when duration_s elapses; this class does not stop
+    # it.
+    def gotoVelocityCb(self,velocity_cmd_msg):
+        self.msg_if.pub_info("Recieved GoTo Velocity Message", log_name_list = self.log_name_list)
+        self.msg_if.pub_info(velocity_cmd_msg)
+        if self.autonomousControlsReadyFunction() is True:
+            setpoint_data=[velocity_cmd_msg.x_mps,velocity_cmd_msg.y_mps,velocity_cmd_msg.z_mps,
+                           velocity_cmd_msg.yaw_degps,velocity_cmd_msg.duration_s]
+            if self.status_msg.ready is False:
+                self.update_error_msg("Ignoring GoTo Velocity Request, Another GoTo Command Process is Active")
+            else:
+                self.status_msg.process_current = "GoTo Velocity"
+                self.status_msg.ready = False
+                self.rbx_cmd_success_current = False
+                self.update_current_errors( [0,0,0,0,0,0,0] )
+                if self.gotoVelocityFunction is not None:
+                    self.rbx_cmd_success_current = self.gotoVelocityFunction(velocity_cmd_msg.x_mps,
+                                                                             velocity_cmd_msg.y_mps,
+                                                                             velocity_cmd_msg.z_mps,
+                                                                             velocity_cmd_msg.yaw_degps,
+                                                                             velocity_cmd_msg.duration_s)
+                self.status_msg.process_last = "GoTo Velocity"
+                self.status_msg.process_current = "None"
+                self.status_msg.cmd_success = self.rbx_cmd_success_current
+                time.sleep(0.5)
+                self.status_msg.ready = True
+
+                str_val = str(setpoint_data)
+                self.last_cmd_string = "goto_rbx_velocity(self,'" + str_val + "',timeout_sec = " + str(self.rbx_info.cmd_timeout)
+                self.publishInfo()
+        else:
+            self.update_error_msg("Ignoring Go command, Autononous Controls not Ready")
+
+
     ### Callback to start rbx goto position process
     def gotoPositionCb(self,position_cmd_msg):
         self.msg_if.pub_info("Recieved GoTo Position Command Message", log_name_list = self.log_name_list)
@@ -1481,7 +1557,9 @@ class RBXRobotIF:
   
     def setCurrentAsDefault(self):
         if self.settings_if is not None:
-          self.settings_if.initialize_settings(do_updates = False)
+          # initialize_settings() has never existed on SettingsIF -- this raised
+          # AttributeError on every setCurrentAsDefault(). init() is the method.
+          self.settings_if.init(do_updates = False)
         pass # We only use the param server, no member variables to apply to param server
    
     ### Info callback
@@ -2124,6 +2202,44 @@ class RBXRobotIF:
         mcs.append(mc)
       return mcs
 
+    def get_motors_status_msg(self):
+      """Builds the standard MotorsStatus message for this RBX device.
+
+      One MotorStatus per motor, named motor_0, motor_1, ... in motor-index
+      order, populated from the manual motor-control speed ratios reported by
+      getMotorControlRatios().
+
+      Note: RBX exposes only a per-motor speed ratio. It has no per-motor
+      direction, max speed, current speed (dps), position feedback, or explicit
+      enable state, so motor_dir is reported as 1, motor_enable as True, and
+      motor_max_speed / motor_speed / motor_position as 0. These map in as RBX
+      gains that feedback.
+
+      Returns:
+          MotorsStatus: Wrapper message published on the dedicated motor_status
+              topic.
+      """
+      msg = MotorsStatus()
+      msg.timestamp = nepi_utils.get_time()
+      msg.device_name = self.device_name
+      if self.getMotorControlRatios is not None:
+        ratios = self.getMotorControlRatios()
+      else:
+        ratios = []
+      motors = []
+      for i in range(len(ratios)):
+        motor = MotorStatus()
+        motor.motor_name = "motor_" + str(i)
+        motor.motor_enable = True
+        motor.motor_dir = 1
+        motor.motor_max_speed = 0.0
+        motor.motor_speed_ratio = ratios[i]
+        motor.motor_speed = 0.0
+        motor.motor_position = 0.0
+        motors.append(motor)
+      msg.motors = motors
+      return msg
+
     def get_3d_transform(self):
         """Returns the current 3D transformation data.
 
@@ -2244,6 +2360,8 @@ class RBXRobotIF:
             self.status_msg.data_ref_description = self.data_ref_description
             self.node_if.publish_pub('status_msg_pub', self.status_msg)
             self.node_if.publish_pub('status_msg_str_pub', str(status_str_msg))
+            # Standard per-motor status on the dedicated motor_status topic
+            self.node_if.publish_pub('motor_status_pub', self.get_motors_status_msg())
 
         # Create ROS Image message
         cv2_img = copy.deepcopy(self.cv2_img) # Initialize status image
@@ -2272,6 +2390,10 @@ class RBXRobotIF:
 
         ## Update image source topic and subscriber if changed from last time.
         image_source = self.node_if.get_param('image_source')
+        if image_source is None:
+            # Param read failed (param server gone at shutdown): keep the
+            # current source this tick rather than crash in find_topic.
+            image_source = self.rbx_image_source_last
         image_topic = nepi_sdk.find_topic(image_source)
         # Unsubscribe-if-changed used to live INSIDE the "if image_topic != ''"
         # branch below, so it only ever ran when switching between two real

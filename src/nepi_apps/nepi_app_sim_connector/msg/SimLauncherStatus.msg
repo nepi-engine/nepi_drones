@@ -5,9 +5,11 @@
 # it a separate message means nothing about SimDeviceIF's existing contract
 # has to change to add it.
 
-# Launch targets this deployment knows about, read from
-# simulator_launch_targets.yaml (nepi_drones, not shipped with the app -- see
-# the plan doc for why). Same reported-list-plus-active-selection shape
+# Launch targets this deployment knows about: the simulators in
+# sim_connector_app_node.py's SIM_TARGETS whose nepi_simulations service has
+# been set up (its config file exists in NEPI storage). Until 2026-09-28 these
+# were read from sim_container/simulator_launch_targets.yaml, which nothing
+# reads now. Same reported-list-plus-active-selection shape
 # SimStatus already uses for its two selectors.
 string[] available_launch_targets
 string[] available_launch_target_names

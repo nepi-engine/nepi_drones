@@ -121,8 +121,8 @@ without error."
      frozen).
    - `available_sensor_topics`/`available_environment_options` populate if the simulator
      reports any.
-5. **Add a matching robot config** to `sim_connector_app_params.yaml`'s `SIM_VEHICLE_DICT` (new
-   named entry — e.g. `webots_wheeled_robot`), matching that simulator's actual capabilities
+5. **Add a matching robot config** -- since 2026-09-29, a folder in the Gazebo service share's
+   `ROBOT_CONFIGS` with its own `nepi_robot_config.yaml` (new named entry — e.g. `webots_wheeled_robot`), matching that simulator's actual capabilities
    (wheel/motor count, which goto variants make sense, camera view control, environment
    control). Select it via `select_robot_config` and confirm the capability flags in
    `capabilities_query` actually flip to match — this is the point where a wrong flag would

@@ -1,0 +1,60 @@
+# Per-deployment simulator profile for the Sim Connector app, read at startup by
+# sim_connector_app_node.py's loadVehicleDictFromParamsFile.
+#
+# Kept out of sim_connector_app_params.yaml on purpose (2026-09-29): the RUI
+# build reads each app's params yaml through a flattening step
+# (nepi_bash_utils' clean_yaml_file keeps only single-line "key: value" lines)
+# that turns anything nested deeper than APP_DICT/RUI_DICT into invalid YAML --
+# which silently dropped this app from the RUI entirely. The filename leaves
+# out "params" so apps_mgr (which only scans *params*.yaml) never mistakes
+# this for an app definition, and CMakeLists.txt keeps it out of the RUI's
+# own copy of the params folder.
+#
+# Why this is config: the contract decides capabilities once at construction
+# and caches them, which is what lets a client render controls purely from the
+# flags. Everything that describes what kind of robot this is (wheel and motor
+# counts, which goto functions exist, which camera view modes are valid) is a
+# named robot config here. Selecting a different config re-derives the cached
+# capability report in place; see SimDeviceIF.apply_capability_profile.
+SIM_VEHICLE_DICT:
+  # Which robot config the app starts in: a folder name in the sim share's
+  # ROBOT_CONFIGS (see robot_configs below). Falls back to the hidden
+  # capability-empty default if that folder is not in the share.
+  default_robot_config: generic_rover
+
+  # Robots are NOT defined here any more (2026-09-29): the Robot Config
+  # selector offers exactly the folders in the Gazebo service's share,
+  # databases/sims/gazebo/ROBOT_CONFIGS in NEPI storage -- e.g. generic_rover
+  # (4-Wheel Rover) and quadcopter -- each named and described by its own
+  # nepi_robot_config.yaml. Add a robot by adding a folder there; see that
+  # folder's README.md. The only entry left here is the hidden
+  # capability-empty placeholder used before anything is selected. (A
+  # profile added here with a gazebo_robot_config: <folder> field would
+  # still claim that folder, as README.md describes, but none do today.)
+  robot_configs:
+
+    # Capability-empty factory default. Every flag off, so the RUI renders no
+    # controls at all. That is the intended safe starting state, not a broken
+    # one -- an operator picks a real robot config from the selector once a
+    # bridge is connected. Verified safe: an all-None callback set answers
+    # capabilities_query with all-False and no-ops every command.
+    default:
+      display_name: Default
+      # Never a real offered choice -- see sim_connector_app_node.py's own
+      # enforcement of this on load, which applies even if this flag is ever
+      # removed here by accident.
+      hidden_from_selector: true
+      description: No capabilities. Safe default until a robot config is selected.
+      wheel_count: 0
+      motor_count: 0
+      has_goto_position: false
+      has_goto_pose: false
+      has_goto_location: false
+      has_go_home: false
+      has_set_home: false
+      has_go_stop: false
+      setup_actions: []
+      go_actions: []
+      has_camera_view_control: false
+      available_camera_view_modes: []
+      has_environment_controls: false

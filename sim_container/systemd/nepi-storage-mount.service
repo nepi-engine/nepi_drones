@@ -43,8 +43,8 @@ Environment=NEPI_DEVICE_SSH_HOST=192.168.179.103
 # NEPI_DRONES_REPO_PATH: this checkout's own location, since a system unit
 # has no per-user %h to expand -- nepi_vm_connect_setup.sh fills this in
 # with the real path automatically; only a hand-installed unit needs to set
-# it manually.
-Environment=NEPI_DRONES_REPO_PATH=/home/suraj/nepi_engine_ws/nepi_drones
+# it manually. The value below is a placeholder.
+Environment=NEPI_DRONES_REPO_PATH=/home/<user>/nepi_engine_ws/nepi_drones
 EnvironmentFile=-/etc/nepi-storage-mount.env
 ExecStart=/bin/bash ${NEPI_DRONES_REPO_PATH}/sim_container/scripts/nepi_vm_storage_mount.sh
 Restart=always

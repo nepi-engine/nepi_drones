@@ -25,9 +25,16 @@ import Select, { Option } from "./Select"
 import Label from "./Label"
 import Input from "./Input"
 import Button, { ButtonMenu } from "./Button"
-import BooleanIndicator from "./BooleanIndicator"
 import Styles from "./Styles"
 import { Columns, Column } from "./Columns"
+
+// "New Sim" (a second, concurrent simulator instance) is hidden for now: the
+// NEPI Gazebo service runs a single Gazebo, so the backend can only refuse
+// it. Everything behind it -- onNewSimClicked, renderSecondaryInstances, the
+// backend's sim/launch_new_simulator -- is kept; set this true to bring the
+// button (and its "Other Running Instances" list) back once multi-instance
+// support exists.
+const SHOW_NEW_SIM = false
 
 @inject("ros")
 @observer
@@ -38,7 +45,7 @@ import { Columns, Column } from "./Columns"
 // trigger over the same passive sim/select_simulator + sim/select_robot_config
 // flow Nepi_IF_Sim already owns, not a replacement for it. Takes the same
 // sim device namespace prop (<app>/sim) Nepi_IF_Sim takes, and talks to the
-// sibling sim/launcher_status, sim/launch_simulator, sim/stop_simulator
+// sibling sim/launcher_status, sim/redeploy_simulator, sim/stop_simulator
 // topics sim_connector_app_node.py publishes/subscribes alongside SimStatus.
 //
 // available_launch_targets is empty on any deployment that hasn't set
@@ -70,26 +77,11 @@ class NepiIFSimLauncher extends Component {
       secondaryStatusListener: null,
 
       // Local dropdown selection, applied on Deploy click -- not published
-      // on every change, only Deploy/Kill/Install actually send anything.
+      // on every change, only Deploy/Kill actually send anything.
       // Only used when this instance isn't given a selected_target prop --
       // see getSelectedTarget/setSelectedTarget.
       selected_target: 'None',
-
-      // Client-side timestamp (Date.now()) of when launcher_state was last
-      // observed transitioning INTO 'installing' -- reported live: "hit
-      // deploy... it doesn't do anything" when a real install (a large
-      // ros-noetic-desktop-full apt transaction, in that case) was several
-      // minutes in with zero feedback beyond a greyed-out button. The
-      // backend has no per-stage progress to report (install_command runs
-      // as one opaque blocking remote command -- see simulator_launcher.py's
-      // install()), so this is deliberately just an elapsed-time
-      // reassurance, not real progress; still far better than nothing.
-      // null whenever not currently installing. tick forces a re-render
-      // once a second so the elapsed time actually counts up live.
-      install_started_at: null,
-      tick: 0,
     }
-    this.tickIntervalId = null
 
     this.getSimNamespace = this.getSimNamespace.bind(this)
 
@@ -103,10 +95,6 @@ class NepiIFSimLauncher extends Component {
     this.onDeployClicked = this.onDeployClicked.bind(this)
     this.onNewSimClicked = this.onNewSimClicked.bind(this)
     this.onKillClicked = this.onKillClicked.bind(this)
-    this.onInstallClicked = this.onInstallClicked.bind(this)
-    this.onLaunchNewClicked = this.onLaunchNewClicked.bind(this)
-    this.onUseExistingClicked = this.onUseExistingClicked.bind(this)
-    this.onKillAllGazeboClicked = this.onKillAllGazeboClicked.bind(this)
 
     this.renderTargetSelector = this.renderTargetSelector.bind(this)
     this.renderDeployControls = this.renderDeployControls.bind(this)
@@ -137,11 +125,6 @@ class NepiIFSimLauncher extends Component {
 
   componentDidMount() {
     this.updateStatusListener()
-    // Drives the elapsed-time install indicator -- see install_started_at's
-    // own comment. Runs for this component's whole lifetime rather than
-    // only while installing (negligible cost either way, and avoids a
-    // second layer of start/stop bookkeeping on top of statusListener's own).
-    this.tickIntervalId = setInterval(() => this.setState({ tick: Date.now() }), 1000)
   }
 
   componentDidUpdate(prevProps, prevState, snapshot) {
@@ -159,10 +142,6 @@ class NepiIFSimLauncher extends Component {
       this.state.secondaryStatusListener.unsubscribe()
     }
     this.setState({ statusListener: null, secondaryStatusListener: null })
-    if (this.tickIntervalId !== null) {
-      clearInterval(this.tickIntervalId)
-      this.tickIntervalId = null
-    }
   }
 
   // Subscribes to <namespace>/launcher_status, message type
@@ -205,26 +184,14 @@ class NepiIFSimLauncher extends Component {
   }
 
   statusListener(message) {
-    // Catches BOTH the edge where install_started_at doesn't exist yet
-    // (e.g. Install was clicked elsewhere, or this component just mounted
-    // mid-install) and a normal transition -- either way, the first status
-    // update this component ever sees while the backend reports
-    // 'installing' is close enough to the real start for an elapsed-time
-    // estimate; it doesn't need to be exact.
-    const was_installing = (this.state.status_msg !== null
-      && this.state.status_msg.launcher_state === 'installing')
-    const now_installing = (message.launcher_state === 'installing')
-    if (now_installing && !was_installing) {
-      this.setState({ install_started_at: Date.now() })
-    } else if (!now_installing && this.state.install_started_at !== null) {
-      this.setState({ install_started_at: null })
-    }
-
     this.setState({ status_msg: message })
-    // Keep the dropdown following the device's own reported selection
-    // (e.g. after a launch started from elsewhere) unless the operator
-    // hasn't picked anything yet.
-    if (message.selected_launch_target !== undefined && message.selected_launch_target !== '') {
+    // Take the device's reported selection only while the operator hasn't
+    // picked anything yet (e.g. on page load). After that the dropdown is
+    // the operator's: they can pick MuJoCo while Gazebo is running and
+    // Deploy it, and an echo of the running simulator must not undo that.
+    const current = this.getSelectedTarget()
+    if ((current === 'None' || current === '') &&
+        message.selected_launch_target !== undefined && message.selected_launch_target !== '') {
       this.setSelectedTarget(message.selected_launch_target)
     }
   }
@@ -263,7 +230,7 @@ class NepiIFSimLauncher extends Component {
   // below, so an already-live bridge picks up the change too) is NOT enough
   // on its own -- confirmed live (2026-08-28) that it still raced runLaunch
   // on a fresh page load (pick Quadcopter, immediate Deploy could still
-  // launch the rover), because select_robot_config and launch_simulator are
+  // launch the rover), because select_robot_config and redeploy_simulator are
   // different ROS topics, each dispatched on its own independent subscriber
   // thread backend-side with no ordering guarantee, even though both are
   // sent back-to-back over this one websocket connection. Embedding
@@ -280,16 +247,16 @@ class NepiIFSimLauncher extends Component {
     })
   }
 
-  // Publishes the selected target key to sim/launch_simulator. The app node
-  // does the rest: ssh launch, readiness poll, then applies whatever robot
+  // Publishes the selected target key to sim/redeploy_simulator. The app node
+  // does the rest: Gazebo service request, readiness poll, then applies whatever robot
   // config is already selected in the Sim Connector panel (the existing,
   // unmodified select_robot_config flow) -- so choosing a simulator here and
   // a model over there, then clicking Deploy, applies both in one action.
   // Nothing here talks to the VM directly.
   //
   // Also doubles as "Use Open Sim" when the selected target already matches
-  // what's running. Routed through sim/redeploy_simulator (not
-  // sim/launch_simulator) so that case is a guaranteed kill-and-relaunch,
+  // what's running. Routed through sim/redeploy_simulator so that case is a
+  // guaranteed kill-and-relaunch,
   // not the old short-circuit that just re-pointed the bridge at whatever
   // was already up without touching the VM -- requested live (2026-09-18):
   // "use open sim should kill and redeploy the sim with the new settings
@@ -331,10 +298,11 @@ class NepiIFSimLauncher extends Component {
   // concurrent instance alongside whatever the primary slot (Use Open Sim/
   // Deploy/Kill above) is already running, rather than replacing it.
   // sim/launch_new_simulator is a distinct topic/thread/state slot from
-  // sim/launch_simulator on the backend (see sim_connector_app_node.py's
+  // sim/redeploy_simulator on the backend (see sim_connector_app_node.py's
   // secondary_launch_states comment) -- only gazebo_rover and
   // gazebo_quadcopter actually have their own GAZEBO_MASTER_URI/
-  // ROS_MASTER_URI (simulator_launch_targets.yaml), so this only really
+  // ROS_MASTER_URI (in the legacy simulator_launch_targets.yaml, no longer
+  // read since 2026-09-28), so this only really
   // supports one OTHER target running concurrently with the primary one,
   // not arbitrary N.
   onNewSimClicked() {
@@ -385,7 +353,7 @@ class NepiIFSimLauncher extends Component {
   // of whatever the primary slot is doing.
   renderSecondaryInstances() {
     const entries = Object.entries(this.state.secondary_states)
-    if (entries.length === 0) {
+    if (SHOW_NEW_SIM === false || entries.length === 0) {
       return null
     }
     return (
@@ -407,62 +375,6 @@ class NepiIFSimLauncher extends Component {
     const namespace = this.getSimNamespace()
     if (namespace != null && namespace !== 'None') {
       this.props.ros.sendTriggerMsg(namespace + '/stop_simulator')
-    }
-  }
-
-  // Publishes the selected target key to sim/install_simulator -- runs that
-  // target's install_command over ssh, then re-checks it. Same namespace
-  // pattern as Deploy/Kill.
-  onInstallClicked() {
-    const namespace = this.getSimNamespace()
-    const target = this.getSelectedTarget()
-    if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
-      this.props.ros.sendStringMsg(namespace + '/install_simulator', target)
-    }
-  }
-
-  // Offered specifically when launcher_state is 'gazebo_conflict' -- see
-  // sim_connector_app_node.py's isGazeboConflictError/runLaunch. Force past
-  // the gazebo that's in the way by killing it (and anything else's gazebo
-  // on that host -- see SimulatorLauncher.kill_all_gazebo's own docstring
-  // for why this is deliberately blunt) and launching the selected target
-  // fresh.
-  onLaunchNewClicked() {
-    const namespace = this.getSimNamespace()
-    const target = this.getSelectedTarget()
-    if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
-      this.resendRobotConfigIfKnown(namespace)
-      this.props.ros.sendStringMsg(namespace + '/force_launch_simulator', this.buildLaunchPayload(target))
-    }
-  }
-
-  // The other conflict-resolution choice: skip starting a new gazebo
-  // entirely and just point this target's bridge (and, for the
-  // quadcopter target, SITL) at whatever's already running. Only works
-  // out if the already-running gazebo happens to have the right world
-  // loaded -- if not, the app's own ready_check reports a clean failure
-  // rather than a false success (see attach_launch_command's own comment
-  // in simulator_launch_targets.yaml).
-  onUseExistingClicked() {
-    const namespace = this.getSimNamespace()
-    const target = this.getSelectedTarget()
-    if (namespace != null && namespace !== 'None' && target !== 'None' && target !== '') {
-      this.resendRobotConfigIfKnown(namespace)
-      this.props.ros.sendStringMsg(namespace + '/attach_simulator', this.buildLaunchPayload(target))
-    }
-  }
-
-  // Standalone escape hatch, not specific to the currently selected
-  // target -- kills every gzclient/gzserver on every configured target's
-  // host, regardless of who started it. Offered here because the
-  // gazebo_conflict state is the situation this exists for, but it isn't
-  // itself part of resolving THIS target's own launch (Launch New already
-  // does this as its first step) -- it's for clearing a stray instance
-  // without immediately relaunching anything.
-  onKillAllGazeboClicked() {
-    const namespace = this.getSimNamespace()
-    if (namespace != null && namespace !== 'None') {
-      this.props.ros.sendTriggerMsg(namespace + '/kill_all_gazebo')
     }
   }
 
@@ -507,23 +419,12 @@ class NepiIFSimLauncher extends Component {
     )
   }
 
-  // Everything below the target selector: dependency state, the running-sim
-  // message, and whichever button set applies. Four mutually-exclusive
-  // cases, checked in this order:
-  //   1. The last launch hit launch_command's own "a gzserver is already
-  //      running" refuse-to-launch guard -- show the error plus Launch New
-  //      / Use Existing / Kill All Gazebo instead of a dead-end failure.
-  //   2. Something is currently running (regardless of the selected
-  //      target's own install state -- it's running, so it's plainly
-  //      present) -- show "You have X open" plus Kill, New Sim, and (only
-  //      when the selection matches what's running) Use Open Sim.
-  //   3. Nothing running, and the SELECTED target is confirmed missing --
-  //      show Install instead of Deploy. "checking"/"unknown" intentionally
-  //      do NOT show Install: unknown means "couldn't reach the host to
-  //      tell" (see SimulatorLauncher.is_installed's docstring), and
-  //      offering to install onto a host that can't be confirmed reachable
-  //      invites a confusing failure rather than a useful one.
-  //   4. Otherwise (idle/installed/unknown, nothing running) -- plain Deploy.
+  // Everything below the target selector: the running-sim message and
+  // whichever button set applies. Two mutually-exclusive cases:
+  //   1. Something is currently running -- show "You have X open" plus Kill,
+  //      New Sim, and (only when the selection matches what's running) Use
+  //      Open Sim.
+  //   2. Otherwise (nothing running) -- plain Deploy.
   renderDeployControls() {
     const status_msg = this.state.status_msg
     const target = this.getSelectedTarget()
@@ -537,13 +438,8 @@ class NepiIFSimLauncher extends Component {
       ? status_msg.available_launch_targets : []
     const names = (status_msg.available_launch_target_names !== undefined)
       ? status_msg.available_launch_target_names : []
-    const check_states = (status_msg.available_launch_target_installed_check_state !== undefined)
-      ? status_msg.available_launch_target_installed_check_state : []
-    const target_ind = available.indexOf(target)
-    const check_state = (target_ind !== -1 && check_states[target_ind] !== undefined)
-      ? check_states[target_ind] : 'unknown'
 
-    const busy = (state === 'launching') || (state === 'stopping') || (state === 'installing')
+    const busy = (state === 'launching') || (state === 'stopping')
     const running = (state === 'running')
     const last_error = (status_msg.last_error !== undefined) ? status_msg.last_error : ''
 
@@ -569,34 +465,9 @@ class NepiIFSimLauncher extends Component {
       </div>
     : null
 
-    // Elapsed-time reassurance while an install is in flight -- reported
-    // live: "hit deploy... it doesn't do anything" partway through a real
-    // install (ros-noetic-desktop-full, several minutes in) with nothing
-    // but a greyed-out button to look at. install_command runs as one
-    // opaque blocking remote command (see simulator_launcher.py's
-    // install()), so there's no real per-stage progress to show here --
-    // this is deliberately just "still going, here's how long," not a
-    // progress bar. this.state.tick (ticked once a second by
-    // componentDidMount's own interval) is read only to force this to
-    // re-render live; its value is never used directly.
-    const installing_row = (state === 'installing' && this.state.install_started_at !== null) ?
-      <Label title={"Installing"}>
-        <div style={{ textAlign: "left", whiteSpace: "normal" }}>
-          {"Installing '" + target + "'... (" +
-            Math.max(0, Math.floor((this.state.tick - this.state.install_started_at) / 1000)) +
-            "s elapsed). Large installs -- ROS/Gazebo package sets, or a "
-            + "from-source ArduPilot build -- can take 10-20+ minutes. This "
-            + "page will update on its own when it finishes; no need to "
-            + "click anything again."}
-        </div>
-      </Label>
-    : null
-
-    // Worst-case copy-paste fallback -- populated by the backend
-    // (publishLauncherStatus) only once a failure is confirmed
-    // dependency-related, for a human to run directly in a terminal when
-    // auto-install either failed or (like the ArduPilot SITL quadcopter
-    // target) was never offered in the first place. A <pre> block, not an
+    // Copy-paste fallback -- populated by the backend (publishLauncherStatus)
+    // when a request fails because the Gazebo service isn't responding, for a
+    // human to run directly on the sim machine. A <pre> block, not an
     // <Input> or the plain wrapping <div> error_row uses -- these are
     // multi-line shell commands meant to be selected and copied verbatim,
     // where preserved line breaks and a monospace font both matter.
@@ -614,30 +485,6 @@ class NepiIFSimLauncher extends Component {
         </pre>
       </Label>
     : null
-
-    // A real choice, not a dead end: launch_command's own refuse-to-launch
-    // guard means a gazebo is already up but isn't tracked as this app's
-    // own launch (see runLaunch's own comment). Checked before the
-    // running/not_installed branches below since it's mutually exclusive
-    // with both (a launch that hit this guard never got as far as
-    // "running", and never needed an install check to fail this way).
-    if (state === 'gazebo_conflict') {
-      return (
-        <React.Fragment>
-
-          {error_row}
-          {installing_row}
-          {manual_fallback_row}
-
-          <ButtonMenu>
-            <Button disabled={busy} onClick={this.onLaunchNewClicked}>{"Launch New"}</Button>
-            <Button disabled={busy} onClick={this.onUseExistingClicked}>{"Use Existing"}</Button>
-            <Button disabled={busy} onClick={this.onKillAllGazeboClicked}>{"Kill All Gazebo"}</Button>
-          </ButtonMenu>
-
-        </React.Fragment>
-      )
-    }
 
     if (running) {
       const running_target = status_msg.selected_launch_target
@@ -674,37 +521,18 @@ class NepiIFSimLauncher extends Component {
           </Label>
 
           {error_row}
-          {installing_row}
           {manual_fallback_row}
 
+          {/* A different simulator picked while this one runs: Deploy
+              switches to it -- the backend stops the running one first. */}
           <ButtonMenu>
             {selection_matches_running ?
               <Button disabled={busy} onClick={this.onDeployClicked}>{"Use Open Sim"}</Button>
+            : <Button disabled={busy} onClick={this.onDeployClicked}>{"Deploy"}</Button>}
+            {SHOW_NEW_SIM ?
+              <Button disabled={busy} onClick={this.onNewSimClicked}>{"New Sim"}</Button>
             : null}
-            <Button disabled={busy} onClick={this.onNewSimClicked}>{"New Sim"}</Button>
             <Button disabled={busy} onClick={this.onKillClicked}>{"Kill"}</Button>
-          </ButtonMenu>
-
-          {this.renderSecondaryInstances()}
-
-        </React.Fragment>
-      )
-    }
-
-    if (check_state === 'not_installed') {
-      return (
-        <React.Fragment>
-
-          <Label title={"Dependencies Installed"}>
-            <BooleanIndicator value={false} />
-          </Label>
-
-          {error_row}
-          {installing_row}
-          {manual_fallback_row}
-
-          <ButtonMenu>
-            <Button disabled={busy} onClick={this.onInstallClicked}>{"Install"}</Button>
           </ButtonMenu>
 
           {this.renderSecondaryInstances()}
@@ -718,7 +546,6 @@ class NepiIFSimLauncher extends Component {
     return (
       <React.Fragment>
         {error_row}
-        {installing_row}
         {manual_fallback_row}
         <ButtonMenu>
           <Button disabled={deploy_disabled} onClick={this.onDeployClicked}>{"Deploy"}</Button>

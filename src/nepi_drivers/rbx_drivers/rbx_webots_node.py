@@ -556,8 +556,8 @@ class WebotsNode:
       self.msg_if.pub_warn("Motor control ignored: motor index " + str(motor_ind) + " out of range")
       return
     # -1.0..1.0, not 0.0..1.0 -- a wheeled rover's motors genuinely reverse,
-    # same reasoning rbx_sim_node.py's/rbx_mujoco_node.py's own identical
-    # methods already document. Reported live (2026-09-21): "making the
+    # same reasoning rbx_sim_node.py's own identical method already
+    # documents. Reported live (2026-09-21): "making the
     # motors negative doesnt make it go backwards" -- root cause was this
     # clamp silently discarding every negative speed_ratio.
     self.motor_ratios[motor_ind] = max(-1.0, min(1.0, speed_ratio))

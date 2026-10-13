@@ -280,6 +280,9 @@ class ArdupilotDiscovery:
   baudrate_list = ['57600']
   ip_addr_list = ['192.168.179.5']
   ip_udp_port_list = ['14550']
+  # Local port mavros binds (on every interface) for a UDP link; the remote
+  # end is the ip_addr_list/ip_udp_port_list entry the path was built from.
+  udp_local_port_str = '14555'
   ip_tcp_port_list = ['14550']
 
   # ArduPilot SITL running locally alongside mavros/the RBX driver (local VM/WSL dev setup,
@@ -299,9 +302,19 @@ class ArdupilotDiscovery:
 
   enable_fake_gps = False
 
-  # Mavros (mavlink) launch configuration
-  APM_PLUGINLISTS_PATH = '/opt/nepi/nepi_engine/share/mavros/launch/apm_pluginlists.yaml'
-  APM_CONFIG_PATH = '/opt/nepi/nepi_engine/share/mavros/launch/apm_config.yaml'
+  # Mavros (mavlink) launch configuration: mavros's own ArduPilot configs,
+  # loaded into the mavros node's namespace before it starts. They ship in the
+  # mavros package's launch/ folder (/opt/ros/noetic/share/mavros/launch on an
+  # apt install), so that folder is found through rospack, with the old fixed
+  # /opt/nepi path as a fallback. Found missing live 2026-10-12: only the fixed
+  # path was tried, it did not exist on the device, and rosparam load failed
+  # quietly -- mavros then ran every plugin with defaults, and with no
+  # rangefinder mapping from apm_config.yaml it logged "DS: no mapping for
+  # sensor id" four times a second for SITL's downward rangefinder.
+  APM_CONFIG_FILES = ['apm_pluginlists.yaml', 'apm_config.yaml']
+  LEGACY_MAVROS_LAUNCH_FOLDER = '/opt/nepi/nepi_engine/share/mavros/launch'
+  mavros_launch_folder = None
+  mavros_launch_folder_checked = False
 
   ################################################
   def __init__(self):
@@ -534,6 +547,31 @@ class ArdupilotDiscovery:
       nepi_drvs.killDriverNode(mav_node_name, mavlink_subproc)
 
 
+  def getMavrosLaunchFolder(self):
+    # Looked up once per discovery instance -- the mavros install does not
+    # move while drivers_mgr runs, and rospack is slow enough to matter on
+    # every relaunch.
+    if self.mavros_launch_folder_checked:
+      return self.mavros_launch_folder
+    self.mavros_launch_folder_checked = True
+    candidates = []
+    try:
+      result = subprocess.run(['rospack', 'find', 'mavros'], capture_output = True, text = True, timeout = 10)
+      if result.returncode == 0 and result.stdout.strip():
+        candidates.append(os.path.join(result.stdout.strip(), 'launch'))
+    except Exception as e:
+      self.logger.log_warn("rospack find mavros failed: " + str(e))
+    candidates.append(self.LEGACY_MAVROS_LAUNCH_FOLDER)
+    for folder in candidates:
+      if all(os.path.isfile(os.path.join(folder, f)) for f in self.APM_CONFIG_FILES):
+        self.mavros_launch_folder = folder
+        self.logger.log_info("Using mavros ArduPilot configs from: " + folder)
+        return folder
+    self.logger.log_warn("mavros ArduPilot configs (" + ", ".join(self.APM_CONFIG_FILES) +
+                         ") not found in " + str(candidates) +
+                         " -- mavros will load every plugin with its defaults")
+    return None
+
   def launchDeviceNode(self, path_str, device_id_str, mav_comp_id, mav_sys_id, fcu_url, gcs_url):
     success = False
     launch_id = path_str
@@ -552,8 +590,10 @@ class ArdupilotDiscovery:
     mav_node_namespace = nepi_sdk.create_namespace(self.base_namespace, mav_node_name)
     self.logger.log_info("Starting mavlink node setup: " + mav_node_name)
     # Load the proper configs for APM
-    subprocess.run(['rosparam', 'load', self.APM_PLUGINLISTS_PATH, mav_node_namespace])
-    subprocess.run(['rosparam', 'load', self.APM_CONFIG_PATH, mav_node_namespace])
+    apm_config_folder = self.getMavrosLaunchFolder()
+    if apm_config_folder is not None:
+      for config_file in self.APM_CONFIG_FILES:
+        subprocess.run(['rosparam', 'load', os.path.join(apm_config_folder, config_file), mav_node_namespace])
     # Adjust the timesync_rate to cut down on log noise
     nepi_sdk.set_param(mav_node_namespace + '/conn/timesync_rate', 1.0)
     # Allow the HIL plugin. Disabled in apm configs for some reason
@@ -829,7 +869,7 @@ class ArdupilotDiscovery:
     device_id_str = ip_str_short + "_" + ip_port_str
     mav_comp_id = 1
     mav_sys_id = 1
-    fcu_url = "udp://192.168.179.103:14555@192.168.179.5:14550"
+    fcu_url = "udp://0.0.0.0:" + self.udp_local_port_str + "@" + ip_addr_str + ":" + ip_port_str
     gcs_url = ""
     return self.launchDeviceNode(path_str, device_id_str, mav_comp_id, mav_sys_id, fcu_url, gcs_url)
 

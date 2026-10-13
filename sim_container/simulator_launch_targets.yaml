@@ -1,3 +1,11 @@
+# NO LONGER READ by nepi_app_sim_connector (2026-09-28): the app now starts
+# and stops each simulator through its service in nepi_simulations
+# (nepi_gazebo/gazebo_setup, and since 2026-10 nepi_mujoco/mujoco_setup) --
+# see the app's api/nepi_sim_service.py. Kept, with the rest of sim_container,
+# as legacy reference until Webots moves over. The mujoco_rover target here
+# was removed on 2026-09-28; MuJoCo came back later as its own service, not
+# through this file.
+#
 # Per-simulator launch targets for the additive auto-launch capability -- see
 # docs/SIMULATOR_AUTO_LAUNCH_PLAN.md. Dev-only config: lives in nepi_drones,
 # not nepi_apps, because a real deployed device never needs to know how to
@@ -31,7 +39,7 @@
 #      address instead and skip the tunnel.
 #
 # ssh_user below is "suraj" for every target -- one specific developer's own
-# VM login, not a generic default. Rather than hand-editing all five blocks
+# VM login, not a generic default. Rather than hand-editing all four blocks
 # for a different deployment, set NEPI_SIM_VM_SSH_USER (and, if host/
 # ssh_port also need to differ -- e.g. skipping the tunnel for a routable
 # VM on port 22 -- NEPI_SIM_VM_HOST / NEPI_SIM_VM_SSH_PORT) wherever
@@ -83,107 +91,6 @@ device_bridge_port: 9030
 # reboot that renumbers the session is a non-event. See that script's own
 # header for the full detection order.
 launch_targets:
-  mujoco_rover:
-    display_name: "MuJoCo"
-    host: "127.0.0.1"
-    ssh_user: "suraj"
-    ssh_port: 12222
-    # Shared-storage transport: the VM's own nepi-vm-command-watcher.service
-    # (sim_container/scripts/vm_command_watcher.py) polls this instance id's
-    # mailbox under VM_COMMANDS_STORAGE_DIR instead of this target being
-    # dialed over SSH -- no reverse tunnel involved. See
-    # simulator_launcher.py's _dispatch_shared_storage docstring.
-    connection_mode: "shared_storage"
-    os_instance_id: "os_dev_vm_1"
-    # nepi_drones existence checked first, same as gazebo_rover/webots_rover.
-    check_installed_command: "bash -lc \"test -d $HOME/nepi_engine_ws/nepi_drones/sim_container && python3 -c 'import mujoco' > /dev/null 2>&1\""
-    # Widened (2026-08-26), same reasoning as gazebo_rover/webots_rover's own
-    # install_command: a fresh Ubuntu 20.04 VM has neither pip3
-    # (python3-pip isn't part of the base install) nor the system OpenGL/EGL
-    # libraries MuJoCo's headless `MUJOCO_GL=egl` renderer links against --
-    # confirmed working on THIS dev VM only because Gazebo/Webots had
-    # already pulled in mesa/GL packages as their own dependencies, which a
-    # MuJoCo-only fresh VM would never get. All of these are safe to
-    # apt-get install unconditionally (small, idempotent, no skip-if-present
-    # guard needed). Also clones nepi_drones first if missing (2026-08-28).
-    install_command: >-
-      bash -lc '
-      set -e;
-      if [ ! -d $HOME/nepi_engine_ws/nepi_drones/sim_container ]; then
-      mkdir -p $HOME/nepi_engine_ws;
-      git clone git@github.com:nepi-engine/nepi_drones.git $HOME/nepi_engine_ws/nepi_drones;
-      fi;
-      sudo apt-get update -qq;
-      sudo apt-get install -y python3-pip libgl1 libegl1 libopengl0 libosmesa6 libglx0;
-      pip3 install --user mujoco
-      '
-    manual_fallback_commands: |-
-      git clone git@github.com:nepi-engine/nepi_drones.git ~/nepi_engine_ws/nepi_drones
-      sudo apt-get update -qq
-      sudo apt-get install -y python3-pip libgl1 libegl1 libopengl0 libosmesa6 libglx0
-      pip3 install --user mujoco
-    # Unlike Gazebo/Webots, there is no separate simulator binary --
-    # mujoco_rbx_bridge.py IS the simulator (a plain Python process owning
-    # both the physics loop and the heartbeat/bridge TCP sockets). It DOES
-    # still need a real DISPLAY/XAUTHORITY for its visible
-    # mujoco.viewer.launch_passive window, same as gazebo_rover/webots_rover
-    # -- same nepi_sim_display_env.sh resolution, sourced below. The camera
-    # image relay (a separate offscreen render context) works either way, so
-    # a missing display degrades to a warning inside the bridge rather than
-    # failing this launch.
-    #
-    # Refuse-to-launch-if-already-running guard, same reasoning as
-    # webots_rover/gazebo_rover (no RUI "conflict" recovery flow exists yet)
-    # -- but checked via the heartbeat PORT, not `pgrep -f`. Confirmed the
-    # hard way: `pgrep -f mujoco_rbx_bridge.py` matches even when nothing is
-    # running, because THIS bash -lc invocation's own argv already contains
-    # that literal text (the launch_command string itself names the script
-    # it's about to run) -- the exact self-match failure mode webots_rover's
-    # own comment warns about for `-f` patterns in general, just triggered a
-    # different way here (no `-x`-able binary name to fall back on, since
-    # this runs as `python3 <script>`, and `-x python3` would match every
-    # unrelated python3 process on the host). A port-liveness check has no
-    # such self-match risk.
-    #
-    # Session-lifetime process group, same as every other target here.
-    # UPDATED (2026-09-21): the refuse-to-launch guard used to probe
-    # /dev/tcp/127.0.0.1/9051 (the heartbeat port) -- that stopped proving
-    # anything the moment mujoco_rbx_bridge.py's heartbeat flipped from
-    # listening to dialing OUT to the device (see that file's own comment
-    # for why: this VM cannot be reached from the device at all, confirmed
-    # live). A `pgrep -f mujoco_rbx_bridge.py` guard can't replace it either
-    # -- see the ORIGINAL version of this comment, preserved below, for why
-    # that self-matches this exact launch script's own argv. Checking the
-    # recorded pgid file's process-group liveness (kill -0 as a pure
-    # existence probe, no signal actually sent) sidesteps both problems: it
-    # reads a file rather than grepping argv, so it can never self-match.
-    launch_command: >-
-      bash -lc '
-      . $HOME/nepi_engine_ws/nepi_drones/sim_container/scripts/nepi_sim_display_env.sh;
-      if [ -f /tmp/sim_connector_mujoco_launch.pgid ] && kill -0 -$(cat /tmp/sim_connector_mujoco_launch.pgid) 2>/dev/null; then echo "REFUSING TO LAUNCH: a MuJoCo bridge instance is already running on this host. Stop the existing simulation first." >&2; exit 3; fi;
-      echo $$ > /tmp/sim_connector_mujoco_launch.pgid;
-      python3 $HOME/nepi_engine_ws/nepi_drones/sim_container/bridges/mujoco/mujoco_rbx_bridge.py < /dev/null > /tmp/sim_connector_mujoco_launch.log 2>&1 & MUJOCO_PID=$!;
-      wait $MUJOCO_PID
-      '
-    # Kills only this launch's own process group -- same PGID-scoped
-    # precision as every other target's stop_command.
-    stop_command: "bash -lc 'f=/tmp/sim_connector_mujoco_launch.pgid; if [ -f $f ]; then kill -- -$(cat $f) 2>/dev/null; rm -f $f; fi; true'"
-    # Process-group liveness via the recorded pgid file -- see
-    # launch_command's own comment above for why this replaced the /dev/tcp
-    # heartbeat-port probe and why a `pgrep -f` text match isn't viable here.
-    ready_check_command: "bash -lc 'f=/tmp/sim_connector_mujoco_launch.pgid; [ -f $f ] && kill -0 -$(cat $f) 2>/dev/null'"
-    # rbx_rover.xml has 4 independently-actuated wheels (see that model's own
-    # comment) -- ground_robot_4_wheel, same profile Gazebo/Webots rovers use.
-    default_robot_config: ground_robot_4_wheel
-    # No MuJoCo quadcopter model exists (mujoco_rbx_bridge.py is a ground-
-    # rover bridge only) -- redirects to Gazebo's own real ArduPilot SITL
-    # quad, same "picking a flight robot config launches somewhere that can
-    # actually fly it" convention gazebo_rover/webots_rover's own
-    # launch_target_overrides already use, just crossing simulator families
-    # since MuJoCo has nothing of its own to redirect to.
-    launch_target_overrides:
-      flight_robot_4_motor: gazebo_quadcopter
-
   # PyBullet and WPILib HAL Sim removed (2026-08-26) -- neither had a
   # launch_command wired through this launcher (install-check only), and
   # both were judged not useful enough to keep offered as selectable
@@ -953,7 +860,7 @@ launch_targets:
     ready_check_command: "bash -lc \"source /opt/ros/noetic/setup.bash; export ROS_MASTER_URI=http://localhost:11312; pgrep -f 'gzserver.*iris_arducopter_cmac.world' > /dev/null && pgrep -f 'sim_vehicle.py -v ArduCopter' > /dev/null && pgrep -f sim_connector_bridge_gazebo_quadcopter.py > /dev/null && rostopic info /camera_rig/camera/image_raw 2>/dev/null | grep -A1 '^Publishers:' | grep -q ' \\* /' && grep -q 'MAVLink heartbeat' ~/.ros/log/sim_connector_bridge_gazebo_quadcopter.log 2>/dev/null\""
     default_robot_config: flight_robot_4_motor
 
-  # Gazebo, Webots, and MuJoCo below all have full launch paths, verified
+  # Gazebo and Webots below both have full launch paths, verified
   # end-to-end. PyBullet and WPILib HAL Sim (which used to sit here,
   # checkable/installable but never wired up to an actual launch_command)
   # were removed entirely (2026-08-26) rather than left as an honest-but-

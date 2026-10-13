@@ -68,7 +68,7 @@ machine, `localhost`; otherwise whatever address/tunnel reaches this
 machine's port 9023 (see "How the pieces fit together" above; this rover
 bridge intentionally uses a *different* port, 9023, than the sim connector
 app's own default listen port, 9030 — the app's `listen_port` in
-`sim_connector_app_params.yaml` is what the app itself listens on for a
+`sim_connector_vehicle_configs.yaml` is what the app itself listens on for a
 bridge to *dial into*, so which side initiates the connection matters:
 check your specific bridge script's own docstring for whether it dials out
 or waits for a connection, and match the app's role accordingly).
@@ -100,8 +100,10 @@ render incorrectly before a real robot config is chosen.
 rostopic pub -1 /nepi/device1/app_sim_connector/sim/select_robot_config std_msgs/String "data: 'ground_robot_2_wheel'"
 ```
 
-Available configs (from `sim_connector_app_params.yaml`'s `robot_configs`;
-add your own there if none of these match your robot):
+Available configs -- historical table. Since 2026-09-29 the Robot Config selector offers
+exactly the folders in the Gazebo service's share (NEPI storage
+`databases/sims/gazebo/ROBOT_CONFIGS/<name>/`, each with its own `nepi_robot_config.yaml`;
+see that folder's `README.md`), e.g. `generic_rover` (4-Wheel Rover) and `quadcopter`:
 
 | Config | Wheels/Motors | Goto surfaces | Setup actions | Camera views | Environment control |
 |---|---|---|---|---|---|
@@ -216,8 +218,8 @@ lets you confirm the NEPI side works before writing a single line of your
 own simulator integration. Copy its shape and swap in real calls into your
 simulator once you're ready.
 
-Add a new `robot_configs` entry in `sim_connector_app_params.yaml`
-describing your robot's real capabilities (see the table above for the
+Add a new robot folder to the share's `ROBOT_CONFIGS` (a `model.config` + `model.sdf`
+plus a `nepi_robot_config.yaml`) describing your robot's real capabilities (see the table above for the
 existing shapes to copy from) rather than reusing a mismatched one — a
 robot with no camera claiming `has_camera_view_control: true` will show a
 camera selector that silently does nothing.

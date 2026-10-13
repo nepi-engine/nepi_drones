@@ -16,83 +16,28 @@
 # - mailto:nepi@numurus.com
 #
 
-# The one generic app node that hosts a SimDeviceIF instance plus the single,
-# well-known TCP/JSON listener any simulator's own bridge script dials into.
-# Connecting a new simulator means writing a small bridge script on the
-# simulator side that speaks this protocol -- not writing new NEPI code. This
-# node is simulator-agnostic: it will be pointed at other simulators with no
-# code change here.
-#
-# This node is the ONLY place that understands the wire protocol.
-# api/device_if_sim.py stays protocol-agnostic, exactly as device_if_rbx.py never
-# knows what transport its drivers speak or that a bridge socket exists.
-#
-# Wire protocol -- newline-delimited JSON both ways on one persistent
-# connection, dispatched by "type" key presence:
-#
-#   in  -- bare line (no "type" key): NavPose telemetry, covering the full
-#          NavPose contract rather than any one vehicle's shape. Every field
-#          optional, gated exactly the way NavPose.msg itself is: x_m/y_m/z_m
-#          => has_position, roll_deg/pitch_deg/yaw_deg => has_orientation,
-#          latitude/longitude => has_location, altitude_m => has_altitude. One
-#          shape fits a wheeled ground robot (position only) and a flying robot
-#          (position + orientation + location + altitude) with no per-vehicle
-#          special-casing.
-#   in  -- {"type":"sensor_topics","topics":[{"topic_name":...,"msg_type":...},...]}
-#          The bridge announces its current live topic list; fed straight into
-#          getAvailableSensorTopicsFunction's return value.
-#   in  -- {"type":"environment_options","options":[...]}
-#          Same idea for available_environment_options.
-#   in  -- {"type":"image","topic_name":...,"data":"<base64 jpeg>","stamp":...}
-#          topic_name distinguishes multiple announced cameras; omitted means
-#          the currently active image topic. Only frames matching the active
-#          topic are decoded and republished -- nothing subscribes to the others.
-#   in  -- {"type":"goto_result","success":bool}
-#          Sent by a bridge once its own goto controller reports the current
-#          target reached (or definitively failed), asynchronously -- the
-#          fire-and-forget goto*Cb methods in device_if_sim.py return before
-#          any convergence is known, so this is the only path that ever sets
-#          cmd_success for a goto command. Applies to "whichever goto is most
-#          recently pending" (no per-command ID) since no bridge tracks more
-#          than one goto target at a time. Optional -- a bridge that never
-#          sends this simply leaves cmd_success untouched for goto commands,
-#          which is the same behavior as before this line existed.
-#
-#   out -- {"type":"motor_control","motor_ind":N,"speed_ratio":R}
-#   out -- {"type":"goto_position","x_meters":...,"y_meters":...,"z_meters":...,"yaw_deg":...}
-#   out -- {"type":"goto_pose","roll_deg":...,"pitch_deg":...,"yaw_deg":...}
-#   out -- {"type":"goto_location","lat":...,"long":...,"altitude_meters":...,"yaw_deg":...}
-#          Field names match GotoPosition.msg / GotoPose.msg / GotoLocation.msg
-#          1:1 -- no reason to invent different names on the wire.
-#   out -- {"type":"go_home"} / {"type":"go_stop"}
-#   out -- {"type":"setup_action","action":"<string>"} / {"type":"go_action","action":"<string>"}
-#   out -- {"type":"camera_settings","view_mode":...}
-#   out -- {"type":"set_active_image_topic","topic_name":...}
-#   out -- {"type":"environment_option","option":...,"enabled":bool}
-#   out -- {"type":"robot_config","config":"<name>"}
-#          Tells the simulator which kind of robot is wanted. Its own type key,
-#          following the existing type-keyed convention rather than inventing a
-#          second framing.
+# The Sim Connector app node. It hosts a SimDeviceIF instance (the Sim
+# Connector panel's controls and status), drives the NEPI simulator services
+# on the sim machine -- Gazebo and MuJoCo -- through their config files in
+# NEPI storage (Deploy/Kill, robot and environment config -- see
+# nepi_sim_service.py), starts and stops the robot's RBX driver to follow what
+# those services report (syncRoverDriver), and
+# forwards the panel's commands to the selected simulator's RBX device
+# (forwardToRbx).
 #
 # Capability timing. The contract decides capabilities once at construction and
 # caches them, which is what lets a client render controls purely from the
-# flags. A generic connector cannot know a specific simulator's wheel or motor
-# counts, or which goto functions make sense, until after a bridge connects --
-# by which point this process and its SimDeviceIF already exist. Resolution:
-# the two fields the contract calls genuinely dynamic
-# (available_sensor_topics, available_environment_options) are live-refreshed
-# from the bridge; everything else is a per-deployment config decision, read
-# from a named SIM_VEHICLE_DICT robot-config entry. Switching robot config is
-# the one case that legitimately changes a robot's kind, and it re-derives the
-# cached report in place through SimDeviceIF.apply_capability_profile -- see
-# that method's docstring for why that is wire-safe.
+# flags. Capabilities are a per-deployment config decision, read from the
+# selected robot config. Switching robot config is the one case that
+# legitimately changes a robot's kind, and it re-derives the cached report in
+# place through SimDeviceIF.apply_capability_profile -- see that method's
+# docstring for why that is safe.
 
-import base64
+import collections
 import copy
 import json
 import os
 import re
-import socket
 import threading
 import time
 
@@ -106,56 +51,49 @@ import yaml
 # memory in static TLS block" -- confirmed by reproducing the exact failure
 # standalone and confirming the fix is import order, not a code bug. Importing
 # device_if_sim (and therefore open3d) before cv2 reserves its TLS slots
-# first and avoids the exhaustion. Do not reorder cv2 above this without
-# re-verifying against that failure.
+# first and avoids the exhaustion. Do not reorder cv2 (nepi_img imports it)
+# above this without re-verifying against that failure.
 from nepi_api.device_if_sim import SimDeviceIF
 from nepi_api.robot_link_relay import RobotLinkRelay
 
 import numpy as np
-import cv2
 
 from nepi_sdk import nepi_sdk
 from nepi_sdk import nepi_utils
 from nepi_sdk import nepi_nav
 from nepi_sdk import nepi_img
 from nepi_sdk import nepi_system
+from nepi_sdk import nepi_drvs
 
 from std_msgs.msg import Bool, Empty, String, Float32, Int32
 from sensor_msgs.msg import Image
 from geographic_msgs.msg import GeoPoint
 
-from nepi_interfaces.msg import AxisControls, DeviceRBXStatus, GotoLocation, GotoPose, \
-    GotoPosition, MotorControl, NavPose, Setting, UpdateControl
+from nepi_interfaces.msg import AxisControls, DeviceRBXStatus, GotoPose, MotorControl, NavPose
 from geographic_msgs.msg import GeoPoint
 
 from nepi_api.messages_if import MsgIF
 
-# Additive simulator auto-launch capability (see
-# docs/SIMULATOR_AUTO_LAUNCH_PLAN.md in nepi_drones) -- both imports are
-# optional at runtime. simulator_launcher.py is installed into nepi_api
-# alongside device_if_sim.py by this package's own CMakeLists (api/ ->
-# nepi_api dist-packages), so it is present on any device that has this
-# app installed; SimLauncherStatus is generated from this same package's
-# msg/. Neither existing import above changes.
-from nepi_api.simulator_launcher import (SimulatorLauncher, LauncherError,
-                                         find_config_path)
+# Simulator launch (Deploy/Kill) goes through the NEPI simulator services on
+# the sim machine -- see nepi_sim_service.py's own module comment. It is
+# installed into nepi_api alongside device_if_sim.py by this package's own
+# CMakeLists (api/ -> nepi_api dist-packages); SimLauncherStatus is generated
+# from this same package's msg/.
+from nepi_api import nepi_sim_service
 from nepi_app_sim_connector.msg import SimLauncherStatus
 
 PKG_NAME = 'SIM_CONNECTOR'
 
-# This app's own ROS package name, used to find its installed params file by
-# matching APP_DICT.pkg_name -- the same key getAppsDict itself keys apps on,
-# so a params-file rename can't silently break the lookup.
+# This app's own ROS package name.
 APP_PKG_NAME = 'nepi_app_sim_connector'
 SIM_VEHICLE_DICT_KEY = 'SIM_VEHICLE_DICT'
+# SIM_VEHICLE_DICT's own file, installed next to this app's params yaml (see
+# that file's header for why it can't live inside the params yaml itself).
+SIM_VEHICLE_DICT_FILENAME = 'sim_connector_vehicle_configs.yaml'
 # system_folders is published by system_mgr, which starts well before any app.
 # A short timeout is enough, and timing out is non-fatal (falls back to the
 # capability-empty factory profile, exactly as before this fallback existed).
 SYSTEM_FOLDERS_TIMEOUT_MSEC = 5000
-
-# Listen port a simulator's bridge script dials into. Configurable per
-# deployment via the params yaml.
-FACTORY_LISTEN_PORT = 9030
 
 # Factory robot-config profile: capability-empty, which renders no controls at
 # all. That is the intended safe default, not a broken state -- an operator
@@ -172,7 +110,7 @@ UPLOADED_ROBOT_CONFIG_NAME = 'custom_uploaded'
 
 # The three checked-in configs (sim_connector_app_params.yaml's own
 # robot_configs section) -- never deletable, and never what
-# saveRobotConfigCb writes over even if an operator names a save the same
+# persistRobotConfigEntry writes over even if an operator names a save the same
 # as one of their display names (the KEY is what's checked here, not the
 # display name, matching how selection/deletion already work on keys
 # everywhere else in this file).
@@ -196,7 +134,8 @@ ROBOT_CONFIGS_STORAGE_DIR = '/mnt/nepi_storage/databases/nepi_app_sim_connector/
 # rather than one fixed model, since an operator switches between Flat/
 # Obstacle Course/Aerial Obstacle Course by switching configs. See
 # generate_model_sdf.py for how curated dimensions.yaml fields become
-# model.sdf, and SimulatorLauncher.push_dimensions for how they reach the VM.
+# model.sdf. Getting them onto the sim machine is not wired up yet for the
+# Gazebo service -- see pushDirtyDimensions.
 ROBOT_DIMENSIONS_MODEL = 'generic_rover'
 DIMENSION_ROLES = ('robot', 'environment')
 DIMENSION_ROLE_MODEL = {'robot': ROBOT_DIMENSIONS_MODEL}
@@ -276,23 +215,6 @@ LEGACY_DEFAULT_DIMENSION_CONFIG_NAME = 'Default'
 # pushDirtyDimensions whenever a value changes or this app restarts.
 DIMENSIONS_STORAGE_DIR = '/mnt/nepi_storage/databases/nepi_app_sim_connector/dimensions'
 
-# Default target used to push dimensions on app startup, before any
-# simulator has been launched/selected this session -- mujoco_rover is the
-# primary, always-available target on this VM (2026-09-25, "make mujoco
-# the main sim"). Purely which os_instance mailbox to write to
-# (_push_dimensions_shared_storage writes dimensions.yaml and regenerates
-# every simulator's own model from it regardless of which target name is
-# passed here), so this rename has no behavioral effect by itself.
-DEFAULT_DIMENSIONS_PUSH_TARGET = 'mujoco_rover'
-
-# Phone-scan (Stray Scanner) uploads land here, device-side -- same
-# persistent-storage category as DIMENSIONS_STORAGE_DIR above, so an upload
-# survives a container restart. Populating this directory (the actual
-# browser -> device upload) is not implemented yet -- see
-# docs/SCAN_TO_SIM_ENVIRONMENT_PLAN.md phase 1; convertPhoneScanCb below only
-# handles the already-uploaded-here -> VM-converted half of the pipeline.
-SCAN_UPLOADS_STORAGE_DIR = '/mnt/nepi_storage/databases/nepi_app_sim_connector/phone_scans'
-
 FACTORY_ROBOT_CONFIG = dict(
     description = 'No capabilities. Safe default until a robot config is selected.',
     # Internal fallback only -- never a real choice an operator should be
@@ -335,30 +257,100 @@ SIM_DISCOVERY_RATE_HZ = 1.0
 # so a driver node that dies stops being offered.
 SIM_DEVICE_STALE_SEC = 10.0
 
-BRIDGE_ACCEPT_BACKLOG = 1
-TELEMETRY_AGE_IF_NEVER_CONNECTED = -1.0
-BRIDGE_RECV_BYTES = 4096
-
 STATUS_PUBLISH_RATE_HZ = 1.0
 
-# Text that identifies a launch_command's own "already running" refuse-to-
-# launch guard (gazebo_rover/gazebo_quadcopter's "a gzserver is already
-# running", mujoco_rover's "a MuJoCo bridge instance is already running" --
-# see simulator_launch_targets.yaml) so runLaunch can offer the operator a
-# real choice (force past it, or clear it with Kill All) instead of just
-# reporting a generic failure. Matched on the wording these guards actually
-# share, not on any structured error code -- LauncherError carries plain
-# text by design (see its own docstring). "Gazebo" in the name is legacy --
-# this now covers any target's own guard.
-ALREADY_RUNNING_ERROR_SIGNATURES = (
-    "a gzserver is already running",
-    "a mujoco bridge instance is already running",
-)
+# The simulators this app launches, each through its NEPI simulator service on
+# the sim machine (nepi_api/nepi_sim_service.py). Keys are the launch-target
+# keys the RUI's Simulator selector sends; 'gazebo_rover' keeps the RUI's own
+# gazebo_ prefix check (Nepi_IF_Sim.js selectedTargetUsesModelSdf) working.
+# Webots was taken out of the launcher 2026-09-28; MuJoCo came back on this
+# service pattern 2026-10-05.
+#
+# default_environment / default_robot: what a Deploy asks for when nothing
+# else is picked, by name within the service's ENVIRONMENT_CONFIGS/
+# ROBOT_CONFIGS folders -- the rover on flat ground. Always sent explicitly,
+# because the service otherwise keeps whatever it last ran.
+GAZEBO_TARGET_KEY = 'gazebo_rover'
+MUJOCO_TARGET_KEY = 'mujoco_rover'
+SIM_TARGETS = collections.OrderedDict([
+    (GAZEBO_TARGET_KEY, dict(
+        service = nepi_sim_service.GAZEBO,
+        default_environment = 'flat.world',
+        default_robot = 'generic_rover',
+        # Shown in the RUI's "Run These Commands Manually" box whenever a
+        # request fails because the service isn't responding.
+        fallback_commands = """On the sim machine, start the NEPI Gazebo service:
 
+  nepi_gazebo_start <nepi_storage password>
 
-def isGazeboConflictError(error_message):
-  message = str(error_message).lower()
-  return any(signature in message for signature in ALREADY_RUNNING_ERROR_SIGNATURES)
+It mounts NEPI storage, starts Gazebo, and then keeps watching
+databases/sims/gazebo/config/nepi_gazebo_config.yaml for Deploy/Kill requests
+from this device. First-time setup: nepi_simulations/nepi_gazebo/gazebo_setup.""")),
+    (MUJOCO_TARGET_KEY, dict(
+        service = nepi_sim_service.MUJOCO,
+        default_environment = 'flat.xml',
+        default_robot = 'generic_rover',
+        fallback_commands = """On the sim machine, start the NEPI MuJoCo service:
+
+  nepi_mujoco_start <nepi_storage password>
+
+It mounts NEPI storage and then keeps watching
+databases/sims/mujoco/config/nepi_mujoco_config.yaml for Deploy/Kill requests
+from this device. First-time setup: nepi_simulations/nepi_mujoco/mujoco_setup.""")),
+])
+DEFAULT_SIM_TARGET = GAZEBO_TARGET_KEY
+# A robot config profile's pointer at the service robot folder it runs as.
+# The value keeps its original name so robot configs saved on a device before
+# MuJoCo existed still load; it applies to whichever simulator is selected.
+SHARE_ROBOT_FOLDER_FIELD = 'gazebo_robot_config'
+# How often the selected simulator's ROBOT_CONFIGS/ENVIRONMENT_CONFIGS are
+# re-read, so a robot folder or world dropped on the share shows up without an
+# app restart.
+SIM_CONFIGS_REFRESH_SEC = 5.0
+# Operator-saved robot configs (persisted on the device)
+# are no longer offered: robots come only from the share's ROBOT_CONFIGS
+# (2026-09-29). The save/upload/delete code and the RUI controls for it are
+# kept, just switched off (the RUI side is Nepi_IF_Sim.js's
+# SHOW_ROBOT_CONFIG_EDITING) -- saving may come back later as "write a new
+# folder into ROBOT_CONFIGS".
+OFFER_DEVICE_SAVED_ROBOT_CONFIGS = False
+
+# How long a Deploy/Kill waits for the service to finish. Start covers the
+# launch plus Gazebo's robot spawn, which its service retries for up to ~20s;
+# the 120s is the old launcher's ready-check budget, sized for a cold VM.
+SIM_START_TIMEOUT_SEC = 120
+SIM_STOP_TIMEOUT_SEC = 60
+
+# A service's STATE -> launcher_state (SimLauncherStatus's own vocabulary,
+# which the RUI renders).
+SERVICE_STATE_TO_LAUNCHER_STATE = {
+    'idle': 'idle',
+    'starting': 'launching',
+    'running': 'running',
+    'stopping': 'stopping',
+    'failed': 'failed',
+}
+
+# The simulated rover's RBX driver (nepi_drivers' rbx_sim_node.py). This app
+# runs it while a simulator service reports running with a robot config whose
+# nepi_robot_config.yaml names nepi_driver: rbx_sim, and stops it whenever the
+# service reports anything else -- Kill, a crash, a stop on the sim machine --
+# so the rover is in Devices -> Robots exactly while it exists. Replaces
+# rbx_sim_discovery.py's heartbeat discovery (port 9022), which is no longer
+# used. See syncRoverDriver.
+ROVER_DRIVER = 'rbx_sim'
+ROVER_DRIVER_FILE = 'rbx_sim_node.py'
+ROVER_DRIVER_DEVICE_NAME = 'sim_rover'
+# Where rbx_sim_node.py listens for the sim machine's nepi_gazebo_bridge.py,
+# UDP and TCP -- the same number as nepi_gazebo.sh's GAZEBO_BRIDGE_PORT.
+ROVER_BRIDGE_PORT = 9023
+# How long a driver that crashed or failed to launch waits before the next
+# launch, so one that dies at once is not relaunched on every status tick.
+ROVER_DRIVER_RETRY_SEC = 10.0
+# Carried over from rbx_sim_discovery.py: on aarch64 the RBX driver's
+# open3d import can fail with "cannot allocate memory in static TLS block"
+# unless libgomp is preloaded.
+ROVER_DRIVER_LD_PRELOAD = '/lib/aarch64-linux-gnu/libgomp.so.1'
 
 
 #########################################
@@ -401,18 +393,17 @@ class NepiSimConnectorApp:
     #
     # Rather than add a new generic behavior to apps_mgr -- core, shared by
     # every app, and a stop-and-write-up change per this repo's own rules --
-    # the app reads its own installed params file directly when the param is
-    # absent. The param still wins when set, so this stays backward compatible
-    # with a future apps_mgr that does propagate these keys, and with anything
-    # that sets the param itself.
+    # the app reads its own installed SIM_VEHICLE_DICT_FILENAME directly when
+    # the param is absent. (That file split out of the params yaml 2026-09-29,
+    # after the third top-level key turned out to also break this app's RUI
+    # page -- see that file's header.) The param still wins when set, so this
+    # stays backward compatible with anything that sets the param itself.
     vehicle_dict_ns = nepi_sdk.create_namespace(self.node_namespace, 'SIM_VEHICLE_DICT')
     self.vehicle_dict = nepi_sdk.get_param(vehicle_dict_ns, dict())
     if not isinstance(self.vehicle_dict, dict):
       self.vehicle_dict = dict()
     if not self.vehicle_dict:
       self.vehicle_dict = self.loadVehicleDictFromParamsFile()
-
-    self.listen_port = int(self.vehicle_dict.get('listen_port', FACTORY_LISTEN_PORT))
 
     robot_configs = self.vehicle_dict.get('robot_configs', dict())
     if not isinstance(robot_configs, dict):
@@ -433,11 +424,23 @@ class NepiSimConnectorApp:
     # whether an older/hand-edited params file forgets the flag.
     if isinstance(self.robot_configs.get(FACTORY_ROBOT_CONFIG_NAME), dict):
       self.robot_configs[FACTORY_ROBOT_CONFIG_NAME]['hidden_from_selector'] = True
-    # Operator-saved configs (see saveRobotConfigCb) merge in on top of the
-    # three checked-in ones above -- persisted separately from
-    # sim_connector_app_params.yaml so a save survives independently of
-    # that file ever being redeployed/reset.
-    self.loadPersistedRobotConfigs()
+    # Operator-saved configs (see persistRobotConfigEntry) used to merge in on top
+    # of the checked-in ones above -- persisted separately so a save survives
+    # independently of that file ever being redeployed/reset. Off while robots
+    # come only from the share; see OFFER_DEVICE_SAVED_ROBOT_CONFIGS.
+    if OFFER_DEVICE_SAVED_ROBOT_CONFIGS:
+      self.loadPersistedRobotConfigs()
+    # The simulator the RUI's Simulator selector currently shows. Its share's
+    # robots and worlds are what the Robot Config and Environment Config
+    # selectors offer -- see selectLaunchTargetCb.
+    self.selected_sim_target = DEFAULT_SIM_TARGET
+    # Robots in the selected simulator's share join these, and claim or extend
+    # the profiles above -- see refreshShareRobotConfigs. Done before the
+    # default is picked so the default profile already carries whatever
+    # capabilities its share folder adds.
+    self.share_robot_config_keys = set()
+    self.claimed_profile_bases = dict()
+    self.refreshShareRobotConfigs()
 
     default_config = str(self.vehicle_dict.get('default_robot_config', FACTORY_ROBOT_CONFIG_NAME))
     if default_config not in self.robot_configs:
@@ -446,16 +449,10 @@ class NepiSimConnectorApp:
     self.profile = self.buildProfileFromConfig(default_config)
 
     ##############################
-    # Bridge connection and live announced state -- the genuinely dynamic
-    # fields, refreshed from whatever the connected bridge last sent.
-    self.client_conn = None
-    self.client_lock = threading.Lock()
-    self.last_telemetry_time = 0.0
-    self.connected_since = None
-    self.available_sensor_topics = []          # [(topic_name, msg_type), ...]
+    # Live state for the SimDeviceIF. No simulator reports environment
+    # options, so that list stays empty.
     self.available_environment_options = []
     self.navpose_dict = copy.deepcopy(nepi_nav.BLANK_NAVPOSE_DICT)
-    self.active_image_topic = ""
     self.motor_ratios = [0.0] * int(self.profile['motor_count'])
 
     ##############################
@@ -470,12 +467,8 @@ class NepiSimConnectorApp:
     ##############################
     # Common four-topic mirror -- a stable, simulator-agnostic viewing point
     # for whichever robot is currently selected_simulator, regardless of
-    # which underlying driver/bridge type it is. Distinct from
-    # image_pub/color_2d_image below (the generic-connector bridge protocol's
-    # own relay, fed over the TCP bridge for a simulator with no RBX driver
-    # of its own): every simulator actually launchable today (Gazebo rover/
-    # quadcopter, Webots rover/quadcopter) instead goes through an RBX
-    # driver that already publishes real ROS Image topics on this same ROS
+    # which underlying driver/bridge type it is. Every simulator goes through
+    # an RBX driver that already publishes real ROS Image topics on this same ROS
     # master -- see rbx_sim_node.py/rbx_ardupilot_node.py's own
     # color_2d_image/robot_color + .../scene_color topics -- so this mirror
     # is a plain re-subscribe, not a protocol decode. Reported live
@@ -502,9 +495,9 @@ class NepiSimConnectorApp:
     # self.navpose_dict (which already feeds this app's own NavPoseIF via
     # getNavPoseCb below). Reported live (2026-09-03): "navpose data in
     # devices -> apps also doesn't seem to detect any of the values" --
-    # root cause: self.navpose_dict was only ever populated by
-    # processTelemetryLine, fed from the generic-connector bridge protocol
-    # (webots_rover) -- Gazebo rover/quadcopter
+    # root cause: self.navpose_dict was only ever populated by the
+    # generic-connector bridge protocol (webots_rover, since removed) --
+    # Gazebo rover/quadcopter
     # go through an RBX driver instead (rbx_sim_node.py/rbx_ardupilot_node.py),
     # exactly like the image mirror's own comment already documents, and
     # that driver's already-correct NavPose (its own NPXDeviceIF, publishing
@@ -558,28 +551,16 @@ class NepiSimConnectorApp:
     self.goto_target = None
 
     ##############################
-    # Image republish -- decode and republish only the currently active image
-    # topic, the one thing a client actually displays, on a name qualified by
-    # this node's own name so a second instance on the same device cannot
-    # collide with it.
-    self.image_topic_name = self.node_name + "/color_2d_image"
-    self.image_pub = nepi_sdk.create_publisher(self.image_topic_name, Image, queue_size = 1)
-
-    ##############################
-    # Launch the generic SimDeviceIF. Every callback below is a thin
-    # wire-protocol sender or getter; device_if_sim.py never knows there is a
-    # TCP bridge underneath.
+    # Launch the generic SimDeviceIF. Its commands are forwarded to the
+    # selected simulator's RBX device (see forwardToRbx).
     device_info = dict(device_name = self.node_name, path = "",
                        serial_number = "", hw_version = "", sw_version = "")
 
     self.sim_if = SimDeviceIF(
         device_info = device_info,
         getNavPoseCb = self.getNavPoseCb,
-        getAvailableSensorTopicsFunction = self.getAvailableSensorTopics,
         getAvailableEnvironmentOptionsFunction = self.getAvailableEnvironmentOptions,
-        setActiveImageTopicFunction = self.setActiveImageTopic,
         getBridgeConnectedFunction = self.isBridgeConnected,
-        getTelemetryAgeFunction = self.getTelemetryAge,
         getAvailableSimulatorsFunction = self.getAvailableSimulators,
         getSelectedSimulatorFunction = self.getSelectedSimulator,
         setSelectedSimulatorFunction = self.setSelectedSimulator,
@@ -591,160 +572,90 @@ class NepiSimConnectorApp:
     )
 
     ##############################
-    # Bridge server thread. This app OWNS the listen socket -- it is the one
-    # stable, well-known connection surface a simulator's bridge dials into,
-    # not a per-simulator client reaching out.
-    self.server_thread = threading.Thread(target = self.bridgeServerLoop)
-    self.server_thread.daemon = True
-    self.server_thread.start()
-
-    ##############################
-    # Simulator auto-launch (additive convenience trigger over the launcher
-    # helper -- see docs/SIMULATOR_AUTO_LAUNCH_PLAN.md). self.launcher stays
-    # None, and the topics below become permanent no-ops, on any deployment
-    # with no launch-targets config present (see find_config_path) -- this
-    # never becomes a required part of the app's own contract.
-    self.launcher = None
+    # Simulator launch -- the RUI launcher panel's Deploy/Kill, carried out by
+    # the NEPI simulator service (Gazebo or MuJoCo) on the sim machine through
+    # its config file in NEPI storage (see nepi_sim_service.py). Same division
+    # of labor as software_mgr and nepi_docker.sh: this node sets a request
+    # flag, then reports what the service writes back. A simulator is offered
+    # once its service's config file exists (the service's first start creates
+    # it); with none, the panel shows "Not configured on this deployment" and
+    # the topics below are no-ops.
     self.launcher_lock = threading.Lock()
-    # Launch, stop, AND install all share this one thread/lock -- simplest
-    # correct answer to "can these run concurrently": no, all three are
-    # heavy SSH operations against the same launch target, and running two
-    # at once (e.g. installing Gazebo while also trying to launch it) has no
-    # sensible outcome worth supporting.
+    # Launch and stop share this one thread/lock -- the service carries out
+    # one request at a time, and a stop racing a start has no sensible
+    # outcome worth supporting.
     self.launcher_thread = None
     self.launcher_state = 'idle'
     self.launcher_last_error = ''
-    # Set alongside launcher_last_error (via setLauncherError below) only
-    # when the LauncherError that produced it carries its own
-    # manual_fallback_commands -- currently just the reverse-tunnel
-    # connectivity diagnosis in simulator_launcher.py's
-    # _classify_connection_failure. Takes priority over the per-target
-    # install fallback in publishLauncherStatus, since a dead tunnel isn't
-    # fixed by that target's own install_command.
-    self.launcher_tunnel_fallback_commands = ''
-    # Which target a dependency-related failure was actually about -- NOT
-    # always active_launch_target (runInstall can fail for a target that
-    # isn't the one currently running/attempted), so publishLauncherStatus's
-    # manual_fallback_commands derivation keys off this instead. Cleared at
-    # the top of every runLaunch/runInstall attempt so a stale fallback from
-    # an earlier, unrelated failure never lingers into a new one.
-    self.launcher_failed_target = ''
+    # Copy-paste commands shown alongside the current failure (the RUI's "Run
+    # These Commands Manually" box) -- set and cleared with
+    # launcher_last_error by setLauncherError.
+    self.launcher_fallback_commands = ''
+    # The simulator whose state the launcher panel shows: the one running,
+    # or the last one deployed/stopped. Reported to the RUI as
+    # selected_launch_target / active_launch_target (see publishLauncherStatus).
     self.selected_launch_target = ''
-    # The target actually running, once resolve_launch_target has done its
-    # work -- may differ from selected_launch_target (the operator's own
-    # pick, e.g. "gazebo_rover"/"Gazebo") when the current robot config
-    # redirects it to a different target entirely (e.g. gazebo_quadcopter
-    # for a flight profile). stop_command/ready_check_command always target
-    # THIS, since it's the one with real SSH-launched processes.
     self.active_launch_target = ''
-    # target_key -> bool / 'unknown'|'checking'|'installed'|'not_installed'.
-    # Independent of launcher_state: every target's dependencies get checked
-    # in the background regardless of which one (if any) is selected.
-    self.launch_target_installed = {}
-    self.launch_target_installed_check_state = {}
+    # What the status timer last saw from each service -- see
+    # refreshLauncherStateCb.
+    self.service_config_found = {t: SIM_TARGETS[t]['service'].config_exists() for t in SIM_TARGETS}
+    self.service_alive = {t: False for t in SIM_TARGETS}
+    self.service_state = {t: None for t in SIM_TARGETS}
 
-    # "New Sim" (2026-09-18: "new sim should literally make a new
-    # window... so there's two or more gazebo windows") -- a SEPARATE,
-    # additive instance slot, deliberately not folded into
-    # selected_launch_target/active_launch_target/launcher_state above.
-    # Those three remain the PRIMARY slot exactly as before (what "Use Open
-    # Sim"/Deploy/redeploy_simulator/Kill all operate on, and what every
-    # existing runLaunch/runStop/runRedeploy/runForceLaunch reference stays
-    # unchanged) -- rewriting that whole state machine to be N-instance-
-    # generic would touch dozens of call sites for a rewrite this app
-    # doesn't need yet. A second concurrent deployment only makes sense
-    # today for gazebo_rover + gazebo_quadcopter (the only two targets
-    # simulator_launch_targets.yaml gives their own GAZEBO_MASTER_URI/
-    # ROS_MASTER_URI -- see that file's own comments on each), so this
-    # tracks an actual_target -> state dict rather than a single scalar,
-    # good enough for "the one other target" without pretending to support
-    # arbitrary N. secondary_launch_lock guards its own thread the same way
-    # launcher_lock guards the primary one, but independently -- a primary
-    # launch/stop in progress must not block a secondary one queuing (they
-    # target different VM processes entirely), and vice versa.
-    self.secondary_launch_lock = threading.Lock()
-    self.secondary_launch_thread = None
-    self.secondary_launch_states = {}   # actual_target -> 'launching'|'installing'|'running'|'failed: ...'
-    launcher_config_path = find_config_path()
-    if launcher_config_path:
-      try:
-        self.launcher = SimulatorLauncher(launcher_config_path)
-        self.msg_if.pub_info("Simulator auto-launch enabled from " + launcher_config_path)
-      except LauncherError as e:
-        self.msg_if.pub_warn("Simulator auto-launch disabled (config at " +
-                             launcher_config_path + " unusable): " + str(e))
+    # The rover's RBX driver process -- see syncRoverDriver.
+    self.rover_driver_lock = threading.Lock()
+    self.rover_driver_process = None
+    self.rover_driver_launched = None             # (target_key, robot folder) it was launched for
+    self.rover_driver_node_name = ''
+    self.rover_driver_busy = False
+    self.rover_driver_retry_after = 0.0
+    self.rover_robot_capabilities = dict()        # target_key -> {robot folder: capabilities}
+    self.rover_robot_capabilities_time = dict()   # target_key -> last read time
+
+    # "New Sim" secondary instances. Each service runs a single simulation,
+    # so this only ever records a refusal for the RUI's "Other Running
+    # Instances" list (see launchNewSimulatorCb).
+    self.secondary_launch_states = {}   # target_key -> 'failed: ...'
 
     self.launcher_status_pub = nepi_sdk.create_publisher(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/launcher_status'),
         SimLauncherStatus, queue_size = 1, latch = True)
-    # Deploying gazebo_quadcopter needs RBX_ARDUPILOT's own discovery
-    # "connection" option set to SITL, not the SERIAL default -- otherwise
-    # ArdupilotDiscovery only ever polls /dev/ttyAMA10 for a physical
-    # autopilot and never even attempts the SITL/MAVLink probe on
-    # 127.0.0.1:5771, so the quadcopter's own gzserver/SITL comes up fine
-    # but never gets detected as an RBX device at all (found live
-    # 2026-09-18: "it killed the rover and launched the quadcopter just
-    # fine, but it didnt get detected by rbx"). Pushed automatically right
-    # before launching that target (see ensureArdupilotSitlConnection,
-    # called from both runLaunch and runLaunchSecondary) so deploying via
-    # the Sim Connector doesn't require the operator to separately know
-    # about and flip a driver-level Devices -> Drivers setting themselves.
-    # Never pushed back to SERIAL automatically -- this app has no way to
-    # know whether a physical ArduPilot is also expected to keep working on
-    # this same device, so reverting on its own could silently break that.
-    self.ardupilot_discovery_update_pub = nepi_sdk.create_publisher(
-        nepi_sdk.create_namespace(self.base_namespace,
-            'drivers_mgr/discovery/RBX_ARDUPILOT/settings/update_setting'),
-        UpdateControl, queue_size = 1)
+    # Environment Config: a world from the selected simulator's
+    # ENVIRONMENT_CONFIGS, picked for the next Deploy. The list is a JSON
+    # array of world file names; both are latched so a client that subscribes
+    # late still gets them.
+    self.environment_configs = []
+    self.selected_environment_config = SIM_TARGETS[self.selected_sim_target]['default_environment']
+    self.sim_configs_refreshed_at = time.monotonic()
+    self.environment_config_names_pub = nepi_sdk.create_publisher(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/environment_config_names'),
+        String, queue_size = 1, latch = True)
+    self.selected_environment_config_pub = nepi_sdk.create_publisher(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/selected_environment_config'),
+        String, queue_size = 1, latch = True)
     nepi_sdk.create_subscriber(
-        nepi_sdk.create_namespace(self.node_namespace, 'sim/launch_simulator'),
-        String, self.launchSimulatorCb, queue_size = 1)
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/select_environment_config'),
+        String, self.selectEnvironmentConfigCb, queue_size = 1)
+    self.refreshEnvironmentConfigs(force_publish = True)
+    # Simulator selector: switches the Robot Config and Environment Config
+    # lists to that simulator's share. Deploy carries its own target too.
+    nepi_sdk.create_subscriber(
+        nepi_sdk.create_namespace(self.node_namespace, 'sim/select_launch_target'),
+        String, self.selectLaunchTargetCb, queue_size = 1)
     nepi_sdk.create_subscriber(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/stop_simulator'),
         Empty, self.stopSimulatorCb, queue_size = 1)
     nepi_sdk.create_subscriber(
-        nepi_sdk.create_namespace(self.node_namespace, 'sim/install_simulator'),
-        String, self.installSimulatorCb, queue_size = 1)
-    nepi_sdk.create_subscriber(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/redeploy_simulator'),
         String, self.redeploySimulatorCb, queue_size = 1)
-    # "Use Existing" -- explicit operator override of launch_command's own
-    # "a gzserver is already running" refuse-to-launch guard, offered
-    # specifically when that guard fires (launcher_state 'gazebo_conflict').
-    # See runLaunch's attach handling and SimulatorLauncher.launch's own
-    # attach_launch_command docstring.
-    nepi_sdk.create_subscriber(
-        nepi_sdk.create_namespace(self.node_namespace, 'sim/attach_simulator'),
-        String, self.attachSimulatorCb, queue_size = 1)
-    # "Launch New" -- the other choice offered alongside Use Existing:
-    # force past the conflict by killing whatever gazebo is in the way
-    # first, then launching fresh. Distinct from redeploy_simulator, which
-    # assumes THIS app is what's currently running (stops via its own
-    # tracked pgid) -- here the blocking gzserver is by definition
-    # something this app never started, so there is nothing of its own to
-    # stop; kill_all_gazebo is the only mechanism that reaches it.
-    nepi_sdk.create_subscriber(
-        nepi_sdk.create_namespace(self.node_namespace, 'sim/force_launch_simulator'),
-        String, self.forceLaunchSimulatorCb, queue_size = 1)
-    # Standalone escape hatch, not tied to any one target -- see
-    # SimulatorLauncher.kill_all_gazebo's own docstring for why this is
-    # deliberately separate from (and much blunter than) the ordinary,
-    # pgid-scoped stop_command path.
-    nepi_sdk.create_subscriber(
-        nepi_sdk.create_namespace(self.node_namespace, 'sim/kill_all_gazebo'),
-        Empty, self.killAllGazeboCb, queue_size = 1)
-    # "New Sim" -- launches target_key as a SECOND, independent instance
-    # alongside whatever the primary slot is already running, rather than
-    # replacing it (see secondary_launch_states' own comment for why this is
-    # a separate slot, not a generalized N-instance rewrite). Same payload
-    # shape as launch_simulator (JSON {target_key, robot_config} or a bare
-    # target_key string), parsed with the same parseLaunchPayload.
+    # "New Sim" -- a second, independent instance alongside the primary one.
+    # Same payload shape as redeploy_simulator (JSON {target_key, robot_config}
+    # or a bare target_key string), parsed with the same parseLaunchPayload.
     nepi_sdk.create_subscriber(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/launch_new_simulator'),
         String, self.launchNewSimulatorCb, queue_size = 1)
-    # Stops one specific secondary instance by its actual_target key (as
-    # reported in secondary_launcher_status) -- NOT the primary slot's own
-    # sim/stop_simulator, which only ever touches active_launch_target.
+    # Clears one entry from secondary_launcher_status by its target key --
+    # NOT the primary slot's own sim/stop_simulator.
     nepi_sdk.create_subscriber(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/stop_new_simulator'),
         String, self.stopNewSimulatorCb, queue_size = 1)
@@ -756,27 +667,9 @@ class NepiSimConnectorApp:
     self.secondary_launcher_status_pub = nepi_sdk.create_publisher(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/secondary_launcher_status'),
         String, queue_size = 1, latch = True)
-    # "Environment Config" top-level deploy selector -- moved server-side
-    # (2026-09-18, reported live: "changing the environment mid sim between
-    # flat, obstacle, aerial, etc. doesnt do anything") after tracing the
-    # RUI's own onDeployEnvironmentConfig: it reaches Nepi_IF_Sim-Controls.js's
-    # setEnvironmentSetting only through this.simControlsRef.current.
-    # wrappedInstance, a documented, fragile mobx-react 5.4.2 Injector hop
-    # (see that ref's own long comment in Nepi_IF_Sim.js) -- the exact same
-    # hop the FOV box's live push ALSO used to go through before today's
-    # earlier fix moved FOV's push through this backend instead. Same fix,
-    # same reasoning, applied to the other live control still going through
-    # that ref. name arrives as the operator-facing config display name
-    # (e.g. "Obstacle Course"); translated to the Selection value here,
-    # mirroring setEnvironmentSetting's own translation exactly so a custom
-    # config name that happens to match a real VM-side model directory
-    # (the whole point of that translation) still works.
-    nepi_sdk.create_subscriber(
-        nepi_sdk.create_namespace(self.node_namespace, 'sim/deploy_environment'),
-        String, self.deployEnvironmentCb, queue_size = 1)
     # Lets an operator try their own robot without editing and redeploying
-    # sim_connector_app_params.yaml -- independent of self.launcher (that's
-    # only auto-launch), so this stays available on every deployment.
+    # sim_connector_app_params.yaml -- independent of the simulator launch
+    # above, so this stays available on every deployment.
     nepi_sdk.create_subscriber(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/upload_robot_config'),
         String, self.uploadRobotConfigCb, queue_size = 1)
@@ -794,15 +687,8 @@ class NepiSimConnectorApp:
     nepi_sdk.create_subscriber(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/get_robot_config'),
         String, self.getRobotConfigCb, queue_size = 1)
-    # Persisted save/delete -- see PROTECTED_ROBOT_CONFIG_KEYS/
-    # ROBOT_CONFIGS_STORAGE_DIR's own comments and saveRobotConfigCb/
-    # deleteRobotConfigCb below. Distinct from upload_robot_config above:
-    # that is a one-shot "try this now, forgotten on restart" slot; these
-    # add a real, named, permanent entry that appears in the same selector
-    # upload's UPLOADED_ROBOT_CONFIG_NAME never does.
-    nepi_sdk.create_subscriber(
-        nepi_sdk.create_namespace(self.node_namespace, 'sim/save_robot_config'),
-        String, self.saveRobotConfigCb, queue_size = 1)
+    # Persisted delete -- see PROTECTED_ROBOT_CONFIG_KEYS/
+    # ROBOT_CONFIGS_STORAGE_DIR's own comments and deleteRobotConfigCb below.
     nepi_sdk.create_subscriber(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/delete_robot_config'),
         String, self.deleteRobotConfigCb, queue_size = 1)
@@ -899,22 +785,15 @@ class NepiSimConnectorApp:
     # "these are separate" decoupling). Requested live (2026-09-18): "if
     # trying to delete the config of something thats currently selected,
     # it should give a popup saying that environment is currently selected
-    # and cant be deleted." Set in deployEnvironmentCb, checked in
-    # deleteDimensionConfigCb -- server-side enforcement, mirroring how
-    # PROTECTED_DIMENSION_CONFIG_NAMES is already checked both client-side
-    # (an immediate alert) and here (authoritative regardless of client).
+    # and cant be deleted." Checked in deleteDimensionConfigCb -- server-side
+    # enforcement, mirroring how PROTECTED_DIMENSION_CONFIG_NAMES is already
+    # checked both client-side (an immediate alert) and here (authoritative
+    # regardless of client). Its only setter was the old deploy_environment
+    # topic, which nothing published, so it stays '' for now.
     self.deployed_environment_config_name = ''
     self.deployed_environment_config_name_pub = nepi_sdk.create_publisher(
         nepi_sdk.create_namespace(self.node_namespace, 'sim/deployed_environment_config_name'),
         String, queue_size = 1, latch = True)
-    # The RESOLVED model (e.g. "obstacle_course"), not the config display
-    # name -- deployEnvironmentCb's own force-refresh guard needs this to
-    # tell "switching to a genuinely different model" (the Setting update
-    # alone already spawns it correctly) apart from "re-deploying onto the
-    # SAME model that's already live" (the only case that actually needs
-    # force=True, since SettingsIF no-ops an unchanged value before ever
-    # calling setEnvironmentAction).
-    self.deployed_environment_model_name = ''
     self.dimension_config_names_pubs = dict()
     self.dimension_config_selected_pubs = dict()
     # Not latched -- a transient "this just happened" notice for the RUI to
@@ -985,42 +864,18 @@ class NepiSimConnectorApp:
         nepi_sdk.create_namespace(self.node_namespace, 'sim/get_environment_dimensions_config'),
         String, self.getEnvironmentDimensionsConfigCb, queue_size = 1)
 
-    ##############################
-    # Phone-scan -> Gazebo environment conversion (see
-    # docs/SCAN_TO_SIM_ENVIRONMENT_PLAN.md). Separate from the dimensions/
-    # SDF-override system above -- a scanned mesh environment isn't a
-    # dimensions.yaml field set, and running scan_to_environment.py takes
-    # minutes (TSDF fusion + convex decomposition over ~1400 frames), so it
-    # runs in its own background thread rather than blocking like
-    # pushDirtyDimensions does for the small text pushes.
-    self.scan_conversion_status_pub = nepi_sdk.create_publisher(
-        nepi_sdk.create_namespace(self.node_namespace, 'sim/phone_scan_conversion_status'),
-        String, queue_size = 1, latch = True)
-    self.scan_conversion_status_pub.publish(String(data = 'idle'))
-    self.scan_conversion_thread = None
-    nepi_sdk.create_subscriber(
-        nepi_sdk.create_namespace(self.node_namespace, 'sim/convert_phone_scan'),
-        String, self.convertPhoneScanCb, queue_size = 1)
-    # Best-effort: the VM may not be reachable yet at startup (tunnel not up,
-    # device just booted) -- pushDirtyDimensions logs and moves on rather
-    # than blocking init, and the next real Launch will retry via the same
-    # dirty flags this left set on failure.
-    if any(self.dimensions_dirty.values()):
-      self.pushDirtyDimensions(DEFAULT_DIMENSIONS_PUSH_TARGET)
-
     # Latched, so a client that subscribes after startup still gets a real
     # report (available targets, "idle") instead of waiting for the first
     # launch/stop -- the same reasoning SimStatus's own latch already uses.
+    # The status timer below replaces it with whatever the simulator services
+    # report within a second.
     self.publishLauncherStatus()
-    if self.launcher is not None:
-      self.startInstalledCheckAll()
 
     ##############################
     # Simulator discovery scan, and the app's own status cadence
     nepi_sdk.start_timer_process(float(1) / SIM_DISCOVERY_RATE_HZ, self.simDiscoveryCb)
     nepi_sdk.start_timer_process(float(1) / STATUS_PUBLISH_RATE_HZ, self.statusPublishCb)
 
-    self.msg_if.pub_info("Sim connector listening on 0.0.0.0:" + str(self.listen_port))
     self.msg_if.pub_info("Initialization Complete")
     nepi_sdk.on_shutdown(self.cleanup_actions)
     nepi_sdk.spin()
@@ -1031,16 +886,15 @@ class NepiSimConnectorApp:
   def loadVehicleDictFromParamsFile(self):
     # Fallback source for SIM_VEHICLE_DICT when it is not on the param server
     # -- see the correction note in __init__ for why that is the normal case.
-    # Reads this app's own installed params yaml, found via system_folders'
-    # apps_param entry (the same folder apps_mgr scans) rather than a
-    # hardcoded path, and identified by APP_DICT.pkg_name rather than a
-    # hardcoded filename.
+    # Reads SIM_VEHICLE_DICT_FILENAME from system_folders' apps_param entry
+    # (the folder apps_mgr scans, where CMakeLists.txt installs it next to
+    # this app's params yaml) rather than a hardcoded path.
     #
     # Every failure path returns an empty dict rather than raising: the caller
     # then proceeds with the capability-empty factory profile, which is the
     # documented safe default and exactly the behavior that existed before
-    # this fallback. A missing or malformed params file must never stop the
-    # node from starting.
+    # this fallback. A missing or malformed file must never stop the node
+    # from starting.
     try:
       folders = nepi_system.get_system_folders(timeout = SYSTEM_FOLDERS_TIMEOUT_MSEC)
       if not isinstance(folders, dict):
@@ -1053,34 +907,26 @@ class NepiSimConnectorApp:
                              SIM_VEHICLE_DICT_KEY + " unavailable, using factory robot config only")
         return dict()
 
-      # Same filename convention getAppsDict matches on ("*params*.yaml").
-      for filename in sorted(os.listdir(params_folder)):
-        if not filename.endswith('.yaml') or 'params' not in filename:
-          continue
-        file_path = os.path.join(params_folder, filename)
-        file_dict = nepi_utils.read_yaml_2_dict(file_path)
-        if not isinstance(file_dict, dict):
-          continue
-        app_dict = file_dict.get('APP_DICT', dict())
-        if not isinstance(app_dict, dict) or app_dict.get('pkg_name', '') != APP_PKG_NAME:
-          continue
-        vehicle_dict = file_dict.get(SIM_VEHICLE_DICT_KEY, dict())
-        if not isinstance(vehicle_dict, dict) or not vehicle_dict:
-          self.msg_if.pub_warn("Found " + file_path + " but it has no usable " +
-                               SIM_VEHICLE_DICT_KEY + ", using factory robot config only")
-          return dict()
-        self.msg_if.pub_info("Loaded " + SIM_VEHICLE_DICT_KEY + " from " + file_path)
-        return vehicle_dict
-
-      self.msg_if.pub_warn("No params file for " + APP_PKG_NAME + " found in " + params_folder +
-                           ", using factory robot config only")
+      file_path = os.path.join(params_folder, SIM_VEHICLE_DICT_FILENAME)
+      if not os.path.isfile(file_path):
+        self.msg_if.pub_warn("No " + SIM_VEHICLE_DICT_FILENAME + " for " + APP_PKG_NAME + " found in " +
+                             params_folder + ", using factory robot config only")
+        return dict()
+      file_dict = nepi_utils.read_yaml_2_dict(file_path)
+      vehicle_dict = file_dict.get(SIM_VEHICLE_DICT_KEY, dict()) if isinstance(file_dict, dict) else None
+      if not isinstance(vehicle_dict, dict) or not vehicle_dict:
+        self.msg_if.pub_warn("Found " + file_path + " but it has no usable " +
+                             SIM_VEHICLE_DICT_KEY + ", using factory robot config only")
+        return dict()
+      self.msg_if.pub_info("Loaded " + SIM_VEHICLE_DICT_KEY + " from " + file_path)
+      return vehicle_dict
     except Exception as e:
-      self.msg_if.pub_warn("Failed to load " + SIM_VEHICLE_DICT_KEY + " from params file: " + str(e) +
-                           ", using factory robot config only")
+      self.msg_if.pub_warn("Failed to load " + SIM_VEHICLE_DICT_KEY + " from " + SIM_VEHICLE_DICT_FILENAME +
+                           ": " + str(e) + ", using factory robot config only")
     return dict()
 
   def buildProfileFromConfig(self, config_name):
-    # A robot config is a capability profile read whole from the params yaml. A
+    # A robot config is a capability profile read whole from SIM_VEHICLE_DICT. A
     # missing key means the capability is off, so a partially-written config
     # entry degrades to fewer controls rather than to a crash.
     entry = self.robot_configs.get(config_name, dict())
@@ -1213,8 +1059,6 @@ class NepiSimConnectorApp:
     # given it only matters in the first few seconds after node start.
     if self.sim_if is not None:
       self.sim_if.apply_capability_profile(**self.buildCapabilityKwargs(self.profile))
-    # Tell the simulator which kind of robot is wanted.
-    self.sendLineToBridge({'type': 'robot_config', 'config': config_name}, "Robot config")
     # Also re-apply the matching "robot" dimensions config (by display_name,
     # not key -- the two axes are keyed independently, see
     # sanitizeRobotConfigKey's own comment) if one exists. Reported live
@@ -1339,52 +1183,11 @@ class NepiSimConnectorApp:
       entry.pop('hidden_from_selector', None)
       self.robot_configs[key] = entry
 
-  def saveRobotConfigCb(self, msg):
-    # Payload is JSON {"name": ..., "yaml": ...} -- same shape as
-    # saveDimensionConfigCb's own payload, and for the same reason (one
-    # message carrying both the chosen name and the config text). The yaml
-    # is validated exactly like an upload (buildProfileFromEntry) before
-    # anything is written, so a bad save can't leave a broken entry sitting
-    # in self.robot_configs.
-    try:
-      payload = json.loads(str(msg.data))
-    except (ValueError, TypeError) as e:
-      self.msg_if.pub_warn("Save robot config payload is not valid JSON: " + str(e))
-      return
-    if not isinstance(payload, dict):
-      self.msg_if.pub_warn("Save robot config payload must be a JSON object")
-      return
-    name = str(payload.get('name', '')).strip()
-    if not name:
-      self.msg_if.pub_warn("Cannot save a robot config with an empty name")
-      return
-    try:
-      entry = yaml.safe_load(str(payload.get('yaml', '')))
-    except yaml.YAMLError as e:
-      self.msg_if.pub_warn("Cannot save robot config '" + name + "': not valid YAML: " + str(e))
-      return
-    if not isinstance(entry, dict):
-      self.msg_if.pub_warn("Cannot save robot config '" + name + "': must be a YAML mapping")
-      return
-    entry = copy.deepcopy(entry)
-    entry.pop('hidden_from_selector', None)
-    try:
-      self.buildProfileFromEntry(entry)
-    except (TypeError, ValueError) as e:
-      self.msg_if.pub_warn("Cannot save robot config '" + name + "': invalid field value: " + str(e))
-      return
-    key = self.persistRobotConfigEntry(name, entry)
-    if key is None:
-      return
-    self.setSelectedRobotConfig(key)
-    self.msg_if.pub_info("Saved robot config '" + name + "' as " + key)
-
   def persistRobotConfigEntry(self, name, entry):
-    # Shared tail of saveRobotConfigCb (an operator-authored/uploaded YAML)
-    # and saveDimensionConfigCb's own auto-link (see that method's own
-    # comment) -- both mean "this display name is now a real, selectable
-    # capability profile," just from different starting material. Returns
-    # the new key, or None if the write failed (already warned).
+    # Tail of saveDimensionConfigCb's own auto-link (see that method's own
+    # comment) -- "this display name is now a real, selectable capability
+    # profile." Returns the new key, or None if the write failed (already
+    # warned).
     entry = copy.deepcopy(entry)
     entry['display_name'] = name
     key = self.sanitizeRobotConfigKey(name)
@@ -1429,7 +1232,7 @@ class NepiSimConnectorApp:
     # itself never applies automatically, since that placeholder is only
     # ever a fallback for "nothing valid was ever selected").
     if self.selected_robot_config == key:
-      self.setSelectedRobotConfig('ground_robot_4_wheel')
+      self.setSelectedRobotConfig(SIM_TARGETS[self.selected_sim_target]['default_robot'])
     return True
 
   def deleteRobotConfigCb(self, msg):
@@ -1626,83 +1429,18 @@ class NepiSimConnectorApp:
     if pub is not None:
       pub.publish(Bool(data = self.dimensions_dirty.get(role, False)))
 
-  def dimensionsToDeploy(self, role):
-    """Returns (yaml_text, sdf_override_text) to actually deploy for role --
-    the SELECTED preset's own saved content, never whatever unsaved edits
-    might currently be sitting in the active store. Requested live
-    (2026-09-08): "there's a popup that keeps saying robot dimensions have
-    been edited by not saved as a preset. this should never be a popup...
-    if its edited but not saved, the default, or whatever is selected for
-    the robot config, should just launch. only time it can be changed is if
-    the user saves the changes, it shows up on the robot config dropdown,
-    and they select that." That popup (removed, see
-    Nepi_IF_SimLauncher.onDeployClicked's own comment) used to be the only
-    thing standing between an unsaved edit and a real deploy; this is the
-    actual fix, on the side that matters (there is no RUI left to bypass).
-
-    selected_dimension_config[role] is '' exactly when the active store's
-    current content doesn't match any saved preset (see
-    resolveMatchingDimensionConfigName) -- an unsaved edit, or any other
-    unresolved state. Whenever it's non-empty, applyDimensionConfigByName
-    already wrote that exact preset's content into the active store, so
-    reading the active store IS reading the selected preset; only the
-    empty case needs to substitute the built-in default's own file
-    instead.
-    """
-    if self.selected_dimension_config.get(role, '') != '':
-      return self.readStoredDimensionsYaml(role), self.readStoredSdfOverride(role)
-    fallback_name = FALLBACK_DIMENSION_CONFIG_NAME.get(role)
-    if fallback_name is not None:
-      path = self.dimensionConfigPath(role, fallback_name)
-      if os.path.exists(path):
-        try:
-          with open(path, 'r') as f:
-            return f.read(), ''
-        except Exception as e:
-          self.msg_if.pub_warn("Failed to read fallback " + role + " dimensions config '" +
-                               fallback_name + "': " + str(e))
-    # No resolvable fallback either (shouldn't happen -- every role has a
-    # built-in) -- deploying the active store is still better than nothing.
-    return self.readStoredDimensionsYaml(role), self.readStoredSdfOverride(role)
-
-  def pushDirtyDimensions(self, target_key):
-    # Called right before a real Launch (see runLaunch) and once at startup
-    # for whatever the device-side store already had persisted -- best
-    # effort either way: a failed push leaves the dirty flag set so the
-    # next attempt retries, rather than silently giving up.
-    if self.launcher is None:
-      return
-    try:
-      target = self.launcher.get_target(target_key)
-    except Exception as e:
-      self.msg_if.pub_warn("Could not resolve launch target '" + target_key +
-                           "' to push dimensions: " + str(e))
-      return
-    for role in DIMENSION_ROLES:
-      if not self.dimensions_dirty.get(role, False):
-        continue
-      if role == 'environment':
-        model_name = self.dimension_config_model.get(role, ENVIRONMENT_LEGACY_MODEL_FALLBACK)
-        if model_name == ENVIRONMENT_MODEL_NONE:
-          # Flat: no model, nothing to generate or push. The live spawn/
-          # delete toggle (EnvironmentModelSpawner -- a separate, pre-
-          # existing mechanism, see sim_container/scripts/
-          # environment_models.py) is what actually controls what's in a
-          # running Gazebo world; this dimensions-config axis only edits a
-          # model's own geometry fields.
-          self.dimensions_dirty[role] = False
-          self.publishDimensionsDirty(role)
-          continue
-      else:
-        model_name = DIMENSION_ROLE_MODEL[role]
-      try:
-        yaml_text, sdf_override_text = self.dimensionsToDeploy(role)
-        self.launcher.push_dimensions(target, model_name, yaml_text, sdf_override_text)
-        self.dimensions_dirty[role] = False
-        self.publishDimensionsDirty(role)
-        self.msg_if.pub_info("Pushed " + role + " dimensions (" + model_name + ") to the sim VM")
-      except LauncherError as e:
-        self.msg_if.pub_warn("Failed to push " + role + " dimensions to the sim VM: " + str(e))
+  def pushDirtyDimensions(self):
+    # Called right before a Deploy (see runLaunch). Pushing edited geometry
+    # to the sim machine went through the old launcher's VM mailbox, which
+    # the Gazebo service replaces; its equivalent (writing into the service's
+    # ROBOT_CONFIGS/ENVIRONMENT_CONFIGS folders in NEPI storage) is a later
+    # pass. Until then, edits stay on the device, flagged dirty, so nothing
+    # is lost when that lands.
+    dirty_roles = [role for role in DIMENSION_ROLES if self.dimensions_dirty.get(role, False)]
+    if dirty_roles:
+      self.msg_if.pub_warn("Edited " + " and ".join(dirty_roles) + " dimensions were not sent "
+                           "to the sim machine -- the Gazebo service doesn't support pushing "
+                           "dimensions yet", throttle_s = 30.0)
 
   #**********************
   # Named dimensions configs -- see the constructor's own "Named dimensions
@@ -2178,7 +1916,6 @@ class NepiSimConnectorApp:
     self.publishSelectedDimensionConfig(role)
     if role == 'robot':
       self.updateCameraFovFromRobotDimensions()
-    self.pushLiveDimensionsIfConnected(role)
     self.msg_if.pub_info("Updated " + role + " dimensions: " + yaml_text.replace(chr(10), ' '))
 
   def uploadRobotModelSdfCb(self, msg):
@@ -2200,63 +1937,6 @@ class NepiSimConnectorApp:
     self.writeStoredSdfOverride(role, sdf_text)
     self.markDimensionsDirty(role)
     self.msg_if.pub_info("Uploaded raw model.sdf override for " + role)
-
-  def convertPhoneScanCb(self, msg):
-    # msg.data is a scan name -- the raw scan folder must already exist at
-    # SCAN_UPLOADS_STORAGE_DIR/<name>/ (see that constant's own comment: the
-    # browser -> device upload step that would populate it isn't built yet).
-    # One conversion at a time -- a second request while one is already
-    # running is rejected rather than queued, same "reject clearly" instinct
-    # as uploadModelSdfCb's empty-upload check.
-    scan_name = str(msg.data).strip()
-    if self.scan_conversion_thread is not None and self.scan_conversion_thread.is_alive():
-      self.msg_if.pub_warn("Ignoring convert_phone_scan for '" + scan_name +
-                           "' -- a conversion is already running")
-      return
-    self.scan_conversion_thread = threading.Thread(
-        target = self.runPhoneScanConversion, args = (scan_name,))
-    self.scan_conversion_thread.start()
-
-  def runPhoneScanConversion(self, scan_name):
-    # Runs in its own thread (see convertPhoneScanCb) -- push_scan_directory
-    # (scp of ~100MB+ of video/PNG frames) and convert_scan_to_environment
-    # (TSDF fusion + convex decomposition, minutes) are both far too slow for
-    # a subscriber callback. Uses DEFAULT_DIMENSIONS_PUSH_TARGET, the same
-    # fixed VM target the dimensions system already pushes to -- there is
-    # only the one dev VM in this setup today.
-    self.scan_conversion_status_pub.publish(String(data = 'running: ' + scan_name))
-    local_scan_dir = os.path.join(SCAN_UPLOADS_STORAGE_DIR, scan_name)
-    if not os.path.isdir(local_scan_dir):
-      msg = ("failed: scan '" + scan_name + "' not found at " + local_scan_dir +
-             " (upload it first)")
-      self.msg_if.pub_warn(msg)
-      self.scan_conversion_status_pub.publish(String(data = msg))
-      return
-    if self.launcher is None:
-      msg = "failed: simulator launcher not configured"
-      self.msg_if.pub_warn(msg)
-      self.scan_conversion_status_pub.publish(String(data = msg))
-      return
-    try:
-      target = self.launcher.get_target(DEFAULT_DIMENSIONS_PUSH_TARGET)
-      self.launcher.push_scan_directory(target, local_scan_dir, scan_name)
-      self.launcher.convert_scan_to_environment(target, scan_name, scan_name)
-    except LauncherError as e:
-      msg = "failed: " + str(e)
-      self.msg_if.pub_warn("Phone scan conversion failed for '" + scan_name + "': " + str(e))
-      self.scan_conversion_status_pub.publish(String(data = msg))
-      return
-    # The new model now exists at sim_container/models/<scan_name>/ on the
-    # VM, alongside obstacle_course -- but rbx_sim_node.py's `environment`
-    # Setting option list is read once at driver construction (see
-    # docs/SCAN_TO_SIM_ENVIRONMENT_PLAN.md section 2.1), so it won't appear
-    # as a selectable option until the rover driver (re)starts or the sim is
-    # relaunched. Said plainly here rather than implying this is immediately
-    # selectable.
-    msg = ("done: '" + scan_name + "' ready on the VM -- restart the rover driver or "
-           "relaunch the sim to select it as an environment")
-    self.msg_if.pub_info(msg)
-    self.scan_conversion_status_pub.publish(String(data = msg))
 
   def getRobotDimensionsCb(self, msg):
     self.getDimensionsCb('robot')
@@ -2416,9 +2096,7 @@ class NepiSimConnectorApp:
     if source_topic == "":
       # The underlying RBX driver's own NavPose topic just disappeared
       # (SITL/Gazebo stopped, or nothing selected) -- leave navpose_dict at
-      # whatever it last reported rather than snapping it back to blank;
-      # matches processTelemetryLine's own "last known good" behavior when
-      # the generic bridge connection drops.
+      # whatever it last reported rather than snapping it back to blank.
       return
     self.navpose_mirror_sub = nepi_sdk.create_subscriber(
         source_topic, NavPose, self.navPoseMirrorCb, queue_size = 1)
@@ -2426,12 +2104,7 @@ class NepiSimConnectorApp:
 
   def navPoseMirrorCb(self, msg):
     # Copies every has_*/value field this message carries into
-    # self.navpose_dict, the exact same dict processTelemetryLine populates
-    # for the generic-connector bridge protocol -- see
-    # updateNavPoseMirrorSubscription's own comment for why a second,
-    # independent source for the same dict is correct here (the two are
-    # mutually exclusive in practice: a given launch target uses one path
-    # or the other, never both).
+    # self.navpose_dict -- see updateNavPoseMirrorSubscription's own comment.
     nd = self.navpose_dict
     if msg.has_location:
       nd['has_location'] = True
@@ -2659,38 +2332,36 @@ class NepiSimConnectorApp:
       self.msg_if.pub_warn("Failed to publish robot link status: " + str(e), throttle_s = 5.0)
 
   #**********************
-  # Simulator auto-launch. A convenience trigger over the existing passive
-  # flow, not a parallel path: on success this calls the same
+  # Simulator launch. A convenience trigger over the existing passive flow,
+  # not a parallel path: on success this calls the same
   # setSelectedRobotConfig already used by the robot-config selector above,
   # so the rest of the app behaves exactly as if an operator had started the
   # simulator by hand and picked that config themselves. Deliberately does
   # NOT touch setSelectedSimulator/selected_simulator -- that selector picks
   # among other simulator-*capable NEPI devices* discovered on the ROS graph
   # (simDiscoveryCb above), a different axis entirely from which simulator
-  # *software* this launch target starts on a dev VM.
+  # *software* a simulator service starts on the sim machine.
   #
-  # launcher.launch()/wait_until_ready()/stop() all block for real seconds
-  # (an ssh round trip, sleeps while the simulator comes up) -- run on a
-  # background thread so the bridge server thread and ROS callback dispatch
-  # are never held up by one. launcher_lock only guards against two
-  # launch/stop requests racing each other, not against the sim's own I/O.
+  # A start or stop blocks for real seconds while the service carries it out
+  # (see nepi_sim_service.SimService.wait_for_request) -- run on a background thread
+  # so the bridge server thread and ROS callback dispatch are never held up
+  # by one. launcher_lock only guards against two launch/stop requests
+  # racing each other.
 
-  def setLauncherError(self, error):
-    """Single place that sets both launcher_last_error and
-    launcher_tunnel_fallback_commands, so every call site (there are over a
-    dozen) doesn't need its own copy of "does this LauncherError carry a
-    manual_fallback_commands override" logic. Accepts either a plain string
-    (the '' clear case, or a hand-built message that was never a
-    LauncherError) or an exception -- str(error) becomes the message either
-    way, and manual_fallback_commands is read off the exception if present
-    (see simulator_launcher.LauncherError/_classify_connection_failure),
-    else cleared, so a fallback from a PREVIOUS failure never lingers onto
-    an unrelated new one."""
+  def setLauncherError(self, error, fallback_commands = ''):
+    """Single place that sets launcher_last_error together with the
+    copy-paste commands shown alongside it, so a fallback from a PREVIOUS
+    failure never lingers onto an unrelated new one."""
     self.launcher_last_error = str(error)
-    self.launcher_tunnel_fallback_commands = getattr(error, 'manual_fallback_commands', None) or ''
+    self.launcher_fallback_commands = fallback_commands
+
+  def failLauncher(self, error, fallback_commands = ''):
+    self.launcher_state = 'failed'
+    self.setLauncherError(error, fallback_commands)
+    self.publishLauncherStatus()
 
   def parseLaunchPayload(self, msg):
-    """Parses a sim/launch_simulator-family String message into
+    """Parses a sim/redeploy_simulator-family String message into
     (target_key, robot_config). The RUI encodes both as one JSON object,
     {"target_key": ..., "robot_config": ...}, so the operator's current
     robot-config selection travels atomically with the launch request
@@ -2706,8 +2377,8 @@ class NepiSimConnectorApp:
     Falls back to treating the whole payload as a bare target_key with no
     robot_config (the topic's original plain-string format) if it isn't a
     JSON object with a target_key field, for any caller still publishing
-    that way -- runLaunch/runRedeploy/runForceLaunch then fall back to
-    self.selected_robot_config themselves, same as before this fix."""
+    that way -- resolveLaunchRobotConfig then falls back to
+    self.selected_robot_config itself, same as before this fix."""
     raw = str(msg.data).strip()
     try:
       payload = json.loads(raw)
@@ -2719,372 +2390,79 @@ class NepiSimConnectorApp:
       pass
     return raw, None
 
-  def launchSimulatorCb(self, msg):
-    if self.launcher is None:
-      self.msg_if.pub_warn("Simulator auto-launch is not configured on this deployment "
-                           "(no launch-targets config found), ignoring launch request")
+  def startLauncherThread(self, run_function, *args):
+    if not any(self.service_config_found.values()):
+      self.msg_if.pub_warn("No simulator service has been set up on the sim machine yet (no " +
+                           " or ".join(SIM_TARGETS[t]['service'].config_file for t in SIM_TARGETS) +
+                           "), ignoring request")
       return
-    target_key, robot_config = self.parseLaunchPayload(msg)
     with self.launcher_lock:
       if self.launcher_thread is not None and self.launcher_thread.is_alive():
         self.msg_if.pub_warn("A launch/stop is already in progress, ignoring")
         return
-      self.launcher_thread = threading.Thread(target = self.runLaunch,
-                                              args = (target_key,),
-                                              kwargs = {'robot_config': robot_config})
+      self.launcher_thread = threading.Thread(target = run_function, args = args)
       self.launcher_thread.daemon = True
       self.launcher_thread.start()
 
   def stopSimulatorCb(self, msg):
-    # Checks BOTH, not just selected_launch_target -- an app restart (e.g.
-    # nepicommit restarting the whole container) resets this node's
-    # in-memory selected_launch_target/active_launch_target to '' even
-    # while a simulator launched by a PREVIOUS process instance is still
-    # genuinely running on the VM (nothing there depends on this app's own
-    # process lifetime). Guarding on selected_launch_target alone made this
-    # a silent no-op in exactly that case -- launcher_state was already
-    # sitting at its fresh-boot 'idle' default, so it read as "stop
-    # succeeded" without runStop (and therefore the actual remote
-    # stop_command) ever being attempted, leaving the orphaned sim running
-    # and blocking the next launch attempt's own "already running" guard.
-    # Confirmed live as the actual mechanism behind repeated "stop reports
-    # idle but the process is still there" reports this session -- matches
-    # the same active-or-selected fallback stop_target already uses below.
-    if self.launcher is None:
-      return
-    # active_launch_target -- the target with real SSH-launched processes
-    # -- may differ from selected_launch_target when the current robot
-    # config redirected the launch elsewhere (see runLaunch); falls back
-    # to selected_launch_target for the ordinary, unredirected case, and
-    # last to whatever the shared-storage watcher says is running: after an
-    # app restart both are '' even though the simulator is still up, and
-    # Stop was then a silent no-op.
-    stop_target = (self.active_launch_target or self.selected_launch_target
-                   or self.launcher.find_running_target())
-    if not stop_target:
-      return
-    with self.launcher_lock:
-      if self.launcher_thread is not None and self.launcher_thread.is_alive():
-        self.msg_if.pub_warn("A launch/stop is already in progress, ignoring")
-        return
-      self.launcher_thread = threading.Thread(target = self.runStop, args = (stop_target,))
-      self.launcher_thread.daemon = True
-      self.launcher_thread.start()
+    # Stops whichever simulator its service reports running -- the services,
+    # not this node's memory, know what's running, so this works the same
+    # after an app restart as it does for a simulation this app just started.
+    self.startLauncherThread(self.runStop)
 
   def redeploySimulatorCb(self, msg):
-    # The explicit "start fresh" action offered alongside the reuse path (see
-    # runLaunch's own short-circuit below) when a client already knows a sim
-    # is up and wants a clean restart rather than reusing it -- e.g. to reset
-    # world state, or because it wants a DIFFERENT target than what's
-    # currently running. Shares the same busy-guard and thread as
-    # launch/stop, since it is just those two run back-to-back.
-    if self.launcher is None:
-      self.msg_if.pub_warn("Simulator auto-launch is not configured on this deployment "
-                           "(no launch-targets config found), ignoring redeploy request")
-      return
+    # Deploy and "Use Open Sim" both publish this: a clean restart (stop,
+    # then start fresh) rather than reusing what's up.
     target_key, robot_config = self.parseLaunchPayload(msg)
-    with self.launcher_lock:
-      if self.launcher_thread is not None and self.launcher_thread.is_alive():
-        self.msg_if.pub_warn("A launch/stop/install is already in progress, ignoring")
-        return
-      self.launcher_thread = threading.Thread(target = self.runRedeploy,
-                                              args = (target_key,),
-                                              kwargs = {'robot_config': robot_config})
-      self.launcher_thread.daemon = True
-      self.launcher_thread.start()
+    self.startLauncherThread(self.runRedeploy, target_key, robot_config)
+
+  def readServiceState(self, target_key):
+    """The STATE the target's service reports right now, '' when unreadable."""
+    service = SIM_TARGETS[target_key]['service']
+    config_dict = service.load_config()
+    return nepi_sim_service.get_config_str(config_dict, service.key('STATE')) if config_dict else ''
+
+  def runningSimTarget(self):
+    """The simulator a service reports starting or running, '' when none is."""
+    for target_key in SIM_TARGETS:
+      if self.readServiceState(target_key) in ('running', 'starting'):
+        return target_key
+    return ''
 
   def runRedeploy(self, target_key, robot_config=None):
-    # Stops whatever is currently tracked as running (if anything) then
-    # launches target_key fresh. Reuses runStop/runLaunch directly rather
-    # than duplicating their logic -- this method IS just those two run
-    # back-to-back on the one background thread redeploySimulatorCb already
-    # started.
-    #
-    # Checks active_launch_target too, not just launcher_state == 'running'
-    # -- same reasoning as stopSimulatorCb's own guard: an app restart
-    # resets launcher_state to its fresh-boot 'idle' even while a simulator
-    # launched by a previous process instance is genuinely still running on
-    # the VM. Skipping runStop here because launcher_state said 'idle' left
-    # the real orphan alive, so runLaunch below hit the launch script's own
-    # "already running" refuse-guard instead of actually redeploying.
-    # Same watcher fallback as stopSimulatorCb: after an app restart this
-    # node has no memory of the running sim, and "redeploy" silently reused
-    # it instead of starting fresh.
-    running_target = self.active_launch_target or self.selected_launch_target
-    if not (self.launcher_state == 'running' or self.active_launch_target):
-      running_target = ''
-    running_target = running_target or self.launcher.find_running_target()
-    if running_target:
-      self.runStop(running_target)
+    if target_key not in SIM_TARGETS:
+      self.failLauncher("Unknown simulator '" + str(target_key) + "'")
+      return
+    # Deploy carries its own target; make the lists match it before the
+    # robot is resolved against them.
+    if target_key != self.selected_sim_target:
+      self.setSelectedSimTarget(target_key)
+    # Checked BEFORE stopping anything, so a Deploy that can't go ahead
+    # leaves whatever is running alone. robot_config itself is passed through
+    # unresolved, so runLaunch still re-reads the selection once it is up.
+    _resolved, _robot_folder, error = self.resolveLaunchRobotConfig(target_key, robot_config)
+    if error:
+      self.failLauncher(error)
+      return
+    # One simulator at a time: both drive the same rover driver over the same
+    # bridge port, so any OTHER simulator that is up is stopped first.
+    for other_key in SIM_TARGETS:
+      if other_key == target_key or self.readServiceState(other_key) not in ('running', 'starting'):
+        continue
+      if not self.service_alive[other_key]:
+        self.msg_if.pub_warn(SIM_TARGETS[other_key]['service'].name + " reports running but its "
+                             "service isn't responding, so it can't be stopped from here")
+        continue
+      self.msg_if.pub_info("Stopping " + SIM_TARGETS[other_key]['service'].name + " before deploying " +
+                           SIM_TARGETS[target_key]['service'].name)
+      self.runStop(other_key)
       if self.launcher_state == 'failed':
         return  # runStop already published the failure; nothing more to do
-    self.runLaunch(target_key, robot_config=robot_config)
-
-  def attachSimulatorCb(self, msg):
-    # "Use Existing" -- see runLaunch's attach handling.
-    if self.launcher is None:
-      self.msg_if.pub_warn("Simulator auto-launch is not configured on this deployment "
-                           "(no launch-targets config found), ignoring attach request")
-      return
-    target_key, robot_config = self.parseLaunchPayload(msg)
-    with self.launcher_lock:
-      if self.launcher_thread is not None and self.launcher_thread.is_alive():
-        self.msg_if.pub_warn("A launch/stop/install is already in progress, ignoring")
-        return
-      self.launcher_thread = threading.Thread(target = self.runLaunch, args = (target_key,),
-                                              kwargs = {'attach': True, 'robot_config': robot_config})
-      self.launcher_thread.daemon = True
-      self.launcher_thread.start()
-
-  def forceLaunchSimulatorCb(self, msg):
-    # "Launch New" -- see runForceLaunch.
-    if self.launcher is None:
-      self.msg_if.pub_warn("Simulator auto-launch is not configured on this deployment "
-                           "(no launch-targets config found), ignoring launch request")
-      return
-    target_key, robot_config = self.parseLaunchPayload(msg)
-    with self.launcher_lock:
-      if self.launcher_thread is not None and self.launcher_thread.is_alive():
-        self.msg_if.pub_warn("A launch/stop/install is already in progress, ignoring")
-        return
-      self.launcher_thread = threading.Thread(target = self.runForceLaunch,
-                                              args = (target_key,),
-                                              kwargs = {'robot_config': robot_config})
-      self.launcher_thread.daemon = True
-      self.launcher_thread.start()
-
-  def runForceLaunch(self, target_key, robot_config=None):
-    # Clears whatever gazebo is in the way first (see
-    # SimulatorLauncher.kill_all_gazebo's own docstring for why this, and
-    # not stop(), is the right tool here -- the blocking gzserver isn't
-    # tracked as any target's own launch), then launches target_key exactly
-    # as a normal Deploy click would. A kill_all_gazebo failure (host
-    # unreachable) is reported the same way a launch failure already is --
-    # there is nothing target-specific to fall back to.
-    try:
-      self.launcher.kill_all_gazebo()
-    except LauncherError as e:
-      self.launcher_state = 'failed'
-      self.launcher_last_error = "Could not clear the existing gazebo: " + str(e)
-      self.publishLauncherStatus()
-      return
-    self.runLaunch(target_key, robot_config=robot_config)
-
-  def killAllGazeboCb(self, msg):
-    if self.launcher is None:
-      self.msg_if.pub_warn("Simulator auto-launch is not configured on this deployment "
-                           "(no launch-targets config found), ignoring kill-all request")
-      return
-    with self.launcher_lock:
-      if self.launcher_thread is not None and self.launcher_thread.is_alive():
-        self.msg_if.pub_warn("A launch/stop/install is already in progress, ignoring")
-        return
-      self.launcher_thread = threading.Thread(target = self.runKillAllGazebo)
-      self.launcher_thread.daemon = True
-      self.launcher_thread.start()
-
-  def runKillAllGazebo(self):
-    # If this app has something tracked as running, stop it properly FIRST
-    # (its own stop_command cleans up SITL/the bridge/camera_rig, not just
-    # gazebo) -- confirmed the hard way: kill_all_gazebo alone pulls
-    # gzserver out from under a running SITL+bridge session without
-    # clearing them, and since it also resets selected_launch_target below,
-    # the ordinary Kill button has nothing left to stop afterward either
-    # (stopSimulatorCb no-ops with no target tracked). kill_all_gazebo
-    # itself still runs unconditionally after, for whatever stray instance
-    # this app was never tracking in the first place.
-    if self.launcher_state == 'running' and self.active_launch_target:
-      self.runStop(self.active_launch_target)
+    if self.readServiceState(target_key) in ('running', 'starting'):
+      self.runStop(target_key)
       if self.launcher_state == 'failed':
         return
-    try:
-      self.launcher.kill_all_gazebo()
-    except LauncherError as e:
-      self.launcher_state = 'failed'
-      self.setLauncherError(e)
-      self.publishLauncherStatus()
-      return
-    # Not tied to any one target's launch/stop bookkeeping -- back to idle
-    # unconditionally, since kill_all_gazebo just cleared everything.
-    self.launcher_state = 'idle'
-    self.setLauncherError('')
-    self.selected_launch_target = ''
-    self.active_launch_target = ''
-    self.publishLauncherStatus()
-
-  def ensureArdupilotSitlConnection(self, actual_target):
-    if actual_target != 'gazebo_quadcopter':
-      return
-    self.ardupilot_discovery_update_pub.publish(UpdateControl(
-        name = 'connection', display_name = '', description = '',
-        value = ['SITL'], index = '', min_bound = '', max_bound = '', options = []))
-
-  # Live dimension edits (2026-09-18, requested live: "changing fov and
-  # environment should happen instantly after hitting enter in the fov box
-  # or changing the dropdown... robot dimensions [geometry] though wouldnt
-  # matter, since you cant really change a robot unless redeploying").
-  # FOV and environment geometry both have a LIVE update path already built
-  # for a different purpose (rbx_sim_node.py's camera_offset_x/y/z Settings,
-  # and EnvironmentModelSpawner's respawn-on-command) that this app's own
-  # dimensions editor never reached before -- pushDirtyDimensions only ever
-  # ran right before a FRESH gzserver launch. This is the same push, fired
-  # immediately from setDimensionsCb instead of only at launch time, plus
-  # the one signal each path still needs to actually re-render: camera_
-  # fov_deg is a Setting (triggers rbx_sim_node.py's own sendCameraSettings
-  # -> live camera respawn with the new FOV baked in, no redeploy);
-  # environment geometry needs an explicit force-respawn afterward (see
-  # REFRESH_ENVIRONMENT's own comment) since re-selecting the SAME
-  # environment name is normally a no-op. Robot chassis/wheel geometry has
-  # no live-respawn equivalent (the spawned rigid-body model would need to
-  # be torn down and rebuilt from scratch either way) -- unchanged, still
-  # deploy-time only via pushDirtyDimensions.
-  REFRESH_ENVIRONMENT_ACTION_INDEX = 2
-
-  def pushLiveDimensionsIfConnected(self, role):
-    if not self.selected_simulator:
-      return
-    if role == 'robot':
-      self.pushLiveCameraFov()
-    elif role == 'environment':
-      actual_target = self.active_launch_target or self.selected_launch_target
-      if actual_target:
-        self.pushDirtyDimensions(actual_target)
-      self.triggerRefreshEnvironment()
-
-  def getOrCreateDynamicPublisher(self, topic, msg_type):
-    # Cached, long-lived publishers for topics whose destination namespace
-    # varies at runtime (self.selected_simulator, whichever RBX device is
-    # currently connected) -- creating a brand-new rospy.Publisher and
-    # publishing on it immediately loses that very first message almost
-    # every time (found live 2026-09-18 chasing why the FOV live-update
-    # never took effect through this path even though the exact same
-    # UpdateControl worked instantly sent directly): a fresh publisher
-    # needs a moment to register with roscore and for the subscriber's own
-    # TCPROS connection to come up, and pypi/rospy does not block a
-    # publish() call to wait for that. Caching means only the FIRST-ever
-    # call for a given topic can still race; every later call (the common
-    # case -- an operator hitting Enter on the FOV box repeatedly, or
-    # editing then re-editing) reuses an already-connected publisher.
-    if not hasattr(self, '_dynamic_pubs'):
-      self._dynamic_pubs = {}
-    pub = self._dynamic_pubs.get(topic)
-    if pub is None:
-      pub = nepi_sdk.create_publisher(topic, msg_type, queue_size = 1)
-      self._dynamic_pubs[topic] = pub
-      # Best-effort short wait for the very first connection on a brand-new
-      # publisher, so even the FIRST live edit after a fresh connect has a
-      # real chance of landing instead of silently vanishing.
-      deadline = time.time() + 1.0
-      while time.time() < deadline and pub.get_num_connections() == 0:
-        time.sleep(0.05)
-    return pub
-
-  def deployEnvironmentCb(self, msg):
-    # name is the operator-facing config display name, e.g. "Obstacle
-    # Course" or a custom "complexcourse" -- EVERY entry the deploy
-    # dropdown lists (built-in or custom) is a real saved file (confirmed
-    # live 2026-09-18: environment_configs/ holds "Flat.yaml", "Obstacle
-    # Course.yaml", "Aerial Obstacle Course.yaml", and any custom names
-    # side by side, no special-casing between them), so resolving through
-    # that file works uniformly for every name rather than guessing the
-    # model from the name's own text the way the old RUI-side
-    # setEnvironmentSetting did. That old guess is exactly why built-ins
-    # worked but a custom config like "complexcourse" didn't: its name
-    # has no relationship to the model directory it actually maps to
-    # (obstacle_course) at all, so guess-from-name could only ever be
-    # right by luck.
-    #
-    # Pushes THIS config's own saved geometry to the VM before flipping the
-    # Setting, so a custom config's own edits (extra obstacles, a
-    # different wall height, etc.) actually reach Gazebo -- reading
-    # self.dimension_config_model/readStoredDimensionsYaml instead would
-    # read whatever's currently active for EDITING, which is a different,
-    # deliberately decoupled concern (see this callback's own comment
-    # history: "changing the environment config in the dropdown also
-    # messed with the dimensions... those are again separate").
-    name = str(msg.data).strip()
-    if not name or not self.selected_simulator:
-      return
-    config_path = self.dimensionConfigPath('environment', name)
-    yaml_text = None
-    if os.path.exists(config_path):
-      try:
-        with open(config_path, 'r') as f:
-          yaml_text = f.read()
-      except Exception as e:
-        self.msg_if.pub_warn("Failed to read environment config '" + name + "' to deploy: " + str(e))
-    if yaml_text is not None:
-      model_name = self.resolveEnvironmentModelFromYaml(yaml_text)
-    else:
-      # No saved file for this exact name -- not reachable from the deploy
-      # dropdown itself (every listed name has one), but kept as a safe
-      # fallback for a raw publish with an arbitrary string: guess the
-      # model from the name's own text, the old behavior.
-      model_name = ('flat_ground' if name in ('Flat', 'Flat Ground') else name.lower())
-    if yaml_text is not None and model_name != ENVIRONMENT_MODEL_NONE:
-      actual_target = self.active_launch_target or self.selected_launch_target
-      if actual_target and self.launcher is not None:
-        try:
-          target = self.launcher.get_target(actual_target)
-          self.launcher.push_dimensions(target, model_name, yaml_text, '')
-        except LauncherError as e:
-          self.msg_if.pub_warn("Failed to push environment config '" + name + "' to the sim VM: " + str(e))
-    self.deployed_environment_config_name = name
-    self.deployed_environment_config_name_pub.publish(String(data = name))
-    setting_value = ('FLAT_GROUND' if model_name == ENVIRONMENT_MODEL_NONE
-                      else re.sub(r'[^A-Z0-9]+', '_', model_name.upper()))
-    pub = self.getOrCreateDynamicPublisher(
-        nepi_sdk.create_namespace(self.selected_simulator, 'settings/update_setting'),
-        UpdateControl)
-    pub.publish(UpdateControl(
-        name = 'environment', display_name = '', description = '',
-        value = [setting_value], index = '', min_bound = '', max_bound = '', options = []))
-    if model_name != ENVIRONMENT_MODEL_NONE and model_name == self.deployed_environment_model_name:
-      # Force a respawn ONLY when re-deploying onto the SAME model that's
-      # already live -- switching between two named configs that map to
-      # the SAME underlying model (e.g. "complexcourse" -> "circlecourse",
-      # both obstacle_course) sends an UNCHANGED Setting value, which
-      # SettingsIF's own update_setting_value short-circuits on ("Setting
-      # allready set") before ever calling setEnvironmentAction -- without
-      # this, that case would push the new geometry to disk but never
-      # actually respawn it, exactly the "just looks like Obstacle Course"
-      # symptom reported live (2026-09-18) for complexcourse/circlecourse's
-      # own extra obstacles.
-      #
-      # Calling this UNCONDITIONALLY (an earlier version of this fix) was
-      # itself the cause of a DIFFERENT symptom reported live right after:
-      # aerial/obstacle_course "flashes in then disappears." Every genuine
-      # switch to a different model already gets a real spawn from the
-      # Setting update just above -- firing a SECOND, forced delete+respawn
-      # moments later (this call) raced Gazebo's own async model teardown
-      # (DeleteModel returning success is not the same as the deletion
-      # having actually finished -- see sim_bridge_node.py's own extensive
-      # comment on the exact same class of race for camera respawns), and
-      # the respawn half of that second, unnecessary cycle could fail
-      # silently while the model it had just deleted never came back.
-      self.triggerRefreshEnvironment()
-    self.deployed_environment_model_name = model_name
-
-  def pushLiveCameraFov(self):
-    pub = self.getOrCreateDynamicPublisher(
-        nepi_sdk.create_namespace(self.selected_simulator, 'settings/update_setting'),
-        UpdateControl)
-    pub.publish(UpdateControl(
-        name = 'camera_fov_deg', display_name = '', description = '',
-        value = [str(self.CAMERA_HORIZONTAL_FOV_DEG)], index = '',
-        min_bound = '', max_bound = '', options = []))
-
-  def triggerRefreshEnvironment(self):
-    # setup_action dispatches by INDEX into RBX_SETUP_ACTIONS -- safe here
-    # specifically because this app both owns the index (rbx_sim_node.py's
-    # own array, kept in sync with REFRESH_ENVIRONMENT_ACTION_INDEX above)
-    # and is the only caller; a device without this action (e.g. the
-    # quadcopter's rbx_ardupilot_node.py, which has no ground obstacle
-    # course to refresh) bounds-checks the index before dispatch and simply
-    # no-ops rather than firing the wrong action.
-    pub = self.getOrCreateDynamicPublisher(
-        nepi_sdk.create_namespace(self.selected_simulator, 'setup_action'), Int32)
-    pub.publish(Int32(data = self.REFRESH_ENVIRONMENT_ACTION_INDEX))
+    self.runLaunch(target_key, robot_config)
 
   def publishSecondaryLauncherStatus(self):
     self.secondary_launcher_status_pub.publish(String(data = json.dumps({
@@ -3093,509 +2471,322 @@ class NepiSimConnectorApp:
     })))
 
   def launchNewSimulatorCb(self, msg):
-    # "New Sim" -- see secondary_launch_states' own __init__ comment for why
-    # this is a separate slot rather than the primary launch/redeploy path.
-    if self.launcher is None:
-      self.msg_if.pub_warn("Simulator auto-launch is not configured on this deployment "
-                           "(no launch-targets config found), ignoring launch request")
+    # "New Sim" -- a second, independent instance alongside the primary one.
+    # Each simulator service runs exactly one simulation (one config file,
+    # one tracked process), so there is nowhere for a second one to go;
+    # reported through the RUI's own "Other Running Instances" list (whose
+    # Stop clears it) rather than silently dropped.
+    target_key, _robot_config = self.parseLaunchPayload(msg)
+    if not target_key or target_key == 'None':
       return
-    target_key, robot_config = self.parseLaunchPayload(msg)
-    # confirmed: the RUI's own answer to "you already have this robot
-    # config open, are you sure you want to open another?" (requested live
-    # 2026-09-18: "if new sim is hit even if the robot being summoned is
-    # the same, it should still work... give a warning... and do it").
-    # Read separately from parseLaunchPayload (whose 2-tuple shape every
-    # OTHER caller of that method already depends on) rather than widening
-    # it -- this field is New Sim's own concern alone.
-    confirmed = False
-    try:
-      payload = json.loads(str(msg.data).strip())
-      if isinstance(payload, dict):
-        confirmed = bool(payload.get('confirmed', False))
-    except ValueError:
-      pass
-    with self.secondary_launch_lock:
-      if self.secondary_launch_thread is not None and self.secondary_launch_thread.is_alive():
-        self.msg_if.pub_warn("A secondary launch/stop is already in progress, ignoring")
-        return
-      self.secondary_launch_thread = threading.Thread(target = self.runLaunchSecondary,
-                                                       args = (target_key,),
-                                                       kwargs = {'robot_config': robot_config,
-                                                                 'confirmed': confirmed})
-      self.secondary_launch_thread.daemon = True
-      self.secondary_launch_thread.start()
+    self.secondary_launch_states[target_key] = 'failed: each simulator service runs a single instance'
+    self.publishSecondaryLauncherStatus()
 
   def stopNewSimulatorCb(self, msg):
-    actual_target = str(msg.data).strip()
-    if not actual_target or self.launcher is None:
-      return
-    with self.secondary_launch_lock:
-      if self.secondary_launch_thread is not None and self.secondary_launch_thread.is_alive():
-        self.msg_if.pub_warn("A secondary launch/stop is already in progress, ignoring")
-        return
-      self.secondary_launch_thread = threading.Thread(target = self.runStopSecondary,
-                                                       args = (actual_target,))
-      self.secondary_launch_thread.daemon = True
-      self.secondary_launch_thread.start()
+    target_key = str(msg.data).strip()
+    if target_key in self.secondary_launch_states:
+      del self.secondary_launch_states[target_key]
+      self.publishSecondaryLauncherStatus()
 
-  def runLaunchSecondary(self, target_key, robot_config=None, confirmed=False):
-    # Deliberately simpler than runLaunch below: no live push of a resolved
-    # robot_config back into self.selected_robot_config (that field is the
-    # PRIMARY panel's own shared selection, and there is no separate control
-    # surface for a secondary instance's robot config in this first pass).
-    # robot_config here is used only for resolve_launch_target's own
-    # redirect (e.g. picking gazebo_quadcopter when the rover is already
-    # the primary instance); the launched instance otherwise gets that
-    # target's default.
+  #**********************
+  # Simulator, Robot and Environment Config -- what a Deploy asks a simulator
+  # service to run. Robots and worlds come from the SELECTED simulator's share
+  # (NEPI storage databases/sims/<simulator>), the contract described in its
+  # ROBOT_CONFIGS/README.md: a robot is a ROBOT_CONFIGS folder, an environment
+  # is a world file in ENVIRONMENT_CONFIGS, and dropping either on the share is
+  # all it takes to offer it. Selections are only applied on the next Deploy.
+
+  def selectLaunchTargetCb(self, msg):
+    target_key = str(msg.data).strip()
+    if target_key not in SIM_TARGETS:
+      if target_key not in ('', 'None'):
+        self.msg_if.pub_warn("Simulator '" + target_key + "' is not one of " +
+                             str(list(SIM_TARGETS.keys())) + ", ignoring")
+      return
+    if target_key != self.selected_sim_target:
+      self.setSelectedSimTarget(target_key)
+
+  def setSelectedSimTarget(self, target_key):
+    """Switches the Robot Config and Environment Config lists to target_key's
+    share. The environment goes back to that simulator's default world (world
+    files are per simulator), and a robot config that only the old share had
+    falls back to the new one's default robot."""
+    self.selected_sim_target = target_key
+    info = SIM_TARGETS[target_key]
+    self.selected_environment_config = info['default_environment']
+    self.refreshShareRobotConfigs()
+    self.refreshEnvironmentConfigs(force_publish = True)
+    if self.selected_robot_config not in self.robot_configs:
+      default_robot = info['default_robot']
+      self.setSelectedRobotConfig(default_robot if default_robot in self.robot_configs
+                                  else FACTORY_ROBOT_CONFIG_NAME)
+    self.publishLauncherStatus()
+    self.msg_if.pub_info("Selected simulator: " + info['service'].name)
+
+  def refreshShareRobotConfigs(self):
+    """Folds the selected simulator's ROBOT_CONFIGS folders into
+    self.robot_configs:
+
+    - A folder a device profile claims through SHARE_ROBOT_FOLDER_FIELD
+      (4-Wheel Rover -> generic_rover) is listed once, under the profile's key
+      and name, with the folder's capability file merged over the profile's
+      own fields -- rebuilt from the untouched profile each time, so a field
+      removed from the folder's file stops applying.
+    - Any other folder becomes a robot config of its own, keyed by folder
+      name, named by its display_name (else the folder name).
+    - A folder gone from the share takes its robot config with it, and so
+      does every folder of the previous simulator when the selection changes.
+
+    Returns True when the offered set changed."""
+    share = SIM_TARGETS[self.selected_sim_target]['service'].list_robot_configs()
+    changed = False
+    for key, base in self.claimed_profile_bases.items():
+      if key in self.robot_configs:
+        self.robot_configs[key] = copy.deepcopy(base)
+    claims = dict()
+    for key, entry in self.robot_configs.items():
+      if key in self.share_robot_config_keys or not isinstance(entry, dict):
+        continue
+      folder = entry.get(SHARE_ROBOT_FOLDER_FIELD, '')
+      if folder:
+        claims[folder] = key
+    claimed_bases = dict()
+    share_keys = set()
+    for folder, capabilities in share.items():
+      if folder in claims:
+        key = claims[folder]
+        base = copy.deepcopy(self.robot_configs[key])
+        merged = copy.deepcopy(base)
+        merged.update({k: v for k, v in capabilities.items() if k != 'display_name'})
+        self.robot_configs[key] = merged
+        claimed_bases[key] = base
+        continue
+      if folder in self.robot_configs and folder not in self.share_robot_config_keys:
+        self.msg_if.pub_warn("Sim share robot '" + folder + "' has the same name as a device robot "
+                             "config -- not offering it", throttle_s = 60.0)
+        continue
+      entry = copy.deepcopy(capabilities)
+      entry['display_name'] = str(capabilities.get('display_name', '') or folder)
+      entry[SHARE_ROBOT_FOLDER_FIELD] = folder
+      if self.robot_configs.get(folder) != entry:
+        changed = True
+      self.robot_configs[folder] = entry
+      share_keys.add(folder)
+    for key in self.share_robot_config_keys - share_keys:
+      self.robot_configs.pop(key, None)
+      changed = True
+    self.share_robot_config_keys = share_keys
+    self.claimed_profile_bases = claimed_bases
+    return changed
+
+  def refreshEnvironmentConfigs(self, force_publish = False):
+    names = SIM_TARGETS[self.selected_sim_target]['service'].list_environment_configs()
+    if names != self.environment_configs or force_publish:
+      self.environment_configs = names
+      self.environment_config_names_pub.publish(String(data = json.dumps(names)))
+      self.selected_environment_config_pub.publish(String(data = self.selected_environment_config))
+
+  def refreshSimConfigsIfDue(self):
+    # Cheap (a couple of directory listings), but no need to do it every
+    # status tick -- this is only how a newly dropped folder or world shows up.
+    now = time.monotonic()
+    if now - self.sim_configs_refreshed_at < SIM_CONFIGS_REFRESH_SEC:
+      return
+    self.sim_configs_refreshed_at = now
+    self.refreshShareRobotConfigs()
+    self.refreshEnvironmentConfigs()
+
+  def selectEnvironmentConfigCb(self, msg):
+    name = str(msg.data).strip()
+    if name not in self.environment_configs:
+      self.msg_if.pub_warn("Environment config '" + name + "' is not in the " +
+                           SIM_TARGETS[self.selected_sim_target]['service'].name +
+                           " share's ENVIRONMENT_CONFIGS " + str(self.environment_configs) + ", ignoring")
+      return
+    self.selected_environment_config = name
+    self.selected_environment_config_pub.publish(String(data = name))
+    self.msg_if.pub_info("Selected environment config for the next Deploy: " + name)
+
+  def resolveLaunchRobotConfig(self, target_key, robot_config=None):
+    """Returns (robot_config, robot_folder, error): the robot config a Deploy
+    applies once the simulation is up and the service robot folder it runs
+    as, or (None, None, message) when this launch can't go ahead.
+
+    robot_config, when given, is the value the caller's own message carried
+    (see parseLaunchPayload) and takes priority over
+    self.selected_robot_config -- reading only self.selected_robot_config
+    raced select_robot_config's own subscriber callback (independent thread,
+    no cross-topic ordering guarantee). FACTORY_ROBOT_CONFIG_NAME ('default',
+    capability-empty) counts as "hasn't picked anything" rather than a real
+    choice worth preserving."""
+    if target_key not in SIM_TARGETS:
+      return None, None, ("Unknown simulator '" + str(target_key) + "' -- can deploy " +
+                          ", ".join(SIM_TARGETS[t]['service'].name for t in SIM_TARGETS))
+    default_robot = SIM_TARGETS[target_key]['default_robot']
     if not robot_config:
-      robot_config = self.launcher.get_default_robot_config(target_key)
-    actual_target = (self.launcher.resolve_launch_target(target_key, robot_config)
-                     if robot_config else target_key)
+      robot_config = self.selected_robot_config
+    if not robot_config or robot_config == FACTORY_ROBOT_CONFIG_NAME:
+      robot_config = default_robot
+    entry = self.robot_configs.get(robot_config, dict())
+    if not isinstance(entry, dict):
+      entry = dict()
+    # Every share robot carries its own folder name here (see
+    # refreshShareRobotConfigs); only the hidden capability-empty placeholder
+    # falls through to the default robot.
+    robot_folder = entry.get(SHARE_ROBOT_FOLDER_FIELD, '') or default_robot
+    return robot_config, robot_folder, ''
 
-    # Requested live (2026-09-18): "if new sim is hit even if the robot
-    # being summoned is the same, it should still work. it should just
-    # give a warning... and do it" -- re-hitting New Sim for a target
-    # that's already open AS A SECONDARY instance now redeploys that same
-    # secondary slot in place (stop, then relaunch fresh) instead of
-    # silently no-op'ing, once the RUI's own confirm dialog has answered
-    # yes (confirmed=True). Without confirmed, this just returns -- the RUI
-    # is expected to have asked first; a non-RUI caller (a raw publish)
-    # skipping the prompt entirely is treated the same as "not confirmed
-    # yet" rather than proceeding blind.
-    if actual_target in self.secondary_launch_states:
-      if not confirmed:
-        return
-      self.launcher.stop_secondary(actual_target)
-      del self.secondary_launch_states[actual_target]
-      self.publishSecondaryLauncherStatus()
-    # The PRIMARY-collision case is a real infrastructure limit, not just a
-    # missing confirm step: simulator_launch_targets.yaml only gives
-    # gazebo_rover and gazebo_quadcopter ONE dedicated GAZEBO_MASTER_URI/
-    # ROS_MASTER_URI pair each (see that file's own comments), so there is
-    # no THIRD port pair to launch this same target on again as a second,
-    # genuinely independent window -- confirming the prompt can't change
-    # that, so this stays a hard refusal either way.
-    if actual_target == self.active_launch_target and self.launcher_state == 'running':
-      self.msg_if.pub_warn(actual_target + " is already the PRIMARY instance, and this app "
-                           "only has one extra port pair configured -- use a different "
-                           "target for New Sim, or Use Open Sim to redeploy this one")
-      return
+  def checkService(self, target_key):
+    """Returns (error, config_dict): error is '' when target_key's service
+    looks reachable -- checked before sending a request, so a dead service
+    fails right away instead of after the request's full wait. config_dict
+    is the config as read just now, which wait_for_request compares the
+    outcome against."""
+    service = SIM_TARGETS[target_key]['service']
+    config_dict = service.load_config()
+    if config_dict is None:
+      return "Could not read " + service.config_file, None
+    service.note_service_poll(config_dict)
+    if not service.is_service_alive():
+      return ("The " + service.name + " service isn't running on the sim machine (" +
+              service.config_file + " has not been updated in over " +
+              str(nepi_sim_service.SERVICE_STALE_AFTER_SEC) + "s)"), config_dict
+    return '', config_dict
 
-    self.secondary_launch_states[actual_target] = 'launching'
-    self.publishSecondaryLauncherStatus()
-    try:
-      needs_install = not self.launcher.is_installed(actual_target)
-    except LauncherError:
-      needs_install = False
-    if needs_install:
-      self.secondary_launch_states[actual_target] = 'installing'
-      self.publishSecondaryLauncherStatus()
-      try:
-        self.launcher.install(actual_target)
-      except LauncherError as e:
-        self.secondary_launch_states[actual_target] = 'failed: ' + str(e)
-        self.publishSecondaryLauncherStatus()
-        return
-      self.secondary_launch_states[actual_target] = 'launching'
-      self.publishSecondaryLauncherStatus()
-
-    self.pushDirtyDimensions(actual_target)
-    self.ensureArdupilotSitlConnection(actual_target)
-    try:
-      # launch_secondary/wait_until_ready_secondary, NOT launch()/
-      # wait_until_ready() -- those two funnel through deploy_state.yaml's
-      # single desired_target slot, which is exactly what would stop
-      # whatever the PRIMARY slot is running the instant this secondary
-      # target differs from it. See launch_secondary's own comment in
-      # simulator_launcher.py for the live-confirmed root cause.
-      self.launcher.launch_secondary(actual_target)
-      ready = self.launcher.wait_until_ready_secondary(actual_target)
-    except LauncherError as e:
-      self.secondary_launch_states[actual_target] = 'failed: ' + str(e)
-      self.publishSecondaryLauncherStatus()
-      return
-    if not ready:
-      self.launcher.stop_secondary(actual_target)
-      self.secondary_launch_states[actual_target] = 'failed: timed out waiting to become ready'
-      self.publishSecondaryLauncherStatus()
-      return
-    self.secondary_launch_states[actual_target] = 'running'
-    self.publishSecondaryLauncherStatus()
-
-  def runStopSecondary(self, actual_target):
-    if actual_target not in self.secondary_launch_states:
-      return
-    self.launcher.stop_secondary(actual_target)
-    del self.secondary_launch_states[actual_target]
-    self.publishSecondaryLauncherStatus()
-
-  def runLaunch(self, target_key, attach=False, robot_config=None):
-    # robot_config, when given, is the value the caller's own message
-    # carried (see parseLaunchPayload) and takes priority over
-    # self.selected_robot_config below -- reading self.selected_robot_config
-    # for the launch-time decision raced select_robot_config's own
-    # subscriber callback (independent thread, no cross-topic ordering
-    # guarantee), so a value passed in here explicitly is what actually
-    # fixes that race; self.selected_robot_config remains the fallback for
-    # any caller that truly doesn't know (e.g. a bare legacy string message,
-    # or "Use Open Sim" re-clicked with nothing new selected).
+  def runLaunch(self, target_key, robot_config=None):
+    info = SIM_TARGETS[target_key]
+    service = info['service']
     explicit_robot_config = robot_config
-
-    # attach=True skips the reuse-check below (nothing is tracked as
-    # running yet -- the gzserver in the way isn't this app's own, so there
-    # is no in-place config update to make), but target resolution still
-    # matters just as much as the normal path: the operator still only
-    # ever picks "Gazebo" (gazebo_rover), and which target's own
-    # attach_launch_command actually needs to run still depends on the
-    # currently selected robot config -- confirmed the hard way, an
-    # earlier version of this skipped resolution entirely and attached
-    # gazebo_rover's OWN rover bridge to an already-running
-    # iris_arducopter_cmac.world, which can never satisfy that bridge's own
-    # ready_check (no rover model in that world) regardless of how long it
-    # waits.
-    if attach:
-      robot_config = explicit_robot_config if explicit_robot_config else self.selected_robot_config
-      if not robot_config or robot_config == FACTORY_ROBOT_CONFIG_NAME:
-        robot_config = self.launcher.get_default_robot_config(target_key)
-      actual_target = (self.launcher.resolve_launch_target(target_key, robot_config)
-                       if robot_config else target_key)
-
-      self.selected_launch_target = target_key
-      self.active_launch_target = actual_target
-      self.launcher_state = 'launching'
-      self.setLauncherError('')
-      self.publishLauncherStatus()
-      self.ensureArdupilotSitlConnection(actual_target)
-      try:
-        self.launcher.launch(actual_target, attach=True)
-        ready = self.launcher.wait_until_ready(actual_target)
-      except LauncherError as e:
-        self.launcher_state = 'failed'
-        self.setLauncherError(e)
-        self.publishLauncherStatus()
-        return
-      if not ready:
-        # Same orphan-prevention reasoning as the non-attach path below:
-        # launch(attach=True) still starts this target's OWN bridge/camera
-        # scripts against the pre-existing gzserver, and those are exactly
-        # what's left running (and blocking every retry) if the ready-check
-        # times out without a stop() call here.
-        try:
-          self.launcher.stop(actual_target)
-        except LauncherError as stop_err:
-          self.msg_if.pub_warn("Best-effort stop after failed ready-check also failed: " + str(stop_err))
-        self.launcher_state = 'failed'
-        self.launcher_last_error = ('Timed out waiting for the simulator to become ready -- '
-                                    'the gazebo that was already running may not have had the '
-                                    'right world loaded for this target')
-        self.publishLauncherStatus()
-        return
-      self.launcher_state = 'running'
-      self.publishLauncherStatus()
-      # explicit_robot_config still wins if the launch message carried one;
-      # otherwise recomputed fresh from self.selected_robot_config (not the
-      # pre-launch snapshot above) in case a select_robot_config arrived
-      # during the launch's several seconds of blocking I/O -- same
-      # race-safety reasoning as the non-attach path below.
-      robot_config = explicit_robot_config if explicit_robot_config else self.selected_robot_config
-      if not robot_config or robot_config == FACTORY_ROBOT_CONFIG_NAME:
-        robot_config = self.launcher.get_default_robot_config(actual_target)
-      if robot_config:
-        robot_config = self.launcher.resolve_robot_config(actual_target, robot_config)
-        self.setSelectedRobotConfig(robot_config)
+    _resolved, robot_folder, error = self.resolveLaunchRobotConfig(target_key, explicit_robot_config)
+    if error:
+      self.failLauncher(error)
       return
-
-    # Resolved BEFORE the reuse check below, using whatever robot config is
-    # selected right now: a target whose own launch mechanics fundamentally
-    # can't serve that robot config (a 4-motor flight profile against the
-    # rover-only Gazebo world/bridge) needs a DIFFERENT target's
-    # launch_command entirely, not just a different config applied on top
-    # of the same one -- see resolve_launch_target's docstring. Most
-    # target/config combinations resolve to target_key unchanged.
-    pre_launch_robot_config = explicit_robot_config if explicit_robot_config else self.selected_robot_config
-    if not pre_launch_robot_config or pre_launch_robot_config == FACTORY_ROBOT_CONFIG_NAME:
-      pre_launch_robot_config = self.launcher.get_default_robot_config(target_key)
-    actual_target = (self.launcher.resolve_launch_target(target_key, pre_launch_robot_config)
-                     if pre_launch_robot_config else target_key)
-
-    # Reuse path: the operator's own pick (target_key) still matches what's
-    # tracked as selected, AND the real target this combination resolves to
-    # still matches what's actually running (active_launch_target) -- e.g.
-    # the operator picked a different robot model that resolves to the SAME
-    # real target. Nothing on the VM needs touching; only the
-    # already-connected bridge needs the new config, exactly as if
-    # select_robot_config had been published directly, resolved through the
-    # ACTIVE target's own robot_config_overrides first (see
-    # resolve_robot_config's docstring). If the resolved target differs
-    # instead (switching to a robot config that needs a different
-    # world/bridge while "Gazebo" stays picked), this is NOT a reuse --
-    # falls through to a real (re)launch below.
-    # is_ready() re-checks that it's really still up: launcher_state is only
-    # this node's own memory of the last launch, and nothing moves it off
-    # 'running' if the simulator dies afterward (e.g. its Gazebo window is
-    # closed) -- without this, re-deploying after that was a silent no-op.
-    if (self.launcher_state == 'running' and self.selected_launch_target == target_key
-        and self.active_launch_target == actual_target
-        and self.launcher.is_ready(actual_target)):
-      if pre_launch_robot_config:
-        resolved_config = self.launcher.resolve_robot_config(actual_target, pre_launch_robot_config)
-        self.setSelectedRobotConfig(resolved_config)
+    # Checked against the share up front, since the service answers an
+    # unknown name by quietly keeping what it had -- see the post-start
+    # check below.
+    if robot_folder not in service.list_robot_configs():
+      self.failLauncher("Robot '" + robot_folder + "' is not in the " + service.name +
+                        " share's ROBOT_CONFIGS (" + service.sim_folder + ")")
+      return
+    environment_config = self.selected_environment_config
+    if environment_config not in service.list_environment_configs():
+      self.failLauncher("Environment '" + environment_config + "' is not in the " + service.name +
+                        " share's ENVIRONMENT_CONFIGS (" + service.sim_folder + ")")
+      return
+    error, before_dict = self.checkService(target_key)
+    if error:
+      self.failLauncher(error, info['fallback_commands'])
       return
 
     self.selected_launch_target = target_key
-    self.active_launch_target = actual_target
+    self.active_launch_target = target_key
     self.launcher_state = 'launching'
     self.setLauncherError('')
-    self.launcher_failed_target = ''
     self.publishLauncherStatus()
 
-    # Auto-install before attempting to launch, so a bare VM missing a
-    # target's dependencies still comes up from a single Deploy click --
-    # previously Install and Deploy were two fully separate actions (see
-    # installSimulatorCb/runInstall below), and an operator on a fresh VM had
-    # to notice the not_installed state and click Install first before Deploy
-    # even appeared (Nepi_IF_SimLauncher.js's renderDeployControls). Skipped
-    # on the attach path above (attach=True returns before reaching here) --
-    # attaching only ever targets an ALREADY-running foreign gzserver, which
-    # implies the dependency is already present. A failed installed-check
-    # (e.g. a dead tunnel) falls through to the real launch attempt below
-    # rather than blocking here on something this app can't confirm is
-    # actually needed -- that attempt fails with its own clear error if the
-    # dependency truly is missing.
-    try:
-      needs_install = not self.launcher.is_installed(actual_target)
-    except LauncherError:
-      needs_install = False
-    if needs_install:
-      self.launcher_state = 'installing'
-      self.launch_target_installed_check_state[actual_target] = 'checking'
-      self.publishLauncherStatus()
-      try:
-        self.launcher.install(actual_target)
-      except LauncherError as e:
-        self.launcher_state = 'failed'
-        self.setLauncherError(e)
-        self.launcher_failed_target = actual_target
-        self.checkInstalledOne(actual_target)
-        self.publishLauncherStatus()
-        return
-      self.checkInstalledOne(actual_target)
-      self.launcher_state = 'launching'
-      self.publishLauncherStatus()
-
-    # Push any pending dimension edits before starting a FRESH gzserver --
-    # unlike the attach path above, this one actually loads the world/models
-    # from disk, so this is the one moment a pushed model.sdf can take
-    # effect. Best-effort (pushDirtyDimensions never raises); a push failure
-    # here should not block the launch it's ahead of.
-    self.pushDirtyDimensions(actual_target)
-    self.ensureArdupilotSitlConnection(actual_target)
-    try:
-      self.launcher.launch(actual_target)
-      ready = self.launcher.wait_until_ready(actual_target)
-    except LauncherError as e:
-      # A real choice, not just a failure: launch_command's own refuse
-      # guard means a gazebo is already up but not one this app started --
-      # offer to reuse it (Use Existing / sim/attach_simulator) or force
-      # past it (Launch New / sim/force_launch_simulator) rather than just
-      # reporting a dead end. Every other LauncherError stays plain 'failed'.
-      self.launcher_state = 'gazebo_conflict' if isGazeboConflictError(str(e)) else 'failed'
-      self.setLauncherError(e)
-      self.publishLauncherStatus()
+    self.pushDirtyDimensions()
+    staged_values = {'UPDATE_ENVIRONMENT_CONFIG': environment_config,
+                     'UPDATE_ROBOT_CONFIG': robot_folder}
+    if not service.start(staged_values):
+      self.failLauncher("Could not write the start request to " + service.config_file)
       return
-    if not ready:
-      # Best-effort cleanup before reporting failed -- active_launch_target
-      # was already set above (needed so a mid-launch status query shows
-      # something), and it stayed set on every prior version of this
-      # timeout path even though the VM-side session the launch_command
-      # started (gzserver, SITL, bridge scripts) is still genuinely running
-      # there. That left a live, untracked orphan blocking every recovery
-      # path: a plain retry hits launch_command's own "already running"
-      # guard, "Use Existing" hits the same ArduCopter-port guard, and
-      # "Launch New" (kill_all_gazebo) only ever pkills gzserver/gzclient,
-      # never SITL. Stopping here, before reporting failed, means a timeout
-      # actually leaves nothing behind for the operator to manually clean up.
-      try:
-        self.launcher.stop(actual_target)
-      except LauncherError as stop_err:
-        self.msg_if.pub_warn("Best-effort stop after failed ready-check also failed: " + str(stop_err))
-      self.launcher_state = 'failed'
-      self.launcher_last_error = 'Timed out waiting for the simulator to become ready'
-      self.publishLauncherStatus()
+    # The service clears START only once the start is done (for Gazebo,
+    # after the robot spawn that follows a launch), so a 'running' result
+    # here already has the robot in the world, or has reported why not
+    # through LAST_ERROR.
+    done, result = service.wait_for_request(
+        'START', nepi_sim_service.START_DONE_STATES, nepi_sim_service.START_FAILED_STATES,
+        SIM_START_TIMEOUT_SEC, before_dict, staged_values)
+    if not done:
+      service.clear_request('START')
+      self.failLauncher(result, info['fallback_commands'] if not service.is_service_alive() else '')
+      return
+    self.service_state[target_key] = nepi_sim_service.get_config_str(result, service.key('STATE'))
+    if self.service_state[target_key] == 'failed':
+      self.failLauncher(nepi_sim_service.get_config_str(result, service.key('LAST_ERROR'))
+                        or service.name + " failed to start")
       return
     self.launcher_state = 'running'
+    # The service validates a staged name against its own local copy of the
+    # share (synced when the service is started), and answers one it doesn't
+    # have yet by keeping what it had and clearing its own error when the
+    # start is handled -- so this comparison is the only place that mismatch
+    # ever shows up. The simulation is running either way, so it is reported
+    # alongside 'running', not as a failure.
+    running_environment = nepi_sim_service.get_config_str(result, service.key('CURRENT_ENVIRONMENT_CONFIG'))
+    running_robot = nepi_sim_service.get_config_str(result, service.key('CURRENT_ROBOT_CONFIG'))
+    if (running_environment, running_robot) != (environment_config, robot_folder):
+      self.setLauncherError(service.name + " started with " + running_environment + " / " +
+                            running_robot + " instead of " + environment_config + " / " +
+                            robot_folder + " -- the sim machine doesn't have them yet. Restart its " +
+                            service.name + " service so it syncs from the share.")
     self.publishLauncherStatus()
-    # Prefers whatever robot config the operator already picked from the
-    # existing selector over the launch target's own canned default -- this
-    # is what makes "choose a simulator, choose a model, Deploy" apply BOTH
-    # in one action without a new message: the model choice was already
-    # made through setSelectedRobotConfig (the existing, unmodified flow),
-    # Deploy just needs to not immediately stomp on it with a one-size
-    # default meant only for an operator who hasn't picked anything yet.
-    # FACTORY_ROBOT_CONFIG_NAME ('default', capability-empty) counts as
-    # "hasn't picked anything" rather than a real choice worth preserving.
-    # explicit_robot_config still wins if the launch message carried one;
-    # otherwise recomputed fresh from self.selected_robot_config (not
-    # pre_launch_robot_config) since launch()/wait_until_ready() block for
-    # real seconds, during which another callback could legitimately have
-    # changed the selection.
-    robot_config = explicit_robot_config if explicit_robot_config else self.selected_robot_config
-    if not robot_config or robot_config == FACTORY_ROBOT_CONFIG_NAME:
-      robot_config = self.launcher.get_default_robot_config(actual_target)
-    # Resolves the plain, selector-offered choice (e.g. "2-Wheel Rover") to
-    # whatever profile the ACTUAL target needs -- most targets need no
-    # mapping (Gazebo's rover configs already match the generic keys), but
-    # WPILib-style targets redirect to their own hidden_from_selector
-    # profile here, so there is no separate "2-Wheel Rover (WPILib)" entry
-    # to pick.
-    if robot_config:
-      robot_config = self.launcher.resolve_robot_config(actual_target, robot_config)
+    # Applies whatever robot config the operator already picked from the
+    # existing selector (or the default when they haven't) -- this is what
+    # makes "choose a model, Deploy" apply BOTH in one action without a new
+    # message. Resolved again rather than reusing the pre-launch value: the
+    # wait above blocks for real seconds, during which another callback
+    # could legitimately have changed the selection.
+    robot_config, _robot_folder, error = self.resolveLaunchRobotConfig(target_key, explicit_robot_config)
+    if not error:
       self.setSelectedRobotConfig(robot_config)
 
-  def runStop(self, target_key):
-    self.launcher_state = 'stopping'
-    self.publishLauncherStatus()
-    try:
-      self.launcher.stop(target_key)
-    except LauncherError as e:
-      self.launcher_state = 'failed'
-      self.launcher_last_error = str(e)
-      self.publishLauncherStatus()
+  def runStop(self, target_key=None):
+    # Kill passes no target: stop whichever simulator is up.
+    if target_key is None:
+      target_key = self.runningSimTarget() or self.selected_launch_target or self.selected_sim_target
+    if target_key not in SIM_TARGETS:
       return
+    info = SIM_TARGETS[target_key]
+    service = info['service']
+    error, before_dict = self.checkService(target_key)
+    if error:
+      self.failLauncher(error, info['fallback_commands'])
+      return
+    self.selected_launch_target = target_key
+    self.launcher_state = 'stopping'
+    self.setLauncherError('')
+    self.publishLauncherStatus()
+    if not service.stop():
+      self.failLauncher("Could not write the stop request to " + service.config_file)
+      return
+    done, result = service.wait_for_request(
+        'STOP', nepi_sim_service.STOP_DONE_STATES, nepi_sim_service.STOP_FAILED_STATES,
+        SIM_STOP_TIMEOUT_SEC, before_dict)
+    if not done:
+      service.clear_request('STOP')
+      self.failLauncher(result, info['fallback_commands'] if not service.is_service_alive() else '')
+      return
+    self.service_state[target_key] = nepi_sim_service.get_config_str(result, service.key('STATE'))
     self.launcher_state = 'idle'
-    self.launcher_last_error = ''
     self.selected_launch_target = ''
     self.active_launch_target = ''
     self.publishLauncherStatus()
 
-  def installSimulatorCb(self, msg):
-    if self.launcher is None:
-      self.msg_if.pub_warn("Simulator auto-launch is not configured on this deployment "
-                           "(no launch-targets config found), ignoring install request")
-      return
-    target_key = str(msg.data).strip()
-    with self.launcher_lock:
-      if self.launcher_thread is not None and self.launcher_thread.is_alive():
-        self.msg_if.pub_warn("A launch/stop/install is already in progress, ignoring")
-        return
-      self.launcher_thread = threading.Thread(target = self.runInstall, args = (target_key,))
-      self.launcher_thread.daemon = True
-      self.launcher_thread.start()
-
-  def runInstall(self, target_key):
-    self.launcher_state = 'installing'
-    self.setLauncherError('')
-    self.launcher_failed_target = ''
-    self.launch_target_installed_check_state[target_key] = 'checking'
-    self.publishLauncherStatus()
-    try:
-      self.launcher.install(target_key)
-    except LauncherError as e:
-      self.launcher_state = 'failed'
-      self.setLauncherError(e)
-      self.launcher_failed_target = target_key
-      # Not marked 'not_installed' here -- the install command failing
-      # doesn't necessarily mean the dependency is confirmed absent (could
-      # be a transient network/package-mirror failure), so re-check for real
-      # rather than assume either outcome.
-      self.checkInstalledOne(target_key)
-      self.publishLauncherStatus()
-      return
-    self.launcher_state = 'idle'
-    self.checkInstalledOne(target_key)
-    self.publishLauncherStatus()
-
-  def checkInstalledOne(self, target_key):
-    # Shared by the install-all background sweep and by runInstall's
-    # post-install re-check -- always leaves a definite state (never
-    # 'checking') so a caller doesn't have to remember to do that itself.
-    try:
-      installed = self.launcher.is_installed(target_key)
-      self.launch_target_installed[target_key] = installed
-      self.launch_target_installed_check_state[target_key] = 'installed' if installed else 'not_installed'
-    except LauncherError as e:
-      self.msg_if.pub_warn("Could not check install state for '" + target_key + "': " + str(e),
-                           throttle_s = 30.0)
-      self.launch_target_installed_check_state[target_key] = 'unknown'
-
-  def startInstalledCheckAll(self):
-    # Runs once at startup and once per config reload (see
-    # refreshLauncherConfigCb) -- NOT on the launcher_thread/launcher_lock
-    # launch/stop/install share, since checking is a read-only, low-stakes
-    # operation against every target and shouldn't be blocked by (or block)
-    # an in-flight launch/stop/install of one specific target.
-    thread = threading.Thread(target = self.checkInstalledAllCb)
-    thread.daemon = True
-    thread.start()
-
-  def checkInstalledAllCb(self):
-    if self.launcher is None:
-      return
-    # ALL targets, hidden_from_selector or not -- a hidden target (e.g.
-    # gazebo_quadcopter, reached only through gazebo_rover's own
-    # launch_target_overrides) still needs its own dependency state tracked
-    # in the background, exactly like a hidden robot_configs entry stays
-    # fully valid/checked without being offered directly.
-    keys = self.launcher.list_all_target_keys()
-    for key in keys:
-      self.launch_target_installed_check_state[key] = 'checking'
-    self.publishLauncherStatus()
-    for key in keys:
-      self.checkInstalledOne(key)
-      self.publishLauncherStatus()
-
   def publishLauncherStatus(self):
     status = SimLauncherStatus()
-    if self.launcher is not None:
-      keys, names = self.launcher.get_available_targets()
-      status.available_launch_targets = keys
-      status.available_launch_target_names = names
-      status.available_launch_target_installed = [
-          bool(self.launch_target_installed.get(k, False)) for k in keys]
-      status.available_launch_target_installed_check_state = [
-          self.launch_target_installed_check_state.get(k, 'unknown') for k in keys]
-    status.selected_launch_target = self.selected_launch_target
+    # Only simulators whose service has been set up (its config file exists)
+    # are offered.
+    targets = [t for t in SIM_TARGETS if self.service_config_found[t]]
+    status.available_launch_targets = targets
+    status.available_launch_target_names = [SIM_TARGETS[t]['service'].name for t in targets]
+    # The services have no install step, so "installed" reports the one
+    # thing that can be checked: the service is up and answering. 'unknown'
+    # rather than 'not_installed' when it isn't -- the RUI would otherwise
+    # offer an Install button with nothing behind it.
+    status.available_launch_target_installed = [self.service_alive[t] for t in targets]
+    status.available_launch_target_installed_check_state = [
+        'installed' if self.service_alive[t] else 'unknown' for t in targets]
+    # The simulator being run or acted on, else the Simulator selector's own
+    # choice -- so a client that has picked nothing yet shows that one.
+    status.selected_launch_target = self.selected_launch_target or self.selected_sim_target
     status.active_launch_target = self.active_launch_target
-    # active_launch_target can be a hidden_from_selector target (e.g.
-    # gazebo_quadcopter), which get_available_targets() above deliberately
-    # excludes -- look its display name up directly rather than searching
-    # the (possibly not-containing-it) keys/names lists just built.
-    if self.active_launch_target and self.launcher is not None:
-      try:
-        status.active_launch_target_name = (
-            self.launcher.get_target(self.active_launch_target).get(
-                'display_name', self.active_launch_target))
-      except LauncherError:
-        status.active_launch_target_name = self.active_launch_target
+    status.active_launch_target_name = (SIM_TARGETS[self.active_launch_target]['service'].name
+                                        if self.active_launch_target in SIM_TARGETS else '')
     status.launcher_state = self.launcher_state
     status.last_error = self.launcher_last_error
-    # launcher_tunnel_fallback_commands (set by setLauncherError whenever the
-    # LauncherError behind the current failure carries its own
-    # manual_fallback_commands -- currently just the reverse-tunnel
-    # connectivity diagnosis, see simulator_launcher's
-    # _classify_connection_failure) takes priority over the per-target
-    # install fallback below: a dead tunnel isn't fixed by that target's own
-    # install_command, and showing both would bury the one that's actually
-    # relevant under a wall of unrelated apt/pip commands.
-    #
-    # The install fallback itself is derived, not stored -- computed fresh
-    # from state this app already tracks (launcher_failed_target,
-    # launch_target_installed) rather than threaded through every individual
-    # failure site that sets launcher_last_error. Keyed off
-    # launcher_failed_target, NOT active_launch_target -- runInstall can
-    # fail for a target that was never the one actively running/attempted.
-    # Only shown once a failure is confirmed dependency-related (the target
-    # is known NOT installed), so a timeout/conflict/network failure with a
-    # perfectly good install doesn't get an irrelevant wall of install
-    # commands attached to it.
-    if self.launcher_state == 'failed' and self.launcher_tunnel_fallback_commands:
-      status.manual_fallback_commands = self.launcher_tunnel_fallback_commands
-    elif (self.launcher_state == 'failed' and self.launcher_failed_target
-        and self.launch_target_installed.get(self.launcher_failed_target, True) is False):
-      status.manual_fallback_commands = self.launcher.get_manual_fallback_commands(
-          self.launcher_failed_target)
-    else:
-      status.manual_fallback_commands = ''
+    status.manual_fallback_commands = (self.launcher_fallback_commands
+                                       if self.launcher_state == 'failed' else '')
     self.launcher_status_pub.publish(status)
 
   #**********************
@@ -3603,9 +2794,9 @@ class NepiSimConnectorApp:
 
   # RBX forwarding -- the app's own Sim Connector control surface
   # (setMotorControlRatio/gotoPosition/gotoPose/gotoLocation/goHome/goStop/
-  # setHome/setSetupActionInd below) was built against SimDeviceIF's generic
-  # bridge protocol (sendLineToBridge, port 9030), which only a dedicated
-  # bridge script (e.g. the ArduPilot quadcopter one) ever dials into.
+  # setHome/setSetupActionInd below) was built against a generic TCP bridge
+  # protocol (port 9030, since removed), which only a dedicated bridge
+  # script (e.g. the ArduPilot quadcopter one) ever dialed into.
   # Confirmed live: every simulator this app discovers (rover or
   # quadcopter -- see SIM_DEVICE_STATUS_MSG_TYPES, DeviceRBXStatus only) is
   # itself an RBX device with its own working goto/motor/home topics
@@ -3613,8 +2804,7 @@ class NepiSimConnectorApp:
   # simulator is forwarded to directly instead: no consumer ever depended
   # on the bridge path once a real RBX device was selected, and this makes
   # the Sim Connector's own panel work for the first time for a rover sim.
-  # Falls back to the legacy bridge path when nothing is selected (kept
-  # for whatever, if anything, still relies on it).
+  # With nothing selected, a command goes nowhere and this returns False.
   def forwardToRbx(self, topic_name, msg, description):
     namespace = self.selected_simulator
     if not namespace:
@@ -3650,44 +2840,31 @@ class NepiSimConnectorApp:
       return self.sim_device_info.get(topic)
 
   def isBridgeConnected(self):
+    # Reported as SimStatus.bridge_connected: whether the selected simulator's
+    # RBX device is ready for manual control.
     info = self.getSelectedSimDeviceInfo()
     if info is not None:
       return bool(info.get("manual_control_mode_ready", False))
-    with self.client_lock:
-      return self.client_conn is not None
-
-  def getTelemetryAge(self):
-    if self.connected_since is None:
-      return TELEMETRY_AGE_IF_NEVER_CONNECTED
-    return nepi_utils.get_time() - self.last_telemetry_time
+    return False
 
   def autonomousControlsReady(self):
-    # Goto commands need a live bridge AND fresh telemetry, since a setpoint is
-    # computed against the current pose. A direct motor command does not, which
-    # is why manual control gates on connection alone.
     info = self.getSelectedSimDeviceInfo()
     if info is not None:
       return bool(info.get("autonomous_control_mode_ready", False))
-    if not self.isBridgeConnected():
-      return False
-    age = self.getTelemetryAge()
-    return age >= 0.0 and age < SIM_DEVICE_STALE_SEC
+    return False
 
   #**********************
-  # SimDeviceIF callbacks -- thin wire-protocol senders and getters, gated at
-  # construction (and on a config change) by the selected robot config
+  # SimDeviceIF callbacks -- forwarded to the selected simulator's RBX device,
+  # gated at construction (and on a config change) by the selected robot config
 
   def setMotorControlRatio(self, motor_ind, speed_ratio):
     if motor_ind < 0 or motor_ind >= len(self.motor_ratios):
       self.msg_if.pub_warn("Motor control ignored: motor index " + str(motor_ind) + " out of range")
       return
     self.motor_ratios[motor_ind] = max(0.0, min(1.0, speed_ratio))
-    if self.forwardToRbx("set_motor_control",
-                         MotorControl(motor_ind = motor_ind, speed_ratio = self.motor_ratios[motor_ind]),
-                         "Motor control"):
-      return
-    self.sendLineToBridge({'type': 'motor_control', 'motor_ind': motor_ind,
-                          'speed_ratio': self.motor_ratios[motor_ind]}, "Motor control")
+    self.forwardToRbx("set_motor_control",
+                      MotorControl(motor_ind = motor_ind, speed_ratio = self.motor_ratios[motor_ind]),
+                      "Motor control")
 
   def getMotorControlRatios(self):
     return self.motor_ratios
@@ -3696,11 +2873,7 @@ class NepiSimConnectorApp:
     with self.goto_target_lock:
       self.goto_target = {'x_meters': msg.x_meters, 'y_meters': msg.y_meters,
                           'z_meters': msg.z_meters, 'yaw_deg': msg.yaw_deg}
-    if self.forwardToRbx("goto_position", msg, "Goto position"):
-      return
-    self.sendLineToBridge({'type': 'goto_position', 'x_meters': msg.x_meters,
-                           'y_meters': msg.y_meters, 'z_meters': msg.z_meters,
-                           'yaw_deg': msg.yaw_deg}, "Goto position")
+    self.forwardToRbx("goto_position", msg, "Goto position")
 
   def gotoPose(self, attitude_enu_degs):
     # This app's own SimDeviceIF already converted whatever the caller sent
@@ -3712,18 +2885,10 @@ class NepiSimConnectorApp:
       yaw_ned_deg = nepi_nav.convert_yaw_enu2ned(attitude_enu_degs[2])
       msg = GotoPose(roll_deg = attitude_enu_degs[0], pitch_deg = attitude_enu_degs[1],
                      yaw_deg = yaw_ned_deg)
-      if self.forwardToRbx("goto_pose", msg, "Goto pose"):
-        return
-    self.sendLineToBridge({'type': 'goto_pose', 'roll_deg': attitude_enu_degs[0],
-                           'pitch_deg': attitude_enu_degs[1],
-                           'yaw_deg': attitude_enu_degs[2]}, "Goto pose")
+      self.forwardToRbx("goto_pose", msg, "Goto pose")
 
   def gotoLocation(self, msg):
-    if self.forwardToRbx("goto_location", msg, "Goto location"):
-      return
-    self.sendLineToBridge({'type': 'goto_location', 'lat': msg.lat, 'long': msg.long,
-                           'altitude_meters': msg.altitude_meters,
-                           'yaw_deg': msg.yaw_deg}, "Goto location")
+    self.forwardToRbx("goto_location", msg, "Goto location")
 
   def getHome(self):
     home = GeoPoint()
@@ -3740,18 +2905,12 @@ class NepiSimConnectorApp:
     return True
 
   def goHome(self):
-    if self.forwardToRbx("go_home", Empty(), "Go home"):
-      return True
-    self.sendLineToBridge({'type': 'go_home'}, "Go home")
-    return self.isBridgeConnected()
+    return self.forwardToRbx("go_home", Empty(), "Go home")
 
   def goStop(self):
     with self.goto_target_lock:
       self.goto_target = None
-    if self.forwardToRbx("go_stop", Empty(), "Go stop"):
-      return True
-    self.sendLineToBridge({'type': 'go_stop'}, "Go stop")
-    return self.isBridgeConnected()
+    return self.forwardToRbx("go_stop", Empty(), "Go stop")
 
   def setSetupActionInd(self, action_ind):
     actions = self.profile['setup_actions']
@@ -3759,40 +2918,25 @@ class NepiSimConnectorApp:
       return False
     # Forwarded by index, not name -- the profile's own action label
     # (e.g. crabrover's "RESET") is not always spelled the same as the
-    # target device's own action list (rbx_mujoco_node.py's "RESET_SIM"),
+    # target device's own action list (e.g. a driver's "RESET_SIM"),
     # matching this codebase's own established index-based convention
     # rather than a name lookup this app has no reliable way to do (it
     # never sees the target device's own setup_action_options).
-    if self.forwardToRbx("setup_action", Int32(data = action_ind), "Setup action"):
-      return True
-    self.sendLineToBridge({'type': 'setup_action', 'action': actions[action_ind]},
-                          "Setup action")
-    return self.isBridgeConnected()
+    return self.forwardToRbx("setup_action", Int32(data = action_ind), "Setup action")
 
   def setGoActionInd(self, action_ind):
     actions = self.profile['go_actions']
     if action_ind < 0 or action_ind >= len(actions):
       return False
-    if self.forwardToRbx("go_action", Int32(data = action_ind), "Go action"):
-      return True
-    self.sendLineToBridge({'type': 'go_action', 'action': actions[action_ind]}, "Go action")
-    return self.isBridgeConnected()
+    return self.forwardToRbx("go_action", Int32(data = action_ind), "Go action")
 
+  # No simulator takes a camera view mode or an environment option yet. Both
+  # stay so the capability-gated controls a robot config turns on still show.
   def setCameraViewMode(self, view_mode):
-    self.sendLineToBridge({'type': 'camera_settings', 'view_mode': view_mode},
-                          "Camera settings")
+    pass
 
   def setEnvironmentOption(self, option, enabled = True):
-    self.sendLineToBridge({'type': 'environment_option', 'option': option,
-                           'enabled': bool(enabled)}, "Environment option")
-
-  def setActiveImageTopic(self, topic_name):
-    self.active_image_topic = topic_name
-    self.sendLineToBridge({'type': 'set_active_image_topic', 'topic_name': topic_name},
-                          "Set active image topic")
-
-  def getAvailableSensorTopics(self):
-    return list(self.available_sensor_topics)
+    pass
 
   def getAvailableEnvironmentOptions(self):
     return list(self.available_environment_options)
@@ -3801,285 +2945,223 @@ class NepiSimConnectorApp:
     return self.navpose_dict
 
   #**********************
-  # Bridge server. Single active client at a time.
-
-  def bridgeServerLoop(self):
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    # rospy installs a process-global socket.setdefaulttimeout(60) during
-    # init_node, which accept() would otherwise apply to every accepted
-    # connection. A command stream is legitimately idle for long stretches, so a
-    # recv timeout must not be read as client death: clear the timeout and block
-    # instead. A real disconnect still unblocks recv with EOF. This is the
-    # socket-handling care documented in src/nepi_drivers/CLAUDE.md, and it must
-    # happen after init_node, which it does -- this thread starts at the end of
-    # __init__.
-    srv.settimeout(None)
-    try:
-      srv.bind(('0.0.0.0', self.listen_port))
-      srv.listen(BRIDGE_ACCEPT_BACKLOG)
-    except Exception as e:
-      self.msg_if.pub_warn("Could not listen on port " + str(self.listen_port) + ": " + str(e) +
-                           ". No simulator bridge can connect until this is resolved.")
-      return
-
-    while not nepi_sdk.is_shutdown():
-      try:
-        conn, addr = srv.accept()
-        conn.settimeout(None)
-      except Exception:
-        continue
-      self.msg_if.pub_info("Bridge client connected from " + str(addr))
-      with self.client_lock:
-        self.client_conn = conn
-        self.connected_since = nepi_utils.get_time()
-        self.last_telemetry_time = self.connected_since
-      self.serveClient(conn)
-      with self.client_lock:
-        if self.client_conn is conn:
-          self.client_conn = None
-      try:
-        conn.close()
-      except Exception:
-        pass
-      self.msg_if.pub_info("Bridge client disconnected")
-
-  def serveClient(self, conn):
-    buf = b''
-    while not nepi_sdk.is_shutdown():
-      try:
-        data = conn.recv(BRIDGE_RECV_BYTES)
-      except Exception as e:
-        self.msg_if.pub_warn("Bridge client recv error: " + repr(e))
-        return
-      if not data:
-        self.msg_if.pub_info("Bridge client closed connection (EOF)")
-        return
-      buf += data
-      while b'\n' in buf:
-        line, buf = buf.split(b'\n', 1)
-        if line.strip():
-          self.processBridgeLine(line)
-
-  def processBridgeLine(self, line):
-    try:
-      msg = json.loads(line)
-    except Exception as e:
-      self.msg_if.pub_warn("Bad line from bridge: " + str(e), throttle_s = 5.0)
-      return
-    if not isinstance(msg, dict):
-      self.msg_if.pub_warn("Ignoring non-object line from bridge", throttle_s = 5.0)
-      return
-    msg_type = msg.get('type')
-    if msg_type == 'sensor_topics':
-      self.processSensorTopicsLine(msg)
-    elif msg_type == 'environment_options':
-      self.processEnvironmentOptionsLine(msg)
-    elif msg_type == 'image':
-      self.processImageLine(msg)
-    elif msg_type == 'goto_result':
-      # Async ack a bridge sends once its own goto controller reports the
-      # target reached (or failed) -- see device_if_sim.py's report_goto_result
-      # for why this is the only place cmd_success gets set for goto commands.
-      self.sim_if.report_goto_result(bool(msg.get('success', False)))
-    else:
-      # A line with no "type" key is telemetry -- the dispatch-by-key-presence
-      # convention the existing bridge scripts already use. An unrecognized type
-      # lands here too and is harmless: nothing in a NavPose parse is required.
-      self.processTelemetryLine(msg)
-
-  def processSensorTopicsLine(self, msg):
-    topics = msg.get('topics', [])
-    parsed = []
-    for entry in topics:
-      if not isinstance(entry, dict):
-        continue
-      topic_name = entry.get('topic_name', '')
-      msg_type = entry.get('msg_type', '')
-      if topic_name and msg_type:
-        parsed.append((topic_name, msg_type))
-    self.available_sensor_topics = parsed
-
-  def processEnvironmentOptionsLine(self, msg):
-    options = msg.get('options', [])
-    if not isinstance(options, list):
-      return
-    self.available_environment_options = [str(o) for o in options]
-
-  def processImageLine(self, msg):
-    topic_name = msg.get('topic_name', self.active_image_topic)
-    if self.active_image_topic and topic_name != self.active_image_topic:
-      return  # Not the selected camera -- nothing subscribes to it
-    try:
-      jpeg_bytes = base64.b64decode(msg['data'])
-      arr = np.frombuffer(jpeg_bytes, dtype = np.uint8)
-      cv2_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-      if cv2_img is None:
-        raise ValueError("cv2.imdecode returned None")
-      ros_img = nepi_img.cv2img_to_rosimg(cv2_img, encoding = "bgr8")
-      self.image_pub.publish(ros_img)
-    except Exception as e:
-      self.msg_if.pub_warn("Failed to process camera image frame: " + str(e), throttle_s = 5.0)
-
-  def processTelemetryLine(self, telem):
-    # Generalized past any one vehicle's shape to the full NavPose contract:
-    # every field optional, each block gated by presence exactly the way
-    # NavPose.msg's own has_* flags are.
-    now = nepi_utils.get_time()
-    nd = self.navpose_dict
-
-    if any(k in telem for k in ('x_m', 'y_m', 'z_m')):
-      nd['has_position'] = True
-      nd['time_position'] = now
-      nd['x_m'] = float(telem.get('x_m', nd['x_m']))
-      nd['y_m'] = float(telem.get('y_m', nd['y_m']))
-      nd['z_m'] = float(telem.get('z_m', nd['z_m']))
-
-    if any(k in telem for k in ('x_m_per_sec', 'y_m_per_sec', 'z_m_per_sec')):
-      nd['has_velocity'] = True
-      nd['time_velocity'] = now
-      nd['x_m_per_sec'] = float(telem.get('x_m_per_sec', nd['x_m_per_sec']))
-      nd['y_m_per_sec'] = float(telem.get('y_m_per_sec', nd['y_m_per_sec']))
-      nd['z_m_per_sec'] = float(telem.get('z_m_per_sec', nd['z_m_per_sec']))
-
-    if any(k in telem for k in ('roll_deg', 'pitch_deg', 'yaw_deg')):
-      nd['has_orientation'] = True
-      nd['time_orientation'] = now
-      nd['roll_deg'] = float(telem.get('roll_deg', nd['roll_deg']))
-      nd['pitch_deg'] = float(telem.get('pitch_deg', nd['pitch_deg']))
-      nd['yaw_deg'] = float(telem.get('yaw_deg', nd['yaw_deg']))
-      nd['roll_deg_per_sec'] = float(telem.get('roll_deg_per_sec', nd['roll_deg_per_sec']))
-      nd['pitch_deg_per_sec'] = float(telem.get('pitch_deg_per_sec', nd['pitch_deg_per_sec']))
-      nd['yaw_deg_per_sec'] = float(telem.get('yaw_deg_per_sec', nd['yaw_deg_per_sec']))
-
-    if any(k in telem for k in ('latitude', 'longitude')):
-      nd['has_location'] = True
-      nd['time_location'] = now
-      nd['latitude'] = float(telem.get('latitude', nd['latitude']))
-      nd['longitude'] = float(telem.get('longitude', nd['longitude']))
-
-    if 'heading_deg' in telem:
-      nd['has_heading'] = True
-      nd['time_heading'] = now
-      nd['heading_deg'] = float(telem.get('heading_deg', nd['heading_deg']))
-
-    if 'altitude_m' in telem:
-      nd['has_altitude'] = True
-      nd['time_altitude'] = now
-      nd['altitude_m'] = float(telem.get('altitude_m', nd['altitude_m']))
-
-    if 'depth_m' in telem:
-      nd['has_depth'] = True
-      nd['time_depth'] = now
-      nd['depth_m'] = float(telem.get('depth_m', nd['depth_m']))
-
-    self.last_telemetry_time = now
-
-  def sendLineToBridge(self, line_dict, description):
-    with self.client_lock:
-      conn = self.client_conn
-      if conn is None:
-        self.msg_if.pub_warn(description + " dropped, no bridge client connected",
-                             throttle_s = 5.0)
-        return
-      # The send happens under the same lock as the client_conn read: this is a
-      # single TCP stream, and two unsynchronized sendall calls can interleave
-      # their bytes and corrupt the newline-delimited JSON the far side parses.
-      try:
-        conn.sendall((json.dumps(line_dict) + '\n').encode())
-      except Exception as e:
-        self.msg_if.pub_warn("Failed to send " + description.lower() + " to bridge: " + str(e))
-        if self.client_conn is conn:
-          self.client_conn = None
-        # shutdown() before close(): bridgeServerLoop's thread is almost
-        # certainly blocked in serveClient's timeout=None recv() on this
-        # exact socket. Closing a fd out from under a thread blocked in
-        # recv() on it does not reliably unblock that recv() on Linux --
-        # without the shutdown(), that thread can stay wedged inside
-        # serveClient forever, never returning to accept() the bridge's next
-        # reconnect attempt. Same fix as sim_bridge_node.py/camera_rig_
-        # controller_ardupilot.py's sendLineToClient (found while chasing a
-        # simulator camera flicker-in-and-out bug with the identical
-        # send-thread/recv-thread split).
-        try:
-          conn.shutdown(socket.SHUT_RDWR)
-        except Exception:
-          pass
-        try:
-          conn.close()
-        except Exception:
-          pass
-
-  #**********************
   # Status
 
   def statusPublishCb(self, timer):
     # SimDeviceIF owns the 2 Hz device status. This slower tick exists so the
     # two selector reports refresh promptly after a discovery scan even if the
     # device status cadence is ever retuned.
+    self.refreshSimConfigsIfDue()
     if self.sim_if is not None:
       self.sim_if.publish_status()
-    self.refreshLauncherConfigCb()
+    self.refreshLauncherStateCb()
     self.publishRobotLinkStatus()
 
-  def refreshLauncherConfigCb(self):
-    # Picks up launch-target config changes (an edited file, or a file that
-    # appears after this node started) without an app restart, so adding a
-    # simulator target is just an edit. Both paths are a cheap stat/isfile
-    # check per tick that only does real work on an actual change.
-    #
-    # Skipped entirely while a launch or stop is in flight -- swapping the
-    # config out from under a running launch would leave its stop_command and
-    # ready_check_command referring to a target definition that no longer
-    # matches what was actually started.
-    if self.launcher_thread is not None and self.launcher_thread.is_alive():
-      return
+  def refreshLauncherStateCb(self):
+    # Follows each simulator service's own report, so the launcher panel
+    # matches what is actually running on the sim machine: a simulation that
+    # crashed or was closed there shows as failed with the service's own
+    # error, one started there directly shows as running, and an app restart
+    # picks up a simulation that is still up instead of forgetting it. Also
+    # picks up a config file appearing after this node started (a service's
+    # first run creates it). A cheap stat plus one small YAML read per
+    # service per tick.
+    changed = False
+    configs = dict()
+    for target_key, info in SIM_TARGETS.items():
+      service = info['service']
+      config_found = service.config_exists()
+      config_dict = service.load_config() if config_found else None
+      if config_dict is not None:
+        service.note_service_poll(config_dict)
+      service_alive = config_found and service.is_service_alive()
+      if (config_found != self.service_config_found[target_key] or
+          service_alive != self.service_alive[target_key]):
+        changed = True
+      self.service_config_found[target_key] = config_found
+      self.service_alive[target_key] = service_alive
+      configs[target_key] = (config_found, config_dict)
+
+    # A launch/stop in flight owns launcher_state until it finishes, and
+    # records the service state it finished on (service_state), so its own
+    # result isn't applied a second time here. Only a CHANGE in what a
+    # service reports is applied, so an app-side failure (e.g. a refused
+    # Deploy) keeps showing its own error rather than being overwritten by
+    # the service's unchanged 'idle'.
+    busy = self.launcher_thread is not None and self.launcher_thread.is_alive()
+    if not busy:
+      for target_key, (_config_found, config_dict) in configs.items():
+        if config_dict is None:
+          continue
+        service = SIM_TARGETS[target_key]['service']
+        state = nepi_sim_service.get_config_str(config_dict, service.key('STATE'))
+        if state == self.service_state[target_key] or state not in SERVICE_STATE_TO_LAUNCHER_STATE:
+          continue
+        self.service_state[target_key] = state
+        if state in ('starting', 'running'):
+          # A simulation coming up becomes the panel's simulator, and the
+          # Robot/Environment lists follow it.
+          self.selected_launch_target = target_key
+          self.active_launch_target = target_key
+          if target_key != self.selected_sim_target:
+            self.setSelectedSimTarget(target_key)
+        elif self.selected_launch_target and self.selected_launch_target != target_key:
+          # The other simulator went idle or failed while the panel shows
+          # the one that is up -- nothing to show for it.
+          continue
+        elif state == 'idle':
+          self.selected_launch_target = ''
+          self.active_launch_target = ''
+        self.launcher_state = SERVICE_STATE_TO_LAUNCHER_STATE[state]
+        if state == 'failed':
+          self.setLauncherError(nepi_sim_service.get_config_str(config_dict, service.key('LAST_ERROR'))
+                                or service.name + " stopped unexpectedly")
+        else:
+          self.setLauncherError('')
+        changed = True
+    if changed:
+      self.publishLauncherStatus()
+    # A file that exists but did not parse was caught mid-write: that says
+    # nothing about the simulation, so the driver is left as it is until a
+    # good read. Treating it as "not running" killed the driver every minute
+    # or two while the service rewrote the file.
+    if all(config_dict is not None or not config_found
+           for config_found, config_dict in configs.values()):
+      self.syncRoverDriver(configs)
+
+  #**********************
+  # Rover RBX driver
+
+  def syncRoverDriver(self, configs):
+    # Runs on every status tick, so every way a simulation can change --
+    # Deploy, Kill, a robot swap, a switch of simulator, a crash, a start or
+    # stop on the sim machine, this app restarting -- is covered by the one
+    # comparison below instead of each path having to remember the driver.
+    # The launch/kill itself runs on its own thread, since stopping a node can
+    # take a few seconds. wanted is (target_key, robot folder): the same robot
+    # name in a different simulator is a different driver launch.
+    wanted = None
+    capabilities = None
+    for target_key, (_config_found, config_dict) in configs.items():
+      service = SIM_TARGETS[target_key]['service']
+      if (not self.service_alive[target_key] or config_dict is None or
+          nepi_sim_service.get_config_str(config_dict, service.key('STATE')) != 'running'):
+        continue
+      robot = nepi_sim_service.get_config_str(config_dict, service.key('CURRENT_ROBOT_CONFIG'))
+      if robot:
+        robot_capabilities = self.getShareRobotCapabilities(target_key, robot)
+        if robot_capabilities is not None and robot_capabilities.get('nepi_driver') == ROVER_DRIVER:
+          wanted = (target_key, robot)
+          capabilities = robot_capabilities
+          break
+
+    with self.rover_driver_lock:
+      if self.rover_driver_busy:
+        return
+      process = self.rover_driver_process
+      running = process is not None and process.poll() is None
+      if process is not None and not running:
+        self.msg_if.pub_warn("Rover driver " + self.rover_driver_node_name + " exited (rc " +
+                             str(process.returncode) + ")")
+        self.rover_driver_process = None
+        self.rover_driver_launched = None
+        self.rover_driver_retry_after = nepi_utils.get_time() + ROVER_DRIVER_RETRY_SEC
+      if running and self.rover_driver_launched == wanted:
+        return
+      if not running and wanted is None:
+        return
+      # Only a crash or a failed launch waits -- a driver this app stopped
+      # itself (Kill, a robot swap) comes back at once.
+      if not running and nepi_utils.get_time() < self.rover_driver_retry_after:
+        return
+      self.rover_driver_busy = True
+    thread = threading.Thread(target = self.applyRoverDriver, args = (wanted, capabilities))
+    thread.daemon = True
+    thread.start()
+
+  def applyRoverDriver(self, wanted, capabilities):
     try:
-      if self.launcher is None:
-        config_path = find_config_path()
-        if not config_path:
-          return
-        self.launcher = SimulatorLauncher(config_path)
-        self.msg_if.pub_info("Simulator auto-launch enabled from " + config_path)
-        self.publishLauncherStatus()
-        self.startInstalledCheckAll()
-      elif self.launcher.reload_if_changed():
-        self.msg_if.pub_info("Reloaded launch targets from " + self.launcher.config_path)
-        # A target that vanished from the config must not stay selected.
-        if self.selected_launch_target:
-          available, _names = self.launcher.get_available_targets()
-          if self.selected_launch_target not in available:
-            self.selected_launch_target = ''
-        self.publishLauncherStatus()
-        # Targets may have been added/edited -- re-check all of them rather
-        # than trying to diff what changed.
-        self.startInstalledCheckAll()
-    except LauncherError as e:
-      # throttle_s alone is correct here: pub_warn derives the throttle uid
-      # itself from the caller's file/function/line, and takes no uid argument
-      # (passing one is a TypeError) -- unlike the lower-level pub_msg, whose
-      # throttling is a no-op without an explicit uid.
-      self.msg_if.pub_warn("Could not load launch targets: " + str(e), throttle_s = 30.0)
+      self.killRoverDriver()
+      if wanted is not None:
+        self.launchRoverDriver(wanted, capabilities)
+    finally:
+      with self.rover_driver_lock:
+        self.rover_driver_busy = False
+
+  def getShareRobotCapabilities(self, target_key, robot):
+    # The folder's nepi_robot_config.yaml as target_key's share has it,
+    # re-read at most every SIM_CONFIGS_REFRESH_SEC.
+    now = nepi_utils.get_time()
+    if (now - self.rover_robot_capabilities_time.get(target_key, 0.0)) > SIM_CONFIGS_REFRESH_SEC:
+      try:
+        self.rover_robot_capabilities[target_key] = SIM_TARGETS[target_key]['service'].list_robot_configs()
+      except Exception as e:
+        self.msg_if.pub_warn("Could not read the " + SIM_TARGETS[target_key]['service'].name +
+                             " share's ROBOT_CONFIGS: " + str(e), throttle_s = 30.0)
+      self.rover_robot_capabilities_time[target_key] = now
+    return self.rover_robot_capabilities.get(target_key, dict()).get(robot)
+
+  def launchRoverDriver(self, wanted, capabilities):
+    target_key, robot = wanted
+    service = SIM_TARGETS[target_key]['service']
+    node_name = nepi_system.get_device_alias(ROVER_DRIVER_DEVICE_NAME)
+    # The same drv_dict rbx_sim_discovery.py used to write, at the path
+    # rbx_sim_node.py reads it from, plus the robot folder's capabilities,
+    # which decide which controls the driver offers. device_path names the
+    # simulator and robot, e.g. "mujoco/generic_rover".
+    drv_dict = dict(
+      DEVICE_DICT = dict(device_name = ROVER_DRIVER_DEVICE_NAME,
+                         device_path = os.path.basename(service.sim_folder) + '/' + robot,
+                         bridge_port = ROVER_BRIDGE_PORT),
+      ROBOT_CONFIG = copy.deepcopy(capabilities))
+    nepi_sdk.set_param(nepi_sdk.create_namespace(self.base_namespace, node_name + '/drv_dict'), drv_dict)
+
+    self.msg_if.pub_info("Starting rover driver " + node_name + " for " + service.name +
+                         " robot config '" + robot + "'")
+    prev_ld_preload = os.environ.get('LD_PRELOAD')
+    if os.path.exists(ROVER_DRIVER_LD_PRELOAD):
+      os.environ['LD_PRELOAD'] = ROVER_DRIVER_LD_PRELOAD
+    try:
+      [success, msg, process] = nepi_drvs.launchDriverNode(ROVER_DRIVER_FILE, node_name)
+    except Exception as e:
+      [success, msg, process] = [False, str(e), None]
+    finally:
+      if prev_ld_preload is None:
+        os.environ.pop('LD_PRELOAD', None)
+      else:
+        os.environ['LD_PRELOAD'] = prev_ld_preload
+
+    with self.rover_driver_lock:
+      if success:
+        self.rover_driver_process = process
+        self.rover_driver_launched = wanted
+        self.rover_driver_node_name = node_name
+      else:
+        self.rover_driver_retry_after = nepi_utils.get_time() + ROVER_DRIVER_RETRY_SEC
+    if not success:
+      self.msg_if.pub_warn("Failed to start rover driver " + node_name + ": " + str(msg))
+
+  def killRoverDriver(self):
+    with self.rover_driver_lock:
+      process = self.rover_driver_process
+      node_name = self.rover_driver_node_name
+      self.rover_driver_process = None
+      self.rover_driver_launched = None
+    if process is None:
+      return
+    self.msg_if.pub_info("Stopping rover driver " + node_name)
+    try:
+      nepi_drvs.killDriverNode(node_name, process)
+    except Exception as e:
+      self.msg_if.pub_warn("Failed to stop rover driver " + node_name + ": " + str(e))
 
   #######################
   # Node Cleanup Function
 
   def cleanup_actions(self):
-    """Closes the bridge connection on node shutdown.
-
-    Closing the accepted connection here unblocks the server thread's recv, so a
-    connected simulator bridge sees a clean disconnect rather than a half-open
-    socket it has to time out on.
-    """
+    """Stops the rover driver, which is this app's child, on node shutdown."""
     self.msg_if.pub_info("Shutting down: Executing script cleanup actions")
-    with self.client_lock:
-      conn = self.client_conn
-      self.client_conn = None
-    if conn is not None:
-      try:
-        conn.close()
-      except Exception:
-        pass
+    self.killRoverDriver()
 
 
 #########################################

@@ -472,7 +472,7 @@ class ArdupilotNode:
   # false for this driver's own flight_robot_4_motor profile only ever
   # meant the OTHER (toggle-buttons) environment UI never renders; the
   # dropdown-driven live Setting this app's own Sim Connector RUI uses is
-  # unconditional and was reaching this driver's settingUpdateFunction the
+  # unconditional and was reaching this driver's setSettingFunction the
   # whole time -- just landing on an unsupported/no-op setting name.
   ENVIRONMENT_SETTING_NAMES = ("environment",)
   # Populated dynamically from the VM's own "environment_options" line (see
@@ -977,6 +977,10 @@ class ArdupilotNode:
     # See the environment re-sync comment in cameraBridgeLoop for why this
     # is a ONE-SHOT flag, not re-checked on every reconnect.
     self._environment_synced_once = False
+    # True once a camera bridge failure has been warned about. The retry runs
+    # every CAMERA_RECONNECT_INTERVAL_SEC, so later failures log at debug
+    # until the next connect clears this.
+    self._camera_retry_warned = False
     # CAMERA_STALE_TIMEOUT_SEC's own comment above explains why this is
     # tracked and watched from a separate thread rather than trusted to
     # self-detect from inside cameraBridgeLoop.
@@ -1038,25 +1042,9 @@ class ArdupilotNode:
       self.real_camera_watch_thread.daemon = True
       self.real_camera_watch_thread.start()
 
-    # Initialize RBX Settings
-    self.cap_settings = self.getCapSettings()
-    '''
-    self.msg_if.pub_warn("CAPS SETTINGS")
-    for setting_name in self.cap_settings.keys():
-        setting = self.cap_settings[setting_name]
-        self.msg_if.pub_warn(str(setting))
-    '''
-    self.factory_settings = self.getFactorySettings()
-    '''
-    self.msg_if.pub_warn("FACTORY SETTINGS")
-    for setting_name in self.factory_settings.keys():
-        setting = self.factory_settings[setting_name]
-        self.msg_if.pub_warn(str(setting))
-    '''
-
     # Per-motor commanded speed ratios (0-1), tracked locally since ArduPilot's
     # DO_MOTOR_TEST is fire-and-forget and reports no ongoing per-motor state.
-    self.motor_ratios = [0.0] * int(self.settings_dict['motor_count']['value'])
+    self.motor_ratios = [0.0] * int(nepi_controls.get_value(self.settings_dict, 'motor_count'))
 
     # Teleop (keyboard-driven) velocity state -- already rotated into ENU and
     # scaled to m/s and rad/s, so sendTeleopVelocityLoop can publish it
@@ -1134,10 +1122,8 @@ class ArdupilotNode:
                                   # camera offsets, capability toggles, keybind
                                   # editor) that depends on that discovery.
                                   data_source_description = ('simulator' if self.is_sitl else 'control_system'),
-                                  capSettings = self.cap_settings,
-                                  factorySettings = self.factory_settings,
-                                  settingUpdateFunction = self.settingUpdateFunction,
-                                  getSettingsFunction=self.getSettings,
+                                  getSettingsFunction = self.getSettingsFunction,
+                                  setSettingFunction = self.setSettingFunction,
                                   axisControls = self.axis_controls,
                                   getBatteryPercentFunction = self.getBatteryPercent,
                                   states = self.RBX_STATES,
@@ -1207,26 +1193,15 @@ class ArdupilotNode:
 
   #**********************
   # Setting functions
-  def getCapSettings(self):
-    return self.CAP_SETTINGS
-
-  def getFactorySettings(self):
-    settings = self.getSettings()
-    #Apply factory setting overides
-    for setting_name in settings.keys():
-      if setting_name in self.FACTORY_SETTINGS_OVERRIDES:
-            settings[setting_name]['value'] = self.FACTORY_SETTINGS_OVERRIDES[setting_name]
-    return settings
-
   def initSettingsDict(self):
     # CAP_SETTINGS/FACTORY_SETTINGS are a legacy, pre-controls-system shape
-    # ({'type','name','options'} / {'type','name','value'}) that RBXRobotIF's
-    # own capSettings=/factorySettings= constructor args accept but never
-    # actually consume any more (see device_if_rbx.py's own comment at its
-    # SettingsIF(...) construction) -- getSettingsFunction/setSettingFunction
+    # ({'type','name','options'} / {'type','name','value'}) that no device IF
+    # accepts any more (RBXRobotIF's old capSettings=/factorySettings=
+    # constructor args are gone) -- getSettingsFunction/setSettingFunction
     # are the only things SettingsIF actually reads, and it requires a real
     # nepi_controls controls dict (each entry carrying 'default', and
-    # 'bounds'/'options' as its type requires), not this legacy shape.
+    # 'bounds'/'options' as its type requires), so this converts the tables
+    # into one.
     # Confirmed live: leaving self.settings_dict as a bare alias of
     # FACTORY_SETTINGS meant every entry was missing 'default', so
     # nepi_controls.update_status_msg() dropped every single setting out of
@@ -1280,7 +1255,7 @@ class ArdupilotNode:
 
     self.init_settings_dict = init_settings_dict
     settings_dict = nepi_controls.create_controls_dict(init_settings_dict)
-    settings_dict_values = nepi_controls.get_controls_values_dict(settings_dict)
+    settings_dict_values = nepi_controls.get_values_dict(settings_dict)
     self.msg_if.pub_info("Initialized Settings: " + str(settings_dict_values))
     return settings_dict
 
@@ -1289,14 +1264,24 @@ class ArdupilotNode:
     # setting whose real option list arrives later, asynchronously, over the
     # camera bridge (see processCameraBridgeLine's 'environment_options'
     # branch), which updates self.settings_dict directly via
-    # nepi_controls.set_control_options() once it actually arrives.
+    # nepi_controls.set_options() once it actually arrives.
     return copy.deepcopy(self.settings_dict)
 
-  def getSettings(self):
+  def getSettingSelection(self, setting_name):
+    # A control's stored 'value' is a string list (Control.msg's string[]
+    # value), and nepi_controls.get_value() hands a Selection back as a
+    # one-element list (['TRUE']) -- so comparing either one against 'TRUE'
+    # is never equal. This returns the selected option itself.
+    value = nepi_controls.get_value(self.settings_dict, setting_name)
+    if isinstance(value, list):
+      value = value[0] if len(value) > 0 else None
+    return value
+
+  def getSettingsFunction(self):
     # Deep copy, not a bare reference: SettingsIF assigns whatever this
     # returns directly to its own self.settings_dict (system_if.py's
     # __init__/init()/reset()/factory_reset()), then mutates individual
-    # entries of it in place (nepi_controls.reset_control_values() etc.).
+    # entries of it in place (nepi_controls.reset_values() etc.).
     # Without a copy here, that mutation lands on THIS object's own live
     # settings_dict too (same nested dicts, shared by reference) --
     # confirmed live: motor_test_max_throttle_percent's own 'value' field
@@ -1309,15 +1294,15 @@ class ArdupilotNode:
     # reported "can arm and disarm, not much else" symptom.
     return copy.deepcopy(self.settings_dict)
 
-  def settingUpdateFunction(self, setting_name, setting_value):
+  def setSettingFunction(self, setting_name, setting_value):
     # SettingsIF (system_if.py) calls setSettingFunction(name, value,
     # [callback_arg]) -- two/three plain positional args, not the single
     # combined {'name','type','value'} dict this function's own body used to
     # be written against (see git history/session notes for that mismatch).
-    # Validation now goes through nepi_controls.get_clean_value(), matching
-    # the modern controls dict initSettingsDict() actually builds -- the old
-    # nepi_settings.check_valid_setting(setting, self.cap_settings) path
-    # validated against CAP_SETTINGS' legacy shape, which is no longer what
+    # Validation goes through nepi_controls.get_clean_value(), matching the
+    # controls dict initSettingsDict() actually builds -- the retired
+    # nepi_settings.check_valid_setting(setting, cap_settings) path validated
+    # against CAP_SETTINGS' legacy shape, which is no longer what
     # self.settings_dict's entries look like.
     success = False
     setting_str = setting_name + ":" + str(setting_value)
@@ -1330,20 +1315,20 @@ class ArdupilotNode:
       msg = (self.node_name + " Setting data " + setting_str + " is not valid")
       return success, msg, copy.deepcopy(self.settings_dict)
 
-    self.settings_dict = nepi_controls.set_control_value(self.settings_dict, setting_name, setting_value)
+    self.settings_dict = nepi_controls.set_value(self.settings_dict, setting_name, setting_value)
     success = True
     msg = (self.node_name + " UPDATED SETTINGS " + setting_str)
     if setting_name == 'motor_count':
       # motor_ratios is sized from motor_count, so it has to be resized with it.
-      self.motor_ratios = [0.0] * int(nepi_controls.get_control_value(self.settings_dict, 'motor_count'))
+      self.motor_ratios = [0.0] * int(nepi_controls.get_value(self.settings_dict, 'motor_count'))
     if setting_name in self.CAMERA_SETTING_NAMES:
       self.sendCameraSettings()
     if setting_name in self.ENVIRONMENT_SETTING_NAMES:
       self.setEnvironmentAction(setting_value)
-    # Deep copy, matching getSettings()'s own reasoning exactly: SettingsIF
-    # assigns this 3rd element straight to its own self.settings_dict, so
-    # returning the live object here would re-alias it right back after
-    # getSettings() already stopped doing so.
+    # Deep copy, matching getSettingsFunction()'s own reasoning exactly:
+    # SettingsIF assigns this 3rd element straight to its own
+    # self.settings_dict, so returning the live object here would re-alias it
+    # right back after getSettingsFunction() already stopped doing so.
     return success, msg, copy.deepcopy(self.settings_dict)
 
   ##########################
@@ -1414,9 +1399,9 @@ class ArdupilotNode:
     # rather than straight onto [0,100] -- e.g. a 20% max throttle setting
     # means the slider's 100% only ever commands 20% actual throttle, so the
     # cap integrates with the slider UI instead of silently overriding it.
-    max_throttle_percent = float(self.settings_dict['motor_test_max_throttle_percent']['value'])
+    max_throttle_percent = float(nepi_controls.get_value(self.settings_dict, 'motor_test_max_throttle_percent'))
     throttle_percent = speed_ratio * max_throttle_percent
-    timeout_s = float(self.settings_dict['motor_test_timeout_s']['value'])
+    timeout_s = float(nepi_controls.get_value(self.settings_dict, 'motor_test_timeout_s'))
     test_cmd = CommandLongRequest()
     test_cmd.broadcast = False
     test_cmd.command = self.MAV_CMD_DO_MOTOR_TEST
@@ -1452,7 +1437,7 @@ class ArdupilotNode:
       # negative) becomes a simple climb-rate command -- "moving the
       # motors" now visibly moves the vehicle too, without guessing this
       # frame's exact per-rotor roll/pitch/yaw mixing.
-      if self.settings_dict['move_with_manual_enabled']['value'] == 'TRUE' and self.teleopControlsReady():
+      if self.getSettingSelection('move_with_manual_enabled') == 'TRUE' and self.teleopControlsReady():
         avg_ratio = sum(self.motor_ratios) / float(len(self.motor_ratios))
         self.setTeleopVelocity(0.0, 0.0, avg_ratio, 0.0)
     else:
@@ -1733,7 +1718,7 @@ class ArdupilotNode:
     # rbx_sim_node.py's identical check. Checked HERE, not just in the RUI
     # (which hides the controls entirely), so disabling it actually blocks
     # the command for any client, not merely the RUI's own buttons.
-    if self.settings_dict['autonomous_movement_enabled']['value'] != 'TRUE':
+    if self.getSettingSelection('autonomous_movement_enabled') != 'TRUE':
       return False
     ready = False
     if self.RBX_STATES[self.state_ind] == "ARM" and self.RBX_MODES[self.mode_ind] == "GUIDED" and self.isAirborne():
@@ -1747,7 +1732,7 @@ class ArdupilotNode:
     # different mode ArduPilot ignores them anyway, but reporting "ready"
     # in that state would be misleading. Plus teleop_movement_enabled, the
     # Sim Connector's own toggle for this feature.
-    if self.settings_dict['teleop_movement_enabled']['value'] != 'TRUE':
+    if self.getSettingSelection('teleop_movement_enabled') != 'TRUE':
       return False
     return (self.RBX_STATES[self.state_ind] == "ARM"
             and self.RBX_MODES[self.mode_ind] == "GUIDED"
@@ -2370,8 +2355,8 @@ class ArdupilotNode:
     self.rbx_if.update_current_errors( [0,0,0,0,0,0,0] )
     cmd_success = False
     if self.state_current == "ARM":
-      takeoff_height_m = float(self.settings_dict['takeoff_height_m']['value'])
-      takeoff_min_pitch_deg = float(self.settings_dict['takeoff_min_pitch_deg']['value'])
+      takeoff_height_m = float(nepi_controls.get_value(self.settings_dict, 'takeoff_height_m'))
+      takeoff_min_pitch_deg = float(nepi_controls.get_value(self.settings_dict, 'takeoff_min_pitch_deg'))
       self.msg_if.pub_info("Sending Takeoff Command to altitude to " + str(takeoff_height_m) + " meters")
       takeoff_cmd = CommandTOLRequest()
       takeoff_cmd.min_pitch = takeoff_min_pitch_deg
@@ -2660,12 +2645,13 @@ class ArdupilotNode:
                                         timeout = self.CAMERA_SOCKET_TIMEOUT_SEC)
         sock.settimeout(self.CAMERA_SOCKET_TIMEOUT_SEC)
       except Exception as e:
-        self.msg_if.pub_warn("Camera bridge connect to " + self.CAMERA_BRIDGE_HOST + ":" +
-                             str(self.CAMERA_BRIDGE_PORT) + " failed: " + str(e))
+        self.logCameraRetry("Camera bridge connect to " + self.CAMERA_BRIDGE_HOST + ":" +
+                            str(self.CAMERA_BRIDGE_PORT) + " failed: " + str(e))
         time.sleep(self.CAMERA_RECONNECT_INTERVAL_SEC)
         continue
       with self.camera_sock_lock:
         self.camera_sock = sock
+      self._camera_retry_warned = False
       # Baseline for the watchdog -- covers the "never got a single frame in
       # the first place" case, not just "frames stopped after a while".
       self.camera_last_frame_time = nepi_utils.get_time()
@@ -2689,7 +2675,7 @@ class ArdupilotNode:
       # it didnt work after." The camera bridge connection to this device
       # type is known to drop and reconnect on its own (a flaky far-end sim
       # process), and every one of those reconnects re-ran this line using
-      # whatever settings_dict['environment']['value'] happened to be at
+      # whatever the 'environment' setting happened to be at
       # that moment -- correct on the very FIRST connect, but on every
       # SUBSEQENT reconnect this could race an operator's own more recent
       # change landing on settings_dict a moment later, re-asserting a
@@ -2698,7 +2684,7 @@ class ArdupilotNode:
       # should trust settings_dict as the last real user intent instead of
       # re-broadcasting it blindly.
       if not self._environment_synced_once:
-        self.setEnvironmentAction(self.settings_dict['environment']['value'])
+        self.setEnvironmentAction(self.getSettingSelection('environment'))
         self._environment_synced_once = True
       buf = b''
       while not nepi_sdk.is_shutdown():
@@ -2723,9 +2709,18 @@ class ArdupilotNode:
         sock.close()
       except Exception:
         pass
-      self.msg_if.pub_warn("Camera bridge connection lost -- retrying in " +
-                           str(self.CAMERA_RECONNECT_INTERVAL_SEC) + "s")
+      self.logCameraRetry("Camera bridge connection lost -- retrying every " +
+                          str(self.CAMERA_RECONNECT_INTERVAL_SEC) + "s")
       time.sleep(self.CAMERA_RECONNECT_INTERVAL_SEC)
+
+  def logCameraRetry(self, msg):
+    # Warn on the first failure only; the 3 s retry loop would otherwise
+    # repeat it for as long as the far end is down.
+    if not self._camera_retry_warned:
+      self.msg_if.pub_warn(msg + " (further retries logged at debug until it connects)")
+      self._camera_retry_warned = True
+    else:
+      self.msg_if.pub_debug(msg)
 
   def processCameraBridgeLine(self, line):
     try:
@@ -2748,7 +2743,7 @@ class ArdupilotNode:
       # CAP_SETTINGS is only ever consulted once, at initSettingsDict() time --
       # the live settings_dict (what SettingsIF/the RUI actually see) has to
       # be updated directly, or this resync never reaches anything.
-      self.settings_dict = nepi_controls.set_control_options(self.settings_dict, 'environment', options)
+      self.settings_dict = nepi_controls.set_options(self.settings_dict, 'environment', options)
       self.ENVIRONMENT_VALUE_TO_MODEL.update({n.upper(): n for n in model_names})
     else:
       self.msg_if.pub_warn("Unrecognized camera bridge line type: " + str(msg.get('type')))
@@ -2842,13 +2837,13 @@ class ArdupilotNode:
     # nothing left to switch.
     cmd = {
       'type': 'camera_settings',
-      'offset_x': float(self.settings_dict['camera_offset_x']['value']),
-      'offset_y': float(self.settings_dict['camera_offset_y']['value']),
-      'offset_z': float(self.settings_dict['camera_offset_z']['value']),
-      'scene_offset_x': float(self.settings_dict['scene_offset_x']['value']),
-      'scene_offset_y': float(self.settings_dict['scene_offset_y']['value']),
-      'scene_offset_z': float(self.settings_dict['scene_offset_z']['value']),
-      'fov_deg': float(self.settings_dict['camera_fov_deg']['value']),
+      'offset_x': float(nepi_controls.get_value(self.settings_dict, 'camera_offset_x')),
+      'offset_y': float(nepi_controls.get_value(self.settings_dict, 'camera_offset_y')),
+      'offset_z': float(nepi_controls.get_value(self.settings_dict, 'camera_offset_z')),
+      'scene_offset_x': float(nepi_controls.get_value(self.settings_dict, 'scene_offset_x')),
+      'scene_offset_y': float(nepi_controls.get_value(self.settings_dict, 'scene_offset_y')),
+      'scene_offset_z': float(nepi_controls.get_value(self.settings_dict, 'scene_offset_z')),
+      'fov_deg': float(nepi_controls.get_value(self.settings_dict, 'camera_fov_deg')),
     }
     self.sendLineToCameraBridge(cmd, "Camera settings")
 

@@ -2666,12 +2666,10 @@ class ROSConnectionStore {
     this.publishMessage({
       name: namespace,
       messageType: "nepi_interfaces/ErrorBounds",
-      data: { 
-        data: {
-          max_distance_error_m: max_m,
-          max_rotation_error_deg: max_d,
-          min_stabilize_time_s: min_stab
-        }
+      data: {
+        max_distance_error_m: max_m,
+        max_rotation_error_deg: max_d,
+        min_stabilize_time_s: min_stab
       },
       noPrefix: true
     })

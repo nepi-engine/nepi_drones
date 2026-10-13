@@ -34,9 +34,33 @@ import yaml from "js-yaml"
 import NepiIFSimControls from "./Nepi_IF_Sim-Controls"
 import NepiIFSimLauncher from "./Nepi_IF_SimLauncher"
 
+// Robots come only from the Gazebo service's share (ROBOT_CONFIGS folders)
+// since 2026-09-29, so the controls that save device-side robot configs --
+// Upload Robot Config, Download Sample Config, Delete Selected Config, and
+// the robot dimensions editor's Save Config / Save As New Config (which also
+// creates a robot config) -- are hidden. Their code is all kept; set this
+// true to bring them back (e.g. once saving writes a ROBOT_CONFIGS folder).
+const SHOW_ROBOT_CONFIG_EDITING = false
+
+// The Robot Config Settings and Environment Config Settings panels (the
+// robot/environment dimensions editors, their saved configs and YAML
+// viewers) are hidden for now: the Gazebo service can't take dimension
+// edits yet, so nothing in them reaches the simulation. Their code is all
+// kept; set this true to bring both panels back.
+const SHOW_CONFIG_SETTINGS_PANELS = false
+
+// "obstacle_course.world" (Gazebo) or "obstacle_course.xml" (MuJoCo) ->
+// "Obstacle Course": how a world file from the selected simulator's
+// ENVIRONMENT_CONFIGS is shown in the Environment Config selector.
+function environmentConfigLabel(name) {
+  return String(name).replace(/\.(world|xml)$/, '').split('_')
+    .map((word) => (word.length > 0) ? word.charAt(0).toUpperCase() + word.slice(1) : word)
+    .join(' ')
+}
+
 // Downloadable reference for the "Upload Robot Config" option below --
 // every field a robot_configs entry understands (see
-// sim_connector_app_params.yaml's own robot_configs for the checked-in
+// sim_connector_vehicle_configs.yaml's own robot_configs for the checked-in
 // equivalents), commented so an operator can see what each one does without
 // cross-referencing the app source. Kept as one flat mapping, matching what
 // uploadRobotConfigCb on the device actually expects: the raw fields, not a
@@ -50,7 +74,7 @@ const SAMPLE_ROBOT_CONFIG_YAML =
 #
 # Every field is optional; anything you omit is treated as capability-off
 # (false / 0 / empty list), same as an incomplete entry in
-# sim_connector_app_params.yaml.
+# sim_connector_vehicle_configs.yaml.
 
 # Shown in the Robot Config selector dropdown.
 display_name: "Custom Test Rover"
@@ -484,7 +508,13 @@ class NepiIFSim extends Component {
       // deliberately spawned, silently despawning it) -- it just means a
       // brand-new page load shows a real, useful choice instead of forcing
       // one before Deploy/Kill even become relevant.
-      environment_deploy_selected_name: 'Flat',
+      // 2026-09-29: now a world file from the Gazebo service's share
+      // (backend's sim/environment_config_names), picked for the next
+      // Deploy. Starts empty and is filled in by the backend's latched
+      // sim/selected_environment_config, so it always shows what the next
+      // Deploy will really use rather than a client-side guess.
+      environment_deploy_selected_name: '',
+      environment_config_names: [],
       // Server-reported "what's actually deployed right now" (see
       // sim_connector_app_node.py's deployed_environment_config_name
       // comment) -- checked by onDeleteDimensionConfigClicked, separate
@@ -651,7 +681,8 @@ class NepiIFSim extends Component {
     }
     ;[this.state.robotDimensionsConfigNamesListener, this.state.environmentDimensionsConfigNamesListener,
       this.state.robotDimensionsSelectedConfigListener, this.state.environmentDimensionsSelectedConfigListener,
-      this.state.environmentDimensionsModelListener, this.state.environmentDimensionsViewingYamlListener]
+      this.state.environmentDimensionsModelListener, this.state.environmentDimensionsViewingYamlListener,
+      this.state.environmentWorldNamesListener, this.state.selectedEnvironmentWorldListener]
       .forEach((listener) => { if (listener != null) { listener.unsubscribe() } })
     this.setState({ statusListener: null, robotConfigYamlListener: null,
                     cameraHorizontalFovListener: null, cameraVerticalFovListener: null,
@@ -659,7 +690,8 @@ class NepiIFSim extends Component {
                     robotDimensionsDirtyListener: null, environmentDimensionsDirtyListener: null,
                     robotDimensionsConfigNamesListener: null, environmentDimensionsConfigNamesListener: null,
                     robotDimensionsSelectedConfigListener: null, environmentDimensionsSelectedConfigListener: null,
-                    environmentDimensionsModelListener: null, environmentDimensionsViewingYamlListener: null })
+                    environmentDimensionsModelListener: null, environmentDimensionsViewingYamlListener: null,
+                    environmentWorldNamesListener: null, selectedEnvironmentWorldListener: null })
   }
 
   // Function for configuring and subscribing to the two static FOV topics --
@@ -705,7 +737,8 @@ class NepiIFSim extends Component {
       this.state.robotDimensionsSelectedConfigListener, this.state.environmentDimensionsSelectedConfigListener,
       this.state.robotDimensionsAutosavedListener, this.state.environmentDimensionsAutosavedListener,
       this.state.deployedEnvironmentConfigListener,
-      this.state.environmentDimensionsModelListener]
+      this.state.environmentDimensionsModelListener,
+      this.state.environmentWorldNamesListener, this.state.selectedEnvironmentWorldListener]
       .forEach((listener) => { if (listener != null) { listener.unsubscribe() } })
     if (namespace == null || namespace === 'None') {
       this.setState({ robotDimensionsYamlListener: null, environmentDimensionsYamlListener: null,
@@ -714,7 +747,8 @@ class NepiIFSim extends Component {
                       robotDimensionsSelectedConfigListener: null, environmentDimensionsSelectedConfigListener: null,
                       robotDimensionsAutosavedListener: null, environmentDimensionsAutosavedListener: null,
                       deployedEnvironmentConfigListener: null,
-                      environmentDimensionsModelListener: null })
+                      environmentDimensionsModelListener: null,
+                      environmentWorldNamesListener: null, selectedEnvironmentWorldListener: null })
       return
     }
     const robotYamlListener = this.props.ros.setupStatusListener(
@@ -806,6 +840,24 @@ class NepiIFSim extends Component {
       namespace + '/environment_dimensions_config_yaml_preview', "std_msgs/String",
       (message) => this.setState({ environment_dimensions_viewing_yaml_text: message.data })
     )
+    // The top "Environment Config" selector's own options and selection --
+    // worlds in the Gazebo service's share, not the dimensions configs above
+    // (see renderEnvironmentConfigSelector). Both latched on the backend.
+    const environmentWorldNamesListener = this.props.ros.setupStatusListener(
+      namespace + '/environment_config_names', "std_msgs/String",
+      (message) => {
+        try {
+          const names = JSON.parse(message.data)
+          this.setState({ environment_config_names: Array.isArray(names) ? names : [] })
+        } catch (e) {
+          this.setState({ environment_config_names: [] })
+        }
+      }
+    )
+    const selectedEnvironmentWorldListener = this.props.ros.setupStatusListener(
+      namespace + '/selected_environment_config', "std_msgs/String",
+      (message) => this.setState({ environment_deploy_selected_name: message.data })
+    )
     this.setState({ robotDimensionsYamlListener: robotYamlListener,
                     environmentDimensionsYamlListener: environmentYamlListener,
                     robotDimensionsDirtyListener: robotDirtyListener,
@@ -818,7 +870,9 @@ class NepiIFSim extends Component {
                     environmentDimensionsAutosavedListener: environmentAutosavedListener,
                     deployedEnvironmentConfigListener: deployedEnvironmentConfigListener,
                     environmentDimensionsModelListener: environmentModelListener,
-                    environmentDimensionsViewingYamlListener: environmentDimensionsViewingYamlListener })
+                    environmentDimensionsViewingYamlListener: environmentDimensionsViewingYamlListener,
+                    environmentWorldNamesListener: environmentWorldNamesListener,
+                    selectedEnvironmentWorldListener: selectedEnvironmentWorldListener })
     this.props.ros.sendTriggerMsg(namespace + '/get_robot_dimensions')
     this.props.ros.sendTriggerMsg(namespace + '/get_environment_dimensions')
   }
@@ -917,8 +971,15 @@ class NepiIFSim extends Component {
   // Shared setter passed down to both NepiIFSimLauncher instances -- see
   // selected_launch_target in this.state for why this lives here instead of
   // in NepiIFSimLauncher's own state.
+  //
+  // Also tells the backend, which switches the Robot Config and Environment
+  // Config lists to that simulator's own robots and worlds.
   onLaunchTargetSelected(value) {
     this.setState({ selected_launch_target: value })
+    const namespace = this.getSimNamespace()
+    if (namespace != null && namespace !== 'None' && value !== 'None' && value !== '') {
+      this.props.ros.sendStringMsg(namespace + '/select_launch_target', value)
+    }
   }
 
   // Downloads whatever YAML text is currently displayed -- same Blob pattern
@@ -1129,18 +1190,14 @@ class NepiIFSim extends Component {
       return
     }
     this.setState({ environment_deploy_selected_name: name })
-    // Published straight to the backend's own sim/deploy_environment topic
-    // (2026-09-18, reported live: "changing the environment mid sim...
-    // doesnt do anything") instead of reaching into NepiIFSimControls via
-    // simControlsRef.current.wrappedInstance -- that ref hop is real
-    // (mobx-react 5.4.2's Injector, see the ref's own long-standing
-    // comment elsewhere in this file) but proved unreliable for this
-    // specific action in practice, unlike the FOV box's own live push,
-    // which was moved off the same ref hop earlier today for the same
-    // reason. sim_connector_app_node.py's deployEnvironmentCb does the
-    // exact same name -> Setting-value translation setEnvironmentSetting
-    // used to do, so this is a straight relocation, not a behavior change.
-    this.props.ros.sendStringMsg(this.getSimNamespace() + '/deploy_environment', name)
+    // 2026-09-29: a world file name, recorded by the backend for the next
+    // Deploy (sim/select_environment_config), which the Gazebo service then
+    // launches -- no longer an immediate model spawn through the rover
+    // driver (the old sim/deploy_environment path, since removed). The
+    // backend echoes what it accepted on
+    // sim/selected_environment_config, which overwrites this optimistic
+    // local value.
+    this.props.ros.sendStringMsg(this.getSimNamespace() + '/select_environment_config', name)
   }
 
   // Read-only YAML preview for the "Environment Configs" viewer dropdown --
@@ -1448,10 +1505,10 @@ class NepiIFSim extends Component {
   // Delete button directly here, "just out there" instead of tucked into a
   // panel like Robot Config's own management controls -- moved.
   //
-  // This is now PURELY a deploy control -- picking a name here only drives
-  // NepiIFSimControls's own "environment" Setting (real Gazebo spawn/
-  // despawn) via onDeployEnvironmentConfig, and has zero effect on the
-  // Dimensions editor (a separate selector further down owns that -- see
+  // This is now PURELY a deploy control -- picking a world here only
+  // records it for the next Deploy (the Gazebo service launches that world;
+  // see onDeployEnvironmentConfig), and has zero effect on the Dimensions
+  // editor (a separate selector further down owns that -- see
   // renderDimensionsEditor). Requested live (2026-09-04): "changing the
   // environment config in the dropdown also messed with the dimensions and
   // what that shows - it shouldnt do that. those are again separate."
@@ -1462,18 +1519,14 @@ class NepiIFSim extends Component {
   // empty (e.g. every name filtered out), rather than letting the browser
   // silently highlight whichever real name happens to be first.
   renderEnvironmentConfigSelector() {
-    // "Custom Obstacles" excluded here (and from the Environment Configs
-    // viewer dropdown / the Dimensions-editing dropdown in
-    // renderEnvironmentConfigSettings) -- requested live (2026-09-04):
-    // "remove 'custom obstacles' since you need to save it as a new name
-    // to select it anyways." It's a template with no obstacles of its
-    // own, never directly deployable; Add Wall/Circle/Triangle is now
-    // available from every environment's own dimensions editor (see
-    // renderCustomObstacleControls), so reaching the same result no
-    // longer needs picking this placeholder first. A config a user
-    // actually SAVED from it keeps appearing here under its own given
-    // name -- only the literal built-in template name is hidden.
-    const names = this.state.environment_dimensions_config_names.filter((n) => n !== 'Custom Obstacles')
+    // Options are the worlds in the Gazebo service's share
+    // (ENVIRONMENT_CONFIGS/*.world -- drop a world there and it appears
+    // here), shown without the .world extension. Picking one only records
+    // it for the next Deploy; see onDeployEnvironmentConfig. Deliberately
+    // NOT environment_dimensions_config_names: those are the dimensions
+    // editor's own geometry configs, which stay separate (and still exclude
+    // "Custom Obstacles" in renderEnvironmentConfigSettings).
+    const names = this.state.environment_config_names
     const selected = this.state.environment_deploy_selected_name
     return (
       <Label title={"Environment Config"}>
@@ -1481,8 +1534,10 @@ class NepiIFSim extends Component {
           onChange={(event) => this.onDeployEnvironmentConfig(event.target.value)}
           value={selected}
         >
-          {(selected === '') ? <Option key={''} value={''}>{'(Select to Deploy)'}</Option> : null}
-          {names.map((name) => <Option key={name} value={name}>{name}</Option>)}
+          {(selected === '' || names.indexOf(selected) === -1) ?
+            <Option key={''} value={''}>{(selected === '') ? '(Select to Deploy)' : environmentConfigLabel(selected) + ' (not in share)'}</Option>
+          : null}
+          {names.map((name) => <Option key={name} value={name}>{environmentConfigLabel(name)}</Option>)}
         </Select>
       </Label>
     )
@@ -1676,11 +1731,13 @@ class NepiIFSim extends Component {
             {names.map((name) => <Option key={name} value={name}>{name}</Option>)}
           </Select>
         </Label>
-        <ButtonMenu>
-          <Button disabled={!this.state.robot_merged_selected_name} onClick={this.onDeleteMergedRobotConfigClicked}>
-            {"Delete Selected Config"}
-          </Button>
-        </ButtonMenu>
+        {SHOW_ROBOT_CONFIG_EDITING ?
+          <ButtonMenu>
+            <Button disabled={!this.state.robot_merged_selected_name} onClick={this.onDeleteMergedRobotConfigClicked}>
+              {"Delete Selected Config"}
+            </Button>
+          </ButtonMenu>
+        : null}
         {/* Two conceptually separate YAML axes -- capability config
             (display_name, goto flags, etc, from sim/get_robot_config) and
             dimensions config (wheel/chassis/camera numeric fields) -- laid
@@ -1737,7 +1794,7 @@ class NepiIFSim extends Component {
   //     viewer where they can see each config") plus the shared display/
   //     download area below. Deliberately keyed on available_robot_configs,
   //     not a hardcoded drone/rover pair: whatever this deployment's
-  //     sim_connector_app_params.yaml actually offers gets a View button, so
+  //     sim_connector_vehicle_configs.yaml actually offers gets a View button, so
   //     a future third preset needs no RUI change to be viewable.
   // Wrapped in Section (bordered box + title) once expanded so it reads as
   // its own distinct panel -- previously just a bare top border on the same
@@ -1786,10 +1843,12 @@ class NepiIFSim extends Component {
               style={{ display: 'none' }}
               onChange={this.onUploadConfigFileChange}
             />
-            <ButtonMenu>
-              <Button onClick={this.onUploadConfigClicked}>{"Upload Robot Config"}</Button>
-              <Button onClick={this.onDownloadSampleConfigClicked}>{"Download Sample Config"}</Button>
-            </ButtonMenu>
+            {SHOW_ROBOT_CONFIG_EDITING ?
+              <ButtonMenu>
+                <Button onClick={this.onUploadConfigClicked}>{"Upload Robot Config"}</Button>
+                <Button onClick={this.onDownloadSampleConfigClicked}>{"Download Sample Config"}</Button>
+              </ButtonMenu>
+            : null}
             {this.renderRobotConfigAndDimensionsButtons()}
           </Section>
         : null}
@@ -3210,6 +3269,12 @@ class NepiIFSim extends Component {
               the top of the page instead (renderRobotConfigAndDimensionsButtons/
               renderEnvironmentConfigSelector), next to the controls that
               pick one -- not duplicated here. */}
+          {/* The robot editor's save controls (this name box, Save Config,
+              Save As New Config) are hidden with SHOW_ROBOT_CONFIG_EDITING --
+              saving a robot here also creates a device-side robot config. The
+              environment editor's own are unaffected. */}
+          {(role !== 'robot' || SHOW_ROBOT_CONFIG_EDITING) ?
+          <React.Fragment>
           <Label title={"Name New Config"}>
             <Input
               id={"DimensionsSaveAsName_" + role}
@@ -3244,6 +3309,8 @@ class NepiIFSim extends Component {
               {"Save As New Config"}
             </Button>
           </ButtonMenu>
+          </React.Fragment>
+          : null}
           {(this.state[role + '_dimensions_autosave_msg'] !== '') ?
             <div style={{
               fontStyle: "italic",
@@ -3276,19 +3343,13 @@ class NepiIFSim extends Component {
     )
   }
 
-  // Read-only status and info display, backed by SimStatus. bridge_connected and
-  // telemetry_age_sec are shown as two separate readings on purpose: a connected
-  // bridge whose telemetry has gone stale (a paused simulator, a hung callback)
-  // is a different condition from a disconnected one, and only showing both makes
-  // that distinguishable.
+  // Read-only status and info display, backed by SimStatus. bridge_connected
+  // is whether the selected simulator's RBX device is ready for manual control.
   renderData() {
     const status_msg = this.state.status_msg
     if (status_msg == null) {
       return null
     }
-
-    const sensor_topics = (status_msg.available_sensor_topics !== undefined)
-      ? status_msg.available_sensor_topics : []
 
     return (
       <React.Fragment>
@@ -3305,15 +3366,6 @@ class NepiIFSim extends Component {
         )}
 
         {this.renderFieldPair(
-          <Label title={"Telemetry Age (s)"}>
-            <Input disabled value={round(status_msg.telemetry_age_sec + .001, 2)} />
-          </Label>,
-          <Label title={"Ready"}>
-            <BooleanIndicator value={status_msg.ready} />
-          </Label>
-        )}
-
-        {this.renderFieldPair(
           <Label title={"Current Process"}>
             <Input disabled value={status_msg.process_current} />
           </Label>,
@@ -3326,8 +3378,8 @@ class NepiIFSim extends Component {
           <Label title={"Last Cmd Success"}>
             <BooleanIndicator value={status_msg.cmd_success} />
           </Label>,
-          <Label title={"Sensor Topics"}>
-            <Input disabled value={String(sensor_topics.length)} />
+          <Label title={"Ready"}>
+            <BooleanIndicator value={status_msg.ready} />
           </Label>
         )}
 
@@ -3597,7 +3649,7 @@ class NepiIFSim extends Component {
           show_live_controls={show_controls}
         />
 
-        {(show_selectors === true) ?
+        {(show_selectors === true && SHOW_CONFIG_SETTINGS_PANELS) ?
           <React.Fragment>
             {this.renderRobotConfigSettings()}
             {this.renderEnvironmentConfigSettings()}

@@ -16,42 +16,64 @@
 # - mailto:nepi@numurus.com
 #
 
-# RBX driver node for the Gazebo simulated rover (RBX_SIM), following
-# rbx_ardupilot_node.py's RBXRobotIF integration pattern. The simulator runs
-# on a dev VM with its own ROS master, so this node holds a persistent TCP
-# connection to the VM's sim_bridge_node.py speaking newline-delimited
-# JSON: velocity commands out ({"linear_x","angular_z"}, republished onto
-# the VM's /nepi/sim/cmd_vel), odometry telemetry in
-# ({"x","y","yaw","linear_x","angular_z","stamp"}, pushed at 10 Hz from the
-# VM's /rover/odom).
+# RBX driver node for a Gazebo-simulated rover (RBX_SIM), following
+# rbx_ardupilot_node.py's RBXRobotIF integration pattern.
 #
-# 2026-09-08 -- DIRECTION REVERSED: this node used to DIAL OUT to the VM's
-# sim_host:bridge_port (see git history for that version), reachable only
-# through a reverse SSH tunnel when the VM had no direct route. That
-# requires the VM to accept an unsolicited inbound connection, which fails
-# by default on a very common real setup this app is meant to support out
-# of the box -- Windows + WSL2, where Windows Firewall's Public-profile
-# default blocks inbound to the VM even once WSL mirrored networking makes
-# it LAN-addressable, and asking every operator to add a firewall exception
-# doesn't scale. Outbound is never blocked, so now this node only ever
-# LISTENS on bridge_port (see bridgeLoop) and the VM's sim_bridge_node.py
-# dials in instead -- no tunnel, no firewall config, on any OS. DEVICE_DICT's
-# sim_host is therefore unused here now (still populated by
-# rbx_sim_discovery.py, still used there to match a heartbeat's arriving
-# peer IP -- see that file's own comment).
+# LIFECYCLE. nepi_app_sim_connector starts and stops this node, not
+# drivers_mgr discovery: when a simulator service (nepi_simulations'
+# nepi_gazebo.sh or nepi_mujoco.sh) reports a robot config running whose
+# nepi_robot_config.yaml names nepi_driver: rbx_sim, the app writes this
+# node's drv_dict and launches it, and when the service reports anything
+# other than running (Kill, a
+# crash, a stop on the VM) the app kills it. So the robot is listed in
+# Devices -> Robots exactly as long as the simulated robot exists. The old
+# rbx_sim_discovery.py heartbeat path (port 9022) is no longer used.
 #
-# Unlike the ArduPilot driver there is no onboard autopilot to delegate goto
-# setpoints to: the rover only understands instantaneous velocity, so this
-# node implements its own closed-loop 2D controller (gotoControlCb) that
-# drives toward the RBXRobotIF-supplied position/yaw target at 10 Hz until
-# within the RBX error bounds. The rover has no ARM/DISARM or flight-mode
-# equivalent, no battery, and no geographic (WGS84) location/goto, so
-# states, modes, gotoLocation, and the battery callback are legitimately
-# empty/None (RBXRobotIF reports the matching has_* capabilities False).
-# Home/set_home *is* wired (getHome/setHome below), reusing RBXRobotIF's
-# GeoPoint-shaped home plumbing with its three floats reinterpreted as
-# local ENU x/y/z meters instead of lat/long/alt degrees -- the only home
-# concept this rover has, since it has no WGS84 reference of its own.
+# BRIDGE. The simulator runs on a separate machine, so this node talks to the
+# VM's bridge over the network, on DEVICE_DICT's bridge_port, UDP and TCP
+# both: Gazebo's nepi_gazebo_bridge.py, or the bridge built into MuJoCo's
+# nepi_mujoco_sim.py, which speaks the same protocol. The VM always speaks first
+# (it sends telemetry to this node's UDP port, and connects to its TCP port),
+# so nothing on the VM has to accept an inbound connection -- a firewalled
+# VM (Windows + WSL2) still works. Every message is one JSON object; on TCP
+# they are newline-delimited.
+#
+#   UDP  VM -> device  {"type":"telemetry","seq","x","y","yaw","linear_x","angular_z","stamp"}
+#                      10 Hz, from the simulated robot's pose. Receiving it is what
+#                      "bridge connected" means (see SimBridgeLink.is_connected).
+#   UDP  device -> VM  {"type":"velocity","seq","linear_x","linear_y","angular_z"}
+#                      20 Hz, ALWAYS, zeros when idle, sent to wherever the
+#                      latest telemetry came from. The VM zeroes the rover
+#                      when this stream stops for 250 ms, so a lost link stops
+#                      the robot rather than leaving it driving.
+#   TCP  VM -> device  {"type":"image","camera","format":"jpeg","data":"<base64>","stamp"}
+#   TCP  device -> VM  {"type":"reset"}
+#
+# UDP carries the two streams where only the newest value matters and a
+# late packet is worse than a lost one; each carries a seq so a stale or
+# duplicated packet is dropped. Images and one-shot commands stay on TCP,
+# where a camera frame cannot be half-delivered and a reset cannot be lost.
+# Keeping them apart also means a camera frame can never delay a position
+# update, which it could when everything shared one TCP stream.
+#
+# CAPABILITIES come from the robot config the app passes in drv_dict
+# (ROBOT_CONFIG, the folder's nepi_robot_config.yaml): a flag that is false
+# there hands RBXRobotIF a None function, so the control is not offered.
+#
+# CONTROL. The rover only understands instantaneous velocity, so this node
+# runs its own closed-loop 2D controller (gotoControlCb) toward the
+# RBXRobotIF-supplied position/yaw target until within the RBX error bounds.
+# No ARM/DISARM, flight modes, battery, or WGS84 location: those are left
+# empty/None and RBXRobotIF reports the matching has_* capabilities False.
+# Home is local ENU x/y/z meters carried over RBXRobotIF's GeoPoint-shaped
+# home plumbing (see getHome/setHome).
+#
+# Not carried over from the sim_container version yet, because each one
+# respawned or rebuilt the robot model and the Gazebo service now owns the
+# model (it spawns the robot folder's model.sdf): the camera offset/tilt/FOV
+# Settings, the environment Setting and REFRESH_ENVIRONMENT (environments are
+# whole .world files chosen at Deploy now), and wheel independence (needs the
+# crab-steer plugin, which the ROBOT_CONFIGS rover does not load).
 
 import base64
 import copy
@@ -67,14 +89,13 @@ import cv2
 from nepi_sdk import nepi_sdk
 from nepi_sdk import nepi_nav
 from nepi_sdk import nepi_utils
-from nepi_sdk import nepi_settings
 from nepi_sdk import nepi_controls
 from nepi_sdk import nepi_img
 
 from std_msgs.msg import UInt32, String
 from sensor_msgs.msg import Image
 
-from nepi_interfaces.msg import AxisControls
+from nepi_interfaces.msg import AxisControls, ErrorBounds
 from geographic_msgs.msg import GeoPoint
 
 from nepi_api.device_if_rbx import RBXRobotIF
@@ -83,6 +104,231 @@ from nepi_api.messages_if import MsgIF
 PKG_NAME = 'RBX_SIM' # Use in display menus
 FILE_TYPE = 'NODE'
 
+FACTORY_BRIDGE_PORT = 9023
+
+
+#########################################
+# Bridge Link
+#########################################
+
+class SimBridgeLink(object):
+  """UDP + TCP link to the VM's simulator bridge. See the module comment
+  for the wire format. Plain sockets and threads, no ROS, so it can be
+  exercised without a NEPI install."""
+
+  # No telemetry for this long reads as disconnected. Telemetry arrives at
+  # 10 Hz, so this rides out a few lost packets without flapping.
+  LINK_TIMEOUT_SEC = 1.0
+  SEQ_RESTART_GAP = 50
+  BIND_RETRY_SEC = 3.0
+  RECV_TIMEOUT_SEC = 0.5
+
+  def __init__(self, port, telemetryFunction, imageFunction, logInfoFunction, logWarnFunction):
+    self.port = int(port)
+    self.telemetryFunction = telemetryFunction
+    self.imageFunction = imageFunction
+    self.logInfo = logInfoFunction
+    self.logWarn = logWarnFunction
+
+    self.running = True
+    self.lock = threading.Lock()
+    self.udp_sock = None
+    self.udp_peer = None
+    self.rx_seq = None
+    self.tx_seq = 0
+    self.last_rx_time = 0.0
+    self.tcp_server = None
+    self.tcp_conn = None
+    self.tcp_send_lock = threading.Lock()
+
+    for target in (self._udpLoop, self._tcpLoop):
+      thread = threading.Thread(target = target)
+      thread.daemon = True
+      thread.start()
+
+  def is_connected(self):
+    with self.lock:
+      last_rx_time = self.last_rx_time
+    return (time.monotonic() - last_rx_time) < self.LINK_TIMEOUT_SEC
+
+  def has_data_connection(self):
+    with self.lock:
+      return self.tcp_conn is not None
+
+  def get_peer(self):
+    with self.lock:
+      return self.udp_peer
+
+  def send_velocity(self, linear_x, angular_z, linear_y = 0.0):
+    with self.lock:
+      sock = self.udp_sock
+      peer = self.udp_peer
+      self.tx_seq += 1
+      seq = self.tx_seq
+    if not self.running or sock is None or peer is None:
+      return False
+    packet = {'type': 'velocity', 'seq': seq,
+              'linear_x': float(linear_x), 'linear_y': float(linear_y), 'angular_z': float(angular_z)}
+    try:
+      sock.sendto(json.dumps(packet).encode(), peer)
+      return True
+    except Exception as e:
+      if self.running:
+        self.logWarn("Failed to send velocity to sim bridge: " + str(e))
+      return False
+
+  def send_line(self, line_dict, description):
+    with self.lock:
+      conn = self.tcp_conn
+    if conn is None:
+      self.logWarn(description + " dropped -- sim bridge data connection is not up")
+      return False
+    try:
+      with self.tcp_send_lock:
+        conn.sendall((json.dumps(line_dict) + '\n').encode())
+      return True
+    except Exception as e:
+      self.logWarn("Failed to send " + description.lower() + " to sim bridge: " + str(e))
+      return False
+
+  def close(self):
+    # The node's timers keep firing after its on_shutdown hook runs, so the
+    # sockets are cleared here and send_velocity stops once running is False.
+    self.running = False
+    with self.lock:
+      socks = [self.udp_sock, self.tcp_server, self.tcp_conn]
+      self.udp_sock = None
+      self.udp_peer = None
+      self.tcp_server = None
+      self.tcp_conn = None
+    for sock in socks:
+      if sock is not None:
+        self._closeSocket(sock)
+
+  def _closeSocket(self, sock):
+    # shutdown before close: another thread may be blocked in recv on this
+    # socket, and a bare close neither wakes it nor tells the far end.
+    try:
+      sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+      pass
+    try:
+      sock.close()
+    except Exception:
+      pass
+
+  def _bind(self, sock_type):
+    while self.running:
+      sock = socket.socket(socket.AF_INET, sock_type)
+      try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(('0.0.0.0', self.port))
+        return sock
+      except Exception as e:
+        sock.close()
+        self.logWarn("Sim bridge " + ('UDP' if sock_type == socket.SOCK_DGRAM else 'TCP') +
+                     " bind on port " + str(self.port) + " failed: " + str(e))
+        time.sleep(self.BIND_RETRY_SEC)
+    return None
+
+  def _udpLoop(self):
+    sock = self._bind(socket.SOCK_DGRAM)
+    if sock is None:
+      return
+    sock.settimeout(self.RECV_TIMEOUT_SEC)
+    with self.lock:
+      self.udp_sock = sock
+    self.logInfo("Listening for sim bridge telemetry on UDP port " + str(self.port))
+    while self.running:
+      try:
+        data, addr = sock.recvfrom(65535)
+      except socket.timeout:
+        continue
+      except Exception:
+        if not self.running:
+          return
+        continue
+      try:
+        msg = json.loads(data.decode())
+      except Exception as e:
+        self.logWarn("Bad packet from sim bridge: " + str(e))
+        continue
+      if msg.get('type') != 'telemetry':
+        continue
+      seq = msg.get('seq')
+      with self.lock:
+        if addr != self.udp_peer:
+          # A new sender (first packet, or the VM bridge restarted on a new
+          # port) starts its own sequence.
+          if self.udp_peer is not None:
+            self.logInfo("Sim bridge telemetry now coming from " + str(addr))
+          self.udp_peer = addr
+          self.rx_seq = None
+        elif (seq is not None and self.rx_seq is not None and
+              self.rx_seq - self.SEQ_RESTART_GAP < seq <= self.rx_seq):
+          # Stale or duplicated. One far behind is a restarted bridge
+          # counting from 1 again, not a late packet, and is taken.
+          continue
+        if seq is not None:
+          self.rx_seq = seq
+        self.last_rx_time = time.monotonic()
+      self.telemetryFunction(msg)
+
+  def _tcpLoop(self):
+    server = self._bind(socket.SOCK_STREAM)
+    if server is None:
+      return
+    server.listen(1)
+    with self.lock:
+      self.tcp_server = server
+    self.logInfo("Listening for sim bridge data connection on TCP port " + str(self.port))
+    while self.running:
+      try:
+        conn, addr = server.accept()
+      except Exception:
+        if not self.running:
+          return
+        continue
+      conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+      with self.lock:
+        old_conn = self.tcp_conn
+        self.tcp_conn = conn
+      if old_conn is not None:
+        # A reconnecting VM replaces a connection that may be half-open.
+        self._closeSocket(old_conn)
+      self.logInfo("Sim bridge data connection from " + str(addr[0]))
+      thread = threading.Thread(target = self._tcpReadLoop, args = (conn,))
+      thread.daemon = True
+      thread.start()
+
+  def _tcpReadLoop(self, conn):
+    buf = b''
+    while self.running:
+      try:
+        data = conn.recv(65536)
+      except Exception:
+        data = b''
+      if not data:
+        break
+      buf += data
+      while b'\n' in buf:
+        line, buf = buf.split(b'\n', 1)
+        if not line.strip():
+          continue
+        try:
+          msg = json.loads(line)
+        except Exception as e:
+          self.logWarn("Bad line from sim bridge: " + str(e))
+          continue
+        if msg.get('type') == 'image':
+          self.imageFunction(msg)
+    with self.lock:
+      if self.tcp_conn is conn:
+        self.tcp_conn = None
+    self._closeSocket(conn)
+    if self.running:
+      self.logWarn("Sim bridge data connection lost -- waiting for the VM to reconnect")
+
 
 #########################################
 # Node Class
@@ -90,388 +336,78 @@ FILE_TYPE = 'NODE'
 
 class SimNode:
 
-  # Camera-rover feature. Both cameras are rigid links welded onto
-  # generic_rover itself (fixed joint poses in generic_rover/model.sdf), not a
-  # single repositionable rig -- that's what makes them lag-free. Both are now
-  # relayed simultaneously as four always-live ROS Image topics (see the
-  # *_TOPIC_SUFFIX constants below: color and colorized depth view, for each
-  # of robot/scene), not switched between via a camera_view_mode Setting:
-  # reworked (2026-08-18) after a live report that a single topic whose
-  # content gets reassigned depending on a mode setting isn't a real second
-  # view a client can rely on ("the third-person view doesn't really
-  # exist"), then widened again (2026-08-20) so color and depth are
-  # simultaneously available instead of a depth_map_enabled toggle swapping
-  # one topic's content. A raw robot_depth_map/scene_depth_map pair (32FC1-
-  # meters, for downstream processing) existed briefly alongside these but
-  # was removed entirely (2026-09-14, requested live: "unness and dont do
-  # anything") -- no processing-pipeline consumer ever existed for it. The
-  # existing Image Source dropdown's
-  # find_topics_by_msg('Image') discovery picks up all of them with no new
-  # RUI plumbing needed (see NepiDeviceRBX.js's createImageOptions).
-  #
-  # Camera offsets ARE still runtime-adjustable, a separate concept from which
-  # view a client is looking at: an offset change is applied by respawning the
-  # rover model with new camera link poses, at its current world pose. That is
-  # viable specifically because the diff_drive plugin uses
-  # <odometrySource>world</odometrySource>, so odom is read back from the
-  # model's Gazebo pose and survives the respawn unbroken. See
-  # respawnRoverWithCameraOffsets in sim_bridge_node.py, which also records
-  # every Gazebo mechanism that does NOT work here.
-  #
-  # camera_offset_* is the ROBOT view (same names the ArduPilot driver uses, so
-  # the RUI's existing offset block renders it unchanged); scene_offset_* is the
-  # scene/chase view. Factory values reproduce generic_rover/model.sdf's
-  # hard-coded camera_link (0.2, 0, 0.65) and camera_link_chase
-  # (-2.5, 0, 1.65) poses exactly, so the default view is unchanged.
-  #
-  # *_yaw/*_tilt added (2026-09-03) -- reported live: "for the camera offsets
-  # as well, yaw and tilt should also be editable. right now its just x y and
-  # z." Both in DEGREES, matching this app's own existing angle convention
-  # (camera_horizontal_fov_deg, max_angular_rate_dps) -- sim_bridge_node.py
-  # converts to radians only when building the SDF <pose> string. "tilt"
-  # (the RUI-facing name the operator used) maps internally to SDF pitch;
-  # roll stays fixed at 0 for both cameras, unchanged, not exposed as a
-  # setting -- matches generic_rover/model.sdf's own pose convention, where
-  # neither camera has ever had roll. Factory values reproduce
-  # generic_rover/model.sdf's hard-coded rotations exactly: camera_link has
-  # none (0, 0, 0) -- FACTORY_CAMERA_LINK_TILT_DEG stays 0.0 -- and
-  # camera_link_chase's own hard-coded downward-look pitch is what
-  # FACTORY_SCENE_TILT_DEG below reproduces in degrees (see that constant's
-  # own comment further down for how it's derived).
-  #
-  # camera_fov_deg added (2026-09-08) -- shared horizontal FOV for both
-  # cameras, same live-respawn mechanism as the offsets above.
-  CAMERA_SETTING_NAMES = ("camera_offset_x", "camera_offset_y", "camera_offset_z",
-                          "camera_offset_yaw", "camera_offset_tilt",
-                          "scene_offset_x", "scene_offset_y", "scene_offset_z",
-                          "scene_offset_yaw", "scene_offset_tilt",
-                          "camera_fov_deg")
+  # The four always-live camera views the VM bridge relays (robot = the
+  # rover's own first-person camera, scene = its chase camera; color and a
+  # colorized depth view of each), published under
+  # <node>/color_2d_image/<view>, which is where nepi_app_sim_connector's
+  # view mirrors and NepiDeviceRBX.js's image list look for them.
+  CAMERA_VIEWS = ("robot_color", "scene_color", "robot_depth", "scene_depth")
 
-  # Suffixes for the four always-live ROS topics published off
-  # self.image_topic_name -- see processImageLine's routing by the bridge
-  # line's "camera" field. color/depth (colorized, for viewing) replace the
-  # old robot_view/scene_view pair once depth_map_enabled was removed
-  # (2026-08-20) in favor of always publishing both simultaneously rather
-  # than toggling which one a single topic shows.
-  ROBOT_COLOR_TOPIC_SUFFIX = "robot_color"
-  SCENE_COLOR_TOPIC_SUFFIX = "scene_color"
-  ROBOT_DEPTH_TOPIC_SUFFIX = "robot_depth"
-  SCENE_DEPTH_TOPIC_SUFFIX = "scene_depth"
-
-  # Environment: was originally two RBX_SETUP_ACTIONS entries
-  # (OBSTACLE_COURSE_ON/OFF), then a dedicated "Environment" dropdown was
-  # added to the RUI that still just sent those two setup actions under the
-  # hood -- redundant with itself once that dropdown existed, and the setup
-  # actions kept cluttering the generic Setup Actions dropdown alongside
-  # RESET_SIM/RETURN_HOME. Modeled as a Setting instead: one clean value, one
-  # place it lives.
-  ENVIRONMENT_SETTING_NAMES = ("environment",)
-  # See CAP_SETTINGS/FACTORY_SETTINGS' own wheel_independence_enabled entry
-  # and setWheelIndependenceAction below.
-  WHEEL_INDEPENDENCE_SETTING_NAMES = ("wheel_independence_enabled",)
-
-  # Which control SURFACES this deployment wants exposed, as opposed to which
-  # ones this robot TYPE structurally supports (that's still
-  # has_autonomous_controls/has_manual_controls etc on the capabilities query,
-  # untouched). These are the Sim Connector's own robot-config "customize the
-  # capabilities that are open" controls. Modeled as Settings, same mechanism
-  # as camera_offset_x, so:
-  #   - the RUI needs no new capability-query plumbing, just the existing
-  #     settingsNamesList/settingsValuesDict gate (see NepiDeviceRBX-Controls.js)
-  #   - the value is "always editable" (the user's own requirement) rather
-  #     than a one-shot capability decided at construction and frozen
-  #   - toggling it takes real effect at the DRIVER too (autonomousControlsReady
-  #     below), not just in the RUI, so a client that bypasses the RUI can't
-  #     do what was turned off either.
-  # camera_controls_enabled: same toggle mechanism, gating whether
-  # camera_offset_*/scene_offset_* show up on the RUI at all (see
-  # NepiDeviceRBX.js's has_camera_offsets/has_scene_offsets, which AND this
-  # in alongside the Setting-existence
-  # check). Unlike autonomous movement, this has no driver-side
-  # enforcement point to add -- there is no "camera controls ready" concept,
-  # positioning a Gazebo camera can't fail the way a goto or a motor command
-  # can -- so it is a pure visibility toggle, RUI-side only.
-  #
-  # enabled_image_sources: comma-separated allowlist of image topic names for
-  # NepiDeviceRBX.js's own Image_Source dropdown (createImageOptions) --
-  # "choose what image sources are good and what aren't". Empty (the factory
-  # value) means unrestricted -- every image topic createImageOptions would
-  # otherwise offer stays offered, so a robot config that never touches this
-  # Setting is completely unaffected. A String Setting, not a Discrete list,
-  # since the candidate topic set is per-deployment and can't be enumerated as
-  # fixed Discrete options the way TRUE/FALSE can.
-  CAPABILITY_SETTING_NAMES = ("autonomous_movement_enabled",
-                              "camera_controls_enabled", "enabled_image_sources",
-                              "move_with_manual_enabled")
-
-  # generic_rover/model.sdf's own hard-coded camera_link_chase POSITION
-  # (body-frame, relative to the rover's own origin) -- requested live
-  # (2026-09-04): "for the scene view cam, the 0 0 0 point should be set
-  # to wherever the cam is by default, not where the center of the robot
-  # is, so its easier for viewers to refer off that." scene_offset_x/y/z
-  # is now a DELTA from this factory mount point, not an absolute
-  # robot-frame coordinate -- FACTORY_SETTINGS below is "0.0" for all
-  # three (no delta = stock position), and sim_bridge_node.py's own
-  # respawnRoverWithCameraOffsets adds these same three constants back in
-  # before writing the actual SDF pose (see that function's own comment).
-  FACTORY_SCENE_OFFSET_X = -2.5
-  FACTORY_SCENE_OFFSET_Y = 0.0
-  FACTORY_SCENE_OFFSET_Z = 1.65
-
-  # generic_rover/model.sdf's own hard-coded camera_link (robot/first-person
-  # view) mount point -- same delta convention as FACTORY_SCENE_OFFSET_X/Y/Z
-  # above, applied here too (2026-09-08, requested live: "the 0 0 0 position
-  # for the robot view cam offset should also be where it is by default on
-  # the rover... make it like what it is for the scene view so its not
-  # confusing"). camera_offset_x/y/z is now a DELTA from this factory mount
-  # point, not an absolute robot-frame coordinate -- FACTORY_SETTINGS below
-  # is "0.0" for all three, and sim_bridge_node.py's own
-  # respawnRoverWithCameraOffsets adds these same three constants back in
-  # before writing the actual SDF pose, exactly like the scene camera's own.
-  FACTORY_CAMERA_OFFSET_X = 0.2
-  FACTORY_CAMERA_OFFSET_Y = 0.0
-  FACTORY_CAMERA_OFFSET_Z = 0.65
-
-  # generic_rover/model.sdf's own hard-coded camera_link_chase pitch, in
-  # degrees -- FACTORY_SETTINGS' scene_offset_tilt reproduces this exactly so
-  # an unconfigured robot config's default view is unchanged. camera_link
-  # itself has no rotation at all (0 rad), so no equivalent constant is
-  # needed for camera_offset_tilt's own factory value (just "0.0" below).
-  # Computed from FACTORY_SCENE_OFFSET_X/Z directly (2026-09-08, was a
-  # hardcoded math.degrees(0.5404195) -- atan2(1.5, 2.5), stale from when
-  # the mount height was 1.5m, not 1.65m -- so this constant and the actual
-  # mount height silently drifted apart; ties them together so they can't
-  # drift again if either ever changes).
-  FACTORY_SCENE_TILT_DEG = math.degrees(math.atan2(FACTORY_SCENE_OFFSET_Z, -FACTORY_SCENE_OFFSET_X))
-
-  # generic_rover/model.sdf's own hard-coded camera horizontal FOV (shared by
-  # both the robot and scene/chase cameras -- see generate_model_sdf.py).
-  # Runtime-adjustable (2026-09-08, requested live: "changing fov settings
-  # doesn't seem to do anything") the same way the camera offsets are: a
-  # change respawns the rover with the new value baked into both cameras'
-  # <horizontal_fov> -- see sim_bridge_node.py's respawnRoverWithCameraOffsets.
-  # This is a SEPARATE control from the Sim Connector app's own
-  # camera_horizontal_fov_deg dimensions field, which only takes effect at
-  # the next fresh deploy (a curated "starting" value, like wheelbase_m);
-  # this one is this robot's live camera setting, works while already running.
-  FACTORY_CAMERA_FOV_DEG = 80.0
-
-  CAP_SETTINGS = dict(
-    max_linear_speed_mps = {"type":"Float","name":"max_linear_speed_mps","options":["0.05","5.0"]},
-    max_angular_rate_dps = {"type":"Float","name":"max_angular_rate_dps","options":["5.0","180.0"]},
-    environment = {"type":"Discrete","name":"environment","options":["FLAT_GROUND","OBSTACLE_COURSE"]},
-    camera_offset_x = {"type":"Float","name":"camera_offset_x","options":["-10.0","10.0"]},
-    camera_offset_y = {"type":"Float","name":"camera_offset_y","options":["-10.0","10.0"]},
-    camera_offset_z = {"type":"Float","name":"camera_offset_z","options":["-10.0","10.0"]},
-    camera_offset_yaw = {"type":"Float","name":"camera_offset_yaw","options":["-180.0","180.0"]},
-    camera_offset_tilt = {"type":"Float","name":"camera_offset_tilt","options":["-90.0","90.0"]},
-    scene_offset_x = {"type":"Float","name":"scene_offset_x","options":["-10.0","10.0"]},
-    scene_offset_y = {"type":"Float","name":"scene_offset_y","options":["-10.0","10.0"]},
-    scene_offset_z = {"type":"Float","name":"scene_offset_z","options":["-10.0","10.0"]},
-    scene_offset_yaw = {"type":"Float","name":"scene_offset_yaw","options":["-180.0","180.0"]},
-    scene_offset_tilt = {"type":"Float","name":"scene_offset_tilt","options":["-90.0","90.0"]},
-    # Bounds match generate_model_sdf.py's own camera_horizontal_fov_deg
-    # curated-field range -- below ~20 deg is barely a lens, above ~150 deg
-    # starts hitting Gazebo's own rendering distortion limits for this
-    # sensor type.
-    camera_fov_deg = {"type":"Float","name":"camera_fov_deg","options":["20.0","150.0"]},
-    autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","options":["TRUE","FALSE"]},
-    camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","options":["TRUE","FALSE"]},
-    move_with_manual_enabled = {"type":"Discrete","name":"move_with_manual_enabled","options":["TRUE","FALSE"]},
-    # A general Devices -> Robots capability switch (requested live,
-    # 2026-09-23), not a per-robot-config dimensions field -- works on the
-    # already-running rover, default one included, and flips back to normal
-    # skid-steer the instant it's turned off. See
-    # sim_bridge_node.py's applyWheelIndependenceSetting for the actual
-    # respawn-with-rebuilt-SDF mechanism this drives. Deliberately
-    # independent of the OLDER dimensions.yaml wheel_independence_enabled
-    # field (generate_model_sdf.py) the same way camera_fov_deg is
-    # deliberately independent of the dimensions-yaml camera_horizontal_
-    # fov_deg field above -- that field still exists unchanged and still
-    # only affects what a FRESH deploy's model.sdf starts with; this
-    # Setting always starts FALSE regardless (see FACTORY_SETTINGS below)
-    # and is the only thing that can change it on an already-running rover.
-    wheel_independence_enabled = {"type":"Discrete","name":"wheel_independence_enabled","options":["TRUE","FALSE"]},
-    # No fixed options -- the candidate topic set is per-deployment.
-    enabled_image_sources = {"type":"String","name":"enabled_image_sources"}
+  # Settings, in the nepi_controls init-dict form. On/off settings are
+  # TRUE/FALSE Selections because NepiDeviceRBX-Controls.js treats any value
+  # other than "FALSE" as on.
+  INIT_SETTINGS = dict(
+    max_linear_speed_mps = {'type': 'Float', 'bounds': [0.05, 5.0], 'default': 0.5},
+    max_angular_rate_dps = {'type': 'Float', 'bounds': [5.0, 180.0], 'default': 45.0},
+    # Gates every goto here in the driver, not only in the RUI, so a client
+    # that bypasses the RUI cannot do what was turned off either.
+    autonomous_movement_enabled = {'type': 'Selection', 'options': ['TRUE', 'FALSE'], 'default': 'TRUE'},
+    # Whether manual motor commands also drive the rover's body, or only
+    # move the motor readouts.
+    move_with_manual_enabled = {'type': 'Selection', 'options': ['TRUE', 'FALSE'], 'default': 'TRUE'},
   )
 
-  FACTORY_SETTINGS = dict(
-    max_linear_speed_mps = {"type":"Float","name":"max_linear_speed_mps","value":"0.5"},
-    max_angular_rate_dps = {"type":"Float","name":"max_angular_rate_dps","value":"45.0"},
-    environment = {"type":"Discrete","name":"environment","value":"FLAT_GROUND"},
-    # Reproduces generic_rover/model.sdf's hard-coded camera_link pose exactly.
-    # Zero delta from generic_rover/model.sdf's own hard-coded camera_link
-    # mount point (FACTORY_CAMERA_OFFSET_X/Y/Z) -- see that constant's own
-    # comment for why this is 0.0 now instead of the absolute 0.2/0.0/0.65
-    # pose.
-    camera_offset_x = {"type":"Float","name":"camera_offset_x","value":"0.0"},
-    camera_offset_y = {"type":"Float","name":"camera_offset_y","value":"0.0"},
-    camera_offset_z = {"type":"Float","name":"camera_offset_z","value":"0.0"},
-    camera_offset_yaw = {"type":"Float","name":"camera_offset_yaw","value":"0.0"},
-    camera_offset_tilt = {"type":"Float","name":"camera_offset_tilt","value":"0.0"},
-    # Zero delta from generic_rover/model.sdf's own hard-coded
-    # camera_link_chase mount point (FACTORY_SCENE_OFFSET_X/Y/Z) -- see that
-    # constant's own comment for why this is 0.0 now instead of the
-    # absolute -2.5/0.0/1.65 pose.
-    scene_offset_x = {"type":"Float","name":"scene_offset_x","value":"0.0"},
-    scene_offset_y = {"type":"Float","name":"scene_offset_y","value":"0.0"},
-    scene_offset_z = {"type":"Float","name":"scene_offset_z","value":"0.0"},
-    scene_offset_yaw = {"type":"Float","name":"scene_offset_yaw","value":"0.0"},
-    scene_offset_tilt = {"type":"Float","name":"scene_offset_tilt","value":str(FACTORY_SCENE_TILT_DEG)},
-    camera_fov_deg = {"type":"Float","name":"camera_fov_deg","value":str(FACTORY_CAMERA_FOV_DEG)},
-    # Both default to enabled: a robot config that never touches these
-    # settings behaves exactly as every robot config did before this feature
-    # existed.
-    autonomous_movement_enabled = {"type":"Discrete","name":"autonomous_movement_enabled","value":"TRUE"},
-    camera_controls_enabled = {"type":"Discrete","name":"camera_controls_enabled","value":"TRUE"},
-    # Defaults TRUE (unlike rbx_ardupilot_node.py's own copy of this
-    # Setting, which defaults FALSE) -- this driver's manual motor control
-    # (motorControlToVelocity, gated below in gotoControlCb) already moved
-    # the rover directly before this Setting existed, so TRUE preserves
-    # that exact prior behavior for anyone who never touches this toggle.
-    move_with_manual_enabled = {"type":"Discrete","name":"move_with_manual_enabled","value":"TRUE"},
-    # FALSE -- today's exact skid-steer behavior byte-for-byte, matching a
-    # robot config that never touches this. See CAP_SETTINGS' own entry for
-    # why this deliberately does NOT inherit dimensions.yaml's own
-    # wheel_independence_enabled starting value.
-    wheel_independence_enabled = {"type":"Discrete","name":"wheel_independence_enabled","value":"FALSE"},
-    # Empty = unrestricted -- see the CAPABILITY_SETTING_NAMES comment above.
-    enabled_image_sources = {"type":"String","name":"enabled_image_sources","value":""}
-  )
+  # What each setup-action name a robot config may list does here. RESET is
+  # the robot-config spelling, RESET_SIM the one this driver has always
+  # reported; both teleport the rover back to its start pose.
+  SETUP_ACTION_NAMES = ("RESET_SIM", "RESET", "RETURN_HOME")
+  DEFAULT_SETUP_ACTIONS = ["RESET_SIM", "RETURN_HOME"]
+  DEFAULT_MOTOR_COUNT = 4
 
-  FACTORY_SETTINGS_OVERRIDES = dict()
-
-  # A generic differential-drive rover has no ARM/DISARM or flight-mode
-  # machinery -- RBXRobotIF handles empty lists correctly (bounds checks
-  # reject any set_state/set_mode index, status shows "Not Set"), so no
-  # placeholder entries are invented. The get*Ind functions must still be
-  # real callables (RBXRobotIF calls them unconditionally).
   RBX_STATES = []
   RBX_MODES = []
-  # Setup Actions dropdown (RUI's "Setup Controls" section, wired to
-  # setSetupActionInd below): a rover has no ARM/mode state machine, but
-  # does need two one-shot commands: an instant physics teleport back to
-  # the Gazebo spawn pose (RESET_SIM, mirroring rbx_ardupilot_node.py's
-  # RESET_SIM setup action, but here reached over the sim_bridge TCP
-  # connection instead of the ArduPilot gz_reset_listener socket -- this
-  # driver has no direct route to the VM's Gazebo otherwise), and driving
-  # back to the user-settable home position under closed-loop control
-  # (RETURN_HOME, also wired as the RBXRobotIF goHomeFunction so the
-  # standard "Go Home" control works too). Obstacle-course switching used to
-  # live here too (OBSTACLE_COURSE_ON/OFF) -- moved to the environment
-  # Setting above once a dedicated RUI dropdown made the setup-action version
-  # redundant with itself.
-  RBX_SETUP_ACTIONS = ["RESET_SIM", "RETURN_HOME", "REFRESH_ENVIRONMENT"]
-  # Go-actions dropdown (RUI's "selected_go_action" control, wired to
-  # setGoActionInd below). Camera view switching used to live here
-  # (VIEW_FIRST_PERSON/VIEW_THIRD_PERSON), then moved to a camera_view_mode
-  # Settings-tab toggle -- both are gone now that robot/scene view are two
-  # always-live ROS Image topics selected via the ordinary Image Source
-  # dropdown, same as any other camera topic (see CAMERA_SETTING_NAMES's own
-  # comment).
   RBX_GO_ACTIONS = []
 
-  # GO_HOME polls the same goto_target the gotoPosition/gotoPose setpoint
-  # functions drive (gotoControlCb clears it on arrival) rather than
-  # returning immediately, matching how RBXRobotIF's go_action dispatch
-  # blocks the calling topic callback on this function's return value to
-  # determine success/failure.
   GO_HOME_TIMEOUT_SEC = 60.0
   GO_HOME_POLL_INTERVAL_SEC = 0.2
 
-  RECONNECT_INTERVAL_SEC = 3.0
-  SOCKET_TIMEOUT_SEC = 5.0
-
-  # Bounded window, at startup only, for the VM to report its available
-  # environment models (see processEnvironmentOptionsLine) before this
-  # driver's capabilities are baked into RBXRobotIF -- RBX capabilities have
-  # no live-refresh path once constructed (see
-  # docs/SCAN_TO_SIM_ENVIRONMENT_PLAN.md section 2.1), so this is the only
-  # window this process gets. Same scale as SOCKET_TIMEOUT_SEC; never blocks
-  # startup indefinitely -- if the VM doesn't answer in time, CAP_SETTINGS'
-  # environment.options (below) and ENVIRONMENT_VALUE_TO_MODEL (just below
-  # that) simply keep the two literal values they already had, unchanged
-  # from this driver's pre-scanned-environments behavior.
-  ENVIRONMENT_OPTIONS_WAIT_SEC = 5.0
-
-  # Discrete-option-value -> spawnable model name, updated in place by
-  # processEnvironmentOptionsLine when the VM reports scanned models
-  # (environment_models.py, VM-side). Starts as this literal two-entry
-  # mapping (FLAT_GROUND -> nothing spawned, OBSTACLE_COURSE -> the one
-  # model this driver has always known about) so setEnvironmentAction always
-  # has something to look up even if the VM never answers.
-  ENVIRONMENT_VALUE_TO_MODEL = {"FLAT_GROUND": None, "OBSTACLE_COURSE": "obstacle_course"}
-
-  # Raised from 10 -- at the higher end of the now-settable max_linear_speed_mps
-  # range (up to 5.0 m/s), a 10Hz control tick lets the rover travel up to 0.5m
-  # between heading corrections, which is coarse enough to overshoot and
-  # oscillate. Finer ticks reduce that per-tick travel distance, independent of
-  # (and in addition to) the wheelTorque headroom bump in generic_rover/model.sdf.
   CONTROLLER_RATE_HZ = 20
   NAVPOSE_UPDATE_RATE = 10
-  TELEMETRY_FRESH_SEC = 2.0
 
-  # Manual motor-ratio tank-drive conversion (RBX_EXTERNAL_HARDWARE_INTERFACES.md
-  # worked example, section 6): motor 0 = left, motor 1 = right. Converted to
-  # the same linear/angular Twist gotoControlCb already sends, via standard
-  # differential-drive kinematics -- no new Gazebo model/plugin or bridge
-  # message needed, since this device's controller loop already owns sending
-  # velocity every tick. Per MotorControl.msg, speed_ratio is a 0-1 magnitude
-  # with no reverse/direction bit, so this can drive straight and
-  # differentially steer but cannot reverse or spin in place -- an honest
-  # limitation of the wire format, not this conversion. MOTOR_WHEEL_BASE_M is
-  # an approximation of generic_rover's actual wheel track width.
-  #
-  # No MOTOR_MAX_LINEAR_MPS constant here on purpose (removed 2026-08-20) --
-  # motorControlToVelocity reads settings_dict['max_linear_speed_mps'] live,
-  # same as gotoControlCb already does, so 100% motor always means "whatever
-  # max_linear_speed_mps currently is," and changing that Setting rescales
-  # manual motor control instantly too. A hardcoded 0.5 here used to silently
-  # match only the Setting's OWN factory default -- changing
-  # max_linear_speed_mps rescaled goto but left manual motor control's 100%
-  # pinned at the old value, found live 2026-08-20.
+  # Manual motor ratios -> the same linear/angular command gotoControlCb
+  # sends, by differential-drive kinematics. Even motor indices are the left
+  # side, odd the right (a 4-motor rover is front_left, front_right,
+  # rear_left, rear_right). MOTOR_WHEEL_BASE_M approximates generic_rover's
+  # track width.
   MOTOR_WHEEL_BASE_M = 0.4
 
-  # Closed-loop goto controller shape: proportional gains, plus a
-  # turn-in-place gate so the rover rotates toward the target bearing
-  # before driving (differential drive can pivot on the spot).
+  # Closed-loop goto controller: proportional gains, plus a turn-in-place
+  # gate so the rover rotates toward the target bearing before driving.
   GOTO_KP_LIN = 0.5       # (m/s per m of distance error)
   GOTO_KP_ANG = 1.5       # (rad/s per rad of heading error)
   GOTO_TURN_GATE_RAD = math.radians(30.0)
-  # Stop inside half the RBX max_distance/rotation error bounds so the
-  # interface's own convergence check (error < bound sustained for the
-  # stabilize window) passes cleanly instead of hovering at the edge.
+  # Stop inside half the RBX error bounds so the interface's own convergence
+  # check passes cleanly instead of hovering at the edge.
   GOTO_TOL_FRACTION = 0.5
-  # Fallback tolerances if the RBX interface is not up yet (matches the
-  # GOTO_TOL_FRACTION of RBXRobotIF's factory 2.0m / 2.0deg error bounds)
   FACTORY_GOTO_TOL_M = 1.0
   FACTORY_GOTO_TOL_RAD = math.radians(1.0)
 
-  # RBXRobotIF's blocking setpoint wait (setpoint_position_local_body) uses a
-  # single fixed cmd_timeout for both the drive and final-yaw phases. A
-  # non-holonomic differential-drive rover can legitimately need close to a
-  # full 360 degrees of cumulative turning for a single goto (turn to face
-  # the bearing, drive, then turn again to the requested final yaw if it
-  # differs from the bearing -- confirmed this can require two ~180 degree
-  # turns back to back) plus the full commanded travel distance at the
-  # capped max_linear_speed_mps. The RBXRobotIF factory default (25s) was
-  # observed to be too short for this: a 6m body-frame goto requiring two
-  # ~180 degree turns logged "Setpoint cmd timed out" (cmd_success False)
-  # at 25s even though the driver's own gotoControlCb went on to converge
-  # and log "Goto target reached" ~2.5s later using its own (independently
-  # correct) tolerance check. Raised here to comfortably cover a full
-  # reorientation (360deg at the factory max_angular_rate_dps of 45 = 8s)
-  # plus a generous single-command travel distance for a Gazebo world (20m
-  # at the factory max_linear_speed_mps of 0.5 = 40s) with margin -- a
-  # heuristic sized to this driver's factory speed defaults and a
-  # "reasonably-sized simulated world", not a guarantee for arbitrarily
-  # long single commands or a user who raises max speeds. See the Phase 5
-  # session summary for the full investigation and the broader, deferred
-  # design question this points to (RBXRobotIF's fixed-timeout model
-  # doesn't scale with maneuver complexity for non-holonomic ground
-  # vehicles in general).
+  # RBXRobotIF's 25 s factory cmd_timeout is too short for a
+  # non-holonomic rover that may need two ~180 degree turns plus the drive
+  # itself at the factory 0.5 m/s.
   GOTO_CMD_TIMEOUT_SEC = 60
+
+  # RBXRobotIF's factory error bounds (2.0 m) make any goto under 2 m count as
+  # already reached: its own convergence check passes on the starting error,
+  # and GOTO_TOL_FRACTION of 2.0 m gives this driver a 1.0 m arrival distance,
+  # so a 1 m goto after a reset never moved. 0.5 m keeps short moves real
+  # (0.25 m driver arrival); rotation and stabilize time stay at factory.
+  GOTO_MAX_ERROR_M = 0.5
+  GOTO_MAX_ERROR_DEG = 2.0
+  GOTO_STABILIZED_SEC = 1.0
+
+  DRV_DICT_READ_RETRIES = 5
+  DRV_DICT_READ_RETRY_SEC = 0.5
 
   #######################
   ### Node Initialization
@@ -492,171 +428,62 @@ class SimNode:
     self.msg_if.pub_info("Starting Node Initialization Processes")
 
     ##############################
-    # Gather Driver Settings from param server drv_dict -- rbx_sim_discovery.py
-    # sets this param on the SAME master an instant before launching this
-    # node, but right after a fresh reboot (cold rosmaster, cold DNS/hostname
-    # resolution for this container's own hostname) that set can still be in
-    # flight when this process's own get_param call lands, reading back the
-    # empty default and self-shutting-down over what is really just a
-    # startup race, not a genuinely missing/invalid dict (confirmed live,
-    # 2026-09-01: reproduced a full-node restart loop this way immediately
-    # after a device+VM reboot; the SAME launch succeeded instantly once the
-    # system had been up a few minutes). Retries a few times with a short
-    # backoff before giving up for real.
-    # ROOT CAUSE (found live 2026-09-17, re-diagnosing "the rover doesn't
-    # seem to be able to get detected"): widening the retry window to 20s
-    # made no difference at all -- this was never the documented cold-boot
-    # race. rbx_sim_discovery.py's launchSimDeviceNode writes this param at
-    # an ABSOLUTE path (create_namespace(self.base_namespace, sim_node_name
-    # + "/drv_dict"), e.g. /nepi/device1/sim_rover1/drv_dict -- confirmed
-    # live via `rosparam list`), but this node is launched via
-    # nepi_drvs.launchDriverNode's plain `rosrun nepi_drivers <file>
-    # __name:=<name>` with no `__ns:=`/ROS_NAMESPACE override, so its own
-    # TRUE registered graph name is just /<name> at the ROOT namespace
-    # (confirmed live via `rosnode list` showing bare /sim_rover1, and
-    # nepi_sdk.get_node_namespace() being a thin wrapper over rospy.get_name()
-    # with nothing that remaps it). A relative '~drv_dict' read therefore
-    # resolves against /sim_rover1, not /nepi/device1/sim_rover1 -- looking
-    # in a namespace nothing ever wrote to, hence KeyError('DEVICE_DICT')
-    # on every single attempt, no matter how long this retries.
-    # rbx_ardupilot_node.py's own identical '~drv_dict' read happens to get
-    # away with this today only because it has no retry-then-shutdown
-    # guard around it at all -- it silently proceeds with whatever
-    # (possibly empty) dict it gets back rather than depending on it being
-    # correct. Fixed by reading from the SAME absolute path
-    # launchSimDeviceNode writes to, using self.base_namespace/self.node_name
-    # (already set above) instead of ROS's native relative-name resolution.
-    DRV_DICT_READ_RETRIES = 5
-    DRV_DICT_READ_RETRY_SEC = 0.5
+    # drv_dict, written by nepi_app_sim_connector just before launching this
+    # node. Read from the same absolute path the app writes (base namespace
+    # + node name), not '~drv_dict': the node is launched with only __name
+    # remapped, so a relative read resolves somewhere nothing wrote to.
     drv_dict_param_name = nepi_sdk.create_namespace(self.base_namespace, self.node_name + '/drv_dict')
-    self.drv_dict = dict()
     last_error = None
-    for attempt in range(DRV_DICT_READ_RETRIES):
+    for attempt in range(self.DRV_DICT_READ_RETRIES):
       self.drv_dict = nepi_sdk.get_param(drv_dict_param_name, dict())
       try:
         self.device_name = self.drv_dict['DEVICE_DICT']['device_name']
         self.device_path = self.drv_dict['DEVICE_DICT']['device_path']
-        self.sim_host = self.drv_dict['DEVICE_DICT']['sim_host']
-        self.bridge_port = self.drv_dict['DEVICE_DICT']['bridge_port']
+        self.bridge_port = int(self.drv_dict['DEVICE_DICT'].get('bridge_port', FACTORY_BRIDGE_PORT))
         last_error = None
         break
       except Exception as e:
         last_error = e
-        nepi_sdk.sleep(DRV_DICT_READ_RETRY_SEC)
+        nepi_sdk.sleep(self.DRV_DICT_READ_RETRY_SEC)
     if last_error is not None:
-        self.msg_if.pub_warn("Failed to load Device Dict " + str(last_error))
-        nepi_sdk.signal_shutdown(self.node_name + ": Shutting down because no valid Device Dict")
-        return
+      self.msg_if.pub_warn("Failed to load Device Dict " + str(last_error))
+      nepi_sdk.signal_shutdown(self.node_name + ": Shutting down because no valid Device Dict")
+      return
+    self.robot_config = self.drv_dict.get('ROBOT_CONFIG', None)
+    if not isinstance(self.robot_config, dict):
+      self.robot_config = None
 
     ##############################
-    # Bridge connection and telemetry state
-    self.sock = None
-    self.sock_lock = threading.Lock()
-    self.last_telemetry_time = 0.0
-    # See the environment re-sync comment at the top of the bridge-accept
-    # loop (setEnvironmentAction call) for why this is a ONE-SHOT flag, not
-    # re-checked on every reconnect.
-    self._environment_synced_once = False
+    # State
     self.navpose_dict = copy.deepcopy(nepi_nav.BLANK_NAVPOSE_DICT)
-
-    ##############################
-    # Camera-rover feature: publish decoded frames on a bare-relative topic
-    # name that RBXRobotIF's find_topic()-based image subscriber is pointed
-    # at via set_image_topic (see below).
-    #
-    # Deliberately a BARE relative name, not
-    # nepi_sdk.create_namespace(self.node_namespace, ...): confirmed by direct
-    # test (rostopic info after deploy) that RBXRobotIF's own subscribe --
-    # also a bare relative rospy.Subscriber(...), since find_topic() returns
-    # the search string itself rather than the matched full topic path --
-    # resolves against a namespace SHARED BY EVERY DRIVER NODE ON THIS DEVICE
-    # (/nepi/<device>, not this node's own self.node_namespace), because
-    # nepi_drvs.launchDriverNode only remaps __name, never __ns -- every
-    # rbx_sim node process inherits the same default ROS namespace.
-    #
-    # Single-robot camera-rover phase used RBXRobotIF's plain factory default
-    # ("color_2d_image", its FACTORY_IMAGE_INPUT_TOPIC_NAME) unmodified,
-    # since with only one instance nothing else could collide with it.
-    # Camera-rover-multi phase found (real cross-talk, not assumed): with two
-    # live sim_rover instances, BOTH processes' bare "color_2d_image" publish
-    # AND both RBXRobotIF instances' bare "color_2d_image" find_topic()
-    # subscribe resolve to the exact same shared /nepi/<device>/color_2d_image
-    # topic (confirmed via rosnode info on the live single-instance deploy,
-    # which already showed /nepi/device1/sim_rover1 publishing AND
-    # subscribing that unnamespaced topic) -- a second instance would publish
-    # to and read from the identical topic, so each robot's frames would
-    # bleed into the other's image data product. Fix: bake this node's own
-    # device_name (sim_rover1/sim_rover2, already unique per
-    # SIM_ROBOT_SLOTS/DEVICE_DICT) into the bare-relative string itself, on
-    # both the publish and the find_topic() search string (via
-    # set_image_topic below) -- still a bare relative name (still resolves
-    # against the shared device-wide namespace), but now distinguished by
-    # content, so /nepi/<device>/sim_rover1/color_2d_image and
-    # .../sim_rover2/color_2d_image never collide.
-    # Four always-live topics (robot/scene x color/depth-view), not one bare
-    # topic -- see CAMERA_SETTING_NAMES's own comment for why.
-    # image_topic_name stays the shared, device-name-qualified BASE all four
-    # are built from, so the cross-instance collision fix above still
-    # applies identically to all of them.
-    self.image_topic_name = self.device_name + "/color_2d_image"
-    self.robot_color_topic_name = self.image_topic_name + "/" + self.ROBOT_COLOR_TOPIC_SUFFIX
-    self.scene_color_topic_name = self.image_topic_name + "/" + self.SCENE_COLOR_TOPIC_SUFFIX
-    self.robot_depth_topic_name = self.image_topic_name + "/" + self.ROBOT_DEPTH_TOPIC_SUFFIX
-    self.scene_depth_topic_name = self.image_topic_name + "/" + self.SCENE_DEPTH_TOPIC_SUFFIX
-    self.image_pub_robot_color = nepi_sdk.create_publisher(self.robot_color_topic_name, Image, queue_size = 1)
-    self.image_pub_scene_color = nepi_sdk.create_publisher(self.scene_color_topic_name, Image, queue_size = 1)
-    self.image_pub_robot_depth = nepi_sdk.create_publisher(self.robot_depth_topic_name, Image, queue_size = 1)
-    self.image_pub_scene_depth = nepi_sdk.create_publisher(self.scene_depth_topic_name, Image, queue_size = 1)
-
-    ##############################
-    # Goto controller state
+    self.have_telemetry = False
     self.goto_target = None       # dict(x_m, y_m, yaw_deg or None) in sim ENU world frame
     self.goto_target_lock = threading.Lock()
     self.stop_triggered = False
-
-    ##############################
-    # Manual motor-ratio state: RBX_EXTERNAL_HARDWARE_INTERFACES.md worked
-    # example (section 6) originally modeled a CAN-bus-style two-motor tank
-    # drive (0=left, 1=right). Widened to 4 (2026-08-20): generic_rover/
-    # model.sdf is a genuine 4-joint skid-steer (front_left, front_right,
-    # rear_left, rear_right -- see its own diff_drive_controller plugin
-    # comment), and RBXRobotIF's own motor_count capability is derived
-    # generically as len(getMotorControlRatios()), the same mechanism that
-    # already makes the ArduPilot driver "automatically show all 4 motors"
-    # (its own self.motor_ratios is sized from motor_count) -- hardcoding 2
-    # here regardless of the selected robot config's declared motor_count
-    # left the Motor Controls panel showing only 2 sliders even for
-    # ground_robot_4_wheel. Order matches the SDF's own joint order: [0]
-    # front_left, [1] front_right, [2] rear_left, [3] rear_right.
-    # libgazebo_ros_diff_drive only ever takes ONE velocity per side (see
-    # that plugin's repeated <leftJoint>/<rightJoint> tags driving both
-    # front+rear identically), so genuinely independent per-wheel speeds
-    # aren't physically realizable here -- motorControlToVelocity below
-    # averages each side's pair, which means all 4 sliders are individually
-    # movable and each has a real effect, but front/rear on the same side
-    # can't diverge from each other.
-    self.motor_ratios = [0.0, 0.0, 0.0, 0.0]
-
-    ##############################
-    # Home position state: local ENU x/y/z meters (this rover has no WGS84
-    # reference), carried over RBXRobotIF's existing GeoPoint-based
-    # set_home/get_home/set_home_current plumbing -- see getHome/setHome
-    # below for why reusing that mechanism (rather than adding a new
-    # message/topic) is safe here.
     self.home_x_m = 0.0
     self.home_y_m = 0.0
     self.home_z_m = 0.0
+    self.rbx_if = None
+
+    motor_count = self.getConfigInt('motor_count', self.DEFAULT_MOTOR_COUNT)
+    self.motor_ratios = [0.0] * max(0, motor_count)
+
+    setup_actions = self.DEFAULT_SETUP_ACTIONS
+    if self.robot_config is not None:
+      setup_actions = [str(a) for a in self.robot_config.get('setup_actions', [])
+                       if str(a) in self.SETUP_ACTION_NAMES]
+    self.setup_actions = list(setup_actions)
 
     ##############################
-    # Initialize RBX Settings
-    # Build the real, modern nepi_controls controls dict here -- see
-    # initSettingsDict()'s own comment (mirrors the identical fix applied to
-    # rbx_ardupilot_node.py) for why self.settings_dict can no longer just be
-    # CAP_SETTINGS/FACTORY_SETTINGS' own legacy shape.
+    # Camera views, published as plain Image topics under this node.
+    self.image_topic_name = nepi_sdk.create_namespace(self.node_namespace, 'color_2d_image')
+    self.image_pubs = dict()
+    for view in self.CAMERA_VIEWS:
+      self.image_pubs[view] = nepi_sdk.create_publisher(self.image_topic_name + "/" + view, Image, queue_size = 1)
+
+    ##############################
+    # Settings
     self.settings_dict = self.initSettingsDict()
-    self.settings_dict = self.refreshSettingsDict()
-    self.cap_settings = self.getCapSettings()
-    self.factory_settings = self.getFactorySettings()
 
     self.axis_controls = AxisControls()
     self.axis_controls.x = True
@@ -667,118 +494,70 @@ class SimNode:
     self.axis_controls.yaw = True
 
     ##############################
-    # Bridge client thread: connects, reads telemetry, reconnects on failure
-    self.environment_options_received_event = threading.Event()
-    self.bridge_thread = threading.Thread(target = self.bridgeLoop)
-    self.bridge_thread.daemon = True
-    self.bridge_thread.start()
-    # Bounded wait (see ENVIRONMENT_OPTIONS_WAIT_SEC's own comment) so that,
-    # when the VM answers quickly, CAP_SETTINGS['environment']['options'] and
-    # ENVIRONMENT_VALUE_TO_MODEL already reflect its scanned models by the
-    # time RBXRobotIF bakes capabilities in below -- and when it doesn't,
-    # startup proceeds anyway with the two-entry fallback unchanged.
-    self.environment_options_received_event.wait(timeout = self.ENVIRONMENT_OPTIONS_WAIT_SEC)
+    # Bridge to the VM
+    self.link = SimBridgeLink(self.bridge_port,
+                              telemetryFunction = self.processTelemetry,
+                              imageFunction = self.processImage,
+                              logInfoFunction = self.msg_if.pub_info,
+                              logWarnFunction = lambda msg: self.msg_if.pub_warn(msg, throttle_s = 5.0))
 
     ##############################
-    # Launch the NEPI RBX interface -- this takes care of initializing all
-    # the rbx settings from config, subscribing/advertising topics and
-    # services, publishing status/navpose, and running the blocking goto
-    # convergence checks against the navpose data supplied by getNavPoseCb.
+    # Launch the NEPI RBX interface
     self.msg_if.pub_info("Launching NEPI RBX interface...")
     self.device_info_dict = dict(device_name = self.device_name,
                                  path = self.device_path,
                                  serial_number = "",
                                  hw_version = "",
                                  sw_version = "")
-    self.msg_if.pub_info(str(self.device_info_dict))
 
+    has_motors = len(self.motor_ratios) > 0
     self.rbx_if = RBXRobotIF(device_info = self.device_info_dict,
-                                  # RBXRobotIF's factory default is
-                                  # 'control_system' -- sim_connector_app_node.py's
-                                  # own device discovery (simDiscoveryCb) only
-                                  # matches DeviceRBXStatus publishers reporting
-                                  # 'simulator' (SIM_SOURCE_DESCRIPTION) here.
-                                  # Without this override, this rover never
-                                  # appears in that app's available_simulators
-                                  # list, so its own selected_simulator can never
-                                  # resolve to this device's namespace -- silently
-                                  # defeating any Sim Connector control surface
-                                  # that depends on that discovery, including the
-                                  # camera-rig controls added 2026-08-13.
-                                  data_source_description = 'simulator',
-                                  capSettings = self.cap_settings,
-                                  factorySettings = self.factory_settings,
-                                  settingUpdateFunction = self.settingUpdateFunction,
-                                  getSettingsFunction = self.getSettings,
-                                  axisControls = self.axis_controls,
-                                  getBatteryPercentFunction = None,
-                                  states = self.RBX_STATES,
-                                  getStateIndFunction = self.getStateInd,
-                                  setStateIndFunction = self.setStateInd,
-                                  modes = self.RBX_MODES,
-                                  getModeIndFunction = self.getModeInd,
-                                  setModeIndFunction = self.setModeInd,
-                                  checkStopFunction = self.checkStopFunction,
-                                  setup_actions = self.RBX_SETUP_ACTIONS,
-                                  setSetupActionIndFunction = self.setSetupActionInd,
-                                  go_actions = self.RBX_GO_ACTIONS,
-                                  setGoActionIndFunction = self.setGoActionInd,
-                                  manualControlsReadyFunction = self.manualControlsReady,
-                                  getMotorControlRatios = self.getMotorControlRatios,
-                                  setMotorControlRatio = self.setMotorControlRatio,
-                                  autonomousControlsReadyFunction = self.autonomousControlsReady,
-                                  getHomeFunction = self.getHome,
-                                  setHomeFunction = self.setHome,
-                                  goHomeFunction = self.returnHomeAction,
-                                  goStopFunction = self.goStop,
-                                  gotoPoseFunction = self.gotoPose,
-                                  gotoPositionFunction = self.gotoPosition,
-                                  gotoLocationFunction = None,
-                                  getNavPoseCb = self.getNavPoseCb,
-                                  navpose_update_rate = self.NAVPOSE_UPDATE_RATE,
-                                  msg_if = self.msg_if
-                                )
+                             # 'simulator', not the 'control_system' default:
+                             # nepi_app_sim_connector finds its robot by this.
+                             data_source_description = 'simulator',
+                             getSettingsFunction = self.getSettingsFunction,
+                             setSettingFunction = self.setSettingFunction,
+                             axisControls = self.axis_controls,
+                             getBatteryPercentFunction = None,
+                             states = self.RBX_STATES,
+                             getStateIndFunction = self.getStateInd,
+                             setStateIndFunction = self.setStateInd,
+                             modes = self.RBX_MODES,
+                             getModeIndFunction = self.getModeInd,
+                             setModeIndFunction = self.setModeInd,
+                             checkStopFunction = self.checkStopFunction,
+                             setup_actions = self.setup_actions,
+                             setSetupActionIndFunction = self.setSetupActionInd if self.setup_actions else None,
+                             go_actions = self.RBX_GO_ACTIONS,
+                             setGoActionIndFunction = self.setGoActionInd,
+                             manualControlsReadyFunction = self.manualControlsReady,
+                             getMotorControlRatios = self.getMotorControlRatios if has_motors else None,
+                             setMotorControlRatio = self.setMotorControlRatio if has_motors else None,
+                             autonomousControlsReadyFunction = self.autonomousControlsReady,
+                             getHomeFunction = self.getHome if self.hasCapability('has_set_home') else None,
+                             setHomeFunction = self.setHome if self.hasCapability('has_set_home') else None,
+                             goHomeFunction = self.returnHomeAction if self.hasCapability('has_go_home') else None,
+                             goStopFunction = self.goStop if self.hasCapability('has_go_stop') else None,
+                             gotoPoseFunction = self.gotoPose if self.hasCapability('has_goto_pose') else None,
+                             gotoPositionFunction = self.gotoPosition if self.hasCapability('has_goto_position') else None,
+                             gotoLocationFunction = None,
+                             getNavPoseCb = self.getNavPoseCb,
+                             navpose_update_rate = self.NAVPOSE_UPDATE_RATE,
+                             msg_if = self.msg_if
+                            )
 
     self.msg_if.pub_info("... RBX interface running")
     time.sleep(1)
 
-    ## Raise the interface's setpoint-wait cmd_timeout above its 25s factory
-    ## default -- see GOTO_CMD_TIMEOUT_SEC above for why a non-holonomic
-    ## rover needs more headroom than the factory value provides.
+    ## See GOTO_CMD_TIMEOUT_SEC.
     self.rbx_if.setCmdTimeoutCb(UInt32(data = self.GOTO_CMD_TIMEOUT_SEC))
-
-    ## Point the interface's image-source search at this instance's own
-    ## per-device-name-qualified robot_color topic by default (matching the
-    ## old FIRST_PERSON factory default, back when there was one switchable
-    ## topic instead of six always-live ones -- see the image_pub_robot_color
-    ## comment above) -- overrides RBXRobotIF's plain "color_2d_image"
-    ## factory default/any stale persisted config every startup, same
-    ## rationale as the cmd_timeout override just above: deterministic
-    ## per-instance behavior regardless of what a previous run left in
-    ## config. The operator can still switch to any of the other five any
-    ## time via the ordinary Image Source dropdown, same as picking any other
-    ## camera topic.
-    self.rbx_if.setImageTopicCb(String(data = self.robot_color_topic_name))
-
-    ## Same "deterministic per-instance behavior regardless of what a
-    ## previous run left in config" rationale as the image-topic override
-    ## just above, for enabled_image_sources specifically (requested live,
-    ## 2026-09-24: "all of the camera images for sim connector are by
-    ## default disabled for some reason every time a new sim is launched -
-    ## make sure they're all enabled by default"). Confirmed live: this
-    ## Setting's own persisted param value had somehow become a malformed,
-    ## non-empty string (a stray control-dict-shaped fragment prepended to
-    ## a stale, partial topic allowlist) -- since empty is this Setting's
-    ## only "unrestricted, show everything" value (see CAP_SETTINGS' own
-    ## comment and both Nepi_IF_Sim-Controls.js's and NepiDeviceRBX.js's
-    ## own "empty means unrestricted" handling), ANY non-empty persisted
-    ## value -- corrupted or not -- silently narrows the camera list down
-    ## to whatever happened to be saved, which is exactly the "all disabled"
-    ## symptom reported. Going through settings_if.update_setting_value
-    ## (not settingUpdateFunction directly) so this is indistinguishable
-    ## from a real operator-issued update: settings_dict, the persisted
-    ## param, and the next status publish all stay in sync.
-    self.rbx_if.settings_if.update_setting_value('enabled_image_sources', '')
+    ## See GOTO_MAX_ERROR_M.
+    self.rbx_if.setErrorBoundsCb(ErrorBounds(max_distance_error_m = self.GOTO_MAX_ERROR_M,
+                                             max_rotation_error_deg = self.GOTO_MAX_ERROR_DEG,
+                                             min_stabilize_time_s = self.GOTO_STABILIZED_SEC))
+    ## Point the interface's image source at this rover's own robot camera,
+    ## regardless of what a previous run left in config.
+    self.rbx_if.setImageTopicCb(String(data = self.image_topic_name + "/robot_color"))
 
     ## Start the closed-loop goto controller
     controller_interval = float(1) / self.CONTROLLER_RATE_HZ
@@ -791,137 +570,70 @@ class SimNode:
 
 
   #**********************
+  # Robot config
+
+  def hasCapability(self, flag):
+    # No robot config (e.g. launched by hand) keeps the full rover control
+    # set this driver has always offered.
+    if self.robot_config is None:
+      return True
+    return self.robot_config.get(flag, False) is True
+
+  def getConfigInt(self, key, default):
+    if self.robot_config is None:
+      return default
+    try:
+      return int(self.robot_config.get(key, 0))
+    except (TypeError, ValueError):
+      return 0
+
+  #**********************
   # Setting functions
 
-  def getCapSettings(self):
-    return self.CAP_SETTINGS
-
-  def getFactorySettings(self):
-    settings = self.getSettings()
-    #Apply factory setting overides
-    for setting_name in settings.keys():
-      if setting_name in self.FACTORY_SETTINGS_OVERRIDES:
-            settings[setting_name]['value'] = self.FACTORY_SETTINGS_OVERRIDES[setting_name]
-    return settings
-
   def initSettingsDict(self):
-    # CAP_SETTINGS/FACTORY_SETTINGS are a legacy, pre-controls-system shape
-    # ({'type','name','options'} / {'type','name','value'}) that RBXRobotIF's
-    # own capSettings=/factorySettings= constructor args accept but never
-    # actually consume any more -- getSettingsFunction/setSettingFunction are
-    # the only things SettingsIF actually reads, and it requires a real
-    # nepi_controls controls dict (each entry carrying 'default', and
-    # 'bounds'/'options' as its type requires), not this legacy shape.
-    # Mirrors the identical fix applied to rbx_ardupilot_node.py -- see that
-    # file's own copy of this method for the full incident writeup
-    # (KeyError: 'default' warnings on every settings status publish,
-    # "setSettingFunction callback failed" on every settings update, and
-    # "cannot marshal None unless allow_none is enabled" once a config reset
-    # tried to persist the resulting None values -- confirmed live
-    # 2026-09-16 for sim_rover1 specifically).
-    init_settings_dict = dict()
-    for setting_name in self.CAP_SETTINGS.keys():
-      cap_setting = self.CAP_SETTINGS[setting_name]
-      setting_type = cap_setting['type']
-      setting_dict = dict()
-      setting_dict['type'] = setting_type
-      # The retired cap-settings form carried an Int/Float control's min and
-      # max in an 'options' pair. The controls contract calls that 'bounds'.
-      if 'options' in cap_setting.keys():
-        try:
-          if setting_type == 'Int':
-            setting_dict['bounds'] = [int(cap_setting['options'][0]), int(cap_setting['options'][1])]
-          elif setting_type == 'Float':
-            setting_dict['bounds'] = [float(cap_setting['options'][0]), float(cap_setting['options'][1])]
-          else:
-            setting_dict['options'] = [str(option) for option in cap_setting['options']]
-        except Exception as e:
-          self.msg_if.pub_warn("Invalid bounds/options for setting: " + setting_name + " : " + str(e))
-
-      default = None
-      if setting_name in self.FACTORY_SETTINGS.keys():
-        default = self.FACTORY_SETTINGS[setting_name]['value']
-      if setting_name in self.FACTORY_SETTINGS_OVERRIDES.keys():
-        default = self.FACTORY_SETTINGS_OVERRIDES[setting_name]
-      if default is None:
-        continue
-      try:
-        if setting_type == 'Int':
-          default = int(float(default))
-        elif setting_type == 'Float':
-          default = float(default)
-        elif setting_type == 'Toggle':
-          default = (str(default) == 'True' or str(default) == 'true')
-        else:
-          default = str(default)
-      except Exception as e:
-        self.msg_if.pub_warn("Invalid factory value for setting: " + setting_name + " : " + str(e))
-        continue
-      setting_dict['default'] = default
-      init_settings_dict[setting_name] = setting_dict
-
-    settings_dict = nepi_controls.create_controls_dict(init_settings_dict)
-    settings_dict_values = nepi_controls.get_controls_values_dict(settings_dict)
-    self.msg_if.pub_info("Initialized Settings: " + str(settings_dict_values))
+    settings_dict = nepi_controls.create_controls_dict(copy.deepcopy(self.INIT_SETTINGS))
+    self.msg_if.pub_info("Initialized Settings: " + str(nepi_controls.get_values_dict(settings_dict)))
     return settings_dict
 
   def refreshSettingsDict(self):
-    # 'environment' is the one setting whose real option list arrives later,
-    # asynchronously, over the sim bridge (see processEnvironmentOptionsLine),
-    # which updates self.settings_dict directly via
-    # nepi_controls.set_control_options() once it actually arrives.
     return copy.deepcopy(self.settings_dict)
 
-  def getSettings(self):
-    # Deep copy, not a bare reference -- SettingsIF assigns whatever this
-    # returns directly to its own self.settings_dict, then mutates
-    # individual entries of it in place. See rbx_ardupilot_node.py's own
-    # getSettings() for the full cross-object mutation hazard this avoids.
-    return copy.deepcopy(self.settings_dict)
+  def getSettingsFunction(self):
+    # A copy: SettingsIF keeps whatever this returns as its own dict and
+    # mutates it in place.
+    return self.refreshSettingsDict()
 
-  def settingUpdateFunction(self, setting_name, setting_value):
-    # SettingsIF (system_if.py) calls setSettingFunction(name, value,
-    # [callback_arg]) -- two/three plain positional args, not the single
-    # combined {'name','type','value'} dict this function's own body used to
-    # be written against. See rbx_ardupilot_node.py's own settingUpdateFunction
-    # for the full incident writeup of this exact bug.
-    success = False
+  def setSettingFunction(self, setting_name, setting_value):
     setting_str = setting_name + ":" + str(setting_value)
     if setting_name not in self.settings_dict.keys():
-      msg = (self.node_name + " Setting name " + setting_str + " is not supported")
-      return success, msg, copy.deepcopy(self.settings_dict)
+      return [False, self.node_name + " Setting name " + setting_str + " is not supported",
+              copy.deepcopy(self.settings_dict)]
     if nepi_controls.get_clean_value(self.settings_dict, setting_name, setting_value) is None:
-      msg = (self.node_name + " Setting data " + setting_str + " is not valid")
-      return success, msg, copy.deepcopy(self.settings_dict)
+      return [False, self.node_name + " Setting data " + setting_str + " is not valid",
+              copy.deepcopy(self.settings_dict)]
+    self.settings_dict = nepi_controls.set_value(self.settings_dict, setting_name, setting_value)
+    return [True, self.node_name + " UPDATED SETTINGS " + setting_str, copy.deepcopy(self.settings_dict)]
 
-    self.settings_dict = nepi_controls.set_control_value(self.settings_dict, setting_name, setting_value)
-    success = True
-    msg = (self.node_name + " UPDATED SETTINGS " + setting_str)
-    if setting_name in self.CAMERA_SETTING_NAMES:
-      self.sendCameraSettings()
-    if setting_name in self.ENVIRONMENT_SETTING_NAMES:
-      self.setEnvironmentAction(setting_value)
-    if setting_name in self.WHEEL_INDEPENDENCE_SETTING_NAMES:
-      self.setWheelIndependenceAction(setting_value)
-    return success, msg, copy.deepcopy(self.settings_dict)
+  def getSettingFloat(self, setting_name):
+    return float(nepi_controls.get_value(self.settings_dict, setting_name))
+
+  def getSettingEnabled(self, setting_name):
+    return str(nepi_controls.get_value(self.settings_dict, setting_name)) != 'FALSE'
 
   ##########################
   # RBX Interface Functions
 
   def getStateInd(self):
-    # No robot states (empty RBX_STATES) -- RBXRobotIF still calls this
-    # unconditionally and displays "Not Set" for the empty list
+    # No robot states -- RBXRobotIF still calls this unconditionally.
     return 0
 
-  def setStateInd(self,state_ind):
-    # Unreachable with empty RBX_STATES (RBXRobotIF bounds-checks first)
+  def setStateInd(self, state_ind):
     return False
 
   def getModeInd(self):
     return 0
 
-  def setModeInd(self,mode_ind):
-    # Unreachable with empty RBX_MODES
+  def setModeInd(self, mode_ind):
     return False
 
   def checkStopFunction(self):
@@ -930,125 +642,86 @@ class SimNode:
     return triggered
 
   def manualControlsReady(self):
-    # Gates manual motor-ratio commands the same way autonomousControlsReady
-    # gates goto commands: require a live bridge connection. Fresh telemetry
-    # is not required here (unlike goto) since a direct motor command doesn't
-    # depend on knowing the current position/heading.
-    with self.sock_lock:
-      return self.sock is not None
+    # A live bridge is all a direct motor command needs.
+    return self.link.is_connected()
 
   def setMotorControlRatio(self, motor_ind, speed_ratio):
-    # Only updates local state -- gotoControlCb (already running continuously
-    # at CONTROLLER_RATE_HZ) is the single authoritative sender of velocity
-    # commands to the bridge. A one-shot send from here was tried first and
-    # confirmed live to be immediately overwritten by that loop's next
-    # (0,0)-when-idle tick, since it sends every tick regardless of whether a
-    # goto or manual command is active. See motorControlToVelocity.
+    # Only updates local state -- gotoControlCb is the single sender of
+    # velocity, every tick, so a one-shot send from here would be
+    # overwritten by its next idle (0, 0) anyway. -1..1: a rover's wheels
+    # reverse.
     if motor_ind < 0 or motor_ind >= len(self.motor_ratios):
       self.msg_if.pub_warn("Motor control ignored: motor index " + str(motor_ind) + " out of range")
       return
-    # -1.0..1.0, not 0.0..1.0 -- a wheeled rover's motors genuinely reverse,
-    # unlike the ArduPilot driver's motor TEST (a prop spin-up check, which
-    # has no meaningful reverse direction and stays 0..1 on its own class).
     self.motor_ratios[motor_ind] = max(-1.0, min(1.0, speed_ratio))
 
   def getMotorControlRatios(self):
     return self.motor_ratios
 
   def autonomousControlsReady(self):
-    # Gates all goto commands: require a live bridge connection with fresh
-    # telemetry so goto targets are computed from a real current position.
-    # Also require autonomous_movement_enabled -- the Sim Connector's own
-    # per-robot-config "automated movement" toggle. Checked HERE, not just in
-    # the RUI (which hides the controls entirely), so disabling it actually
-    # blocks the command for any client, not merely the RUI's own buttons.
-    if self.settings_dict['autonomous_movement_enabled']['value'] != 'TRUE':
+    # Every goto needs a live bridge (which implies fresh telemetry, so the
+    # target is computed from a real current position) and autonomous
+    # movement switched on.
+    if not self.getSettingEnabled('autonomous_movement_enabled'):
       return False
-    with self.sock_lock:
-      connected = self.sock is not None
-    fresh = (nepi_utils.get_time() - self.last_telemetry_time) < self.TELEMETRY_FRESH_SEC
-    return connected and fresh
+    return self.link.is_connected()
 
   def goStop(self):
     self.stop_triggered = True
     self.clearGotoTarget()
-    self.sendVelocityCmd(0.0, 0.0)
+    self.link.send_velocity(0.0, 0.0)
     return True
 
-  def gotoPose(self,attitude_enu_degs):
-    # RBXRobotIF passes target attitude ENU [roll,pitch,yaw] degrees; only
-    # yaw is achievable on a ground rover (roll/pitch stay ~0 on flat
-    # ground, so the interface's roll/pitch error checks converge). Hold
-    # position, turn in place.
+  def gotoPose(self, attitude_enu_degs):
+    # Only yaw is achievable on a ground rover: hold position, turn in place.
     self.msg_if.pub_info("Recieved Pose setpoint command: " + str(attitude_enu_degs))
     with self.goto_target_lock:
       self.goto_target = {'x_m': self.navpose_dict['x_m'],
                           'y_m': self.navpose_dict['y_m'],
                           'yaw_deg': attitude_enu_degs[2]}
 
-  def gotoPosition(self,point_enu_m,orientation_enu_deg):
-    # RBXRobotIF passes the goal as an ENU offset point from the current
-    # position plus an absolute target orientation (its own convergence
-    # check uses current + offset), so the controller target is computed
-    # the same way from the same navpose source. z is ignored: the rover
-    # moves in the ground plane (z stays 0, matching a z=0 offset input).
+  def gotoPosition(self, point_enu_m, orientation_enu_deg):
+    # RBXRobotIF passes an ENU offset from the current position plus an
+    # absolute target orientation. z is ignored: the rover stays on the
+    # ground plane.
     self.msg_if.pub_info("Recieved Position setpoint command: " + str(point_enu_m))
-    # yaw_locked (2026-09-23, requested live: "position changes keep the
-    # base locked to whatever angle they're at while moving the wheels")
-    # -- with wheel independence on, a POSITION command never rotates the
-    # base at all, not even once the position is reached (gotoControlCb's
-    # own final-yaw phase skips convergence entirely when this is set,
-    # same as it already does for a None yaw_deg -- see RETURN_HOME's own
-    # goto_target). orientation_enu_deg is still recorded (not discarded)
-    # in case a future caller wants it, just never converged toward while
-    # this flag is set. A gotoPose call (see that method's own goto_target)
-    # never sets this -- "changing the yaw angle should simply rotate the
-    # base" always goes through unaffected, wheel independence or not.
-    wheel_independence_on = self.settings_dict['wheel_independence_enabled']['value'] == 'TRUE'
     with self.goto_target_lock:
       self.goto_target = {'x_m': self.navpose_dict['x_m'] + point_enu_m.x,
                           'y_m': self.navpose_dict['y_m'] + point_enu_m.y,
-                          'yaw_deg': orientation_enu_deg[2],
-                          'yaw_locked': wheel_independence_on}
+                          'yaw_deg': orientation_enu_deg[2]}
 
   def getNavPoseCb(self):
+    # None until the first telemetry: NPXDeviceIF derives which NavPose
+    # fields exist from the first real reading, and waits for one when this
+    # returns None rather than locking in a blank dict's all-False flags.
+    if not self.have_telemetry:
+      return None
     return self.navpose_dict
 
   #######################
-  ### Setup-Action Functions
+  ### Setup/Go-Action Functions
 
   def setSetupActionInd(self, action_ind):
-    # action_ind is already bounds-checked against RBX_SETUP_ACTIONS by
-    # RBXRobotIF before this is called.
-    action = self.RBX_SETUP_ACTIONS[action_ind]
-    if action == "RESET_SIM":
+    # action_ind is already bounds-checked by RBXRobotIF.
+    action = self.setup_actions[action_ind]
+    if action in ("RESET_SIM", "RESET"):
       return self.resetSimAction()
     elif action == "RETURN_HOME":
       return self.returnHomeAction()
-    elif action == "REFRESH_ENVIRONMENT":
-      return self.refreshEnvironmentAction()
     return False
 
-  #######################
-  ### Go-Action Functions
-
   def setGoActionInd(self, action_ind):
-    # Unreachable with empty RBX_GO_ACTIONS (RBXRobotIF bounds-checks first)
+    # Unreachable with empty RBX_GO_ACTIONS
     return False
 
   #######################
   ### Home Functions
 
   def getHome(self):
-    # No GPS/WGS84 reference on a ground rover -- RBXRobotIF's home
-    # mechanism only carries a plain 3-float GeoPoint though, so this reuses
-    # that same plumbing (set_home/get_home/set_home_current topics, config
-    # persistence via RBXRobotIF's own 'home_location' param) with the
-    # three floats reinterpreted as local ENU x/y/z meters instead of
-    # lat/long/alt degrees. See processTelemetryLine's navpose_dict
-    # latitude/longitude/altitude_m fields for the matching reinterpretation
-    # that makes RBXRobotIF's set_home_current ("use current position")
-    # path work correctly for this driver with zero shared-API changes.
+    # No WGS84 reference on this rover, so RBXRobotIF's GeoPoint home carries
+    # local ENU x/y/z meters in its latitude/longitude/altitude fields. See
+    # processTelemetry's matching latitude/longitude, which is what makes
+    # "use current position as home" capture the real position.
     home = GeoPoint()
     home.latitude = self.home_x_m
     home.longitude = self.home_y_m
@@ -1062,13 +735,8 @@ class SimNode:
     return True
 
   def returnHomeAction(self):
-    # Drives to the stored home position the same way a gotoPosition
-    # setpoint is: set the goto_target and let gotoControlCb's existing
-    # closed-loop controller take it from there. No forced final yaw --
-    # home is just a position here, not a position+heading. Blocks until
-    # arrival (or timeout) since both the go_action/setup_action dispatch
-    # and RBXRobotIF's own goHomeFunction call treat this call's return
-    # value as success/failure, not just "accepted".
+    # Drives home under the closed-loop controller and blocks until arrival
+    # or timeout, since both callers treat the return value as the outcome.
     if not self.autonomousControlsReady():
       return False
     with self.goto_target_lock:
@@ -1083,81 +751,13 @@ class SimNode:
     return False
 
   def resetSimAction(self):
-    # Unlike GO_HOME (drive there under the closed-loop controller), this is
-    # an instant physics teleport back to the Gazebo spawn pose -- mirrors
-    # rbx_ardupilot_node.py's RESET_SIM setup action, but reached over the
-    # existing sim_bridge TCP connection (this driver has no direct route to
-    # the VM's Gazebo/gz_reset_listener otherwise).
+    # An instant teleport back to the start pose, done on the VM. Motor
+    # ratios are cleared too, or the next control tick would resend a stale
+    # manual command and undo the reset.
     self.clearGotoTarget()
-    # Clearing motor_ratios (not just sending one zero velocity command) is
-    # required, not cosmetic -- reported live (2026-09-02): "if the rover is
-    # a little discombobulated... it doesn't stabilize it, it continues to
-    # glitch around". gotoControlCb runs continuously at CONTROLLER_RATE_HZ
-    # and falls back to `elif any(self.motor_ratios): ... motorControlToVelocity()`
-    # whenever there's no active goto -- if an operator had left manual motor
-    # sliders non-zero, the very NEXT control tick after this method's own
-    # sendVelocityCmd(0.0, 0.0) would see motor_ratios still non-zero and
-    # immediately resend that stale non-zero command, undoing the reset
-    # within a single tick (this method's own zero-send would look like it
-    # "didn't work" even though it ran correctly). RUI motor sliders read
-    # getMotorControlRatios() (via rbx/status's current_motor_control_settings),
-    # so clearing the array here is also what makes them visibly snap back
-    # to 0 the moment Reset Sim is hit, not just internally stop driving.
     self.motor_ratios = [0.0] * len(self.motor_ratios)
-    self.sendVelocityCmd(0.0, 0.0)
-    with self.sock_lock:
-      connected = self.sock is not None
-    if not connected:
-      return False
-    self.sendLineToBridge({'type': 'reset'}, "Reset sim")
-    return True
-
-  def setEnvironmentAction(self, environment_value, force = False):
-    # Fire-and-forget over the bridge, same pattern as resetSimAction: the VM
-    # side (sim_bridge_node.py) owns the actual Gazebo spawn/delete service
-    # calls and its own currently-spawned bookkeeping (environment_models.py's
-    # EnvironmentModelSpawner), so this side just needs a live connection to
-    # send the request on. environment_value is a Discrete option string
-    # (FLAT_GROUND, OBSTACLE_COURSE, or an uppercased scanned model name);
-    # ENVIRONMENT_VALUE_TO_MODEL maps it to the real model directory name to
-    # spawn, or None for "nothing spawned" (FLAT_GROUND). Formerly
-    # setObstacleCourseAction(enabled: bool), generalized from a single
-    # hardcoded model to any of the models environment_options reports (see
-    # docs/SCAN_TO_SIM_ENVIRONMENT_PLAN.md section 5.6).
-    with self.sock_lock:
-      connected = self.sock is not None
-    if not connected:
-      return False
-    model_name = self.ENVIRONMENT_VALUE_TO_MODEL.get(environment_value)
-    self.sendLineToBridge({'type': 'environment', 'model_name': model_name, 'force': force},
-                          "Environment set to " + environment_value)
-    return True
-
-  def setWheelIndependenceAction(self, setting_value):
-    # Fire-and-forget over the bridge, same pattern as setEnvironmentAction:
-    # sim_bridge_node.py's applyWheelIndependenceSetting owns the actual
-    # rebuild-SDF-and-respawn work and its own currently-applied bookkeeping
-    # (self.wheel_independence_enabled there), so this side just needs a
-    # live connection to send the request on. setting_value is this
-    # Setting's own Discrete option string ("TRUE"/"FALSE").
-    with self.sock_lock:
-      connected = self.sock is not None
-    if not connected:
-      return False
-    self.sendLineToBridge({'type': 'wheel_independence', 'enabled': (setting_value == 'TRUE')},
-                          "Wheel independence set to " + setting_value)
-    return True
-
-  def refreshEnvironmentAction(self):
-    # Force a live re-spawn of whatever environment is currently selected,
-    # picking up geometry pushed to model.sdf since it was first spawned --
-    # see EnvironmentModelSpawner.set_active_model's own force= docstring.
-    # Triggered by sim_connector_app_node.py (via the standard setup_action
-    # path, same as RESET_SIM/RETURN_HOME) right after it pushes an
-    # environment-dimensions edit, so "save the same custom environment
-    # while it's already live" reaches Gazebo without a full redeploy
-    # (requested live 2026-09-18).
-    return self.setEnvironmentAction(self.settings_dict['environment']['value'], force = True)
+    self.link.send_velocity(0.0, 0.0)
+    return self.link.send_line({'type': 'reset'}, "Reset sim")
 
   #######################
   ### Goto Controller Processes
@@ -1166,37 +766,24 @@ class SimNode:
     with self.goto_target_lock:
       self.goto_target = None
 
-  def gotoControlCb(self,timer):
-    # 10 Hz closed-loop differential-drive controller: turn toward the
-    # target bearing, drive when roughly aligned, then rotate to the final
-    # yaw goal. A velocity command is sent on EVERY tick, active goto or
-    # not (defaulting to (0, 0) when idle) -- never rely on a single
-    # one-shot zero command to stop the rover. The sim bridge is a plain
-    # TCP link with no delivery guarantee/ack (see sendLineToBridge): if a
-    # single stop packet -- or the last drive-phase command right at
-    # convergence -- is ever dropped, Gazebo's diff-drive plugin latches
-    # whatever velocity it last received and the rover keeps drifting
-    # (typically a slow, small residual yaw rotation) indefinitely, since
-    # nothing would ever re-send the correction. Re-asserting every 100ms
-    # makes that self-healing: the next tick after any drop still lands.
+  def gotoControlCb(self, timer):
+    # Closed-loop differential-drive controller: turn toward the target
+    # bearing, drive when roughly aligned, then rotate to the final yaw goal.
+    # A velocity command goes out on EVERY tick, zeros when idle -- the VM
+    # stops the rover when this stream stops, and a lost packet is replaced
+    # 50 ms later.
     with self.goto_target_lock:
       target = self.goto_target
 
     lin = 0.0
-    lin_y = 0.0
     ang = 0.0
-    # Read fresh every tick, not cached from when a goto/manual command
-    # started -- an operator can flip this mid-command and both the goto
-    # drive phase below and the manual-motor branch should honor it on
-    # their very next tick either way.
-    wheel_independence_on = self.settings_dict['wheel_independence_enabled']['value'] == 'TRUE'
     if target is not None:
       cur_x = self.navpose_dict['x_m']
       cur_y = self.navpose_dict['y_m']
       cur_yaw_rad = math.radians(self.navpose_dict['yaw_deg'])
 
-      max_lin = float(self.settings_dict['max_linear_speed_mps']['value'])
-      max_ang = math.radians(float(self.settings_dict['max_angular_rate_dps']['value']))
+      max_lin = self.getSettingFloat('max_linear_speed_mps')
+      max_ang = math.radians(self.getSettingFloat('max_angular_rate_dps'))
       tol_m = self.FACTORY_GOTO_TOL_M
       tol_rad = self.FACTORY_GOTO_TOL_RAD
       if self.rbx_if is not None:
@@ -1208,88 +795,42 @@ class SimNode:
       dist = math.hypot(dx, dy)
 
       if dist > tol_m:
-        if wheel_independence_on:
-          # Holonomic drive phase (requested live, 2026-09-23: "position
-          # changes keep the base locked to whatever angle they're at
-          # while moving the wheels") -- translate straight at the target
-          # in the body frame; ang stays 0.0 (base yaw untouched) the
-          # whole way there, unlike the turn-then-drive shape below. World-
-          # frame (dx,dy) rotated by -cur_yaw_rad into the body frame
-          # crab_steer_plugin.cpp's own OnUpdate expects (that plugin
-          # rotates a body-frame cmd_vel by +yaw right back into world
-          # frame -- see its own comment).
-          speed = min(max_lin, self.GOTO_KP_LIN * dist)
-          scale = speed / dist if dist > 0.0 else 0.0
-          lin = (dx * math.cos(cur_yaw_rad) + dy * math.sin(cur_yaw_rad)) * scale
-          lin_y = (-dx * math.sin(cur_yaw_rad) + dy * math.cos(cur_yaw_rad)) * scale
-        else:
-          # Drive phase: point at the target, drive when roughly aligned
-          bearing_err = self.normalizeAngle(math.atan2(dy, dx) - cur_yaw_rad)
-          ang = max(-max_ang, min(max_ang, self.GOTO_KP_ANG * bearing_err))
-          if abs(bearing_err) < self.GOTO_TURN_GATE_RAD:
-            lin = max(0.0, min(max_lin, self.GOTO_KP_LIN * dist))
+        # Drive phase: point at the target, drive when roughly aligned
+        bearing_err = self.normalizeAngle(math.atan2(dy, dx) - cur_yaw_rad)
+        ang = max(-max_ang, min(max_ang, self.GOTO_KP_ANG * bearing_err))
+        if abs(bearing_err) < self.GOTO_TURN_GATE_RAD:
+          lin = max(0.0, min(max_lin, self.GOTO_KP_LIN * dist))
       else:
-        # Final yaw phase (skipped if no yaw goal, or if this goto's own
-        # yaw_locked says a position command should never rotate the base
-        # at all -- see gotoPosition's own comment)
+        # Final yaw phase (skipped if no yaw goal)
         yaw_err = 0.0
-        if target['yaw_deg'] is not None and not target.get('yaw_locked', False):
+        if target['yaw_deg'] is not None:
           yaw_err = self.normalizeAngle(math.radians(target['yaw_deg']) - cur_yaw_rad)
         if abs(yaw_err) > tol_rad:
           ang = max(-max_ang, min(max_ang, self.GOTO_KP_ANG * yaw_err))
         else:
-          # Target reached: clear (lin/lin_y/ang stay 0.0 -- rover stops)
+          # Target reached: clear (lin/ang stay 0.0 -- rover stops)
           self.clearGotoTarget()
           self.msg_if.pub_info("Goto target reached")
-    elif any(self.motor_ratios) and self.settings_dict['move_with_manual_enabled']['value'] == 'TRUE':
-      # No active goto -- an active manual motor command takes over this same
-      # tick, so there is exactly one authoritative sender rather than a race
-      # between this loop and a separate one-shot command.
-      #
-      # Gated on move_with_manual_enabled (added 2026-09-14, requested live:
-      # "it be nice for there to be a checkbox in the sim connector called
-      # move with manual that actually moves the robot when the motors are
-      # messed with manually, and when they're not, it moves the motors
-      # properly but it doesnt actually move the robot. this should work
-      # for the rover too"). setMotorControlRatio below still always
-      # updates self.motor_ratios regardless of this Setting -- the RUI's
-      # own sliders and rbx/status's current_motor_control_settings keep
-      # reporting the commanded ratio either way ("moves the motors
-      # properly"); only whether that ratio also drives the rover's body
-      # velocity is what this toggle controls.
+    elif any(self.motor_ratios) and self.getSettingEnabled('move_with_manual_enabled'):
+      # No active goto -- an active manual motor command drives this same
+      # tick, so there is exactly one sender.
       lin, ang = self.motorControlToVelocity()
-      if wheel_independence_on:
-        # Base stays locked to whatever angle it's at under wheel
-        # independence, same as a position goto's own yaw_locked -- a
-        # manual differential motor ratio is a skid-steer "turn" gesture
-        # that has no meaning here (requested live, 2026-09-23, after
-        # watching this exact case rotate the base: "the base should not
-        # move, only the wheels"). Only an explicit gotoPose (the "Yaw
-        # Deg"/Pose control, or the pose phase above) can ever rotate the
-        # base while wheel independence is on.
-        ang = 0.0
-    self.sendVelocityCmd(lin, ang, lin_y)
+    self.link.send_velocity(lin, ang)
 
   def motorControlToVelocity(self):
-    # [0]=front_left, [1]=front_right, [2]=rear_left, [3]=rear_right --
-    # averaged per side since the diff-drive plugin only takes one command
-    # per side (see self.motor_ratios' own comment).
-    left = (self.motor_ratios[0] + self.motor_ratios[2]) / 2.0
-    right = (self.motor_ratios[1] + self.motor_ratios[3]) / 2.0
-    max_lin = float(self.settings_dict['max_linear_speed_mps']['value'])
+    left_ratios = self.motor_ratios[0::2]
+    right_ratios = self.motor_ratios[1::2]
+    left = sum(left_ratios) / len(left_ratios) if left_ratios else 0.0
+    right = sum(right_ratios) / len(right_ratios) if right_ratios else left
+    max_lin = self.getSettingFloat('max_linear_speed_mps')
     lin = (left + right) / 2.0 * max_lin
     ang = (right - left) / self.MOTOR_WHEEL_BASE_M * max_lin
-    # Clamped to max_angular_rate_dps -- same bound gotoControlCb's own turn
-    # phase already respects, just missing here (confirmed live, 2026-09-23:
-    # with max_linear_speed_mps raised to 3.0 on this device, full-opposite
-    # motor ratios computed -7.5 rad/s here -- over a full revolution per
-    # second, with nothing capping it before it reached
-    # sendVelocityCmd/the sim bridge).
-    max_ang = math.radians(float(self.settings_dict['max_angular_rate_dps']['value']))
+    # Same turn-rate bound the goto controller respects.
+    max_ang = math.radians(self.getSettingFloat('max_angular_rate_dps'))
     ang = max(-max_ang, min(max_ang, ang))
     return lin, ang
 
-  def normalizeAngle(self,angle_rad):
+  def normalizeAngle(self, angle_rad):
     while angle_rad > math.pi:
       angle_rad -= 2.0 * math.pi
     while angle_rad < -math.pi:
@@ -1297,184 +838,25 @@ class SimNode:
     return angle_rad
 
   #######################
-  ### Bridge Processes
+  ### Bridge Callbacks
 
-  def bridgeLoop(self):
-    # Listens for the VM's sim_bridge_node.py to dial in (see this file's
-    # own 2026-09-08 module-docstring note for why the direction reversed).
-    # Bind/listen once; accept in a loop so the VM side can restart
-    # independently of this node -- any disconnect just goes back to
-    # accept() and waits for the next connection.
-    srv = None
-    while srv is None and not nepi_sdk.is_shutdown():
-      try:
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(('0.0.0.0', int(self.bridge_port)))
-        srv.listen(1)
-      except Exception as e:
-        self.msg_if.pub_warn("Bridge listen on 0.0.0.0:" + str(self.bridge_port) +
-                             " failed: " + str(e))
-        srv = None
-        time.sleep(self.RECONNECT_INTERVAL_SEC)
-    if srv is None:
-      return
-    self.msg_if.pub_info("Listening for sim bridge on 0.0.0.0:" + str(self.bridge_port))
-
-    while not nepi_sdk.is_shutdown():
-      try:
-        sock, addr = srv.accept()
-        sock.settimeout(self.SOCKET_TIMEOUT_SEC)
-      except Exception:
-        continue
-      with self.sock_lock:
-        self.sock = sock
-      self.msg_if.pub_info("Sim bridge connected from " + str(addr[0]))
-      # Sync the VM side to this node's actual current camera settings on
-      # every (re)connect -- a bare restart of this node resets settings_dict
-      # to factory, but the VM's camera_rig_controller.py keeps whatever ROS
-      # params it last had, so an explicit push avoids relying on both sides
-      # coincidentally matching factory defaults.
-      self.sendCameraSettings()
-      # Same reasoning, same fix, for the environment state -- found live
-      # (2026-08-20): a fresh driver launch defaults its own
-      # settings_dict['environment'] to FLAT_GROUND but never told the
-      # bridge, so a Gazebo/bridge session left over from an earlier test
-      # (some model already spawned, sim_bridge_node.py's own spawner state
-      # still tracking it) stayed in that mode indefinitely -- "flat ground"
-      # only took effect once an operator happened to manually re-toggle the
-      # Environment dropdown, which is the only other code path that calls
-      # setEnvironmentAction. On the very first connect (this thread hasn't
-      # reached the receive loop yet, so ENVIRONMENT_VALUE_TO_MODEL is still
-      # whatever __init__ left it as) this is always FLAT_GROUND -> None,
-      # which is correct regardless -- settings_dict only ever holds a
-      # scanned-model value once a user has explicitly selected one, and
-      # that can't happen until after __init__'s bounded wait has already
-      # completed.
-      #
-      # Guarded to fire ONCE per process, not on every reconnect -- found
-      # live (2026-09-17): "changing the environment config mid sim or even
-      # before a sim doesnt work - it only summons the flat one." The VM
-      # bridge connection is known to drop and reconnect on its own (a
-      # flaky far-end sim process, unrelated to this driver), and every one
-      # of those reconnects re-ran this same line using whatever
-      # settings_dict['environment']['value'] happened to be at that
-      # moment -- which is correct on the very FIRST connect (see above),
-      # but on every SUBSEQUENT reconnect it was re-asserting a value that
-      # could already be stale relative to an operator's more recent
-      # selection, racing (and usually losing to, since reconnects were
-      # frequent) the RUI's own resend-on-mismatch correction in
-      # Nepi_IF_Sim-Controls.js. Only the first connect after this node
-      # starts needs this defensive push; every later reconnect should
-      # trust settings_dict as the last real user intent instead of
-      # re-broadcasting it blindly.
-      if not self._environment_synced_once:
-        self.setEnvironmentAction(self.settings_dict['environment']['value'])
-        self._environment_synced_once = True
-      buf = b''
-      while not nepi_sdk.is_shutdown():
-        try:
-          data = sock.recv(4096)
-        except socket.timeout:
-          # VM side pushes at 10 Hz -- a quiet-but-open socket past the
-          # timeout means the far side is gone
-          data = b''
-        except Exception:
-          data = b''
-        if not data:
-          break
-        buf += data
-        while b'\n' in buf:
-          line, buf = buf.split(b'\n', 1)
-          if line.strip():
-            self.processBridgeLine(line)
-      with self.sock_lock:
-        self.sock = None
-      try:
-        sock.close()
-      except Exception:
-        pass
-      self.msg_if.pub_warn("Sim bridge connection lost -- waiting for reconnect")
-
-  def processBridgeLine(self, line):
-    # Single entry point for every line off the bridge socket: parse once,
-    # then dispatch by key presence (no mandatory "type" tag on the
-    # already-verified telemetry shape, which predates this dispatch and
-    # carries none) -- image frames carry "type":"image", environment-model
-    # announcements carry "type":"environment_options"; everything else is
-    # telemetry, the only other shape the bridge server ever sends.
+  def processImage(self, msg):
+    # One JPEG camera frame -> a raw sensor_msgs/Image on the matching view.
     try:
-      msg = json.loads(line)
-    except Exception as e:
-      self.msg_if.pub_warn("Bad line from bridge: " + str(e))
-      return
-    if msg.get('type') == 'image':
-      self.processImageLine(msg)
-    elif msg.get('type') == 'environment_options':
-      self.processEnvironmentOptionsLine(msg)
-    else:
-      self.processTelemetryLine(msg)
-
-  def processEnvironmentOptionsLine(self, msg):
-    # Sent by sim_bridge_node.py on every (re)connect, listing whatever
-    # environment_models.py finds on the VM (obstacle_course plus any
-    # scan_to_environment.py output) -- see
-    # docs/SCAN_TO_SIM_ENVIRONMENT_PLAN.md section 5.6. Rebuilds both
-    # CAP_SETTINGS['environment']['options'] (what the Discrete setting
-    # reports as selectable) and ENVIRONMENT_VALUE_TO_MODEL (what a selected
-    # option string actually spawns) from the same list, wholesale --
-    # FLAT_GROUND always means "nothing spawned" and is not itself a model
-    # directory. self.environment_options_received_event.set() unblocks the
-    # bounded startup wait in __init__ as soon as the first announcement
-    # arrives, rather than waiting out the full timeout.
-    model_names = [str(n) for n in msg.get('options', [])]
-    options = ["FLAT_GROUND"] + [n.upper() for n in model_names]
-    self.CAP_SETTINGS['environment']['options'] = options
-    # CAP_SETTINGS is only ever consulted once, at initSettingsDict() time --
-    # the live settings_dict (what SettingsIF/the RUI actually see) has to
-    # be updated directly, or this resync never reaches anything.
-    self.settings_dict = nepi_controls.set_control_options(self.settings_dict, 'environment', options)
-    self.ENVIRONMENT_VALUE_TO_MODEL = {"FLAT_GROUND": None}
-    self.ENVIRONMENT_VALUE_TO_MODEL.update({n.upper(): n for n in model_names})
-    self.environment_options_received_event.set()
-
-  # Which publisher each bridge "camera" tag routes to. Built once as a class
-  # dict of attribute names (not direct publisher references) since the
-  # actual publishers don't exist yet at class-definition time -- resolved
-  # against self in processImageLine below.
-  CAMERA_PUB_ATTR = {
-    "robot_color": "image_pub_robot_color",
-    "scene_color": "image_pub_scene_color",
-    "robot_depth": "image_pub_robot_depth",
-    "scene_depth": "image_pub_scene_depth",
-  }
-
-  def processImageLine(self, msg):
-    # Bridge image frame -> decode the relayed frame and republish as a raw
-    # sensor_msgs/Image on this instance's own namespaced image topic (see
-    # the image_pub_robot_color / setImageTopicCb comments in __init__ for
-    # why the topic name is device_name-qualified and RBXRobotIF is pointed
-    # at one of them via set_image_topic). "camera" picks which of the four
-    # publishers this frame goes to; an older sender with no "camera" field
-    # defaults to robot_color, matching the original single-topic behavior.
-    try:
-      camera = msg.get('camera', self.ROBOT_COLOR_TOPIC_SUFFIX)
-      pub_attr = self.CAMERA_PUB_ATTR.get(camera, "image_pub_robot_color")
-      image_pub = getattr(self, pub_attr)
+      image_pub = self.image_pubs.get(msg.get('camera', 'robot_color'))
+      if image_pub is None:
+        return
       encoded_bytes = base64.b64decode(msg['data'])
-      arr = np.frombuffer(encoded_bytes, dtype = np.uint8)
-      cv2_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+      cv2_img = cv2.imdecode(np.frombuffer(encoded_bytes, dtype = np.uint8), cv2.IMREAD_COLOR)
       if cv2_img is None:
         raise ValueError("cv2.imdecode returned None")
-      ros_img = nepi_img.cv2img_to_rosimg(cv2_img, encoding = "bgr8")
-      image_pub.publish(ros_img)
+      image_pub.publish(nepi_img.cv2img_to_rosimg(cv2_img, encoding = "bgr8"))
     except Exception as e:
       self.msg_if.pub_warn("Failed to process camera image frame: " + str(e), throttle_s = 5.0)
 
-  def processTelemetryLine(self, telem):
-    # Bridge telemetry -> navpose dict consumed by getNavPoseCb (published
-    # as the standard NEPI navpose by RBXRobotIF's NPXDeviceIF and bridged
-    # to the current_* attributes its goto convergence checks use)
+  def processTelemetry(self, telem):
+    # Bridge telemetry -> the navpose dict getNavPoseCb serves (published by
+    # RBXRobotIF's NPXDeviceIF, and what its goto convergence checks read).
     now = nepi_utils.get_time()
     x_m = float(telem.get('x', 0.0))
     y_m = float(telem.get('y', 0.0))
@@ -1488,13 +870,8 @@ class SimNode:
     self.navpose_dict['x_m'] = x_m
     self.navpose_dict['y_m'] = y_m
     self.navpose_dict['z_m'] = 0.0
-    # No WGS84 fix on this rover (has_location stays unset/False), but
-    # RBXRobotIF's set_home_current path unconditionally mirrors
-    # navpose_dict's latitude/longitude/altitude_m into its own
-    # current_location_wgs84_geo bookkeeping regardless of has_location --
-    # mirroring the local x/y/z here too is what makes "use current
-    # position as home" (setHome above) capture the rover's real position
-    # instead of always reading back (0, 0, 0).
+    # No WGS84 fix, but RBXRobotIF's set_home_current reads these
+    # regardless of has_location -- see getHome.
     self.navpose_dict['latitude'] = x_m
     self.navpose_dict['longitude'] = y_m
     self.navpose_dict['altitude_m'] = 0.0
@@ -1514,59 +891,16 @@ class SimNode:
     self.navpose_dict['pitch_deg'] = 0.0
     self.navpose_dict['yaw_deg'] = math.degrees(yaw_rad)
     self.navpose_dict['yaw_deg_per_sec'] = math.degrees(ang_radps)
-
-    self.last_telemetry_time = now
-
-  def sendVelocityCmd(self, linear_x, angular_z, linear_y = 0.0):
-    # linear_y (2026-09-23): only ever nonzero from gotoControlCb's own
-    # wheel-independence drive phase -- see that method's own comment.
-    # Every other caller keeps sending plain (linear_x, angular_z), which
-    # sim_bridge_node.py's cmdCb already treats a missing linear_y as 0.0,
-    # so this is additive and changes nothing for a skid-steer rover.
-    cmd = {'linear_x': linear_x, 'angular_z': angular_z, 'linear_y': linear_y}
-    self.sendLineToBridge(cmd, "Velocity command")
-
-  def sendCameraSettings(self):
-    # No view_mode -- both views are always-live, separate ROS topics now
-    # (see CAMERA_SETTING_NAMES's own comment), nothing left to switch.
-    # offset_yaw/offset_tilt/scene_offset_yaw/scene_offset_tilt are in
-    # degrees, same convention as every other angle this app sends over the
-    # bridge -- sim_bridge_node.py converts to radians itself.
-    cmd = {
-      'type': 'camera_settings',
-      'offset_x': float(self.settings_dict['camera_offset_x']['value']),
-      'offset_y': float(self.settings_dict['camera_offset_y']['value']),
-      'offset_z': float(self.settings_dict['camera_offset_z']['value']),
-      'offset_yaw': float(self.settings_dict['camera_offset_yaw']['value']),
-      'offset_tilt': float(self.settings_dict['camera_offset_tilt']['value']),
-      'scene_offset_x': float(self.settings_dict['scene_offset_x']['value']),
-      'scene_offset_y': float(self.settings_dict['scene_offset_y']['value']),
-      'scene_offset_z': float(self.settings_dict['scene_offset_z']['value']),
-      'scene_offset_yaw': float(self.settings_dict['scene_offset_yaw']['value']),
-      'scene_offset_tilt': float(self.settings_dict['scene_offset_tilt']['value']),
-      'fov_deg': float(self.settings_dict['camera_fov_deg']['value']),
-    }
-    self.sendLineToBridge(cmd, "Camera settings")
-
-  def sendLineToBridge(self, line_dict, description):
-    with self.sock_lock:
-      sock = self.sock
-    if sock is None:
-      self.msg_if.pub_warn(description + " dropped -- sim bridge not connected", throttle_s = 5.0)
-      return
-    try:
-      sock.sendall((json.dumps(line_dict) + '\n').encode())
-    except Exception as e:
-      # bridgeLoop's recv will fail on the same dead socket and reconnect
-      self.msg_if.pub_warn("Failed to send " + description.lower() + " to bridge: " + str(e))
+    self.have_telemetry = True
 
   #######################
   # Node Cleanup Function
 
   def cleanup_actions(self):
-    """Stops the rover on node shutdown by sending a zero velocity command."""
+    """Stops the rover on node shutdown."""
     self.msg_if.pub_info("Shutting down: Executing script cleanup actions")
-    self.sendVelocityCmd(0.0, 0.0)
+    self.link.send_velocity(0.0, 0.0)
+    self.link.close()
 
 
 #########################################

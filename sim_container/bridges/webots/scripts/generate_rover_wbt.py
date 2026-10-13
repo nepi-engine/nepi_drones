@@ -113,8 +113,7 @@ DEFAULT_DIMENSIONS = {
 # (name, x_sign, y_sign) -- matches generate_model_sdf.py's own ROVER_WHEELS
 # ordering (front_left/front_right/rear_left/rear_right) and this file's own
 # pre-existing wheel1-4 naming (wheel1=front_left, wheel2=front_right,
-# wheel3=rear_left, wheel4=rear_right -- see rbx_mujoco_node.py's identical
-# convention comment).
+# wheel3=rear_left, wheel4=rear_right).
 ROVER_WHEELS = [
     ("wheel1", 1, 1),
     ("wheel2", 1, -1),

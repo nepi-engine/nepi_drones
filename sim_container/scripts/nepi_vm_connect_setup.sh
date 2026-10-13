@@ -6,7 +6,7 @@
 # "a real deployment has NO device-to-VM network path at all, reverse-SSH
 # included -- installation will already be dealt with in a setup script").
 #
-# What this does NOT do: install Gazebo/ArduPilot/Webots/MuJoCo themselves.
+# What this does NOT do: install Gazebo/ArduPilot/Webots themselves.
 # That's handled automatically, per-target, the first time you Deploy from
 # the Sim Connector RUI (simulator_launch_targets.yaml's own
 # install_command/check_installed_command machinery) -- this script only
@@ -134,4 +134,4 @@ fi
 echo
 echo "Done. This machine (instance '${INSTANCE_ID}') is ready to be used as a Sim Connector"
 echo "deploy target -- clicking Deploy in the RUI for any target now reaches it automatically,"
-echo "installing Gazebo/ArduPilot/Webots/MuJoCo on first use as needed."
+echo "installing Gazebo/ArduPilot/Webots on first use as needed."

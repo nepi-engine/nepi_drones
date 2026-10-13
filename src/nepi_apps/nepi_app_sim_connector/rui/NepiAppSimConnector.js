@@ -94,9 +94,11 @@ class NepiAppSimConnector extends Component {
               shared-storage transport (simulator_launch_targets.yaml's
               connection_mode: shared_storage + os_instance_id, dispatched
               via simulator_launcher.py's _dispatch_shared_storage to
-              vm_command_watcher.py's mailbox) is the only deploy mechanism
-              in use, one fixed VM, no reverse SSH tunnel and no per-machine
-              registration UI needed. */}
+              vm_command_watcher.py's mailbox) was then the only deploy
+              mechanism in use, one fixed VM, no reverse SSH tunnel and no
+              per-machine registration UI needed. Since 2026-09-28 that
+              transport is gone too: Deploy/Kill go through the
+              nepi_simulations services via api/nepi_sim_service.py. */}
 
           {/* show_controls is deliberately false, not a bug -- this panel's job is
               standing up the right sim/robot config, not direct control. Manual

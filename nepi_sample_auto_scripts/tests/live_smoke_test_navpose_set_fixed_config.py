@@ -23,12 +23,14 @@
 # This was NOT reachable from the sandbox this test was authored in
 # (connection timed out) -- it has not been run against a live device yet.
 
+import os
 import subprocess
 import sys
 
 SSH_CMD = [
     "ssh", "-p", "2222",
-    "-i", "/home/suraj/.ssh/nepi_default_ssh_key",
+    # NEPI_SSH_KEY, as the deploy scripts use it, else the default key.
+    "-i", os.environ.get("NEPI_SSH_KEY", os.path.expanduser("~/.ssh/nepi_default_ssh_key")),
     "-o", "ConnectTimeout=5",
     "-o", "BatchMode=yes",
     "nepi@nepi",

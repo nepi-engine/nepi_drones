@@ -40,7 +40,7 @@ inventing a new secret-handling mechanism:**
   has no business shipping with the app. Concretely:
   `nepi_drones/sim_container/simulator_launch_targets.yaml` — plain text,
   host/port/launch-command only, safe to commit and read.
-- **`sim_connector_app_params.yaml` (in `nepi_apps`, ships with the app)
+- **`sim_connector_vehicle_configs.yaml` (in `nepi_apps`, ships with the app)
   stays exactly as it is** — `robot_configs` describes robot *capabilities*,
   which is legitimately part of the app's own contract and already correct.
   Launch targets describe *dev infrastructure*, a different concern, hence
@@ -68,7 +68,7 @@ launch_targets:
     heartbeat_host: "192.168.x.x"
     heartbeat_port: 9022
     bridge_port: 9023
-    # Which sim_connector_app_params.yaml robot_configs entry this target's
+    # Which sim_connector_vehicle_configs.yaml robot_configs entry this target's
     # bridge expects -- auto-selected on successful launch.
     default_robot_config: ground_robot_2_wheel
   webots_rover: {}   # filled in once Phase 2 below is reached

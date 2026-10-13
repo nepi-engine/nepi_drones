@@ -15,8 +15,8 @@ simulator. It intentionally does not contain build history or phase-by-phase log
 anymore; those live in git history and in `MULTI_SIMULATOR_INTEGRATION_PLAN.md`.
 
 **The one rule that matters most:** adding a new simulator should only ever mean writing
-a new bridge script (speaking the wire protocol below) plus a new entry in
-`sim_connector_app_params.yaml`'s robot-config list. It should never require changing
+a new bridge script (speaking the wire protocol below) plus a new robot folder in the
+Gazebo service share's `ROBOT_CONFIGS` (its `nepi_robot_config.yaml` is the robot config). It should never require changing
 `device_if_sim.py`, `sim_connector_app_node.py`, or the RUI components. If a new
 simulator genuinely can't be expressed this way, that's a real gap in the contract worth
 writing up deliberately — not something to patch around per-simulator.

@@ -1265,23 +1265,9 @@ class SimDeviceIF:
     self.last_cmd_string = "go_sim_stop()"
     self.publishInfo()
 
-  def report_goto_result(self, success):
-    """Called by the hosting node when a bridge reports a goto has converged or
-    failed, asynchronously, after the fire-and-forget gotoPoseCb/gotoPositionCb/
-    gotoLocationCb below already returned. There is no per-command ID in the wire
-    protocol, so this always applies to "whatever goto is most recently pending" --
-    correct as long as a bridge only ever tracks one goto at a time, which matches
-    every bridge's own goto-controller design (a new goto command simply replaces
-    the previous target rather than queuing).
-    """
-    self.status_msg.cmd_success = bool(success)
-    self.publishInfo()
-
   # The three goto delegators. See the scope note at the top of this file:
   # fire-and-forget delegation to the injected function -- no blocking
-  # convergence-polling wait here. Success/failure, when a bridge reports it,
-  # arrives later and asynchronously via report_goto_result() above; until then
-  # (or if a bridge never reports it) cmd_success is left untouched rather than
+  # convergence-polling wait here. cmd_success is left untouched rather than
   # claiming a success that nothing verified.
   def gotoPoseCb(self, msg):
     if self.gotoPoseFunction is None:
@@ -1335,12 +1321,3 @@ class SimDeviceIF:
     """Rolls the current setpoint errors into the previous-errors report."""
     self.status_msg.errors_prev = copy.deepcopy(self.status_msg.errors_current)
     self.status_msg.errors_current = GotoErrors()
-
-  def get_namespace(self):
-    """Returns this interface's ROS namespace.
-
-    Returns:
-        str: The sim sub-namespace under the hosting node, e.g.
-            "/nepi/device1/app_sim_connector/sim".
-    """
-    return self.namespace

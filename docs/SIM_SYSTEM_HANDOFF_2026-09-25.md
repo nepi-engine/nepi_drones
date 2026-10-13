@@ -7,6 +7,27 @@ runs on. Where an older plan doc already covers something in depth (referenced i
 this doc gives the current-state summary and points there for detail rather than repeating
 it.*
 
+> **Superseded in part, 2026-09-28.** MuJoCo was removed (its bridge under
+> `sim_container/bridges/mujoco/` and the `rbx_mujoco_*` drivers), to come back later on the
+> new pattern below — everything this doc says about MuJoCo is history now. The Sim Connector
+> app no longer launches through `simulator_launcher.py`/`simulator_launch_targets.yaml`/
+> `vm_command_watcher.py`: Deploy/Kill now start and stop Gazebo through the NEPI Gazebo
+> service in `nepi_simulations` (`nepi_gazebo/gazebo_setup/resources/config/nepi_gazebo.sh`),
+> by request flags in `databases/sims/gazebo/config/nepi_gazebo_config.yaml` in NEPI storage
+> (see the app's `api/nepi_gazebo.py`). Webots is out of the launcher for now (its code is
+> kept). That service does not yet start the heartbeat/bridge scripts, so a Gazebo it starts
+> does not appear on the device as an RBX robot until that is added.
+
+> **Update, 2026-10-13.** Two statements in the note above are out of date. MuJoCo is back,
+> on the same service pattern as Gazebo (`nepi_simulations/nepi_mujoco/mujoco_setup`,
+> `nepi_mujoco.sh`); the app drives both services through `api/nepi_sim_service.py`, which
+> replaced `api/nepi_gazebo.py`. And the Gazebo service now starts the bridges itself: the
+> rover bridge for an `rbx_sim` robot, and ArduPilot SITL with its MAVLink relay and
+> camera/reset helpers for the quadcopter. Both robots do appear on the device: the app
+> launches RBX_SIM itself when the service reports the rover running (the heartbeat path is
+> no longer used), and the quadcopter comes up through RBX_ARDUPILOT_SITL discovery, which
+> must be enabled on the Drivers page.
+
 ## 0. TL;DR for a new developer
 
 - **MuJoCo is now the primary/default simulator**, not Gazebo. It supports the same crab-

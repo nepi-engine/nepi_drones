@@ -421,9 +421,10 @@ class NepiIFSimControls extends Component {
       // root cause: it was reading this.state.capabilities instead, which
       // comes from THIS app's own SimCapabilitiesQuery (queryCapabilities,
       // above), whose setup_action_options is always empty --
-      // sim_connector_app_node.py only ever populates it from a target's
-      // own 'setup_actions' entry in simulator_launch_targets.yaml, and
-      // that key is never actually set there for any target. The real,
+      // sim_connector_app_node.py only ever populated it from a target's
+      // own 'setup_actions' entry in simulator_launch_targets.yaml (legacy,
+      // no longer read since 2026-09-28), and that key was never set there
+      // for any target. The real,
       // always-correctly-populated list is the connected RBX driver's own
       // capabilities (confirmed live: rosservice call .../rbx/
       // capabilities_query already reports ["RESET_SIM", "RETURN_HOME"]),
@@ -1123,9 +1124,10 @@ class NepiIFSimControls extends Component {
     // reset_sim thing in the sim connector anywhere." this.state.capabilities
     // comes from THIS app's own SimCapabilitiesQuery (queryCapabilities),
     // whose setup_action_options is always empty: sim_connector_app_node.py
-    // only ever populates it from a target's own 'setup_actions' entry in
-    // simulator_launch_targets.yaml, and that key is never actually set
-    // there for any target. rbxDevices holds the connected RBX driver's own
+    // only ever populated it from a target's own 'setup_actions' entry in
+    // simulator_launch_targets.yaml (legacy, no longer read since
+    // 2026-09-28), and that key was never set there for any target.
+    // rbxDevices holds the connected RBX driver's own
     // capabilities instead (confirmed live: rosservice call .../rbx/
     // capabilities_query already reports ["RESET_SIM", "RETURN_HOME"]),
     // the same source NepiDeviceRBX.js's own Setup Actions dropdown uses.

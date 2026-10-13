@@ -46,10 +46,11 @@ Type=simple
 # identifier under vm_commands/<instance_id>/ -- must match whatever the
 # device's own os_instance_registry has recorded for this machine (the
 # setup script picks a sensible default; override here or via the env file
-# if the device side used something else).
-User=suraj
+# if the device side used something else). User= and NEPI_DRONES_REPO_PATH
+# below are placeholders the setup script replaces.
+User=<user>
 WorkingDirectory=~
-Environment=NEPI_DRONES_REPO_PATH=/home/suraj/nepi_engine_ws/nepi_drones
+Environment=NEPI_DRONES_REPO_PATH=/home/<user>/nepi_engine_ws/nepi_drones
 Environment=NEPI_VM_INSTANCE_ID=baseline
 EnvironmentFile=-/etc/nepi-storage-mount.env
 ExecStartPre=/bin/bash -c 'until mountpoint -q /mnt/nepi_share_storage; do sleep 2; done'

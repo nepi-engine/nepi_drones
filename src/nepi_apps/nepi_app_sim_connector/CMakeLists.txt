@@ -113,8 +113,12 @@ set( NEPI_RUI_PARAMS_FOLDER
   ${NEPI_RUI}/src/rui_webserver/rui-app/src/apps
 )
 
+# The RUI build flattens (and rewrites in place) every yaml it finds here, so
+# only the app params yaml goes -- SIM_VEHICLE_DICT's own file is the node's
+# alone (see its header).
 install(DIRECTORY params/
   DESTINATION ${NEPI_RUI_PARAMS_FOLDER}
+  PATTERN "sim_connector_vehicle_configs.yaml" EXCLUDE
 )
 
 set( NEPI_RUI_SOURCE_FOLDER

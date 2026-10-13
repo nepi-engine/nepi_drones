@@ -49,7 +49,7 @@ already use).
 
 Before a robot is deployed, there is no live driver to read Settings from at all -- the only
 existing pre-deploy configuration mechanism is the Robot Config selector (a preset baked into
-`sim_connector_app_params.yaml`'s `robot_configs`). This plan does not add a second,
+`sim_connector_vehicle_configs.yaml`'s `robot_configs`). This plan does not add a second,
 parallel way to edit preset defaults pre-deploy (that would mean building config-file editing
 UI, a materially larger and different feature than what's missing here) -- it makes every
 Setting control render as soon as a robot IS live (the same "no device yet" empty state
