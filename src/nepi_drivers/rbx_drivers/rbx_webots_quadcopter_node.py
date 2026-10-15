@@ -303,10 +303,8 @@ class WebotsQuadcopterNode:
     self.msg_if.pub_info(str(self.device_info_dict))
 
     self.rbx_if = RBXRobotIF(device_info = self.device_info_dict,
-                             capSettings = self.cap_settings,
-                             factorySettings = self.factory_settings,
-                             settingUpdateFunction = self.settingUpdateFunction,
                              getSettingsFunction = self.getSettings,
+                             setSettingFunction = self.settingUpdateFunction,
                              axisControls = self.axis_controls,
                              getBatteryPercentFunction = None,
                              states = self.RBX_STATES,
@@ -444,7 +442,7 @@ class WebotsQuadcopterNode:
       msg = (self.node_name + " Setting data " + setting_str + " is not valid")
       return success, msg, copy.deepcopy(self.settings_dict)
 
-    self.settings_dict = nepi_controls.set_control_value(self.settings_dict, setting_name, setting_value)
+    self.settings_dict = nepi_controls.set_value(self.settings_dict, setting_name, setting_value)
     success = True
     msg = (self.node_name + " UPDATED SETTINGS " + setting_str)
     if setting_name in self.CAMERA_SETTING_NAMES:

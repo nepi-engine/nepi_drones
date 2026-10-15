@@ -327,8 +327,16 @@ class RobotLinkRelay:
     if not found:
       return None
     service = nepi_sdk.connect_service(service_name, RBXCapabilitiesQuery)
-    return nepi_sdk.call_service(service, RBXCapabilitiesQueryRequest(),
-                                 verbose = False)
+    response = nepi_sdk.call_service(service, RBXCapabilitiesQueryRequest(),
+                                     verbose = False)
+    # RBXCapabilitiesQueryResponse carries a single field, device_status (the
+    # device's DeviceRBXStatus), and every capability this relay reads --
+    # setup_action_options, state_options, mode_options, device_node_name --
+    # lives on it. Return the status itself so callers read the same field
+    # names they always have; None still means "unavailable".
+    if response is None:
+      return None
+    return response.device_status
 
   def _wire_mavlink_relay(self, sim_caps, phys_caps, new_subs, new_pubs):
     # See MAVLINK_SETPOINT_TOPICS' own module-level comment for why this
@@ -399,7 +407,7 @@ class RobotLinkRelay:
     # for why this replaced a raw set_state/set_mode command relay. Built
     # from the SAME capabilities responses already fetched above for
     # setup_action translation -- state_options/mode_options are on the same
-    # RBXCapabilitiesQueryResponse.
+    # DeviceRBXStatus (see _query_capabilities).
     phys_state_index_by_name = {name: i for i, name in enumerate(phys_caps.state_options)}
     phys_mode_index_by_name = {name: i for i, name in enumerate(phys_caps.mode_options)}
     self._last_sim_armed = None
